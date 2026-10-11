@@ -217,7 +217,12 @@ public:
     {
         if (!src.is_cpu())
             NN_FAIL("clone: src tensor is not CPU");
-        return Tensor::from_matrix(Matrix(src.cpu_matrix()));  // 深拷贝
+        // CPU 原语基于 f32 Matrix → 非 f32 输入走通用边界 cast（抬 f32 拷贝 →
+        // 落回源精度）；f32 直通。精度策略在此实现，基类入口不做能力分支。
+        return move_(src, [](const Tensor& s) -> Result<Tensor>
+        {
+            return Tensor::from_matrix(Matrix(s.cpu_matrix()));  // 深拷贝
+        });
     }
 
     // ── 行切片：拷贝 src 的行 [start_row, start_row + count) 到新 Tensor ──
@@ -226,17 +231,20 @@ public:
     {
         if (!src.is_cpu())
             NN_FAIL("slice_rows: src tensor is not CPU");
-        const Matrix& m = src.cpu_matrix();
-        if (start_row + count > m.rows())
-            NN_FAIL("slice_rows: range out of bounds");
-        Matrix result(count, m.cols());
-        const auto src_span = m.span();
-        auto dst_span = result.span();
-        const std::size_t cols = m.cols();
-        for (std::size_t r = 0; r < count; ++r)
-            std::copy_n(src_span.begin() + (start_row + r) * cols, cols,
-                        dst_span.begin() + r * cols);
-        return Tensor::from_matrix(std::move(result));
+        return move_(src, [start_row, count](const Tensor& s) -> Result<Tensor>
+        {
+            const Matrix& m = s.cpu_matrix();
+            if (start_row + count > m.rows())
+                NN_FAIL("slice_rows: range out of bounds");
+            Matrix result(count, m.cols());
+            const auto src_span = m.span();
+            auto dst_span = result.span();
+            const std::size_t cols = m.cols();
+            for (std::size_t r = 0; r < count; ++r)
+                std::copy_n(src_span.begin() + (start_row + r) * cols, cols,
+                            dst_span.begin() + r * cols);
+            return Tensor::from_matrix(std::move(result));
+        });
     }
 
     // ── 行插入：将 src 的所有行写入 dst 的行 [dst_start_row, ...) ──
@@ -245,6 +253,8 @@ public:
     {
         if (!dst.is_cpu() || !src.is_cpu())
             NN_FAIL("insert_rows: tensors are not CPU");
+        if (dst.precision() != Precision::F32 || src.precision() != Precision::F32)
+            return insert_rows_cast_(dst, dst_start_row, src);
         if (dst.cols() != src.cols())
             NN_FAIL("insert_rows: column count mismatch");
         if (dst_start_row + src.rows() > dst.rows())
@@ -271,6 +281,17 @@ public:
     //   - 行块并行避免跨行数据竞争（每行独立写入）
     [[nodiscard]] Result<Tensor> gather_rows_impl(
         const Tensor& table, const Tensor& indices) override
+    {
+        // 输出精度 = 源精度（表）→ 非 f32 表走边界 cast 助手。
+        return move_(table, [this, &indices](const Tensor& t) -> Result<Tensor>
+        {
+            return gather_rows_f32_(t, indices);
+        });
+    }
+
+private:
+    [[nodiscard]] Result<Tensor> gather_rows_f32_(
+        const Tensor& table, const Tensor& indices)
     {
         if (!table.is_cpu() || !indices.is_cpu())
             NN_FAIL("gather_rows: tensors are not CPU");
@@ -324,11 +345,21 @@ public:
         return Tensor::from_matrix(std::move(result));
     }
 
+public:
     // ── scatter_add_rows: 按 indices 把 grad 的行原子累加到 dst ──
     //   dst: (vocab, D) 原地修改, indices: 任意形状（按 flat 遍历）, grad: (num_indices, D)
     //   语义: dst[flat_indices[i]] += grad[i]
     [[nodiscard]] Result<void> scatter_add_rows_impl(
         Tensor& dst, const Tensor& indices, const Tensor& grad) override
+    {
+        if (dst.precision() != Precision::F32 || grad.precision() != Precision::F32)
+            return scatter_add_rows_cast_(dst, indices, grad);
+        return scatter_add_rows_f32_(dst, indices, grad);
+    }
+
+private:
+    [[nodiscard]] Result<void> scatter_add_rows_f32_(
+        Tensor& dst, const Tensor& indices, const Tensor& grad)
     {
         if (!dst.is_cpu() || !indices.is_cpu() || !grad.is_cpu())
             NN_FAIL("scatter_add_rows: tensors are not CPU");
@@ -360,6 +391,7 @@ public:
         return {};
     }
 
+public:
     // ── 3D 维度转置：(M, B, N) ↔ (B, M, N) ──
     //   inverse=false: (M, B*N) → (B*M, N), out[b*M+m, n] = in[m, b*N+n]
     //   inverse=true:  (B*M, N) → (M, B*N), out[m, b*N+n] = in[b*M+m, n]
@@ -372,6 +404,12 @@ public:
         const Tensor& x, std::size_t M, std::size_t B, std::size_t N,
         bool inverse) override
     {
+        // 非 f32：边界 cast（抬 f32 → 重入本函数 → 落回源精度）
+        if (x.precision() != Precision::F32)
+            return move_(x, [this, M, B, N, inverse](const Tensor& t) -> Result<Tensor>
+            {
+                return rearrange_3d_impl(t, M, B, N, inverse);
+            });
         if (x.is_gpu())
             NN_FAIL("CpuEngine: GPU tensor on CPU engine");
         const Matrix& m = x.cpu_matrix();
@@ -424,6 +462,11 @@ public:
     // ── 矩阵转置：A (R, C) → out (C, R) ──
     [[nodiscard]] Result<Tensor> transpose_impl(const Tensor& A) override
     {
+        if (A.precision() != Precision::F32)
+            return move_(A, [this](const Tensor& t) -> Result<Tensor>
+            {
+                return transpose_impl(t);
+            });
         if (A.is_gpu())
             NN_FAIL("CpuEngine: GPU tensor on CPU engine");
         return Tensor::from_matrix(A.cpu_matrix().transpose());
@@ -438,6 +481,11 @@ public:
         std::size_t k, std::size_t stride, std::size_t pad,
         std::size_t OH, std::size_t OW) override
     {
+        if (x.precision() != Precision::F32)
+            return move_(x, [this, C, H, W, k, stride, pad, OH, OW](const Tensor& t) -> Result<Tensor>
+            {
+                return im2col_impl(t, C, H, W, k, stride, pad, OH, OW);
+            });
         if (x.is_gpu())
             NN_FAIL("CpuEngine: GPU tensor on CPU engine");
         if (C == 0 || H == 0 || W == 0 || k == 0 || stride == 0 || OH == 0 || OW == 0)
@@ -506,6 +554,11 @@ public:
         std::size_t k, std::size_t stride, std::size_t pad,
         std::size_t OH, std::size_t OW) override
     {
+        if (col.precision() != Precision::F32)
+            return move_(col, [this, C, H, W, k, stride, pad, OH, OW](const Tensor& t) -> Result<Tensor>
+            {
+                return col2im_impl(t, C, H, W, k, stride, pad, OH, OW);
+            });
         if (col.is_gpu())
             NN_FAIL("CpuEngine: GPU tensor on CPU engine");
         if (C == 0 || H == 0 || W == 0 || k == 0 || stride == 0 || OH == 0 || OW == 0)
@@ -568,13 +621,28 @@ public:
     // 矩阵级原语
     // ══════════════════════════════════════════════════════════════════════
 
+    // ── 能力摘要（唯一对外通道；只披露事实，不用于选路）──────────────────
+    // CPU 引擎：原语基于 f32 Matrix（无原生 f16 搬运/归约，无融合变体）；
+    // 三值打包 GEMM 有 CPU 参考实现（行块解码 + 稠密微内核）。
+    [[nodiscard]] EngineInfo describe() const override
+    {
+        EngineInfo i;
+        i.engine = "cpu";
+        i.device = "cpu";
+        i.native_f16_move = false;
+        i.native_f16_reduce = false;
+        i.fused_prec_variant = false;
+        i.ternary_gemm = true;
+        i.int8_dot = false;
+        i.int8_dot_accelerated = false;
+        return i;
+    }
+
     // ── 三值打包权重（P2 / F3）：打包 + 量化 GEMM（CPU 参考实现）──────────
     // 语义与布局：compute_engine.hpp 的 trit_pack / matmul_q、ternary_pack.hpp。
     // 解码只在"逐存储行"上做一次（一行 16 个权重共享一个 32-bit 字，解码一遍
     // 进小缓冲，之后按标量 FMA 复用）—— 既不物化 4 B/权重的 f32 副本，也不
     // 让内层循环反复移位。
-    [[nodiscard]] bool supports_ternary_gemm() const noexcept override { return true; }
-
     [[nodiscard]] Result<Tensor> trit_pack_impl(const Tensor& w,
                                                 const Tensor& scale) override
     {
@@ -1004,6 +1072,11 @@ public:
 
     [[nodiscard]] Result<void> add_inplace_impl(Tensor& A, const Tensor& B) override
     {
+        if (A.precision() != Precision::F32 || B.precision() != Precision::F32)
+            return inplace2_(A, B, [this](Tensor& a, const Tensor& b) -> Result<void>
+            {
+                return add_inplace_impl(a, b);
+            });
         if (A.rows() != B.rows() || A.cols() != B.cols())
             NN_FAIL("add_inplace: shape mismatch");
         A.cpu_matrix().add_inplace(B.cpu_matrix());
@@ -1012,12 +1085,22 @@ public:
 
     [[nodiscard]] Result<void> scale_inplace_impl(Tensor& A, Scalar s) override
     {
+        if (A.precision() != Precision::F32)
+            return inplace1_(A, [this, s](Tensor& a) -> Result<void>
+            {
+                return scale_inplace_impl(a, s);
+            });
         A.cpu_matrix().scale_inplace(s);
         return {};
     }
 
     [[nodiscard]] Result<void> zero_impl(Tensor& A) override
     {
+        if (A.precision() != Precision::F32)
+            return inplace1_(A, [this](Tensor& a) -> Result<void>
+            {
+                return zero_impl(a);
+            });
         A.cpu_matrix().zero();
         return {};
     }
@@ -1036,7 +1119,28 @@ public:
         const Tensor& A0, const Tensor& B0, bool has_state,
         std::size_t dk, std::size_t heads, bool causal,
         const Tensor& boundary, bool has_bnd,
-        Precision = Precision::F32) override
+        Precision prec = Precision::F32) override
+    {
+        const std::vector<Tensor> ts{K, V, P, R, A0, B0, boundary};
+        if (prec == Precision::F32 && all_f32(ts))
+            return scan_prefix_outer_f32_(K, V, P, R, A0, B0, has_state, dk, heads,
+                                          causal, boundary, has_bnd);
+        // 边界 cast：全部操作数抬 f32 → 算 → 输出按 prec 落回
+        auto c = to_f32_all(ts);
+        NN_TRY_CHECK(c);
+        auto r = scan_prefix_outer_f32_((*c)[0], (*c)[1], (*c)[2], (*c)[3],
+                                        (*c)[4], (*c)[5], has_state, dk, heads,
+                                        causal, (*c)[6], has_bnd);
+        NN_TRY_CHECK(r);
+        return to_prec(std::move(*r), prec);
+    }
+
+private:
+    [[nodiscard]] Result<Tensor> scan_prefix_outer_f32_(
+        const Tensor& K, const Tensor& V, const Tensor& P, const Tensor& R,
+        const Tensor& A0, const Tensor& B0, bool has_state,
+        std::size_t dk, std::size_t heads, bool causal,
+        const Tensor& boundary, bool has_bnd)
     {
         for (const auto& t : {K, V, P, R, A0, B0, boundary})
             if (t.is_gpu())
@@ -1178,12 +1282,30 @@ public:
         return Tensor::from_matrix(std::move(out));
     }
 
+public:
     // ── 后缀扫描（backward pass 2：gK/gV）────────────────────────────────
     [[nodiscard]] Result<Tensor> scan_suffix_outer_impl(
         const Tensor& D, const Tensor& X, const Tensor& Y,
         std::size_t dk, std::size_t heads, bool causal,
         const Tensor& boundary, bool has_bnd,
-        Precision = Precision::F32) override
+        Precision prec = Precision::F32) override
+    {
+        const std::vector<Tensor> ts{D, X, Y, boundary};
+        if (prec == Precision::F32 && all_f32(ts))
+            return scan_suffix_outer_f32_(D, X, Y, dk, heads, causal, boundary, has_bnd);
+        auto c = to_f32_all(ts);
+        NN_TRY_CHECK(c);
+        auto r = scan_suffix_outer_f32_((*c)[0], (*c)[1], (*c)[2], dk, heads,
+                                        causal, (*c)[3], has_bnd);
+        NN_TRY_CHECK(r);
+        return to_prec(std::move(*r), prec);
+    }
+
+private:
+    [[nodiscard]] Result<Tensor> scan_suffix_outer_f32_(
+        const Tensor& D, const Tensor& X, const Tensor& Y,
+        std::size_t dk, std::size_t heads, bool causal,
+        const Tensor& boundary, bool has_bnd)
     {
         for (const auto& t : {D, X, Y, boundary})
             if (t.is_gpu())
@@ -1271,11 +1393,27 @@ public:
         return Tensor::from_matrix(std::move(out));
     }
 
+public:
     // ── 逐列外积（backward 的 dL/dA、dL/dB 物化）─────────────────────────
     [[nodiscard]] Result<Tensor> outer_col_impl(
         const Tensor& P, const Tensor& R, const Tensor& S,
         std::size_t dk, bool has_scale,
-        Precision = Precision::F32) override
+        Precision prec = Precision::F32) override
+    {
+        const std::vector<Tensor> ts{P, R, S};
+        if (prec == Precision::F32 && all_f32(ts))
+            return outer_col_f32_(P, R, S, dk, has_scale);
+        auto c = to_f32_all(ts);
+        NN_TRY_CHECK(c);
+        auto r = outer_col_f32_((*c)[0], (*c)[1], (*c)[2], dk, has_scale);
+        NN_TRY_CHECK(r);
+        return to_prec(std::move(*r), prec);
+    }
+
+private:
+    [[nodiscard]] Result<Tensor> outer_col_f32_(
+        const Tensor& P, const Tensor& R, const Tensor& S,
+        std::size_t dk, bool has_scale)
     {
         for (const auto& t : {P, R, S})
             if (t.is_gpu())
@@ -1318,12 +1456,19 @@ public:
         return Tensor::from_matrix(std::move(out));
     }
 
+public:
     // ══════════════════════════════════════════════════════════════════════
     // 归约原语
     // ══════════════════════════════════════════════════════════════════════
 
-    [[nodiscard]] Result<Tensor> row_reduce_sum_impl(const Tensor& A, Precision = Precision::F32) override
+    [[nodiscard]] Result<Tensor> row_reduce_sum_impl(const Tensor& A, Precision P = Precision::F32) override
     {
+        // 非 f32 输入 / 非 f32 输出精度 → 通用边界 cast（归约恒 f32 累加）
+        if (A.precision() != Precision::F32 || P != Precision::F32)
+            return unary_(A, P, [this](const Tensor& a) -> Result<Tensor>
+            {
+                return row_reduce_sum_impl(a, Precision::F32);
+            });
         const Matrix& m = A.cpu_matrix();
         Matrix result = m.row_reduce(Scalar{0},
             [](Scalar a, Scalar b) noexcept { return a + b; },
@@ -1331,8 +1476,13 @@ public:
         return Tensor::from_matrix(std::move(result));
     }
 
-    [[nodiscard]] Result<Tensor> col_reduce_sum_impl(const Tensor& A, Precision = Precision::F32) override
+    [[nodiscard]] Result<Tensor> col_reduce_sum_impl(const Tensor& A, Precision P = Precision::F32) override
     {
+        if (A.precision() != Precision::F32 || P != Precision::F32)
+            return unary_(A, P, [this](const Tensor& a) -> Result<Tensor>
+            {
+                return col_reduce_sum_impl(a, Precision::F32);
+            });
         const Matrix& m = A.cpu_matrix();
         Matrix result = m.col_reduce(Scalar{0},
             [](Scalar a, Scalar b) noexcept { return a + b; },
@@ -1340,8 +1490,13 @@ public:
         return Tensor::from_matrix(std::move(result));
     }
 
-    [[nodiscard]] Result<Tensor> col_reduce_max_impl(const Tensor& A, Precision = Precision::F32) override
+    [[nodiscard]] Result<Tensor> col_reduce_max_impl(const Tensor& A, Precision P = Precision::F32) override
     {
+        if (A.precision() != Precision::F32 || P != Precision::F32)
+            return unary_(A, P, [this](const Tensor& a) -> Result<Tensor>
+            {
+                return col_reduce_max_impl(a, Precision::F32);
+            });
         const Matrix& m = A.cpu_matrix();
         Matrix result = m.col_reduce(
             std::numeric_limits<Scalar>::lowest(),
@@ -1401,15 +1556,25 @@ public:
 
     [[nodiscard]] Result<Tensor> grouped_reduce_sum_impl(
         const Tensor& x, std::size_t G, std::size_t R,
-        Precision = Precision::F32) override
+        Precision P = Precision::F32) override
     {
+        if (x.precision() != Precision::F32 || P != Precision::F32)
+            return unary_(x, P, [this, G, R](const Tensor& t) -> Result<Tensor>
+            {
+                return grouped_reduce_sum_impl(t, G, R, Precision::F32);
+            });
         return grouped_reduce_cpu_<false>(x, G, R);
     }
 
     [[nodiscard]] Result<Tensor> grouped_reduce_max_impl(
         const Tensor& x, std::size_t G, std::size_t R,
-        Precision = Precision::F32) override
+        Precision P = Precision::F32) override
     {
+        if (x.precision() != Precision::F32 || P != Precision::F32)
+            return unary_(x, P, [this, G, R](const Tensor& t) -> Result<Tensor>
+            {
+                return grouped_reduce_max_impl(t, G, R, Precision::F32);
+            });
         return grouped_reduce_cpu_<true>(x, G, R);
     }
 
@@ -1425,8 +1590,20 @@ public:
         const ExprSpec& spec,
         std::span<const Tensor> inputs,
         std::size_t rows, std::size_t cols,
-        Precision = Precision::F32) override
+        Precision P = Precision::F32) override
     {
+        trace_variant_(spec, inputs, P);
+        // CPU 无带类型融合变体：任何非 f32（输入或输出精度）都走边界 cast
+        if (P != Precision::F32 || !all_f32(inputs))
+        {
+            if (prec_trace_enabled_())
+                trace_miss_(spec, inputs, P);
+            auto in32 = to_f32_all(inputs);
+            NN_TRY_CHECK(in32);
+            auto r = eval_expr_impl(spec, *in32, rows, cols, Precision::F32);
+            NN_TRY_CHECK(r);
+            return to_prec(std::move(*r), P);
+        }
         // 输出会被下面的输出循环完整覆盖（每个下标恰好写一次）→ 未初始化构造，
         // 省掉一遍全尺寸零写（见 Tensor::cpu_uninitialized）
         Tensor out = Tensor::cpu_uninitialized(rows, cols);
@@ -1444,8 +1621,19 @@ public:
         const ExprSpec& spec,
         std::span<const Tensor> inputs,
         std::size_t rows, std::size_t cols,
-        Precision = Precision::F32) override
+        Precision P = Precision::F32) override
     {
+        trace_variant_(spec, inputs, P);
+        if (P != Precision::F32 || !all_f32(inputs))
+        {
+            if (prec_trace_enabled_())
+                trace_miss_(spec, inputs, P);
+            auto in32 = to_f32_all(inputs);
+            NN_TRY_CHECK(in32);
+            auto r = eval_expr_reduce_impl(spec, *in32, rows, cols, Precision::F32);
+            NN_TRY_CHECK(r);
+            return to_prec(std::move(*r), P);
+        }
         const bool vec_is_row =
             (expr_spec_reduce_axis(canonicalize_expr_spec(spec)) == 0);
         // 归约向量输出同样被完整写满 → 未初始化构造
@@ -1470,6 +1658,21 @@ public:
         std::span<const Tensor> inputs,
         std::size_t rows, std::size_t cols, Tensor& dst) override
     {
+        // 目标传递：out 可能是 f16 —— 在 f32 空间求值后 cast_into 写回原存储
+        //（out 常同时是输入之一：抬 f32 的拷贝即"读旧值"，语义正确）。
+        if (dst.precision() != Precision::F32 || !all_f32(inputs))
+        {
+            trace_variant_(spec, inputs, dst.precision());
+            if (prec_trace_enabled_())
+                trace_miss_(spec, inputs, dst.precision());
+            auto in32 = to_f32_all(inputs);
+            NN_TRY_CHECK(in32);
+            auto tmp = create_tensor(rows, cols, Precision::F32);
+            auto r = eval_expr_into_impl(spec, *in32, rows, cols, tmp);
+            NN_TRY_CHECK(r);
+            return cast_into(tmp, dst);
+        }
+        trace_variant_(spec, inputs, Precision::F32);
         if (dst.rows() != rows || dst.cols() != cols)
             NN_FAIL("eval_expr_into: dst shape mismatch");
         if (expr_spec_reduce_axis(canonicalize_expr_spec(spec)) != -1)

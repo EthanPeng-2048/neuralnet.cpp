@@ -150,16 +150,16 @@ void test_primitives(nn::ComputeEngine& eng, const char* tag)
 {
     constexpr std::size_t ROWS = 7, K = 40, N = 3;   // K 故意非 16 倍数
     std::printf("[2][3][4] trit_pack / matmul_q / matmul_q_t（%s）\n", tag);
-    if (!eng.supports_ternary_gemm())
+    if (!eng.describe().ternary_gemm)
     {
         std::puts("    （该引擎尚未接三值打包原语 → 跳过；BitLinear 会自动走 f16 路径）");
         return;
     }
     // P3 门禁（W2A8）：int8 点积能力 —— 决定"激活 int8 + 整数点积"内核在
     // 本设备上是否可建（正确性无关，只影响那条路线的可行性与收益）
-    std::printf("    P3 门禁：supports_int8_dot() = %s，硬件加速 = %s\n",
-                eng.supports_int8_dot() ? "true" : "false",
-                eng.int8_dot_accelerated() ? "true" : "false");
+    std::printf("    P3 门禁：describe().int8_dot = %s，硬件加速 = %s\n",
+                eng.describe().int8_dot ? "true" : "false",
+                eng.describe().int8_dot_accelerated ? "true" : "false");
 
     // 造 latent 权重（含正负/微小值，覆盖三值三种码）
     nn::Matrix W(ROWS, K);
@@ -311,7 +311,7 @@ void test_bitlinear_paths(nn::ComputeEngine& eng, const char* tag)
 {
     constexpr std::size_t IN = 24, OUT = 9, B = 4;   // IN 非 16 倍数：覆盖尾部
     std::printf("[5] BitLinear：打包路径 vs f16 稠密路径（%s）\n", tag);
-    if (!eng.supports_ternary_gemm())
+    if (!eng.describe().ternary_gemm)
     {
         std::puts("    （引擎无打包能力 → 跳过；该引擎上 BitLinear 自动走 f16 路径）");
         return;
@@ -486,7 +486,7 @@ void check_gemm_shape(nn::ComputeEngine& eng, std::size_t M, std::size_t K,
 void test_shapes(nn::ComputeEngine& eng, const char* tag, bool gpu)
 {
     std::printf("[6] 跨形状对拍：分块内核形状契约（%s）\n", tag);
-    if (!eng.supports_ternary_gemm())
+    if (!eng.describe().ternary_gemm)
     {
         std::puts("    （引擎无打包能力 → 跳过）");
         return;
@@ -593,7 +593,7 @@ void check_bitlinear_shape(nn::ComputeEngine& eng, std::size_t IN, std::size_t O
 void test_bitlinear_shapes(nn::ComputeEngine& eng, const char* tag)
 {
     std::printf("[7] BitLinear 跨形状：打包 vs 稠密（%s）\n", tag);
-    if (!eng.supports_ternary_gemm())
+    if (!eng.describe().ternary_gemm)
     {
         std::puts("    （引擎无打包能力 → 跳过）");
         return;

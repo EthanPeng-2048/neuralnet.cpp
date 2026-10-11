@@ -29,12 +29,14 @@
 //     输出精度 = 源精度（§8.4 的自然语义）。
 //   - **in-place** 原语（add_inplace / scale_inplace / zero / eval_expr_into）**
 //     存储精度不可变**（§8.3）。
-//   - **边界 cast 层（NVI 公共入口）**：f16 无变体算子的"抬 f32 算 → 按 P
-//     落回"逻辑住在基类非虚入口里（原 PrecisionEngine 装饰器已下沉删除，
-//     见 docs/development/15-computeengine-refresh.md §4.1）：基类问能力
-//     （supports_native_* / supports_expr_precision_variant）→ 基类决定
-//     cast → 引擎只实现 `*_impl`。全 f32 配置下每个入口都是快速直通分支，
-//     与原生引擎逐字节一致。
+//   - **精度策略住在各引擎的 `*_impl` 里**：基类公共入口只做 bind 检查 +
+//     出生绑定（`stamp_`）后**直通** `*_impl`，**不做任何能力分支**；"原生
+//     f16 直读直写"还是"抬 f32 算 → 按 P 落回"由引擎自己决定（CPU 引擎基于
+//     f32 Matrix → 边界 cast；GPU 引擎有 f16 变体/字节级原语 → 原生）。
+//     基类只保留**通用 cast 助手**（`to_f32` / `to_prec` / `move_` /
+//     `unary_` / `binary_` / `inplace*_`）供各引擎的 `*_impl` 复用。
+//   - **能力查询不是接口的一部分**：引擎能力是各实现类的私有细节；对外只经
+//     `describe()` 返回的 `EngineInfo` 披露**事实**（禁止用于选路）。
 // ─────────────────────────────────────────────────────────────────────────
 
 #include <algorithm>
@@ -174,14 +176,53 @@ struct InitSpec
 inline constexpr std::uint64_t kInitSeed = 42;
 
 // ══════════════════════════════════════════════════════════════════════════
+// EngineInfo — 引擎身份 / 能力摘要（唯一对外查询通道）
+//
+// 一句话：能力**信息**（CLI / 探针 / 测试 / 日志要看的那一份）只能经这里
+// 披露；它**只陈述事实**，**禁止用于选路** —— 选路必须落在各引擎内部
+// （见 AGENTS 铁律「引擎能力体系」）。字段描述的是 init 期已解析完成的
+// 设备事实，读取无副作用、无计算。
+// ══════════════════════════════════════════════════════════════════════════
+struct EngineInfo
+{
+    std::string engine;             // 引擎类别："cpu" / "vulkan"
+    std::string device;             // 设备名（CPU 引擎 = "cpu"）
+    bool native_f16_move = false;   // 非 f32 数据搬运/原地原语可直读直写
+    bool native_f16_reduce = false; // 非 f32 归约原语可直读输入
+    bool fused_prec_variant = false; // 具备带类型（f16）融合 shader 机制
+    bool ternary_gemm = false;      // 三值打包 GEMM（trit_pack / matmul_q）
+    bool int8_dot = false;          // 设备侧 4×int8 打包点积（DP4A 语义）
+    bool int8_dot_accelerated = false;  // 上者是硬件指令（非驱动软件展开）
+
+    // 稳定、可机读的一行式摘要（字段顺序固定；供日志/审计正则匹配）
+    [[nodiscard]] std::string text() const
+    {
+        std::string s = "engine=" + engine + " device=" + device;
+        const auto bit = [&s](const char* name, bool v)
+        {
+            s += ' ';
+            s += name;
+            s += (v ? "=1" : "=0");
+        };
+        bit("native_f16_move", native_f16_move);
+        bit("native_f16_reduce", native_f16_reduce);
+        bit("fused_prec_variant", fused_prec_variant);
+        bit("ternary_gemm", ternary_gemm);
+        bit("int8_dot", int8_dot);
+        bit("int8_dot_accelerated", int8_dot_accelerated);
+        return s;
+    }
+};
+
+// ══════════════════════════════════════════════════════════════════════════
 // ComputeEngine — 计算引擎抽象接口
 // ══════════════════════════════════════════════════════════════════════════
 //
 // 分层（NVI：Non-Virtual Interface）：
-//   public  非虚入口 = 边界 cast 层（原 PrecisionEngine 逻辑）：
-//           变体优先 / 全 f32 快速直通 / 无变体时"抬 f32 → *_impl → 按 P 落回"。
-//   protected 虚 `*_impl` = 引擎原生实现（只管算，不管精度边界）。
-//   能力查询（supports_*）：基类决策用的虚函数，CPU 默认 false / GPU 覆盖。
+//   public  非虚入口 = 薄适配层：bind 检查 + `stamp_` 出生绑定 → 直通 `*_impl`。
+//           **不做能力分支**（精度策略下沉到各引擎的 `*_impl`）。
+//   protected 虚 `*_impl` = 引擎实现：既管算，也管自己的精度边界策略。
+//   能力：各引擎私有事实（`*_` 私有成员 / 编译期常量）；对外只经 `describe()`。
 class ComputeEngine
 {
 public:
@@ -189,6 +230,10 @@ public:
 
     // ── 设备查询 ──────────────────────────────────────────────────────────
     [[nodiscard]] virtual Device device() const noexcept = 0;
+
+    // ── 引擎身份 / 能力摘要（唯一对外查询通道）───────────────────────────
+    // 只披露事实；**禁止**据此选路（选路在各引擎内部）。默认 = 未知引擎。
+    [[nodiscard]] virtual EngineInfo describe() const { return EngineInfo{}; }
 
     // ── 批处理控制 ────────────────────────────────────────────────────────
     // CPU 引擎：no-op（操作立即同步执行）
@@ -640,19 +685,18 @@ public:
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // 边界 cast 层（NVI 公共入口）—— 原 PrecisionEngine 逻辑
+    // 精度策略（原 PrecisionEngine 逻辑）—— 现已**下沉到各引擎的 `*_impl`**
     //
     // 一句话：**f16 只改变"数据存哪儿"，不改变"算子怎么算"**——算术始终以
-    // f32 为参考精度，f16 的精度边界处理全部集中在本层入口。每个入口先问
-    // 能力查询（supports_native_data_move / supports_native_f16_reduce /
-    // supports_expr_precision_variant），没有原生路径才走边界 cast：
-    //   变体优先：引擎有带类型融合 shader → 直接把 f16 原张量交给 *_impl
-    //           （读 f16 / 写 f16，算术 f32），零边界临时量；
+    // f32 为参考精度。两种落地方式（由引擎自己选，基类入口不做能力分支）：
+    //   原生：引擎有带类型融合 shader / 字节级原语 → 直接把原张量交给内核
+    //         （读 f16 / 写 f16，算术 f32），零边界临时量；
     //   边界 cast：入 = 把 f16 操作数抬到 f32（已是 f32 则零拷贝直通），
-    //           算 = 调用 *_impl 的既有 f32 实现（零分歧），
-    //           出 = 结果按目标精度落回（f16 写出 = round-half-to-even）。
+    //         算 = 调用既有 f32 实现（零分歧），
+    //         出 = 结果按目标精度落回（f16 写出 = round-half-to-even）。
     // in-place 入口用 `cast_into` 写回**原存储**：保留张量对象身份与底层
-    // buffer（§8.3：in-place 存储精度不可变）。
+    // buffer（§8.3：in-place 存储精度不可变）。基类仍提供通用 cast 助手
+    // （`to_f32` / `to_prec` / `move_` / `unary_` / `binary_` / `inplace*_`）。
     //
     // 全 f32 配置下本层纯直通（每入口一条快速判定分支），行为与直接调用
     // 引擎实现逐字节一致（G5 零回归）。
@@ -715,11 +759,8 @@ public:
     [[nodiscard]] Result<Tensor> clone(const Tensor& src)
     {
         NN_TRY(ec, bind_check_({&src}));
-        // 原生 f16 数据搬运：引擎的 clone 是模板化字节拷贝 → 直接放行，
-        // 省掉"抬 f32 → 拷贝 → 落回 f16"的 2 份全尺寸临时量。
-        if (src.precision() != Precision::F32 && supports_native_data_move())
-            return stamp_(clone_impl(src));
-        return stamp_(move_(src, [this](const Tensor& s) { return clone_impl(s); }));
+        // 精度策略（原生 f16 字节拷贝 / 抬 f32 再落回）在引擎的 clone_impl 内。
+        return stamp_(clone_impl(src));
     }
 
     // 将 CPU Matrix 数据写入已有 Tensor（CPU 拷贝 / GPU 上传）
@@ -743,12 +784,7 @@ public:
         const Tensor& src, std::size_t start_row, std::size_t count)
     {
         NN_TRY(ec, bind_check_({&src}));
-        if (src.precision() != Precision::F32 && supports_native_data_move())
-            return stamp_(slice_rows_impl(src, start_row, count));
-        return stamp_(move_(src, [this, start_row, count](const Tensor& s)
-        {
-            return slice_rows_impl(s, start_row, count);
-        }));
+        return stamp_(slice_rows_impl(src, start_row, count));
     }
 
     // 将 src 的所有行写入 dst 的行 [dst_start_row, dst_start_row + src.rows())。
@@ -760,21 +796,7 @@ public:
     {
         NN_TRY(ec, bind_check_({&dst, &src}));
         WriteEpochGuard wg{dst};
-        if (dst.precision() != Precision::F32 && dst.precision() == src.precision() &&
-            supports_native_data_move())
-            return insert_rows_impl(dst, dst_start_row, src);
-        if (dst.precision() == Precision::F32 && src.precision() == Precision::F32)
-            return insert_rows_impl(dst, dst_start_row, src);
-        // 不同精度（或 f16 dst）：统一在 f32 空间插入后写回 dst 的原存储
-        auto d = to_f32(dst);
-        NN_TRY_CHECK(d);
-        auto s = to_f32(src);
-        NN_TRY_CHECK(s);
-        auto r = insert_rows_impl(*d, dst_start_row, *s);
-        NN_TRY_CHECK(r);
-        if (dst.precision() == Precision::F32)
-            return {};
-        return cast_into(*d, dst);
+        return insert_rows_impl(dst, dst_start_row, src);
     }
 
     // ── 行 gather / scatter-add 原语（op-level 数据操作，不含算法语义） ──
@@ -787,10 +809,7 @@ public:
         const Tensor& table, const Tensor& indices)
     {
         NN_TRY(ec, bind_check_({&table, &indices}));
-        return stamp_(move_(table, [this, &indices](const Tensor& t)
-        {
-            return gather_rows_impl(t, indices);
-        }));
+        return stamp_(gather_rows_impl(table, indices));
     }
 
     // scatter_add_rows: 按 indices 把 grad 的行原子累加到 dst 的对应行
@@ -805,21 +824,7 @@ public:
     {
         NN_TRY(ec, bind_check_({&dst, &indices, &grad}));
         WriteEpochGuard wg{dst};
-        if (dst.precision() == Precision::F32 && grad.precision() == Precision::F32)
-            return scatter_add_rows_impl(dst, indices, grad);
-        // 原生 f16（GPU：打包 half CAS 变体；无 pipeline 时引擎内 cast 回退）
-        // → 直通，不为 dst/grad 物化 f32 副本。CPU 能力 false → 边界 cast。
-        if (supports_native_data_move())
-            return scatter_add_rows_impl(dst, indices, grad);
-        auto d = to_f32(dst);
-        NN_TRY_CHECK(d);
-        auto g = to_f32(grad);
-        NN_TRY_CHECK(g);
-        auto r = scatter_add_rows_impl(*d, indices, *g);
-        NN_TRY_CHECK(r);
-        if (dst.precision() == Precision::F32)
-            return {};
-        return cast_into(*d, dst);
+        return scatter_add_rows_impl(dst, indices, grad);
     }
 
     // 3D 维度转置：(M, B, N) ↔ (B, M, N)
@@ -834,10 +839,7 @@ public:
         bool inverse = false)
     {
         NN_TRY(ec, bind_check_({&x}));
-        return stamp_(move_(x, [this, M, B, N, inverse](const Tensor& t)
-        {
-            return rearrange_3d_impl(t, M, B, N, inverse);
-        }));
+        return stamp_(rearrange_3d_impl(x, M, B, N, inverse));
     }
 
     // ── 矩阵转置：A (R, C) → out (C, R) ──
@@ -845,7 +847,7 @@ public:
     [[nodiscard]] Result<Tensor> transpose(const Tensor& A)
     {
         NN_TRY(ec, bind_check_({&A}));
-        return stamp_(move_(A, [this](const Tensor& t) { return transpose_impl(t); }));
+        return stamp_(transpose_impl(A));
     }
 
     // ── 卷积/池化窗口展开原语（op-level 数据搬运，零算法语义）─────────────
@@ -866,10 +868,7 @@ public:
         std::size_t OH, std::size_t OW)
     {
         NN_TRY(ec, bind_check_({&x}));
-        return stamp_(move_(x, [this, C, H, W, k, stride, pad, OH, OW](const Tensor& t)
-        {
-            return im2col_impl(t, C, H, W, k, stride, pad, OH, OW);
-        }));
+        return stamp_(im2col_impl(x, C, H, W, k, stride, pad, OH, OW));
     }
 
     // col2im：im2col 的伴随（adjoint / 反向散射）。
@@ -886,10 +885,7 @@ public:
         std::size_t OH, std::size_t OW)
     {
         NN_TRY(ec, bind_check_({&col}));
-        return stamp_(move_(col, [this, C, H, W, k, stride, pad, OH, OW](const Tensor& t)
-        {
-            return col2im_impl(t, C, H, W, k, stride, pad, OH, OW);
-        }));
+        return stamp_(col2im_impl(col, C, H, W, k, stride, pad, OH, OW));
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -998,10 +994,7 @@ public:
         };
         const double pre_d = dbg ? mx(dst) : 0.0;
         const double pre_s = dbg ? mx(src) : 0.0;
-        auto r = inplace2_(dst, src, [this](Tensor& d, const Tensor& s)
-        {
-            return add_inplace_impl(d, s);
-        });
+        auto r = add_inplace_impl(dst, src);
         if (dbg)
         {
             const double post_d = mx(dst);
@@ -1018,10 +1011,7 @@ public:
     {
         NN_TRY(ec, bind_check_({&A, &B}));
         WriteEpochGuard wg{A};
-        return inplace2_(A, B, [this](Tensor& a, const Tensor& b)
-        {
-            return add_inplace_impl(a, b);
-        });
+        return add_inplace_impl(A, B);
     }
 
     // A *= scalar
@@ -1029,7 +1019,7 @@ public:
     {
         NN_TRY(ec, bind_check_({&A}));
         WriteEpochGuard wg{A};
-        return inplace1_(A, [this, s](Tensor& a) { return scale_inplace_impl(a, s); });
+        return scale_inplace_impl(A, s);
     }
 
     // A = 0
@@ -1037,10 +1027,7 @@ public:
     {
         NN_TRY(ec, bind_check_({&A}));
         WriteEpochGuard wg{A};
-        // 原生 f16 清零：fill_zero 是字节级原语（每步 zero_grad 调用 N 次）
-        if (A.precision() != Precision::F32 && supports_native_data_move())
-            return zero_impl(A);
-        return inplace1_(A, [this](Tensor& a) { return zero_impl(a); });
+        return zero_impl(A);
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -1060,29 +1047,13 @@ public:
     //   入口不带 bias（BitLinear 在调用点用一次 row_broadcast 加）—— 保持原语
     //   最小；把 bias 折进 shader 是后续可选优化（省一次 (out,batch) dispatch）。
     //
-    // 能力：`supports_ternary_gemm()` false 的引擎（尚未接打包的 GPU 后端）
-    //   一律 fail-fast，BitLinear 会退回 f16 稠密缓冲路径，不会静默走错。
+    // 能力：不支持打包的引擎由 `*_impl` 自己 fail-fast（基类默认实现即
+    // NN_FAIL），公共入口不做能力分支（策略在引擎内部）。
     // ══════════════════════════════════════════════════════════════════════
-    [[nodiscard]] virtual bool supports_ternary_gemm() const noexcept { return false; }
-
-    // ── P3（W2A8）能力位：int8 点积 ───────────────────────────────────────
-    // true = 引擎/设备能在 shader 里做 4×int8 打包点积（DP4A 语义，SPIR-V
-    // `SPV_KHR_integer_dot_product` / GLSL `dotPacked4x8EXT`）。这是"激活 int8
-    // 量化 + 整数点积"内核（打包在 GPU 上真正打赢稠密 f16 的前提）的**门禁**：
-    // false 的引擎一律走现有 f16 累加路径，不静默换算法。
-    // `supports_int8_dot()` 是"能不能用"；加速与否（硬件 DP4A vs 驱动软件展开）
-    // 是**性能**问题，由后端诊断接口另行披露，不改变正确性契约。
-    [[nodiscard]] virtual bool supports_int8_dot() const noexcept { return false; }
-    // 诊断位（不参与正确性/门禁）：int8 点积是否**硬件加速**（DP4A 指令）还是
-    // 驱动软件展开。软件展开时"激活 int8"仍省一半激活带宽，但算力不占优 ——
-    // P3 内核是否值得创建/分派靠这两个位合起来判断。
-    [[nodiscard]] virtual bool int8_dot_accelerated() const noexcept { return false; }
 
     [[nodiscard]] Result<Tensor> trit_pack(const Tensor& w, const Tensor& scale)
     {
         NN_TRY(ec, bind_check_({&w, &scale}));
-        if (!supports_ternary_gemm())
-            NN_FAIL("trit_pack: 该引擎不支持三值打包（docs 21 §5 P2）");
         return stamp_(trit_pack_impl(w, scale));
     }
 
@@ -1109,8 +1080,6 @@ private:
                                                     std::size_t out_rows, Precision P)
     {
         NN_TRY(ec, bind_check_({&packed, &scale, &B}));
-        if (!supports_ternary_gemm())
-            NN_FAIL("matmul_q: 该引擎不支持三值 GEMM（docs 21 §5 P2）");
         // 精度策略与 matmul 同款：非 f32 下传引擎自行决定（GPU 有 in-kernel f16
         // 变体 → 直读 f16 的 B / 直写 f16 的 C，零边界 cast；CPU/无变体时由
         // 引擎内部抬 f32 计算 + 按 P 落回，见各 *matmul_q_impl*）。
@@ -1163,28 +1132,9 @@ public:
         Precision prec = Precision::F32)
     {
         NN_TRY(ec, bind_check_({&K, &V, &P, &R, &A0, &B0, &boundary}));
-        if (prec == Precision::F32 && K.precision() == Precision::F32 &&
-            V.precision() == Precision::F32 && P.precision() == Precision::F32 &&
-            R.precision() == Precision::F32 && A0.precision() == Precision::F32 &&
-            B0.precision() == Precision::F32 && boundary.precision() == Precision::F32)
-            return stamp_(scan_prefix_outer_impl(K, V, P, R, A0, B0, has_state, dk, heads,
-                                          causal, boundary, has_bnd,
-                                          Precision::F32));
-        if (supports_native_data_move())
-        {
-            auto r = scan_prefix_outer_impl(K, V, P, R, A0, B0, has_state, dk, heads,
-                                            causal, boundary, has_bnd, prec);
-            NN_TRY_CHECK(r);
-            return stamp_(to_prec(std::move(*r), prec));
-        }
-        const std::vector<Tensor> ts{K, V, P, R, A0, B0, boundary};
-        auto c = to_f32_all(ts);
-        NN_TRY_CHECK(c);
-        auto r = scan_prefix_outer_impl((*c)[0], (*c)[1], (*c)[2], (*c)[3],
-                                        (*c)[4], (*c)[5], has_state, dk, heads,
-                                        causal, (*c)[6], has_bnd, Precision::F32);
-        NN_TRY_CHECK(r);
-        return stamp_(to_prec(std::move(*r), prec));
+        // 精度策略（原生 f16 扫描 / 引擎内边界 cast）在引擎的 *_impl 内。
+        return stamp_(scan_prefix_outer_impl(K, V, P, R, A0, B0, has_state, dk, heads,
+                                             causal, boundary, has_bnd, prec));
     }
 
     // 后缀扫描（RLA 反向 pass 2）：
@@ -1200,25 +1150,8 @@ public:
         Precision prec = Precision::F32)
     {
         NN_TRY(ec, bind_check_({&D, &X, &Y, &boundary}));
-        if (prec == Precision::F32 && D.precision() == Precision::F32 &&
-            X.precision() == Precision::F32 && Y.precision() == Precision::F32 &&
-            boundary.precision() == Precision::F32)
-            return stamp_(scan_suffix_outer_impl(D, X, Y, dk, heads, causal, boundary,
-                                          has_bnd, Precision::F32));
-        if (supports_native_data_move())
-        {
-            auto r = scan_suffix_outer_impl(D, X, Y, dk, heads, causal, boundary,
-                                            has_bnd, prec);
-            NN_TRY_CHECK(r);
-            return stamp_(to_prec(std::move(*r), prec));
-        }
-        const std::vector<Tensor> ts{D, X, Y, boundary};
-        auto c = to_f32_all(ts);
-        NN_TRY_CHECK(c);
-        auto r = scan_suffix_outer_impl((*c)[0], (*c)[1], (*c)[2], dk, heads,
-                                        causal, (*c)[3], has_bnd, Precision::F32);
-        NN_TRY_CHECK(r);
-        return stamp_(to_prec(std::move(*r), prec));
+        return stamp_(scan_suffix_outer_impl(D, X, Y, dk, heads, causal, boundary,
+                                            has_bnd, prec));
     }
 
     // 逐列外积（RLA 反向的 dL/dA、dL/dB 物化）：
@@ -1232,22 +1165,7 @@ public:
         Precision prec = Precision::F32)
     {
         NN_TRY(ec, bind_check_({&P, &R, &S}));
-        if (prec == Precision::F32 && P.precision() == Precision::F32 &&
-            R.precision() == Precision::F32 && S.precision() == Precision::F32)
-            return stamp_(outer_col_impl(P, R, S, dk, has_scale, Precision::F32));
-        if (supports_native_data_move())
-        {
-            auto r = outer_col_impl(P, R, S, dk, has_scale, prec);
-            NN_TRY_CHECK(r);
-            return stamp_(to_prec(std::move(*r), prec));
-        }
-        const std::vector<Tensor> ts{P, R, S};
-        auto c = to_f32_all(ts);
-        NN_TRY_CHECK(c);
-        auto r = outer_col_impl((*c)[0], (*c)[1], (*c)[2], dk, has_scale,
-                                Precision::F32);
-        NN_TRY_CHECK(r);
-        return stamp_(to_prec(std::move(*r), prec));
+        return stamp_(outer_col_impl(P, R, S, dk, has_scale, prec));
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -1265,16 +1183,7 @@ public:
         const Tensor& A, Precision P = Precision::F32)
     {
         NN_TRY(ec, bind_check_({&A}));
-        if (A.precision() != Precision::F32 && supports_native_f16_reduce())
-        {
-            auto r = row_reduce_sum_impl(A, P);
-            NN_TRY_CHECK(r);
-            return stamp_(to_prec(std::move(*r), P));
-        }
-        return stamp_(unary_(A, P, [this](const Tensor& a)
-        {
-            return row_reduce_sum_impl(a, Precision::F32);
-        }));
+        return stamp_(row_reduce_sum_impl(A, P));
     }
 
     // 按列求和：A (rows, cols) → out (1, cols)
@@ -1283,16 +1192,7 @@ public:
         const Tensor& A, Precision P = Precision::F32)
     {
         NN_TRY(ec, bind_check_({&A}));
-        if (A.precision() != Precision::F32 && supports_native_f16_reduce())
-        {
-            auto r = col_reduce_sum_impl(A, P);
-            NN_TRY_CHECK(r);
-            return stamp_(to_prec(std::move(*r), P));
-        }
-        return stamp_(unary_(A, P, [this](const Tensor& a)
-        {
-            return col_reduce_sum_impl(a, Precision::F32);
-        }));
+        return stamp_(col_reduce_sum_impl(A, P));
     }
 
     // 按列求最大值：A (rows, cols) → out (1, cols)
@@ -1301,16 +1201,7 @@ public:
         const Tensor& A, Precision P = Precision::F32)
     {
         NN_TRY(ec, bind_check_({&A}));
-        if (A.precision() != Precision::F32 && supports_native_f16_reduce())
-        {
-            auto r = col_reduce_max_impl(A, P);
-            NN_TRY_CHECK(r);
-            return stamp_(to_prec(std::move(*r), P));
-        }
-        return stamp_(unary_(A, P, [this](const Tensor& a)
-        {
-            return col_reduce_max_impl(a, Precision::F32);
-        }));
+        return stamp_(col_reduce_max_impl(A, P));
     }
 
     // ── 分组归约（segmented reduce，沿行方向按固定长度分组）───────────────
@@ -1325,32 +1216,14 @@ public:
         Precision P = Precision::F32)
     {
         NN_TRY(ec, bind_check_({&x}));
-        if (x.precision() != Precision::F32 && supports_native_f16_reduce())
-        {
-            auto r = grouped_reduce_sum_impl(x, G, R, P);
-            NN_TRY_CHECK(r);
-            return stamp_(to_prec(std::move(*r), P));
-        }
-        return stamp_(unary_(x, P, [this, G, R](const Tensor& t)
-        {
-            return grouped_reduce_sum_impl(t, G, R, Precision::F32);
-        }));
+        return stamp_(grouped_reduce_sum_impl(x, G, R, P));
     }
     [[nodiscard]] Result<Tensor> grouped_reduce_max(
         const Tensor& x, std::size_t G, std::size_t R,
         Precision P = Precision::F32)
     {
         NN_TRY(ec, bind_check_({&x}));
-        if (x.precision() != Precision::F32 && supports_native_f16_reduce())
-        {
-            auto r = grouped_reduce_max_impl(x, G, R, P);
-            NN_TRY_CHECK(r);
-            return stamp_(to_prec(std::move(*r), P));
-        }
-        return stamp_(unary_(x, P, [this, G, R](const Tensor& t)
-        {
-            return grouped_reduce_max_impl(t, G, R, Precision::F32);
-        }));
+        return stamp_(grouped_reduce_max_impl(x, G, R, P));
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -1375,19 +1248,9 @@ public:
         Precision P = Precision::F32)
     {
         NN_TRY(ec, bind_check_(inputs));
-        trace_variant_(spec, inputs, P);
-        if (P == Precision::F32 && all_f32(inputs))
-            return stamp_(eval_expr_impl(spec, inputs, rows, cols, Precision::F32));
-        // ── in-kernel f16 优先（Phase 2）────────────────────────────────────
-        if (supports_expr_precision_variant(spec, inputs, P))
-            return stamp_(eval_expr_impl(spec, inputs, rows, cols, P));
-        if (prec_trace_enabled_())
-            trace_miss_(spec, inputs, P);
-        auto in32 = to_f32_all(inputs);
-        NN_TRY_CHECK(in32);
-        auto r = eval_expr_impl(spec, *in32, rows, cols, Precision::F32);
-        NN_TRY_CHECK(r);
-        return stamp_(to_prec(std::move(*r), P));
+        // 变体选路 / 边界 cast 归因**只做一次**：整段下沉到引擎的
+        // eval_expr_impl（它本来就要算 key/精度签名）——F2 修复。
+        return stamp_(eval_expr_impl(spec, inputs, rows, cols, P));
     }
 
     // ── 归约向量原生形状输出（LayerNorm/RMSNorm 小向量缓存等） ──────────
@@ -1401,19 +1264,7 @@ public:
         Precision P = Precision::F32)
     {
         NN_TRY(ec, bind_check_(inputs));
-        trace_variant_(spec, inputs, P);
-        if (P == Precision::F32 && all_f32(inputs))
-            return stamp_(eval_expr_reduce_impl(spec, inputs, rows, cols, Precision::F32));
-        // in-kernel f16 优先（与 eval_expr 同款；归约带类型变体由 gen_fused 生成）
-        if (supports_expr_precision_variant(spec, inputs, P))
-            return stamp_(eval_expr_reduce_impl(spec, inputs, rows, cols, P));
-        if (prec_trace_enabled_())
-            trace_miss_(spec, inputs, P);
-        auto in32 = to_f32_all(inputs);
-        NN_TRY_CHECK(in32);
-        auto r = eval_expr_reduce_impl(spec, *in32, rows, cols, Precision::F32);
-        NN_TRY_CHECK(r);
-        return stamp_(to_prec(std::move(*r), P));
+        return stamp_(eval_expr_reduce_impl(spec, inputs, rows, cols, P));
     }
 
     // ── 目标传递（destination-passing）：结果写入已有张量 ────────────────
@@ -1430,72 +1281,12 @@ public:
         NN_TRY(ec, bind_check_(inputs));
         NN_TRY(ec2, bind_check_({&out}));
         WriteEpochGuard wg{out};
-        trace_variant_(spec, inputs, out.precision());
-        if (out.precision() == Precision::F32 && all_f32(inputs))
-        {
-            if (prec_trace_enabled_())
-                std::fprintf(stderr, "[into] branch=native_f32\n");
-            return eval_expr_into_impl(spec, inputs, rows, cols, out);
-        }
-        // in-kernel f16 优先：目标传递 + 带类型变体 = 直接读写原存储，零临时量
-        if (supports_expr_precision_variant(spec, inputs, out.precision()))
-        {
-            if (prec_trace_enabled_())
-                std::fprintf(stderr, "[into] branch=native_variant out_p=%d\n",
-                             static_cast<int>(out.precision()));
-            return eval_expr_into_impl(spec, inputs, rows, cols, out);
-        }
-        // 目标可能是 f16：在 f32 空间求值后 cast_into 写回 out 的原存储
-        // （out 常同时是输入之一——in32 里的 f32 拷贝即"读旧值"，语义正确）
-        if (prec_trace_enabled_())
-        {
-            trace_miss_(spec, inputs, out.precision());
-            std::fprintf(stderr, "[into] branch=cast_fallback out_p=%d\n",
-                         static_cast<int>(out.precision()));
-        }
-        auto in32 = to_f32_all(inputs);
-        NN_TRY_CHECK(in32);
-        auto tmp = create_tensor(rows, cols, Precision::F32);
-        auto r = eval_expr_into_impl(spec, *in32, rows, cols, tmp);
-        NN_TRY_CHECK(r);
-        return cast_into(tmp, out);
-    }
-
-    // ── 原生 f16 数据路径能力（Phase 2 / C1 钩子）──────────────────────────
-    // GPU 引擎为 true：数据搬运原语（clone/slice/insert/zero = 模板化字节
-    // 拷贝；transpose/rearrange/gather/im2col/col2im = f16 pipeline 或引擎内
-    // cast 回退）与原地算术（add_inplace/scale_inplace = f16 pipeline 或
-    // 引擎内回退）都能**直接消费 f16 张量**——无 pipeline 时引擎内部完成
-    // 边界 cast，基类入口无需物化 f32 副本（归因表搬运/inplace 大头由此消灭）。
-    // CPU 引擎为 false：其原语基于 f32 Matrix → 基类入口维持边界 cast。
-    // 返回 true 时基类直接放行 f16 张量（省掉"抬 f32 → 算 → 落回 f16"的
-    // 全尺寸临时量与 3 倍流量）。
-    [[nodiscard]] virtual bool supports_native_data_move() const noexcept { return false; }
-    // ── 原生 f16 归约能力（Phase C2）────────────────────────────────────────
-    // GPU 引擎为 true：row/col_reduce_sum/max 可直接消费 f16 输入张量
-    // （reduce.comp f16 变体：输入 float16_t 直读、f32 归约、输出 f32 向量；
-    // 设备无 16bit 存储时引擎内部 cast 回退）。基类据此跳过"抬 f32 副本 →
-    // 归约"的全尺寸临时量（归因 L756 大头：Linear::backward grad_bias 直调
-    // row_reduce_sum 的 (64,8192)×38）。
-    // CPU 引擎为 false：其归约基于 f32 Matrix → 基类入口维持边界 cast。
-    [[nodiscard]] virtual bool supports_native_f16_reduce() const noexcept { return false; }
-    // ── 精度变体能力查询（Phase 2 in-kernel f16）──────────────────────────
-    // 该 (结构, 输入精度, 目标输出精度) 是否有预生成的**带类型**融合 shader？
-    // 默认 false（原生引擎无变体概念）→ 基类入口退回边界 cast（把 f16 输入
-    // 抬成 f32 副本再调用 *_impl）：正确性不变，只多花带宽。
-    // 返回 true 的引擎承诺 `*_impl(spec, inputs, rows, cols, P)` 能直接消费
-    // 非 f32 存储的 inputs（读 f16 / 写 f16，算术仍在 f32）。
-    [[nodiscard]] virtual bool supports_expr_precision_variant(
-        const ExprSpec& spec, std::span<const Tensor> inputs,
-        Precision P = Precision::F32) const
-    {
-        (void)spec; (void)inputs; (void)P;
-        return false;
+        return eval_expr_into_impl(spec, inputs, rows, cols, out);
     }
 
     // ══════════════════════════════════════════════════════════════════════
     // 引擎实现接口（protected 虚函数，NVI 的内层）—— 引擎只实现这些：
-    // 只管算，不管精度边界（边界由上面的公共入口处理）。
+    // **既管算，也管自己的精度边界策略**（原生 f16 直通 / 抬 f32 再落回）。
     // 默认实现仅覆盖"引擎未提供"的少数入口；其余为纯虚。
     // ══════════════════════════════════════════════════════════════════════
 protected:
@@ -1605,8 +1396,8 @@ protected:
         bool transA, bool transB, Precision P) = 0;
 
     // 三值打包权重（P2 / F3）：语义见公共入口 trit_pack / matmul_q 的说明。
-    // 默认 = 引擎未接打包路径（fail-fast），与 supports_ternary_gemm() 的默认
-    // false 一致 —— 上层（BitLinear）据此退回 f16 稠密缓冲。
+    // 默认 = 引擎未接打包路径（fail-fast）；不支持打包的引擎由这里的默认
+    // 实现或各自的覆盖 fail-fast（能力不下沉到上层）。
     [[nodiscard]] virtual Result<Tensor> trit_pack_impl(const Tensor& w,
                                                         const Tensor& scale)
     {
@@ -1699,7 +1490,10 @@ protected:
         NN_FAIL("eval_expr_into: 该引擎不支持原地表达式求值");
     }
 
-private:
+protected:
+    // 下面这些是**引擎实现可复用的 cast / 绑定助手**（各引擎的 `*_impl`
+    // 在"原生路径不可用"时用它们表达边界 cast）。对外不可见。
+    //
     // 库内 stamp 通道（15 §4.2 D2）：有引擎在场、但产物走静态工厂的位置
     // （dsl::compute 的 eval_cpu 出口与扫描占位、compute_reduce 的归约向量
     // 出口）统一经此补绑定。非用户 API——friend 限定给 nn::dsl 两个入口。
@@ -1915,11 +1709,8 @@ private:
     {
         if (A.precision() == Precision::F32 && B.precision() == Precision::F32)
             return fn(A, B);
-        // Phase C1b：引擎原生支持 f16（GPU：f16 pipeline 原地直加/缩放，
-        // 无 pipeline 引擎内回退）→ 直通，A 不物化 f32 副本（inplace 归因
-        // 大头由此消灭）。CPU 钩子 false → 维持边界 cast。
-        if (supports_native_data_move())
-            return fn(A, B);
+        // 纯边界 cast 助手（不做能力分支）：需要"原生 f16 直通"的引擎在自己
+        // 的 `*_impl` 里先处理 f16，再落到这里（或根本不进来）。
         auto b = to_f32(B, loc);
         NN_TRY_CHECK(b);
         if (A.precision() == Precision::F32)
@@ -1937,10 +1728,6 @@ private:
                                          std::source_location loc = std::source_location::current())
     {
         if (A.precision() == Precision::F32)
-            return fn(A);
-        // Phase C1b：同 inplace2_——GPU 原生 f16 原地（scale_inplace 的
-        // (2048,256) 归因大头由此消灭）；CPU 钩子 false → 维持边界 cast
-        if (supports_native_data_move())
             return fn(A);
         auto a = to_f32(A, loc);
         NN_TRY_CHECK(a);
@@ -1989,16 +1776,42 @@ private:
         const Precision out_p = A.precision();
         if (out_p == Precision::F32)
             return fn(A);
-        // Phase C1：引擎原生支持 f16 数据搬运（GPU：f16 pipeline 直读直写；
-        // 无 pipeline 时引擎内自行 cast 回退）→ 直通，**不物化 f32 副本**。
-        // CPU 引擎此钩子为 false → 维持边界 cast（其原语基于 f32 Matrix）。
-        if (supports_native_data_move())
-            return fn(A);
         auto a = to_f32(A, loc);
         NN_TRY_CHECK(a);
         auto r = fn(*a);
         NN_TRY_CHECK(r);
         return to_prec(std::move(*r), out_p, loc);
+    }
+
+    // 不同精度行插入（供引擎 `insert_rows_impl` 在非 f32 时复用）：在 f32 空间
+    // 插入后写回 dst 的原存储（§8.3 in-place 存储精度不可变）。
+    [[nodiscard]] Result<void> insert_rows_cast_(
+        Tensor& dst, std::size_t dst_start_row, const Tensor& src)
+    {
+        auto d = to_f32(dst);
+        NN_TRY_CHECK(d);
+        auto s = to_f32(src);
+        NN_TRY_CHECK(s);
+        auto r = insert_rows_impl(*d, dst_start_row, *s);
+        NN_TRY_CHECK(r);
+        if (dst.precision() == Precision::F32)
+            return {};
+        return cast_into(*d, dst);
+    }
+
+    // 不同精度 scatter-add（供引擎 `scatter_add_rows_impl` 在非 f32 时复用）。
+    [[nodiscard]] Result<void> scatter_add_rows_cast_(
+        Tensor& dst, const Tensor& indices, const Tensor& grad)
+    {
+        auto d = to_f32(dst);
+        NN_TRY_CHECK(d);
+        auto g = to_f32(grad);
+        NN_TRY_CHECK(g);
+        auto r = scatter_add_rows_impl(*d, indices, *g);
+        NN_TRY_CHECK(r);
+        if (dst.precision() == Precision::F32)
+            return {};
+        return cast_into(*d, dst);
     }
 
     // ── 多精度变体发现 / 边界 cast 归因（诊断；NN_PREC_TRACE=1）────────────
