@@ -64,15 +64,14 @@ private:
     // src/ternary_gemm_test.cpp 对拍。
     bool use_packed_ = false;
 
-    // 打包路径的**选址策略**（F3 的实测结论，2026-10-11，102/40HX）：
-    //   · 窄 batch（≤ kPackedMaxBatch，典型 = 自回归生成 batch=1）→ GEMM 是
-    //     **权重带宽受限**：打包后权重读 2 B → 0.25 B/权重，快。
-    //   · 宽 batch（训练：GPT 一次 8×256=2048 个 token）→ GEMM 是**计算受限**：
-    //     打包内核按输出元素重复解码，输给分块的 f16 GEMM（实测 60 步
-    //     d256/L4 训练：打包 4.0 s vs 基线 2.0 s）。故此时退回 f16 稠密缓冲。
-    //   `force_pack_`：-1 = 按形状自动选；0/1 = 强制（A/B 与回退用）。
-    //   阈值是**启发式**（待 P2 的分块解码 GEMM 落地后重新标定，见 docs 21 §4.11）。
-    static constexpr std::size_t kPackedMaxBatch = 8;
+    // 打包路径开关（F3 的实测结论，2026-10-11，102/40HX）：
+    //   · 默认 = **跟随引擎能力**（`supports_ternary_gemm()`）；
+    //   · `force_pack_`：-1 = 跟随能力；0/1 = 强制关/开（A/B 与回退用）。
+    // 为什么不再按激活宽度选址：**分块解码版** `matmul_q.comp` 落地后，打包路径在
+    // 宽 batch（训练）下也与 f16 稠密分块 GEMM 持平 —— 实测 d256/L4 60 步
+    // 2.0 s vs 2.0 s、d512/L8 30 步 5.2 s vs 5.1 s；同时省下 wq 的
+    // 2 B → 0.25 B/权重（整卡峰值 −7.5%~8.4%）。此前"每输出元素独立解码"的
+    // 初版在宽 batch 下慢 2×（4.0 s），那条启发式已被分块版取代。
     int force_pack_ = -1;
 
     Tensor input_cache_; // forward 输入缓存（backward 用）
@@ -207,10 +206,9 @@ public:
             NN_FAIL("bitlinear forward: input shape mismatch");
         if (!checkpoint_mode_)
             input_cache_ = input;
-        // 选址（F3）：默认按激活宽度选缓冲形态（窄 batch = 权重带宽受限 → 打包；
-        // 宽 batch = 计算受限 → f16 稠密分块 GEMM）；`set_ternary_pack_enabled`
-        // 之后走强制模式。换形态即作废量化缓存（下一次 forward 重算）。
-        select_buffer_mode_(input.cols());
+        // 缓冲形态：默认跟随引擎能力（分块解码版下训练/解码都不亏，见成员注释）；
+        // `set_ternary_pack_enabled` 之后走强制模式。换形态即作废量化缓存。
+        sync_buffer_mode_();
         // τ / wq 只在 latent 权重变过时重算（同权重下的 N 次 forward 共享）。
         // 重算失败：直接上抛（不静默沿用上一步的旧缓冲）。
         if (needs_quantize_())
@@ -286,8 +284,8 @@ public:
     }
 
 private:
-    // 按当前模式策略（force_pack_ / 引擎能力 / 激活宽度）选定缓冲形态。
-    void select_buffer_mode_(std::size_t batch)
+    // 按当前模式策略（force_pack_ / 引擎能力）选定缓冲形态。
+    void sync_buffer_mode_()
     {
         if (!engine_ref().supports_ternary_gemm())
         {
@@ -299,9 +297,7 @@ private:
             }
             return;
         }
-        const bool want = (force_pack_ == 0) ? false
-                        : (force_pack_ == 1) ? true
-                                             : (batch <= kPackedMaxBatch);
+        const bool want = (force_pack_ == 0) ? false : true;
         if (want == use_packed_) return;
         use_packed_ = want;
         quant_valid_ = false;   // 缓冲形态变了 → 派生物必须重算

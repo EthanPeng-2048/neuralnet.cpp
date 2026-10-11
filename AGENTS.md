@@ -43,7 +43,7 @@ cmake -B build -G Ninja -DNN_ENABLE_TESTS=ON && cmake --build build && ctest --t
 | 加/改引擎原语（GPU 实现） | `compute_gpu_engine.hpp` + `backend/compute_vk_backend.hpp` + `backend/compute_vk_device.hpp` + `shaders/*.comp` |
 | 张量/设备抽象 | `compute_tensor.hpp` |
 | 按需 include（不走聚合头） | `engine.hpp` / `layer.hpp` / `loss.hpp` / `optimizer.hpp` / `model.hpp` / `train.hpp` = **薄转发头**（`nn.hpp` 仍是唯一聚合头；只求好记，不省 parse） |
-| 混合精度 / f16 类型系统 / 三值（T1_58） | `precision.hpp`（Precision 枚举含 `T1_58`、`precision_rank()`、`nn::f16`、`PrecisionProfile`）；层能力声明 `PrecisionSet`/`PrecisionSupport` + `Layer::precision_support()`/`layer_name()`（`compute_layer_base.hpp`）；三值打包布局 `ternary_pack.hpp`；打包 GEMM 原语 `trit_pack`/`matmul_q`(`_t`)（`compute_engine.hpp` + CPU/GPU 实现 + `shaders/{trit_pack,matmul_q}.comp`） |
+| 混合精度 / f16 类型系统 / 三值（T1_58） | `precision.hpp`（Precision 枚举含 `T1_58`、`precision_rank()`、`nn::f16`、`PrecisionProfile`）；层能力声明 `PrecisionSet`/`PrecisionSupport` + `Layer::precision_support()`/`layer_name()`（`compute_layer_base.hpp`）；三值打包布局 `ternary_pack.hpp`；打包 GEMM 原语 `trit_pack`/`matmul_q`(`_t`)（`compute_engine.hpp` + CPU/GPU 实现 + `shaders/{trit_pack,matmul_q,matmul_q_gemv}.comp`） |
 | 矩阵/代数层（CPU 存储与手写内核） | `algebra_matrix.hpp` / `algebra_span.hpp` / `algebra_ops.hpp`（`Expression`/`BoolExpression` 概念在 `expr_dsl.hpp`） |
 | 表达式 DSL / 融合 IR | `expr_dsl.hpp` / `expr_spec.hpp` / `expr_opt.hpp` / `expr_registry.hpp`（IR-C 图融合未采用、无 `expr_graph.hpp`；取舍记录见 `docs/history.md`） |
 | 后端代码生成（IR-D emitter 抽象） | `expr_emitter.hpp`（注册表）+ `expr_glsl_gen.hpp`（GlslEmitter） |
@@ -149,10 +149,17 @@ BitLinear 的量化缓存静默用旧权重**（`src/write_epoch_test.cpp` 逐�
 （与 microsoft/BitNet `pack_weight.py` 一致；不做其 CUDA interleave），容器是 f32 张量
 当原始字（布局/编解码唯一来源 `ternary_pack.hpp`）。`supports_ternary_gemm()` =
 能力位（GPU = 两条 pipeline 都在）。
-③ **按宽度选址**：BitLinear 默认**按激活宽度**选缓冲（≤ 8 → 打包；> 8 → f16 稠密分块
-GEMM）——因为打包内核在宽 batch 下输给分块 GEMM（实测 60 步训练 4.0 s vs 2.0 s）。
-`set_ternary_pack_enabled()` 强制开关（A/B/回退）。**动这块前先量**：本机与 102 的
-训练/解码/显存 A/B 口径见 docs 21 §4.12 的表。
+③ **打包是默认的权重缓冲形态（训练与解码同一条路）**：`BitLinear` 跟随引擎能力
+（`supports_ternary_gemm()`）用打包缓冲，`set_ternary_pack_enabled()` 是 A/B 与回退的
+强制开关。**分块版 `matmul_q.comp` 的两条不变量**：网格随分块常量（BM=BN=64）、
+**轴向 x↔输出列 N / y↔输出行 M**（与 `matmul_tiled`/`batched_matmul` 同约定）——
+写反只会在 M≠N 的形状上错值（方形小形状恰好正确，是 WIP 卡住一轮的根因）。
+`N ≤ 8 且 transA=0` 走 **`matmul_q_gemv.comp`**（subgroup = 4 行、subgroup 内沿打包字
+分片、`subgroupAdd` 每 (行,列) 一次 → 无 barrier/shared；**host 侧 `grid.x =
+ceil(M/(4·(256/subgroup_size)))` 是布局契约**）。CPU 侧 `matmul_q_impl` 走**行块解码
+（RB=64）+ 稠密微内核**（`multiply_to`/`transpose_multiply_to`）——逐元素直算比稠密慢
+~70×，禁止回退到那种写法。**动这块前先量**：`layer_bench --op matmul,matmul_q,matmul_q_bw
+--f16 --inner N` 的配对 A/B + 端到端（训练/解码/显存/CPU）口径见 docs 21 §4.14。
 ④ **梯度惰性分配**：`Linear` / `BitLinear` 的梯度只在 `param_gradients()` /
 `backward()` 首次触及时建（`grad_buffers_allocated()` 可见）；新增层若也用
 `ensure_grad_()` 模式，注意**返回 void 的函数里用 `NN_CHECK` 而不是 `NN_FAIL`**
