@@ -264,7 +264,7 @@ void print_usage(const char *prog)
     help.opt("--accum-steps <n>", "梯度累积步数 (默认: 1)\n每 n 步 forward/backward 累加梯度后再更新参数，等效放大 batch_size×n");
     help.opt("--seq-len <n>", "序列长度 (默认: 256)");
     help.opt("--stride <n>", "滑动窗口步长 (默认: 等于 --seq-len，即不重叠)\n设小可产生重叠窗口，增加训练样本数");
-    help.opt("--optimizer <name>", "优化器: sgd/sgd_momentum/adam/adamw/muon (默认: adam)");
+    help.opt("--optimizer <name>", "优化器: sgd/sgd_momentum/adam/adamw/adamwquant/muon (默认: adam)\nadamwquant: 量化状态的 AdamW（状态 4 B/权重 vs 8 B；见 docs/development/21 §4.13）");
     help.opt("--weight-decay <w>", "AdamW 权重衰减系数 (默认: 0.01)");
     help.opt("--beta1 <b>", "Adam/AdamW 一阶动量衰减 β1 (默认: 0.9，sgd/muon 忽略)");
     help.opt("--beta2 <b>", "Adam/AdamW 二阶动量衰减 β2 (默认: 0.999，sgd/muon 忽略)\nLLM 预训练惯例常取 0.95 (GPT-3/LLaMA 配方)");
@@ -449,10 +449,10 @@ TrainConfig parse_args(int argc, char *argv[])
             cfg.optimizer_name = argv[++i];
             if (cfg.optimizer_name != "sgd" && cfg.optimizer_name != "sgd_momentum" &&
                 cfg.optimizer_name != "adam" && cfg.optimizer_name != "adamw" &&
-                cfg.optimizer_name != "muon")
+                cfg.optimizer_name != "adamwquant" && cfg.optimizer_name != "muon")
             {
                 std::cerr << "未知优化器: " << cfg.optimizer_name
-                          << "，可选: sgd, sgd_momentum, adam, adamw, muon\n";
+                          << "，可选: sgd, sgd_momentum, adam, adamw, adamwquant, muon\n";
                 std::exit(1);
             }
         }

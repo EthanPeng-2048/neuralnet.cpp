@@ -176,7 +176,8 @@ int main(int argc, char* argv[])
     // 结构不依赖形状，任取小 R×C 即可（Muon 的 NS 只对 ≥2D 参数生效）。
     {
         const std::size_t R = 8, C = 5;
-        for (const char* name : {"sgd", "sgd_momentum", "adam", "adamw", "muon"})
+        for (const char* name : {"sgd", "sgd_momentum", "adam", "adamw",
+                                 "adamwquant", "muon"})
         {
             nn::Tensor p = scan_tensor(R, C);
             nn::Tensor g = scan_tensor(R, C);

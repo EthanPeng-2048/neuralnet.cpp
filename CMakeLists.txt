@@ -478,6 +478,10 @@ if(NN_ENABLE_TESTS)
     nn_add_executable(ternary_gemm_test src/ternary_gemm_test.cpp)
     list(APPEND NN_TEST_TARGETS ternary_gemm_test)
 
+    # ── 量化状态优化器 AdamWQuant（F5 第一步，docs 21 §4.13）──
+    nn_add_executable(adam_quant_test src/adam_quant_test.cpp)
+    list(APPEND NN_TEST_TARGETS adam_quant_test)
+
     # ── 分词器正确性（BPE pre_tokenize 对拍 + 标记往返）─────────────────
     nn_add_executable(tokenizer_test src/tokenizer_test.cpp)
     list(APPEND NN_TEST_TARGETS tokenizer_test)
@@ -625,6 +629,11 @@ if(NN_ENABLE_TESTS)
     if(TARGET ternary_gemm_test)
         add_test(NAME ternary_gemm_test_gpu COMMAND ternary_gemm_test --gpu)
         set_tests_properties(ternary_gemm_test_gpu PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
+    # 量化状态优化器的 GPU 变体（状态读写全在设备侧；GPU 上表达式须命中闭合世界）。
+    if(TARGET adam_quant_test)
+        add_test(NAME adam_quant_test_gpu COMMAND adam_quant_test --gpu)
+        set_tests_properties(adam_quant_test_gpu PROPERTIES SKIP_RETURN_CODE 77)
     endif()
     foreach(TARGET ${NN_BENCH_TARGETS})
         set_target_properties(${TARGET} PROPERTIES

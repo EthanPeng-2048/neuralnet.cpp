@@ -78,7 +78,7 @@ void print_usage(const char *prog)
     help.opt("--epochs <n>", "训练轮数 (默认: 10)");
     help.opt("--lr <lr>", "学习率 (默认: 0.001)");
     help.opt("--batch-size <n>", "批大小 (默认: 64)");
-    help.opt("--optimizer <name>", "优化器: sgd/sgd_momentum/adam/adamw/muon (默认: adam)");
+    help.opt("--optimizer <name>", "优化器: sgd/sgd_momentum/adam/adamw/adamwquant/muon (默认: adam)\nadamwquant: 量化状态的 AdamW（状态 4 B/权重 vs 8 B；见 docs/development/21 §4.13）");
     help.opt("--weight-decay <w>", "AdamW 权重衰减系数 (默认: 0.01)");
     help.opt("--max-samples <n>", "限制训练样本数 (默认: 全部，用于快速测试)");
     help.opt("--shuffle-steps <true|false>", "每 epoch 打乱 batch 顺序 (默认: true)");
