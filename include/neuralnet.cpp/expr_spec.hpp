@@ -76,7 +76,8 @@ enum class ExprOp : uint8_t
     return op == ExprOp::ColSum || op == ExprOp::ColMax;
 }
 // 指令实际使用的操作数个数（未用的 b/c 保持默认 {0,0}，不可当作 Reg(0) 引用）
-[[nodiscard]] inline std::size_t expr_instr_num_operands(ExprOp op) noexcept
+// constexpr：供 expr_op_table.hpp 的算子元数据一致性编译期断言复用（RV-07）
+[[nodiscard]] inline constexpr std::size_t expr_instr_num_operands(ExprOp op) noexcept
 {
     switch (op)
     {

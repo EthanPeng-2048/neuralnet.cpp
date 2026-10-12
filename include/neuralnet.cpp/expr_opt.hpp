@@ -34,6 +34,7 @@
 #include <vector>
 
 #include "expr_spec.hpp"
+#include "expr_op_table.hpp" // 算子元数据单一真源（可折叠标志 / CPU 语义，RV-07）
 
 namespace nn
 {
@@ -43,25 +44,17 @@ namespace nn
 [[nodiscard]] inline bool expr_eval_const_fold(ExprOp op, Scalar a, Scalar b,
                                                Scalar c, Scalar& out_v)
 {
-    switch (op)
-    {
-    case ExprOp::Neg:    out_v = -a;                 return true;
-    case ExprOp::Abs:    out_v = std::fabs(a);       return true;
-    case ExprOp::Add:    out_v = a + b;              return true;
-    case ExprOp::Sub:    out_v = a - b;              return true;
-    case ExprOp::Mul:    out_v = a * b;              return true;
-    case ExprOp::Div:    out_v = a / b;              return true;
-    case ExprOp::Max:    out_v = std::max(a, b);     return true;
-    case ExprOp::Min:    out_v = std::min(a, b);     return true;
-    case ExprOp::Lt:     out_v = (a <  b) ? Scalar{1} : Scalar{0}; return true;
-    case ExprOp::Le:     out_v = (a <= b) ? Scalar{1} : Scalar{0}; return true;
-    case ExprOp::Gt:     out_v = (a >  b) ? Scalar{1} : Scalar{0}; return true;
-    case ExprOp::Ge:     out_v = (a >= b) ? Scalar{1} : Scalar{0}; return true;
-    case ExprOp::Eq:     out_v = (a == b) ? Scalar{1} : Scalar{0}; return true;
-    case ExprOp::Ne:     out_v = (a != b) ? Scalar{1} : Scalar{0}; return true;
-    case ExprOp::Select: out_v = (a != Scalar{0}) ? b : c;         return true;
-    default:             return false;  // 超越函数 / 归约不折叠
-    }
+    // 可折叠性 + 标量语义均来自 expr_op_table（超越函数 / 归约 foldable=false）
+    const detail::ExprOpInfo& info = detail::expr_op_info(op);
+    if (!info.foldable)
+        return false;
+    if (info.arity == 1)
+        out_v = info.unary(a);
+    else if (info.arity == 2)
+        out_v = info.binary(a, b);
+    else
+        out_v = (a != Scalar{0}) ? b : c;   // Select
+    return true;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

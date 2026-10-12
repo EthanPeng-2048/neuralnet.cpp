@@ -48,6 +48,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "core_env.hpp"   // RV-09：环境变量读取唯一入口
+
 namespace nn::prof
 {
 
@@ -56,51 +58,10 @@ namespace nn::prof
 //   NN_PROFILE_TRACE=<path>   额外写 Chrome trace JSON 到 <path>（隐含开启）
 //   NN_PROFILE_EVERY=<n>      每 n 次 dump() 打一次阶段表（默认 0 = 仅显式 dump）
 
-namespace detail
-{
-
-inline bool env_flag(const char* name)
-{
-#if defined(_MSC_VER)
-    char* buf = nullptr;
-    std::size_t len = 0;
-    if (_dupenv_s(&buf, &len, name) == 0 && buf != nullptr)
-    {
-        const bool on = len > 0 && buf[0] != '\0' && buf[0] != '0';
-        std::free(buf);
-        return on;
-    }
-    return false;
-#else
-    const char* v = std::getenv(name);
-    return v != nullptr && v[0] != '\0' && v[0] != '0';
-#endif
-}
-
-inline std::string env_string(const char* name)
-{
-#if defined(_MSC_VER)
-    char* buf = nullptr;
-    std::size_t len = 0;
-    if (_dupenv_s(&buf, &len, name) == 0 && buf != nullptr)
-    {
-        std::string s = buf != nullptr ? buf : "";
-        std::free(buf);
-        return s;
-    }
-    return {};
-#else
-    const char* v = std::getenv(name);
-    return v != nullptr ? std::string(v) : std::string();
-#endif
-}
-
-}   // namespace detail
-
 // ── 全局开关（静态初始化期读环境变量，进程内恒定）─────────────────────────
-inline const bool g_enabled = detail::env_flag("NN_PROFILE") ||
-                              !detail::env_string("NN_PROFILE_TRACE").empty();
-inline const std::string g_trace_path = detail::env_string("NN_PROFILE_TRACE");
+inline const bool g_enabled = ::nn::detail::env_flag_raw("NN_PROFILE") ||
+                              !::nn::detail::env_string_raw("NN_PROFILE_TRACE").empty();
+inline const std::string g_trace_path = ::nn::detail::env_string_raw("NN_PROFILE_TRACE");
 
 [[nodiscard]] inline bool enabled() noexcept { return g_enabled; }
 

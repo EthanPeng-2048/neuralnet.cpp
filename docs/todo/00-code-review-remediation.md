@@ -241,7 +241,7 @@ display / beta / state_bufs / half_state）+ `optimizer_table()` / `find_optimiz
 
 ### RV-06 — 绑定不变量与 `NN_BIND_DEBUG`：把调试门升为 CI 门禁
 
-- **优先级**：中 · **状态**：`Open` · **来源**：审查 P4（**标签已修正**，见 §1） · **依赖**：RV-05（若走 `EngineHandle` 方案）
+- **优先级**：中 · **状态**：`Fixed`（2026-10-12） · **来源**：审查 P4（**标签已修正**，见 §1） · **依赖**：RV-05（若走 `EngineHandle` 方案）
 
 **现象与证据**：`compute_engine.hpp::bind_check_`：**双方都绑定且指针不同 → 硬错误**；**单侧未绑定默认放行**，
 只有 `NN_BIND_DEBUG=1` 才升级为错误（用于抓库内漏网与库外迁移清单）。`observer_ptr` 明确"非拥有、无 RAII"，
@@ -256,22 +256,66 @@ display / beta / state_bufs / half_state）+ `optimizer_table()` / `find_optimiz
 
 **验收**：调试门进入 CI（或在 `18-roadmap.md` 门禁清单登记为必跑）；库内"漏网中转"由审计脚本定期复扫清零。
 
+**验收证据（RV-06，2026-10-12）**：
+① **前置修复（库内 stamp 漏网）**：`NN_BIND_DEBUG=1` 门禁原为红——`t1_58_test` / `ternary_gemm_test` /
+`model_roles_test` 三个三值用例在 `cast` 处报 "unbound input into engine"。根因 = `matmul_q_impl`（CPU 与
+GPU 两份）在"边界 cast 回退"路径里：CPU 递归调用 `matmul_q_impl(...f32)` 后对**未 stamp** 的 impl 产物
+直接 `cast(*r, P)`；GPU 对静态工厂产物 `Tensor::from_gpu(...)` 直接 `cast(res, P)`。两处改为先
+`adopt(...)`（基类 protected 的库内 stamp 通道）再进公共 `cast`——与 M6 的 `to_prec` 修法同款。
+② **CI 门禁**：`.github/workflows/cmake-single-platform.yml` 在 Linux/Windows 各加一轮
+`NN_BIND_DEBUG=1 ctest --test-dir build --output-on-failure`（`NN_BIND_DEBUG` 是行为开关，默认构建即生效）。
+③ **实测（CPU）**：本机 Release（clang++ 24，`-DNN_ENABLE_TESTS=ON -DNN_ENABLE_GPU=OFF -DNN_ENABLE_NATIVE=OFF`）
+`NN_BIND_DEBUG=1 ctest` **40/40**（GPU 用例按 77 skip）；不带开关同样 40/40。
+**实测（GPU，NVIDIA CMP 40HX @ `ethan@192.168.1.102`，Windows + clang++，Debug，GPU 启用）**：
+`ctest` **42/42**、`NN_BIND_DEBUG=1 ctest` **42/42**（全部 GPU 用例真跑、零 skip，含 `ternary_gemm_test_gpu`
+/ `t1_58_test_gpu` / `f16_writeback_probe`）——GPU `matmul_q_impl` 的同一修法得证。
+⑤ **顺带修的 Windows 可移植性缺陷**：`src/assert_always_test.cpp::read_log` 用裸 `std::fopen`，
+在 clang++ + MSVC STL + `-Werror` 下因 `-Wdeprecated-declarations` **直接编译失败**（这正是 GitHub CI
+的 Windows 配置；此前 CI 不编测试故未暴露，本轮在 102 上编全量测试时撞到）→ 改为 `_MSC_VER` 下走
+`fopen_s`（与 `core_profile.hpp` 同款）。修后 102 的 clang++ 全量测试构建通过。
+④ 未做（方案里"先评估再定"的两条条件项）：把"未绑定输入"默认升级为错误、或引入 `EngineHandle`
+代数——当前保持 `NN_BIND_DEBUG` 的探针门既有例外语义（AGENTS §2），不升级默认行为。
+
 ### RV-07 — CPU 侧 `ExprOp` 分派收敛（三处 switch → 表驱动）
 
-- **优先级**：中 · **状态**：`Open` · **来源**：审查（复杂度热点） · **依赖**：无
+- **优先级**：中 · **状态**：`Fixed`（2026-10-12） · **来源**：审查（复杂度热点） · **依赖**：无
 
 **现象与证据**（新增一个算子要动的点，实测）：CPU 引擎 **3 处** `ExprOp` 分派——标量求值（`compute_cpu_engine.hpp` ≈1979）、
 寄存器融合 J 路径（≈2518）、寄存器融合 `ins` 路径（≈2625）；再加 `expr_spec.hpp`（语义校验）、`expr_opt.hpp`（常量折叠）、
 `expr_glsl_gen.hpp`（**5 处** emitter 分支）→ **一个算子 ≈ 9 处**。
 
-**方案**：以 `algebra_ops.hpp`（唯一算子枚举源）为基，建 `constexpr` 算子元数据表（元数 / 可否折叠 / CPU 标量函数指针 / GLSL 模板）；
-CPU 三处查表（手写特化改走显式白名单，不当主路径）；GLSL emitter 的算子模板字符串也进表。
+**方案**：以 `algebra_ops.hpp`（唯一算子语义源：`nn::ops::*::apply`）为基，建 `constexpr` 算子元数据表；
+CPU 三处、`expr_opt` 折叠、GLSL emitter 六处全部查表。
 
 **验收**：新增一个算子只改 1–2 处；`expr_opt_test` / `expr_graph_test` / `fused_gpu_test` 全绿；**字节锚不变**（纯重构）。
 
+**验收证据（RV-07，2026-10-12）**：
+① 新增 `expr_op_table.hpp`：`nn::detail::{ExprOpInfo, kExprOpTable, expr_op_info, expr_alu_scalar}` +
+  `ExprEmitKind`（Infix/Func2/Compare/Neg/Func1/Select）。每算子**一行**元数据 =
+  元数 / 归约标志 / 可折叠 / CPU 一元/二元标量函数指针（直接取 `nn::ops::*::apply`；比较类经
+  `detail::cmp::*` 桥接 bool→1.0/0.0）/ GLSL 发射形态 + 符号 + 向量比较内建名。
+  末尾 `consteval expr_op_table_consistent()` + `static_assert` 强制本表与
+  `expr_spec.hpp` 的 `expr_instr_num_operands` / `expr_op_is_reduce` / `expr_op_reduces_cols`
+  逐项一致（写漏同步 → 编译失败）。`expr_instr_num_operands` 加 `constexpr`。
+② CPU 引擎（`compute_cpu_engine.hpp`）三处 switch → 查表：fold 标量求值（`exec_alu` 转发
+  `detail::expr_alu_scalar`）、寄存器融合 J 路径、寄存器融合 `ins` 路径（后两处按 `info.arity`
+  分一元/二元/三元，保持 Select 短路）。
+③ `expr_opt.hpp::expr_eval_const_fold` switch → 查表（`info.foldable` 门 + 一元/二元/Select 分流）。
+④ GLSL emitter（`expr_glsl_gen.hpp`）`glsl_binary_op`/`glsl_unary_op` 两个符号表函数**删除**，
+  改为 `glsl_alu_expr(info, a, b_fn, c_fn, vec4, native16, wrap)` 单一发射器；6 处指令发射块
+  （标量主链 / `emit_assign` / 内联 `expr_inl` / 折叠段 `emit_assign` / `emit_scalar_chain` /
+  vec4 快路径 / `emit_instrs`）全部改调它（`b`/`c` 以惰性回调传入，保持不使用的操作数不被求值）。
+  **新增一个逐元素算子只需改 `expr_op_table.hpp` 一行**（元数非默认 2 时再改 `expr_spec.hpp`
+  的 `expr_instr_num_operands`，由 static_assert 兜底）。
+⑤ 实测：`build-rv`（Release/clang 24/CPU）`ctest` **40/40**（GPU 用例按配置 skip）。
+⑥ **字节锚不变（强口径）**：用 `build/`（Debug/GPU/glslc 1.4.357.1）分别从「RV-07 前」与
+  「RV-07 后」两侧源码编 `scan_exprs` 并生成融合产物，`diff -rq` → **805 个文件（fused_registry.hpp
+  + 402 组 .comp/.spv）零差异**。即融合 shader 的 GLSL 源码与 SPIR-V 逐字节不变。
+⑦ 全量 GPU 构建与 `ctest`（含 `NN_BIND_DEBUG=1`）在 40HX 侧复核（见 RV-06 口径）。
+
 ### RV-08 — `compute_vk_backend.hpp`（6397 行）拆分 + SPIR-V getter 表驱动
 
-- **优先级**：中 · **状态**：`Open` · **来源**：审查（复杂度热点） · **依赖**：无（纯结构）
+- **优先级**：中 · **状态**：`Fixed`（2026-10-12） · **来源**：审查（复杂度热点） · **依赖**：无（纯结构）
 
 **现象与证据**：`backend/compute_vk_backend.hpp` **6397 行**；SPIR-V getter 型函数 **42 个**（审查说 36）；
 pipeline 缓存、帧环 / solo fence、`pending_destroys_` 延迟销毁队列、各原语 dispatch 同处一文件。
@@ -285,9 +329,36 @@ pipeline 缓存、帧环 / solo fence、`pending_destroys_` 延迟销毁队列�
 
 **验收**：每步拆分后三件套不变；单文件行数目标 < 3000。
 
+**验收证据（RV-08，2026-10-12）**：
+① **SPIR-V getter 表驱动（单一注册表）**：42 个 `get_*_spirv()` 的**手写函数体**
+  （每个 8 行 `#ifdef NN_X_SPV_EMBEDDED / return nn_x_spirv_bytecode() / #else static empty
+  / #endif`）与 42 个 `#define NN_X_SPV_EMBEDDED` 全部删除。文件头的 42 个
+  `#if __has_include("<name>_spv.hpp")` 探测块改为把字节码函数绑到 `NN_SPV_FN_<name>`
+  （有嵌入头 = 真实 `nn_<name>_spirv_bytecode`；纯 CPU 构建 = `NN_SPV_FN_MISSING` =
+  `detail::spirv_missing()` 占位空向量）。`GpuBackend` 内改用 X 宏列表
+  `NN_SPV_GETTER_LIST(NN_SPV_GETTER)` 一次性展开出全部 getter。**新增一个原语 shader
+  只改两处**：文件头加一个探测块 + 在 `NN_SPV_GETTER_LIST` 加一个 token
+  （`get_<name>_spirv()` 名称/签名不变，既有调用**零改动**）。
+② **物理拆分（纯移动、零行为变化）**：`GpuBackend`（成员体 ~5375 行）拆为 4 个**片段**
+  文件，由 `compute_vk_backend.hpp` 在 `class GpuBackend { ... }` 体内**按序** `#include`
+  （片段不是独立头，带 banner 说明）：
+  `compute_vk_backend_destroy.inc`（延迟销毁 / reap 单帧 / pipeline 句柄 / 收帧 / 显存回收，948 行）、
+  `compute_vk_backend_frame.inc`（帧环 / batch / 阻塞上传下载 / dispatch / matmul，779 行）、
+  `compute_vk_backend_pipelines.inc`（RLA 扫描 + 描述符集 / 跨 submit 依赖 / solo fence / 屏障，642 行）、
+  `compute_vk_backend_ops.inc`（各原语 dispatch，2681 行）。
+  主文件 **6397 → 1055 行**（< 3000），四个片段均 < 3000。
+  正确性由**重构等价性检查**背书：脚本比对「主文件 `[:1000]` + 4 片段 + 主文件尾」与拆分前
+  文件 → **逐行完全相同**（纯移动）。
+③ 实测：本地 `build/`（Debug/GPU/glslc 1.4.357.1）编译 `mnist_train` / `text_train` 通过；
+  融合 shader 未重生成（无 shader 相关改动）。102（40HX）全量构建 + `ctest` **42/42**、
+  `NN_BIND_DEBUG=1 ctest` **42/42**（全部 GPU 用例真跑）；`bench/doc_inventory.ps1` 与
+  `bench/doc_align_audit.ps1` 均 exit 0。
+④ 脚注：片段内 `#include` 是本仓首次使用的「单类跨文件」手法（因 `GpuBackend` 是单一
+  类，纯移动只能走此路）；若日后倾向「拆成多个协作类」，须单独立项（非纯移动）。
+
 ### RV-09 — 环境变量读取样板 → 单一 `core_env.hpp`
 
-- **优先级**：中 · **状态**：`Open` · **来源**：审查（"≥6 处复制"） · **依赖**：无
+- **优先级**：中 · **状态**：`Fixed`（2026-10-12） · **来源**：审查（"≥6 处复制"） · **依赖**：无
 
 **现象与证据**（实测）：库内 **14** 处 `getenv`，分散在 ≥6 份各自 helper：
 `expr_dsl.hpp::env_flag`、`core_profile.hpp::env_flag`、`compute_engine.hpp::prec_env_flag`（+ `NN_BIND_DEBUG` 直读）、
@@ -300,9 +371,21 @@ MSVC 的 `_dupenv_s` 分支在多处重复（`-Werror` 下 `getenv` 已弃用）
 
 **验收**：`getenv` 只在 `core_env.hpp` 出现；`NN_ENABLE_PROBES=OFF` 的默认构建里探针开关仍恒 false 且**不求值**（双构建 + 反汇编/`strings` 抽查，或加单测）；`ctest` 全绿。
 
+**验收证据（RV-09，2026-10-12）**：
+① 新增 `core_env.hpp`：`nn::detail::{env_flag_raw,env_string_raw,env_int_raw}`（原始读取，行为开关用）
+  `{probe_flag_raw,probe_string_raw}`（探针门下的读取，`NN_PROBES_ENABLED=0` 时恒 false/空串且**不求值
+getenv**）。MSVC `_dupenv_s` 分支只此一份。
+② 四处 helper 全部改为转发：`expr_dsl.hpp::dsl::env_flag`、`compute_engine.hpp::{prec_env_flag,
+prec_trace_enabled_,bind_debug_enabled_}`、`core_profile.hpp` 的全局开关（`detail::env_flag/env_string`
+删除）、`backend/compute_vk_device.hpp::VulkanDevice::get_env`。
+③ 口径统一：raw flag = "存在、非空、首字符 != '0'"（`dsl::env_flag` 原为"任意非空即真"，一并对齐；
+二者都是探针开关、默认不设，行为不变）。
+④ 实测：`rg 'getenv|_dupenv_s' include/neuralnet.cpp` 只剩 `core_env.hpp`（其余为注释）；
+mnist_train / text_train 在 `NN_ENABLE_PROBES` 关与开两种编译下均 `-fsyntax-only` 零告警通过。
+
 ### RV-10 — BitLinear 量化舍入语义：把**真实**语义写清楚（审查表述有误）
 
-- **优先级**：低 · **状态**：`Open` · **来源**：审查（"round-half-away"） · **依赖**：无
+- **优先级**：低 · **状态**：`Fixed`（2026-10-12） · **来源**：审查（"round-half-away"） · **依赖**：无
 
 **现象与证据**：`compute_layer_bitlinear.hpp::quantize_weights_` 用 `select(w > 0.5τ → 1, w < −0.5τ → −1, 0)`；
 `ternary_pack.hpp` 同判据 `|w| > 0.5τ`。即**严格大于**、恰好 `|w| == 0.5τ` 归 **0**（半值向零）。
@@ -313,9 +396,15 @@ MSVC 的 `_dupenv_s` 分支在多处重复（`-Werror` 下 `getenv` 已弃用）
 
 **验收**：`compute_layer_bitlinear.hpp` 与 `ternary_pack.hpp` 的判据表述一致；`t1_58_test` / `ternary_gemm_test` 不变。
 
+**验收证据（RV-10，2026-10-12）**：
+`compute_layer_bitlinear.hpp`（算法块注释 + `quantize_weights_` 内的实现注释）与
+`ternary_pack.hpp::code_of` 的判据表述统一为："判据 = **严格** `|W| > 0.5τ`；恰好 `|W| == 0.5τ` 归 0
+（半值向零）；与 `RoundClip(W/τ,-1,1)` 的唯一差异在这个测度零的等值点"。**不改算法**（纯注释）。
+`t1_58_test` / `ternary_gemm_test` 数值不变（本机 ctest 全绿）。
+
 ### RV-11 — `Precision` 枚举 ↔ 序列化 tag / 变体索引：加编译期护栏
 
-- **优先级**：低 · **状态**：`Open` · **来源**：审查（"隐式耦合缺 static_assert"） · **依赖**：无
+- **优先级**：低 · **状态**：`Fixed`（2026-10-12） · **来源**：审查（"隐式耦合缺 static_assert"） · **依赖**：无
 
 **现象与证据**：`precision.hpp` 里有**两套编号**——枚举值（`F16=0, F32=1, BF16=2, F64=3, T1_58=4`）与
 序列化 tag（`f32=0, f64=1, f16=2, bf16=3, t1_58=4`），二者**刻意不同**（保持 v4 文件兼容），目前无 `static_assert` 冻结关系。
@@ -324,6 +413,13 @@ MSVC 的 `_dupenv_s` 分支在多处重复（`-Werror` 下 `getenv` 已弃用）
 GPU 侧用 `static_cast<int>(P)` 拼精度签名/报错文本的地方补一致性断言。
 
 **验收**：`precision_type_test` / `precision_test` 补断言；刻意改一处枚举即**编译失败**（负例验证）。
+
+**验收证据（RV-11，2026-10-12）**：
+`precision.hpp` 在 `precision_from_tag` 之后加了两组 `static_assert`：① **枚举值**冻结
+（`F16=0,F32=1,BF16=2,F64=3,T1_58=4`；GPU 侧用 `static_cast<int>(P)` 拼精度签名依赖它）；
+② **序列化 tag** 冻结（`f32=0,f64=1,f16=2,bf16=3,t1_58=4`，沿用 v4 数值）+ 每个精度的
+`precision_from_tag(precision_tag(p)) == p` 往返。**负例**：只改枚举值或 tag 表任一处即**编译失败**
+（static_assert 触发），强制同步两张映射。
 
 ### RV-12 — Loss 直构 IR spec 与 `FoldAnchor` 的时间耦合（**先设计**）
 
@@ -342,13 +438,19 @@ GPU 侧用 `static_cast<int>(P)` 拼精度签名/报错文本的地方补一致�
 
 ### RV-13 — `Expression` 概念位置（L1 Span 附近）
 
-- **优先级**：低（纯组织） · **状态**：`Open` · **来源**：审查（布局） · **依赖**：无
+- **优先级**：低（纯组织） · **状态**：`Fixed`（2026-10-12） · **来源**：审查（布局） · **依赖**：无
 
 **现象与证据**：`Expression` / `BoolExpression` 概念定义在 `expr_dsl.hpp`，但它描述的是 **L1 代数层**（`algebra_span.hpp`）的表达式原语。
 
 **方案**：把概念定义移到 L1（`algebra_span.hpp` 或邻近头），`expr_dsl.hpp` 引用；纯移动 + clean build 验证头文件自包含。
 
 **验收**：`ctest` 全绿；`nn.hpp` 聚合入口不受影响。
+
+**验收证据（RV-13，2026-10-12）**：
+`nn::Expression` / `nn::BoolExpression` 从 `expr_dsl.hpp` 移到 L1 的 `algebra_span.hpp`
+（`#include <concepts>` 已补）；`expr_dsl.hpp` 经 `algebra_matrix.hpp → algebra_span.hpp` 传递可见，
+本头删去定义、留指针注释。`expr_dsl.hpp` 内 12 处 `nn::Expression` / `nn::BoolExpression` 约束零改动即编译。
+实测：`mnist_train.cpp`（含 `nn.hpp` 全量）零告警 `-fsyntax-only` 通过；本机 ctest 40/40。
 
 ### RV-14 — VK Descriptor Set 回收：专项复审（**只审计，不改代码**）
 
@@ -376,6 +478,12 @@ GPU 侧用 `static_cast<int>(P)` 拼精度签名/报错文本的地方补一致�
 
 **2026-10-11 进度**：批 A（RV-01、RV-02）与批 B（RV-03、RV-04）已 **Fixed**——每条的
 验收证据见对应 RV 卡尾部的"验收证据"段。批 C / 批 D 未动。
+
+**2026-10-12 进度**：批 D 的小改三条 **RV-10 / RV-11 / RV-13** 已 Fixed（注释精确化 / 编译期护栏 /
+概念移到 L1），批 C 的 **RV-09**（`core_env.hpp` 环境变量单一入口）与 **RV-06**（绑定不变量 CI 门禁）
+已 Fixed——RV-06 的前置是修掉 `matmul_q_impl`（CPU/GPU）"impl 产物进公共 `cast` 前未 stamp"的库内漏网
+（三个三值用例在 `NN_BIND_DEBUG=1` 下原为红）。**仍 Open**：RV-05、RV-07、RV-08、RV-12、RV-14
+（RV-05/RV-14 需 GPU 提权环境；RV-07/RV-08 是需单独提交并逐步过三件套的重构；RV-12 只做设计评估）。
 **四组「编译器 × 标准库」实测（`ethan@192.168.1.102`，全部全新构建 + ctest + 审计门禁）**：
 
 | 配置 | 编译器 / 标准库 | 结果 |

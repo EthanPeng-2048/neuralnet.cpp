@@ -16,6 +16,7 @@
 
 #include "compute_engine.hpp"
 #include "expr_opt.hpp"
+#include "expr_op_table.hpp" // 算子元数据单一真源（CPU 标量语义 / GLSL 形态，RV-07）
 #include "expr_registry.hpp" // scan 模式融合 kernel 登记（NN_EXPR_SCAN）
 #include "expr_dsl.hpp"      // matmul_with_bias 经 DSL 融合（单一事实源）
 #include "ternary_pack.hpp"  // 三值打包布局（trit_pack / matmul_q，P2）
@@ -733,7 +734,10 @@ public:
             NN_TRY(r, matmul_q_impl(packed, scale, *b32, transA, out_rows,
                                     Precision::F32));
             if (P == Precision::F32) return r;
-            return cast(*r, P);
+            // 递归产物是 `*_impl` 直构（未 stamp）；进公共 cast（内含 bind_check_）
+            // 前先补出生绑定，否则 NN_BIND_DEBUG 门禁把"基类内部中转"误判成库内
+            // 漏网（17 §5 M6）。
+            return cast(adopt(std::move(*r)), P);
         }
         if (packed.precision() != Precision::F32 || scale.precision() != Precision::F32 ||
             B.precision() != Precision::F32)
@@ -1976,32 +1980,11 @@ public:
                 return (cur_d < vecd.size()) ? vecd[cur_d] : Scalar{0};
             }
         };
-        // 非归约指令求值（va 已取自 a，vb 取自 b——与主链 switch 同构）
+        // 非归约指令求值（标量语义唯一来源 = expr_op_table 的 CPU 函数指针对；
+        //  va 已取自 a、vb 取自 b；Select 由 eval_full 单独处理，归约不进本函数）
         const auto exec_alu = [](ExprOp op, Scalar va, Scalar vb) -> Scalar
         {
-            switch (op)
-            {
-            case ExprOp::Neg:   return -va;
-            case ExprOp::Exp:   return std::exp(va);
-            case ExprOp::Log:   return std::log(va);
-            case ExprOp::Sqrt:  return std::sqrt(va);
-            case ExprOp::Rsqrt: return Scalar{1} / std::sqrt(va);
-            case ExprOp::Abs:   return std::fabs(va);
-            case ExprOp::Tanh:  return std::tanh(va);
-            case ExprOp::Add:   return va + vb;
-            case ExprOp::Sub:   return va - vb;
-            case ExprOp::Mul:   return va * vb;
-            case ExprOp::Div:   return va / vb;
-            case ExprOp::Max:   return std::fmax(va, vb);
-            case ExprOp::Min:   return std::fmin(va, vb);
-            case ExprOp::Lt:    return va <  vb ? Scalar{1} : Scalar{0};
-            case ExprOp::Le:    return va <= vb ? Scalar{1} : Scalar{0};
-            case ExprOp::Gt:    return va >  vb ? Scalar{1} : Scalar{0};
-            case ExprOp::Ge:    return va >= vb ? Scalar{1} : Scalar{0};
-            case ExprOp::Eq:    return va == vb ? Scalar{1} : Scalar{0};
-            case ExprOp::Ne:    return va != vb ? Scalar{1} : Scalar{0};
-            default:            return Scalar{0};   // Select/归约不走本函数
-            }
+            return detail::expr_alu_scalar(op, va, vb, Scalar{0});
         };
         // Select：三元（fold body 允许，validate 未禁——按主链语义）
         const auto eval_full = [&](const ExprInstr& ins, std::size_t r,
@@ -2515,34 +2498,14 @@ public:
                         continue;  // 归约指令已在上方处理中完整计算
                     const Scalar va = eval_op(J.a);
                     const ExprOp op = static_cast<ExprOp>(J.op);
-                    switch (op)
-                    {
-                    // 一元
-                    case ExprOp::Neg:   regs[J.dst] = -va; break;
-                    case ExprOp::Exp:   regs[J.dst] = std::exp(va); break;
-                    case ExprOp::Log:   regs[J.dst] = std::log(va); break;
-                    case ExprOp::Sqrt:  regs[J.dst] = std::sqrt(va); break;
-                    case ExprOp::Rsqrt: regs[J.dst] = Scalar{1} / std::sqrt(va); break;
-                    case ExprOp::Abs:   regs[J.dst] = std::abs(va); break;
-                    case ExprOp::Tanh:  regs[J.dst] = std::tanh(va); break;
-                    // 二元
-                    case ExprOp::Add:   regs[J.dst] = va + eval_op(J.b); break;
-                    case ExprOp::Sub:   regs[J.dst] = va - eval_op(J.b); break;
-                    case ExprOp::Mul:   regs[J.dst] = va * eval_op(J.b); break;
-                    case ExprOp::Div:   regs[J.dst] = va / eval_op(J.b); break;
-                    case ExprOp::Max:   regs[J.dst] = std::max(va, eval_op(J.b)); break;
-                    case ExprOp::Min:   regs[J.dst] = std::min(va, eval_op(J.b)); break;
-                    // 比较（输出 1.0 / 0.0）
-                    case ExprOp::Lt:    regs[J.dst] = (va <  eval_op(J.b)) ? Scalar{1} : Scalar{0}; break;
-                    case ExprOp::Le:    regs[J.dst] = (va <= eval_op(J.b)) ? Scalar{1} : Scalar{0}; break;
-                    case ExprOp::Gt:    regs[J.dst] = (va >  eval_op(J.b)) ? Scalar{1} : Scalar{0}; break;
-                    case ExprOp::Ge:    regs[J.dst] = (va >= eval_op(J.b)) ? Scalar{1} : Scalar{0}; break;
-                    case ExprOp::Eq:    regs[J.dst] = (va == eval_op(J.b)) ? Scalar{1} : Scalar{0}; break;
-                    case ExprOp::Ne:    regs[J.dst] = (va != eval_op(J.b)) ? Scalar{1} : Scalar{0}; break;
-                    // 选择
-                    case ExprOp::Select: regs[J.dst] = (va != Scalar{0}) ? eval_op(J.b) : eval_op(J.c); break;
-                    default: break;  // 归约指令已在 continue 中跳过
-                    }
+                    // 算子语义查表（expr_op_table）——一元/二元/三元分流
+                    const detail::ExprOpInfo& info = detail::expr_op_info(op);
+                    if (info.arity == 3)
+                        regs[J.dst] = (va != Scalar{0}) ? eval_op(J.b) : eval_op(J.c);
+                    else if (info.arity == 2)
+                        regs[J.dst] = info.binary(va, eval_op(J.b));
+                    else
+                        regs[J.dst] = info.unary(va);
                 }
 
                 return eval_op(R.a);
@@ -2622,34 +2585,14 @@ public:
                     continue;  // 归约指令已预计算（隐式向量，不经寄存器）
                 const Scalar va = eval_op(ins.a);
                 const ExprOp op = static_cast<ExprOp>(ins.op);
-                switch (op)
-                {
-                // 一元
-                case ExprOp::Neg:   regs[ins.dst] = -va; break;
-                case ExprOp::Exp:   regs[ins.dst] = std::exp(va); break;
-                case ExprOp::Log:   regs[ins.dst] = std::log(va); break;
-                case ExprOp::Sqrt:  regs[ins.dst] = std::sqrt(va); break;
-                case ExprOp::Rsqrt: regs[ins.dst] = Scalar{1} / std::sqrt(va); break;
-                case ExprOp::Abs:   regs[ins.dst] = std::abs(va); break;
-                case ExprOp::Tanh:  regs[ins.dst] = std::tanh(va); break;
-                // 二元
-                case ExprOp::Add:   regs[ins.dst] = va + eval_op(ins.b); break;
-                case ExprOp::Sub:   regs[ins.dst] = va - eval_op(ins.b); break;
-                case ExprOp::Mul:   regs[ins.dst] = va * eval_op(ins.b); break;
-                case ExprOp::Div:   regs[ins.dst] = va / eval_op(ins.b); break;
-                case ExprOp::Max:   regs[ins.dst] = std::max(va, eval_op(ins.b)); break;
-                case ExprOp::Min:   regs[ins.dst] = std::min(va, eval_op(ins.b)); break;
-                // 比较（输出 1.0 / 0.0）
-                case ExprOp::Lt:    regs[ins.dst] = (va <  eval_op(ins.b)) ? Scalar{1} : Scalar{0}; break;
-                case ExprOp::Le:    regs[ins.dst] = (va <= eval_op(ins.b)) ? Scalar{1} : Scalar{0}; break;
-                case ExprOp::Gt:    regs[ins.dst] = (va >  eval_op(ins.b)) ? Scalar{1} : Scalar{0}; break;
-                case ExprOp::Ge:    regs[ins.dst] = (va >= eval_op(ins.b)) ? Scalar{1} : Scalar{0}; break;
-                case ExprOp::Eq:    regs[ins.dst] = (va == eval_op(ins.b)) ? Scalar{1} : Scalar{0}; break;
-                case ExprOp::Ne:    regs[ins.dst] = (va != eval_op(ins.b)) ? Scalar{1} : Scalar{0}; break;
-                // 选择
-                case ExprOp::Select: regs[ins.dst] = (va != Scalar{0}) ? eval_op(ins.b) : eval_op(ins.c); break;
-                default: break;  // 归约指令已在上方 continue 跳过
-                }
+                // 算子语义查表（expr_op_table）——一元/二元/三元分流
+                const detail::ExprOpInfo& info = detail::expr_op_info(op);
+                if (info.arity == 3)
+                    regs[ins.dst] = (va != Scalar{0}) ? eval_op(ins.b) : eval_op(ins.c);
+                else if (info.arity == 2)
+                    regs[ins.dst] = info.binary(va, eval_op(ins.b));
+                else
+                    regs[ins.dst] = info.unary(va);
             }
             return regs[last.dst];
         };

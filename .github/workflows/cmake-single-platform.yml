@@ -184,7 +184,8 @@ jobs:
           -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} \
           -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
           -DCMAKE_C_COMPILER_LAUNCHER=ccache \
-          -DNN_ENABLE_NATIVE=OFF
+          -DNN_ENABLE_NATIVE=OFF \
+          -DNN_ENABLE_TESTS=ON
       env:
         CC: clang
         CXX: clang++
@@ -200,13 +201,41 @@ jobs:
           -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} `
           -DCMAKE_CXX_COMPILER_LAUNCHER=ccache `
           -DCMAKE_C_COMPILER_LAUNCHER=ccache `
-          -DNN_ENABLE_NATIVE=OFF
+          -DNN_ENABLE_NATIVE=OFF `
+          -DNN_ENABLE_TESTS=ON
       env:
         CC: clang
         CXX: clang++
 
     - name: Build
       run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}}
+
+    # ========== 真跑测试（roadmap P0-1）==========
+    # 需 Vulkan 的用例在无 GPU 的 runner 上按退出码 77 记 skip（非失败）。
+    - name: Test ctest (Linux)
+      if: runner.os == 'Linux'
+      run: ctest --test-dir ${{github.workspace}}/build --output-on-failure
+
+    - name: Test ctest (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: ctest --test-dir ${{github.workspace}}/build --output-on-failure
+
+    # ========== 绑定不变量门禁（RV-06）==========
+    # NN_BIND_DEBUG=1：任何"未绑定输入进引擎"一律报错（默认只对"双方都绑定且
+    # 不同"报错）。它抓库内 stamp 漏网——必须全绿，故升为默认 CI 门禁。
+    - name: Test ctest + NN_BIND_DEBUG (Linux)
+      if: runner.os == 'Linux'
+      run: ctest --test-dir ${{github.workspace}}/build --output-on-failure
+      env:
+        NN_BIND_DEBUG: "1"
+
+    - name: Test ctest + NN_BIND_DEBUG (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: ctest --test-dir ${{github.workspace}}/build --output-on-failure
+      env:
+        NN_BIND_DEBUG: "1"
 
     # 将编译产物打包为 7z
     - name: Package binaries (Linux)
@@ -218,7 +247,9 @@ jobs:
           ${{github.workspace}}/build/text_train \
           ${{github.workspace}}/build/text_infer \
           ${{github.workspace}}/build/tokenizer_train \
-          ${{github.workspace}}/build/tokenizer_infer
+          ${{github.workspace}}/build/tokenizer_infer \
+          ${{github.workspace}}/build/dataset_gen \
+          ${{github.workspace}}/build/dataset_convert
 
     - name: Package binaries (Windows)
       if: runner.os == 'Windows'
@@ -229,7 +260,9 @@ jobs:
           ${{github.workspace}}/build/text_train.exe `
           ${{github.workspace}}/build/text_infer.exe `
           ${{github.workspace}}/build/tokenizer_train.exe `
-          ${{github.workspace}}/build/tokenizer_infer.exe
+          ${{github.workspace}}/build/tokenizer_infer.exe `
+          ${{github.workspace}}/build/dataset_gen.exe `
+          ${{github.workspace}}/build/dataset_convert.exe
 
     # 将 7z 包上传为 artifact，供 release job 使用
     - name: Upload build artifacts

@@ -41,7 +41,7 @@ cmake -B build -G Ninja -DNN_ENABLE_TESTS=ON && cmake --build build && ctest --t
 | 加/改损失函数 | `compute_loss.hpp` |
 | 加/改优化器（SGD/Adam/AdamW/**AdamWQuant**/Muon） | `compute_optimizer.hpp`（`AdamWQuant` = 量化状态 AdamW：状态 f16 + 按行有界尺度，4 B/权重 vs 8 B）。**名单唯一真源 = 该文件的 `kOptimizerTable`**（RV-04，2026-10-11）：CLI 帮助/校验（`nn::find_optimizer` / `nn::optimizer_names`）、`scan_exprs` dry-run、`mem_probe` 状态账、GUI 下拉（运行时从 CLI `--help` 派生 + `bench/gui_cli_audit.py` 第 [4] 节断言）全部查表——**新增优化器只需表 1 行 + `create_optimizer` 1 个分支**） |
 | 加/改引擎原语（CPU 实现） | `compute_engine.hpp`（接口）+ `compute_cpu_engine.hpp` |
-| 加/改引擎原语（GPU 实现） | `compute_gpu_engine.hpp` + `backend/compute_vk_backend.hpp` + `backend/compute_vk_device.hpp` + `shaders/*.comp` |
+| 加/改引擎原语（GPU 实现） | `compute_gpu_engine.hpp` + `backend/compute_vk_backend.hpp` + `backend/compute_vk_device.hpp` + `shaders/*.comp`。`GpuBackend` 成员体已按主题拆成 4 个**片段**（`backend/compute_vk_backend_{destroy,frame,pipelines,ops}.inc`，由主文件在 class 体内按序 `#include`；纯移动，**片段不可单独编译**，改动按其主题选文件）；原语 SPIR-V getter 由 `NN_SPV_GETTER_LIST` 单一注册表展开（**新增 shader = 文件头加探测块 + 列表加 token**，见 RV-08） |
 | 张量/设备抽象 | `compute_tensor.hpp` |
 | 按需 include（不走聚合头） | `engine.hpp` / `layer.hpp` / `loss.hpp` / `optimizer.hpp` / `model.hpp` / `train.hpp` = **薄转发头**（`nn.hpp` 仍是唯一聚合头；只求好记，不省 parse） |
 | 混合精度 / f16 类型系统 / 三值（T1_58） | `precision.hpp`（Precision 枚举含 `T1_58`、`precision_rank()`、`nn::f16`、`PrecisionProfile`）；层能力声明 `PrecisionSet`/`PrecisionSupport` + `Layer::precision_support()`/`layer_name()`（`compute_layer_base.hpp`）；三值打包布局 `ternary_pack.hpp`；打包 GEMM 原语 `trit_pack`/`matmul_q`(`_t`)（`compute_engine.hpp` + CPU/GPU 实现 + `shaders/{trit_pack,matmul_q,matmul_q_gemv}.comp`） |
@@ -315,7 +315,7 @@ optimizer.step();
 |------|--------|
 | `README.md` | **文档总索引与分册定位**（含 2026-10-11 整理记录） |
 | `history/history.md` | **全仓唯一的历史状态归档**：演进记录 / 已修复勘误 / 被否决方案 / 性能 A/B 过程。代码注释与其他文档只记录当前状态；查"为什么当初这么改、旧数字是多少"只来这里。**原 `development/15`（ComputeEngine Refresh 设计）与 `16`（P0 盘点）、已删的 `13`（重构清单）均归档在本文** |
-| `release-notes/v*.md` | 面向使用者的版本变更说明（破坏性 API 变更 + 迁移指南 + 验收基线）。当前为 `release-notes/v1.7.0.md`（v1.6.1 → **统一数据集**：`.nndataset`/`.nnvocab`/KVRecord v2 + `nn::Dataset` + `dataset_gen`/`dataset_convert` + 模型 v6 + 错误处理宏族，ctest 24 → 27，含 v1.6.1 补记；上一版 v1.6.0.md = v1.5.1 → AOT 融合二期收官） |
+| `release-notes/v*.md` | 面向使用者的版本变更说明（破坏性 API 变更 + 迁移指南 + 验收基线）。当前为 `release-notes/v1.8.1.md`（v1.8.0 → **代码审查整改 RV-06…RV-13**：算子分派单一表 + VK 后端拆分 + 环境变量单一入口 + 精度映射护栏 + CI 真跑测试与 `NN_BIND_DEBUG` 门禁 + ccache×PCH 提速，无破坏性 API；上一版 v1.7.0.md = v1.6.1 → **统一数据集**：`.nndataset`/`.nnvocab`/KVRecord v2 + `nn::Dataset` + 模型 v6 + 错误处理宏族，ctest 24 → 27） |
 
 ### 介绍类（docs/introduction/）
 

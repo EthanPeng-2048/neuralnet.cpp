@@ -21,6 +21,7 @@
 
 #include "../core_errors.hpp"
 #include "../core_config.hpp"
+#include "../core_env.hpp"   // RV-09：环境变量读取唯一入口
 
 namespace nn
 {
@@ -128,19 +129,10 @@ public:
     VulkanDevice(VulkanDevice&&) = delete;
     VulkanDevice& operator=(VulkanDevice&&) = delete;
 
-    // 读取环境变量（MSVC CRT 把 getenv 标记弃用，-Werror 下必须用 _dupenv_s）
+    // 读取环境变量（RV-09：实现收敛到 core_env.hpp；本包装保留供后端调用）
     [[nodiscard]] static std::string get_env(const char* name)
     {
-#if defined(_MSC_VER)
-        char* buf = nullptr;
-        std::size_t len = 0;
-        _dupenv_s(&buf, &len, name);
-        const std::unique_ptr<char, decltype(&std::free)> guard(buf, &std::free);
-        return buf != nullptr ? std::string(buf) : std::string{};
-#else
-        const char* value = std::getenv(name);
-        return value != nullptr ? std::string(value) : std::string{};
-#endif
+        return ::nn::detail::env_string_raw(name);
     }
 
     // ── 手动指定计算设备（必须在 initialize() 之前调用）────────────────────
