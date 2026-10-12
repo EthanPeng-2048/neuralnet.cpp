@@ -140,9 +140,12 @@ int main(int argc, char* argv[])
     auto init_result = backend.initialize(gpu_device);
     if (!init_result)
     {
-        std::cout << " 失败\n";
+        // 无可用 Vulkan 设备（CI runner / 缺 ICD / 驱动不可用）→ 77 = ctest SKIP
+        // （与 cnn_test / batchnorm_test / write_epoch_test 的可用性预检同一约定：
+        //  GPU 用例不得在无卡环境计为假红，也不得冒充 Passed）
+        std::cout << " 失败（无可用 GPU 设备 → SKIP）\n";
         std::cerr << "GPU 初始化失败: " << init_result.error().message << "\n";
-        return 1;
+        return 77;
     }
     auto gpu_engine = std::make_unique<GpuEngine>(backend);
     // 打印所选物理设备：选错卡（例如把独显老卡当目标）会直接表现为
