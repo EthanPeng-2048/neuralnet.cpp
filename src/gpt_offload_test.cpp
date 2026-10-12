@@ -58,7 +58,13 @@ int run_test()
 
     auto& backend = GpuBackend::instance();
     auto init_r = backend.initialize();
-    NN_EXIT(init_r, 1, "GPU 初始化失败: ");
+    if (!init_r)
+    {
+        // 无可用 Vulkan 设备（CI runner / 缺 ICD）→ 77 = ctest SKIP
+        // （与 cnn_test / batchnorm_test 的可用性预检同一约定）
+        std::cout << "[SKIP] GPU 不可用: " << init_r.error().message << "\n";
+        return 77;
+    }
     GpuEngine eng(backend);
 
     std::cout << "========================================\n"

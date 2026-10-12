@@ -11,7 +11,13 @@ int main() {
 
     // Explicitly initialize
     auto init_r = backend.initialize();
-    NN_EXIT(init_r, 1, "GPU init FAILED: %s\n");
+    if (!init_r)
+    {
+        // 无可用 Vulkan 设备（CI runner / 缺 ICD）→ 77 = ctest SKIP
+        // （与 cnn_test / batchnorm_test 的可用性预检同一约定）
+        printf("[SKIP] GPU 不可用: %s\n", init_r.error().message.c_str());
+        return 77;
+    }
     printf("GPU backend: OK\n");
     printf("shaderFloat16: %s\n", backend.has_shader_float16() ? "YES" : "NO");
 
@@ -273,7 +279,8 @@ int main() {
 #else
 #include <cstdio>
 int main() {
-    printf("Vulkan not available\n");
-    return 0;
+    // 纯 CPU 构建：无法执行 GPU 用例 → 77 = ctest SKIP（不得计为 Passed）
+    printf("[SKIP] Vulkan not available\n");
+    return 77;
 }
 #endif

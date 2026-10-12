@@ -852,7 +852,14 @@ int main()
     auto cpu_engine = std::make_unique<CpuEngine>();
     auto& backend = GpuBackend::instance();
     auto init_r = backend.initialize();
-    NN_EXIT(init_r, 1, "GPU 初始化失败: ");
+    if (!init_r)
+    {
+        // 无可用 Vulkan 设备（CI runner / 缺 ICD）→ 77 = ctest SKIP。
+        // 本 main 既作独立用例 `fused_gpu_test`，又被 `expr_gpu_test` 以
+        // `test_fused_gpu()` 复用——后者已把 77 当作"该子测试跳过"。
+        std::cout << "[SKIP] GPU 不可用: " << init_r.error().message << "\n";
+        return 77;
+    }
     auto gpu_engine = std::make_unique<GpuEngine>(backend);
     std::cout << "[init] CpuEngine + GpuEngine 就绪\n";
 

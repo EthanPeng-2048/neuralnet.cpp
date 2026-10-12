@@ -566,7 +566,14 @@ int main()
 #else
     auto& backend = nn::GpuBackend::instance();
     auto init_r = backend.initialize();
-    NN_EXIT(init_r, 1, "GPU 初始化失败: ");
+    if (!init_r)
+    {
+        // 无可用 Vulkan 设备（CI runner / 缺 ICD）→ 77 = ctest SKIP
+        // （与 cnn_test / batchnorm_test 的可用性预检同一约定：GPU 用例
+        //  在无卡环境记 Skipped，而非假红——CPU 段另由 expr_cpu_test 等覆盖）
+        std::cout << "[SKIP] GPU 不可用: " << init_r.error().message << "\n";
+        return 77;
+    }
     nn::GpuEngine gpu_engine(backend);
     fail += run_case(gpu_engine, "GPU");
     fail += run_old_new_parity(gpu_engine, "GPU");
