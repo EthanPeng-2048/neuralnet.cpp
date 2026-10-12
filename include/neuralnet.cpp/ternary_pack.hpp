@@ -50,8 +50,9 @@ inline constexpr std::uint32_t kMask = (1u << kBits) - 1u;
     return words_per_row(k) * sizeof(std::uint32_t);
 }
 
-// 量化码：码 = 三值 + 2（∈{1,2,3}）；判据 = |w| > 0.5·τ（BitNet 定义形式，
-// 与 BitLinear 的 select 阈值逐点一致）。
+// 量化码：码 = 三值 + 2（∈{1,2,3}）；判据 = |w| > 0.5·τ（**严格**大于：
+// 恰好 |w| == 0.5·τ 归 0，半值向零）。与 BitLinear::quantize_weights_ 的
+// select 阈值逐点一致（RV-10：等值点归零是刻意的，非 round-half-away）。
 [[nodiscard]] inline std::uint32_t code_of(float w, float tau) noexcept
 {
     const float half = 0.5f * tau;

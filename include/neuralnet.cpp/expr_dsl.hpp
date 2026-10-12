@@ -34,29 +34,17 @@
 #include <ranges>
 
 #include "core_config.hpp"   // NN_PROBES_ENABLED（探针编译门）
+#include "core_env.hpp"      // RV-09：环境变量读取唯一入口
 
 namespace nn::dsl
 {
-// 环境变量开关（MSVC 下 getenv 标记 deprecated → -Werror 会炸；走 _dupenv_s）
+// 环境变量开关（RV-09：实现收敛到 core_env.hpp；本函数保留 dsl 门面名，
+// 供 layer/engine 侧的诊断开关调用）。
 // ⚠ 探针门：默认构建（未 -DNN_ENABLE_PROBES=ON）里恒返回 false 且**不求值 getenv**
 //   → 调用点被编译期折叠，"NN_F16_DEBUG" 之类的诊断开关不会在正常训练里生效。
 inline bool env_flag(const char* name)
 {
-#if !NN_PROBES_ENABLED
-    (void)name;
-    return false;
-#else
-#ifdef _MSC_VER
-    char* buf = nullptr;
-    std::size_t len = 0;
-    const bool on = (_dupenv_s(&buf, &len, name) == 0 && buf != nullptr && buf[0] != '\0');
-    std::free(buf);
-    return on;
-#else
-    const char* v = std::getenv(name);
-    return v != nullptr && v[0] != '\0';
-#endif
-#endif
+    return ::nn::detail::probe_flag_raw(name);
 }
 } // namespace nn::dsl
 #include <utility>
@@ -70,21 +58,9 @@ inline bool env_flag(const char* name)
 #include "algebra_ops.hpp"    // nn::ops（唯一算子来源，含 op_id()）
 #include "algebra_matrix.hpp" // Matrix
 
-// ── 表达式概念（定义于本头；DSL 是其唯一使用者）──────────────────────────
-namespace nn
-{
-/// 表达式：可按索引求值为 Scalar 的类型（Span/ConstSpan 与所有 DSL 节点满足）
-template <typename T>
-concept Expression = requires(const T &t, std::size_t i) {
-    { t.eval(i) } -> std::convertible_to<Scalar>;
-};
-
-/// 布尔表达式：可按索引求值为 bool 的类型（用于条件选择 select）
-template <typename T>
-concept BoolExpression = requires(const T &t, std::size_t i) {
-    { t.eval(i) } -> std::convertible_to<bool>;
-};
-} // namespace nn
+// ── 表达式概念 nn::Expression / nn::BoolExpression（RV-13：定义已移到 L1 的
+//    algebra_span.hpp——它描述的是 L1 原语的契约；本头经 algebra_matrix.hpp
+//    → algebra_span.hpp 传递可见）────────────────────────────────────────
 
 namespace nn::dsl
 {

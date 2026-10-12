@@ -21,6 +21,7 @@
 #include <string>
 
 #include "expr_spec.hpp"
+#include "expr_op_table.hpp" // 算子元数据单一真源（GLSL 发射形态/符号，RV-07）
 #include "expr_emitter.hpp"   // IR-D：emitter 抽象（GlslEmitter 实现）
 
 namespace nn
@@ -61,41 +62,58 @@ namespace nn
         "}\n\n";
 }
 
-// ── 算子 → GLSL 表达式片段 ────────────────────────────────────────────────
-
-// 二元/比较（输出 1.0/0.0 用于比较）
-inline const char* glsl_binary_op(ExprOp op, bool& is_compare)
+// ── 算子 → GLSL 右值片段（形态/符号来自 expr_op_table.hpp，RV-07）──────────
+//
+// 一条逐元素指令的字符串骨架由"发射形态"（ExprEmitKind）唯一决定，符号/函数名
+// 由元数据表提供——新增算子只需在表里选一个已有形态并填符号，不必改本文件。
+//   vec4    ：向量形态（比较用向量内建、Select 用 mix/notEqual）
+//   native16：f16 算术变体的字面量类型（比较/Select 的 1/0 须显式 f16）
+//   wrap    ：内联上下文需额外一层括号（与语句形态逐字一致）
+// b/c 以惰性回调传入：一元 / 函数算子不触碰不使用的操作数（保持原求值副作用序）。
+template <class GetB, class GetC>
+[[nodiscard]] inline std::string glsl_alu_expr(const detail::ExprOpInfo& info,
+                                               const std::string& a,
+                                               GetB&& b, GetC&& c,
+                                               bool vec4, bool native16, bool wrap)
 {
-    is_compare = false;
-    switch (op)
+    switch (info.emit)
     {
-    case ExprOp::Add: return "+";
-    case ExprOp::Sub: return "-";
-    case ExprOp::Mul: return "*";
-    case ExprOp::Div: return "/";
-    case ExprOp::Lt:  is_compare = true; return "<";
-    case ExprOp::Le:  is_compare = true; return "<=";
-    case ExprOp::Gt:  is_compare = true; return ">";
-    case ExprOp::Ge:  is_compare = true; return ">=";
-    case ExprOp::Eq:  is_compare = true; return "==";
-    case ExprOp::Ne:  is_compare = true; return "!=";
-    default: return "";
-    }
-}
-
-inline const char* glsl_unary_op(ExprOp op)
-{
-    switch (op)
+    case detail::ExprEmitKind::Infix:
     {
-    case ExprOp::Neg:   return "(-";    // 前缀，后接表达式与 ")"
-    case ExprOp::Exp:   return "exp";
-    case ExprOp::Log:   return "log";
-    case ExprOp::Sqrt:  return "sqrt";
-    case ExprOp::Rsqrt: return "inversesqrt";
-    case ExprOp::Abs:   return "abs";
-    case ExprOp::Tanh:  return "tanh";
-    default: return "";
+        const std::string e = a + " " + info.sym + " " + b();
+        return wrap ? ("(" + e + ")") : e;
     }
+    case detail::ExprEmitKind::Func2:
+        return std::string(info.sym) + "(" + a + ", " + b() + ")";
+    case detail::ExprEmitKind::Compare:
+        if (vec4)
+            return std::string("vec4(") + info.sym_vec + "(" + a + ", " + b() + "))";
+        {
+            const std::string e = "(" + a + " " + info.sym + " " + b() + ") ? "
+                + (native16 ? "float16_t(1.0)" : "1.0") + " : "
+                + (native16 ? "float16_t(0.0)" : "0.0");
+            return wrap ? ("(" + e + ")") : e;
+        }
+    case detail::ExprEmitKind::Neg:
+    {
+        const std::string e = "-(" + a + ")";
+        return wrap ? ("(" + e + ")") : e;
+    }
+    case detail::ExprEmitKind::Func1:
+        return std::string(info.sym) + "(" + a + ")";
+    case detail::ExprEmitKind::Select:
+        if (vec4)
+            // mix(x,y,t) = x(1-t) + y·t：t=(a≠0) 时须取 b → b 在 y 位
+            return "mix(" + c() + ", " + b() + ", notEqual(" + a + ", vec4(0.0)))";
+        {
+            const std::string e = "(" + a + " != "
+                + (native16 ? "float16_t(0.0)" : "0.0") + ") ? " + b() + " : " + c();
+            return wrap ? ("(" + e + ")") : e;
+        }
+    case detail::ExprEmitKind::None:
+        break;   // 归约指令：不经逐元素发射
+    }
+    return {};
 }
 
 // ── 视图 → 读取第 i 个元素的索引/表达式 ──────────────────────────────────
@@ -455,49 +473,15 @@ inline void glsl_emit_matmul_tail_fn(std::ostringstream& L, const ExprSpec& spec
             const ExprOp op = static_cast<ExprOp>(ins.op);
             const std::string dst = "r" + std::to_string(ins.dst);
             const std::string a = operand(ins.a);
-            switch (op)
-            {
-            case ExprOp::Add: case ExprOp::Sub: case ExprOp::Mul: case ExprOp::Div:
-            {
-                bool cmp = false;
-                const char* s = glsl_binary_op(op, cmp);
-                L << "    " << dst << " = " << a << " " << s << " "
-                  << operand(ins.b) << ";\n";
-                break;
-            }
-            case ExprOp::Max: case ExprOp::Min:
-            {
-                const char* s = (op == ExprOp::Max) ? "max" : "min";
-                L << "    " << dst << " = " << s << "(" << a << ", "
-                  << operand(ins.b) << ");\n";
-                break;
-            }
-            case ExprOp::Lt: case ExprOp::Le: case ExprOp::Gt:
-            case ExprOp::Ge: case ExprOp::Eq: case ExprOp::Ne:
-            {
-                bool cmp = false;
-                const char* s = glsl_binary_op(op, cmp);
-                L << "    " << dst << " = (" << a << " " << s << " "
-                  << operand(ins.b) << ") ? 1.0 : 0.0;\n";
-                break;
-            }
-            case ExprOp::Neg:
-                L << "    " << dst << " = -(" << a << ");\n";
-                break;
-            case ExprOp::Exp: case ExprOp::Log: case ExprOp::Sqrt:
-            case ExprOp::Rsqrt: case ExprOp::Abs: case ExprOp::Tanh:
-            {
-                const char* s = glsl_unary_op(op);
-                L << "    " << dst << " = " << s << "(" << a << ");\n";
-                break;
-            }
-            case ExprOp::Select:
-                L << "    " << dst << " = (" << a << " != 0.0) ? "
-                  << operand(ins.b) << " : " << operand(ins.c) << ";\n";
-                break;
-            default:
+            const detail::ExprOpInfo& info = detail::expr_op_info(op);
+            if (info.emit == detail::ExprEmitKind::None)
                 return;  // 归约指令：由 generate_glsl_reduce 处理 → 上层报错
-            }
+            // 发射形态/符号查表（expr_op_table）→ 单处生成，与标量链逐字一致
+            L << "    " << dst << " = "
+              << glsl_alu_expr(info, a, [&] { return operand(ins.b); },
+                               [&] { return operand(ins.c); },
+                               /*vec4=*/false, /*native16=*/false, /*wrap=*/false)
+              << ";\n";
         }
         L << "    return r" << last_dst << ";\n";
     }
@@ -1367,36 +1351,18 @@ inline std::string generate_glsl_fold(const std::string& name, const ExprSpec& s
     {
         const ExprOp op = static_cast<ExprOp>(ins.op);
         const std::string a = operand(ins.a, kbv);
-        if (op == ExprOp::Select)
+        // 发射形态/符号查表（expr_op_table）；归约指令由调用方分流（不达此处）
+        const detail::ExprOpInfo& info = detail::expr_op_info(op);
+        if (info.emit == detail::ExprEmitKind::None)
         {
-            L << dst_str << " = (" << a << " != 0.0) ? "
-              << operand(ins.b, kbv) << " : " << operand(ins.c, kbv) << ";\n";
+            L << dst_str << " = (" << a << ");\n";
             return;
         }
-        if (op == ExprOp::Max || op == ExprOp::Min)
-        {
-            L << dst_str << " = " << (op == ExprOp::Max ? "max" : "min")
-              << "(" << a << ", " << operand(ins.b, kbv) << ");\n";
-            return;
-        }
-        bool cmp = false;
-        const char* s = glsl_binary_op(op, cmp);
-        if (s && *s)
-        {
-            const std::string b = operand(ins.b, kbv);
-            if (cmp)
-                L << dst_str << " = (" << a << " " << s << " " << b
-                  << ") ? 1.0 : 0.0;\n";
-            else
-                L << dst_str << " = " << a << " " << s << " " << b << ";\n";
-            return;
-        }
-        if (op == ExprOp::Neg)
-        {
-            L << dst_str << " = -(" << a << ");\n";
-            return;
-        }
-        L << dst_str << " = " << glsl_unary_op(op) << "(" << a << ");\n";
+        L << dst_str << " = "
+          << glsl_alu_expr(info, a, [&] { return operand(ins.b, kbv); },
+                           [&] { return operand(ins.c, kbv); },
+                           /*vec4=*/false, /*native16=*/false, /*wrap=*/false)
+          << ";\n";
     };
 
     // ── 内联表达式文本（递归展开可内联元素寄存器；与 emit_assign 同形）────
@@ -1424,23 +1390,13 @@ inline std::string generate_glsl_fold(const std::string& name, const ExprSpec& s
     {
         const ExprOp op = static_cast<ExprOp>(ins.op);
         const std::string a = opnd_inl(ins.a, kbv);
-        if (op == ExprOp::Select)
-            return "((" + a + " != 0.0) ? " + opnd_inl(ins.b, kbv) + " : "
-                   + opnd_inl(ins.c, kbv) + ")";
-        if (op == ExprOp::Max || op == ExprOp::Min)
-            return std::string(op == ExprOp::Max ? "max" : "min") + "(" + a
-                   + ", " + opnd_inl(ins.b, kbv) + ")";
-        bool cmp = false;
-        const char* s = glsl_binary_op(op, cmp);
-        if (s && *s)
-        {
-            const std::string b = opnd_inl(ins.b, kbv);
-            return cmp ? ("((" + a + " " + s + " " + b + ") ? 1.0 : 0.0)")
-                       : ("(" + a + " " + s + " " + b + ")");
-        }
-        if (op == ExprOp::Neg)
-            return "(-(" + a + "))";
-        return std::string(glsl_unary_op(op)) + "(" + a + ")";
+        // 内联上下文：整体再包一层括号（与语句形态逐字一致）
+        const detail::ExprOpInfo& info = detail::expr_op_info(op);
+        if (info.emit == detail::ExprEmitKind::None)
+            return "(" + a + ")";   // 归约指令：不经内联（调用方分流）
+        return glsl_alu_expr(info, a, [&] { return opnd_inl(ins.b, kbv); },
+                             [&] { return opnd_inl(ins.c, kbv); },
+                             /*vec4=*/false, /*native16=*/false, /*wrap=*/true);
     };
 
     // ── 块循环（k0 步进 BLOCK；valid gate 尾块——与 CPU 同序）──────────
@@ -1798,39 +1754,15 @@ inline std::string generate_glsl_fold_v2(const std::string& name, const ExprSpec
     {
         const ExprOp op = static_cast<ExprOp>(ins.op);
         const std::string a = operand(ins.a, ctx, jv);
-        std::ostringstream s;
-        if (op == ExprOp::Select)
-        {
-            const std::string bt = operand(ins.b, ctx, jv);
-            const std::string ce = operand(ins.c, ctx, jv);
-            s << dst_str << " = (" << a << " != 0.0) ? " << bt << " : " << ce << ";";
-            return "          " + s.str() + "\n";
-        }
-        if (op == ExprOp::Max || op == ExprOp::Min)
-        {
-            s << dst_str << " = " << (op == ExprOp::Max ? "max" : "min")
-              << "(" << a << ", " << operand(ins.b, ctx, jv) << ");";
-            return "          " + s.str() + "\n";
-        }
-        bool cmp = false;
-        const char* bin = glsl_binary_op(op, cmp);
-        if (bin && *bin)
-        {
-            const std::string bv = operand(ins.b, ctx, jv);
-            if (cmp)
-                s << dst_str << " = (" << a << " " << bin << " " << bv
-                  << ") ? 1.0 : 0.0;";
-            else
-                s << dst_str << " = " << a << " " << bin << " " << bv << ";";
-            return "          " + s.str() + "\n";
-        }
-        if (op == ExprOp::Neg)
-        {
-            s << dst_str << " = -(" << a << ");";
-            return "          " + s.str() + "\n";
-        }
-        s << dst_str << " = " << glsl_unary_op(op) << "(" << a << ");";
-        return "          " + s.str() + "\n";
+        // 发射形态/符号查表（expr_op_table）
+        const detail::ExprOpInfo& info = detail::expr_op_info(op);
+        if (info.emit == detail::ExprEmitKind::None)
+            return "          " + dst_str + " = (" + a + ");\n";  // 归约：调用方分流
+        return "          " + dst_str + " = "
+            + glsl_alu_expr(info, a, [&] { return operand(ins.b, ctx, jv); },
+                            [&] { return operand(ins.c, ctx, jv); },
+                            /*vec4=*/false, /*native16=*/false, /*wrap=*/false)
+            + ";\n";
     };
 
     // ── 块循环 + body 段扫描发射 ─────────────────────────────────────────
@@ -2539,53 +2471,16 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec,
             const ExprOp op = static_cast<ExprOp>(ins.op);
             const std::string dst = "r" + std::to_string(ins.dst);
             const std::string a = operand(ins.a);
-            switch (op)
-            {
-            case ExprOp::Add: case ExprOp::Sub: case ExprOp::Mul: case ExprOp::Div:
-            {
-                bool cmp = false;
-                const char* s = glsl_binary_op(op, cmp);
-                o << indent << dst << " = " << a << " " << s << " "
-                  << operand(ins.b) << ";\n";
-                break;
-            }
-            case ExprOp::Max: case ExprOp::Min:
-            {
-                const char* s = (op == ExprOp::Max) ? "max" : "min";
-                o << indent << dst << " = " << s << "(" << a << ", "
-                  << operand(ins.b) << ");\n";
-                break;
-            }
-            case ExprOp::Lt: case ExprOp::Le: case ExprOp::Gt:
-            case ExprOp::Ge: case ExprOp::Eq: case ExprOp::Ne:
-            {
-                bool cmp = false;
-                const char* s = glsl_binary_op(op, cmp);
-                // 0/1 字面量按目标寄存器类型发射：f16 寄存器不能隐式收窄 float
-                o << indent << dst << " = (" << a << " " << s << " "
-                  << operand(ins.b) << ") ? "
-                  << (native16 ? "float16_t(1.0)" : "1.0") << " : "
-                  << (native16 ? "float16_t(0.0)" : "0.0") << ";\n";
-                break;
-            }
-            case ExprOp::Neg:
-                o << indent << dst << " = -(" << a << ");\n";
-                break;
-            case ExprOp::Exp: case ExprOp::Log: case ExprOp::Sqrt:
-            case ExprOp::Rsqrt: case ExprOp::Abs: case ExprOp::Tanh:
-            {
-                const char* s = glsl_unary_op(op);
-                o << indent << dst << " = " << s << "(" << a << ");\n";
-                break;
-            }
-            case ExprOp::Select:
-                o << indent << dst << " = (" << a << " != "
-                  << (native16 ? "float16_t(0.0)" : "0.0") << ") ? "
-                  << operand(ins.b) << " : " << operand(ins.c) << ";\n";
-                break;
-            default:
+            const detail::ExprOpInfo& info = detail::expr_op_info(op);
+            if (info.emit == detail::ExprEmitKind::None)
                 return;  // 未知算子：让上层报错
-            }
+            // 发射形态/符号查表；0/1 字面量按目标寄存器类型发射（f16 寄存器
+            //   不能隐式收窄 float）——由 native16 控制
+            o << indent << dst << " = "
+              << glsl_alu_expr(info, a, [&] { return operand(ins.b); },
+                               [&] { return operand(ins.c); },
+                               /*vec4=*/false, native16, /*wrap=*/false)
+              << ";\n";
         }
     };
 
@@ -2713,60 +2608,15 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec,
         const ExprOp op = static_cast<ExprOp>(ins.op);
         const std::string dst = "r" + std::to_string(ins.dst);
         const std::string a = vec4_operand(ins.a);
-        switch (op)
-        {
-        case ExprOp::Add: case ExprOp::Sub: case ExprOp::Mul: case ExprOp::Div:
-        {
-            bool cmp = false;
-            const char* s = glsl_binary_op(op, cmp);
-            L << "        " << dst << " = " << a << " " << s << " "
-              << vec4_operand(ins.b) << ";\n";
-            break;
-        }
-        case ExprOp::Max: case ExprOp::Min:
-        {
-            const char* s = (op == ExprOp::Max) ? "max" : "min";
-            L << "        " << dst << " = " << s << "(" << a << ", "
-              << vec4_operand(ins.b) << ");\n";
-            break;
-        }
-        case ExprOp::Lt: case ExprOp::Le: case ExprOp::Gt:
-        case ExprOp::Ge: case ExprOp::Eq: case ExprOp::Ne:
-        {
-            const char* s = nullptr;
-            switch (op)
-            {
-            case ExprOp::Lt: s = "lessThan"; break;
-            case ExprOp::Le: s = "lessThanEqual"; break;
-            case ExprOp::Gt: s = "greaterThan"; break;
-            case ExprOp::Ge: s = "greaterThanEqual"; break;
-            case ExprOp::Eq: s = "equal"; break;
-            case ExprOp::Ne: s = "notEqual"; break;
-            default: break;
-            }
-            L << "        " << dst << " = vec4(" << s << "(" << a << ", "
-              << vec4_operand(ins.b) << "));\n";
-            break;
-        }
-        case ExprOp::Neg:
-            L << "        " << dst << " = -(" << a << ");\n";
-            break;
-        case ExprOp::Exp: case ExprOp::Log: case ExprOp::Sqrt:
-        case ExprOp::Rsqrt: case ExprOp::Abs: case ExprOp::Tanh:
-        {
-            const char* s = glsl_unary_op(op);
-            L << "        " << dst << " = " << s << "(" << a << ");\n";
-            break;
-        }
-        case ExprOp::Select:
-            // mix(x,y,t) = x(1-t) + y·t：t=(a≠0) 时须取 b → b 在 y 位
-            L << "        " << dst << " = mix(" << vec4_operand(ins.c) << ", "
-              << vec4_operand(ins.b) << ", notEqual(" << a
-              << ", vec4(0.0)));\n";
-            break;
-        default:
+        const detail::ExprOpInfo& info = detail::expr_op_info(op);
+        if (info.emit == detail::ExprEmitKind::None)
             return std::string{};  // 未知算子：让上层报错
-        }
+        // 发射形态/符号查表；向量形态：比较用向量内建、Select 用 mix/notEqual
+        L << "        " << dst << " = "
+          << glsl_alu_expr(info, a, [&] { return vec4_operand(ins.b); },
+                           [&] { return vec4_operand(ins.c); },
+                           /*vec4=*/true, /*native16=*/false, /*wrap=*/false)
+          << ";\n";
     }
     // 运行期精度分派：输出双视图 + uniform 存储分支（每元素只写一次，
     // 两侧视图按各自的元素宽度寻址，无别名风险）。
@@ -3129,49 +2979,15 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec,
                 continue;
             const std::string dst = "r" + std::to_string(ins.dst);
             const std::string a = operand(ins.a);
-            switch (op)
-            {
-            case ExprOp::Add: case ExprOp::Sub: case ExprOp::Mul: case ExprOp::Div:
-            {
-                bool cmp = false;
-                const char* s = glsl_binary_op(op, cmp);
-                L << "        " << dst << " = " << a << " " << s << " "
-                  << operand(ins.b) << ";\n";
-                break;
-            }
-            case ExprOp::Max: case ExprOp::Min:
-            {
-                const char* s = (op == ExprOp::Max) ? "max" : "min";
-                L << "        " << dst << " = " << s << "(" << a
-                  << ", " << operand(ins.b) << ");\n";
-                break;
-            }
-            case ExprOp::Lt: case ExprOp::Le: case ExprOp::Gt:
-            case ExprOp::Ge: case ExprOp::Eq: case ExprOp::Ne:
-            {
-                bool cmp = false;
-                const char* s = glsl_binary_op(op, cmp);
-                L << "        " << dst << " = (" << a << " " << s << " "
-                  << operand(ins.b) << ") ? 1.0 : 0.0;\n";
-                break;
-            }
-            case ExprOp::Neg:
-                L << "        " << dst << " = -(" << a << ");\n";
-                break;
-            case ExprOp::Exp: case ExprOp::Log: case ExprOp::Sqrt:
-            case ExprOp::Rsqrt: case ExprOp::Abs: case ExprOp::Tanh:
-            {
-                const char* s = glsl_unary_op(op);
-                L << "        " << dst << " = " << s << "(" << a << ");\n";
-                break;
-            }
-            case ExprOp::Select:
-                L << "        " << dst << " = (" << a << " != 0.0) ? "
-                  << operand(ins.b) << " : " << operand(ins.c) << ";\n";
-                break;
-            default:
-                break;  // 归约指令已 continue
-            }
+            const detail::ExprOpInfo& info = detail::expr_op_info(op);
+            if (info.emit == detail::ExprEmitKind::None)
+                continue;  // 归约指令已在上方 continue 分流
+            // 发射形态/符号查表（expr_op_table）
+            L << "        " << dst << " = "
+              << glsl_alu_expr(info, a, [&] { return operand(ins.b); },
+                               [&] { return operand(ins.c); },
+                               /*vec4=*/false, /*native16=*/false, /*wrap=*/false)
+              << ";\n";
         }
     };
 

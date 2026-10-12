@@ -17,7 +17,7 @@
 //
 // 算法（只在此处，不在 Engine/Shader）：
 //   τ_o   = (1/K)·Σ_k |W[o,k]|                      （逐输出通道 absmean）
-//   wq    = RoundClip(W/τ, -1, 1)                   （DSL 无 round → 阈值 0.5 的 select 等价）
+//   wq    = select(|W|>0.5τ → ±1, 否则 0)           （= RoundClip(W/τ,-1,1)；等值点差异见下）
 //   Y     = (wq · X)·τ + b                          （τ 逐行广播，b 逐行广播）
 //   dX    = wqᵀ · (dY∘τ)                            （等价于 (τ∘wq)ᵀ·dY）
 //   dW    = (dY · Xᵀ)∘τ                             （STE：∂wq/∂W ≡ 1，含去量化尺度）
@@ -543,8 +543,10 @@ private:
             return {};
         }
 
-        // RoundClip(W/τ, -1, 1)：DSL 没有 round/floor，但在 [-1,1] 区间内
-        // 与"阈值 0.5τ 的两侧 select"等价（BitNet 的定义形式）。
+        // RoundClip(W/τ, -1, 1) 的等价实现（BitNet 定义形式）：DSL 没有
+        // round/floor，故用**严格**阈值 select —— 判据是 |W| > 0.5τ，恰好
+        // |W| == 0.5τ **不**取正负号 → 归 0（半值向零）。与 RoundClip 的
+        // 唯一差异正在这个测度零的等值点（RoundClip 按 round-half-* 取值）。
         auto lo = dsl::row_broadcast(tau_) * dsl::rparam(Scalar{-0.5});
         auto hi = dsl::row_broadcast(tau_) * dsl::rparam(Scalar{0.5});
         auto r = dsl::compute_into(engine,

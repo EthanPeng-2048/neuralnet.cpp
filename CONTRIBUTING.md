@@ -185,10 +185,12 @@ clang-format -i path/to/new_file.hpp
 [`.github/workflows/cmake-single-platform.yml`](.github/workflows/cmake-single-platform.yml)：
 
 * Linux + Windows，**Clang**，Release，`NN_ENABLE_NATIVE=OFF`（可移植基线），带 Vulkan SDK（GPU 编译）；
-* 构建 6 个应用入口（`mnist_train/infer`、`text_train/infer`、`tokenizer_train/infer`）并打包成 `.7z` 产物；
+* `-DNN_ENABLE_TESTS=ON` 构建并**真跑 `ctest`**（需 Vulkan 的用例在无 GPU 的 runner 上按退出码 77 记 skip，非失败）；
+* 再跑一轮 `NN_BIND_DEBUG=1 ctest`（**绑定不变量门禁**：任何"未绑定输入进引擎"一律报错，抓库内 stamp 漏网）；
+* 构建 **8** 个应用入口（`mnist_train/infer`、`text_train/infer`、`tokenizer_train/infer`、`dataset_gen`、`dataset_convert`）并打包成 `.7z` 产物；
 * push 到 `main` 时创建/更新 `nightly` 预发布。
 
-⚠ **CI 目前不跑 ctest**（`NN_ENABLE_TESTS` 默认 OFF，见 roadmap P0-1）。测试是你本地要保证的事。
+> 本地复现 CI 的三条门禁：`ctest --preset dev`、`NN_BIND_DEBUG=1 ctest --test-dir build`（都应全绿）。
 
 ---
 

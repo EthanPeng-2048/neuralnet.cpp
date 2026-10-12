@@ -8,6 +8,7 @@
 // 注：Span 作为 Matrix 的底层存储视图与 DSL 叶子的数据载体。
 // ─────────────────────────────────────────────────────────────────────────
 
+#include <concepts>
 #include <cstddef>
 #include <span>
 
@@ -15,6 +16,20 @@
 
 namespace nn
 {
+
+// ── 表达式概念（L1 代数层；RV-13：从 expr_dsl.hpp 移入——它描述的是本层
+//    原语的契约，DSL 只是其唯一使用者）────────────────────────────────────
+/// 表达式：可按索引求值为 Scalar 的类型（Span/ConstSpan 与所有 DSL 节点满足）
+template <typename T>
+concept Expression = requires(const T &t, std::size_t i) {
+    { t.eval(i) } -> std::convertible_to<Scalar>;
+};
+
+/// 布尔表达式：可按索引求值为 bool 的类型（用于条件选择 select）
+template <typename T>
+concept BoolExpression = requires(const T &t, std::size_t i) {
+    { t.eval(i) } -> std::convertible_to<bool>;
+};
 
 // ══════════════════════════════════════════════════════════════════════════
 // Span：可写智能数据视图（DSL 叶子的数据载体）

@@ -75,7 +75,15 @@ int normalize_rc(int rc)
 std::string read_log()
 {
     std::string s;
-    std::FILE* f = std::fopen(kLogPath, "rb");
+    // MSVC CRT 把 fopen 标记 deprecated（-Werror 下编译失败）→ 走 fopen_s；
+    // 与 core_profile.hpp 的落盘/读盘口径一致（clang++ 在 Windows 下也定义
+    // _MSC_VER，故这里不能用"编译器是 clang ⇒ 走 POSIX"来判）。
+    std::FILE* f = nullptr;
+#if defined(_MSC_VER)
+    if (fopen_s(&f, kLogPath, "rb") != 0) f = nullptr;
+#else
+    f = std::fopen(kLogPath, "rb");
+#endif
     if (f == nullptr) return s;
     char buf[512];
     std::size_t n = 0;

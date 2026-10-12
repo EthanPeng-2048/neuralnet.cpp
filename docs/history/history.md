@@ -20,7 +20,7 @@
 - [GPU 后端与 GPU 引擎（backend/*, compute_gpu_engine.hpp）](#GPU 后端与 GPU 引擎（backend/*, compute_gpu_engine.hpp）)（17 条）
 - [注意力 / ZiPT / Transformer / FeedForward 层](#注意力 / ZiPT / Transformer / FeedForward 层)（16 条）
 - [RAPT / CNN / MLP / Softmax / GPT 层](#RAPT / CNN / MLP / Softmax / GPT 层)（13 条）
-- [引擎接口 / CPU 引擎 / 精度 / 张量 / 损失 / 优化器](#引擎接口 / CPU 引擎 / 精度 / 张量 / 损失 / 优化器)（19 条）
+- [引擎接口 / CPU 引擎 / 精度 / 张量 / 损失 / 优化器](#引擎接口 / CPU 引擎 / 精度 / 张量 / 损失 / 优化器)（21 条）
 - [代数层 / 基础设施 / 模型容器与序列化](#代数层 / 基础设施 / 模型容器与序列化)（15 条）
 - [领域模型工厂与 CLI 公共头](#领域模型工厂与 CLI 公共头)（3 条）
 - [src 应用入口（text/mnist/tokenizer/bench）](#src 应用入口（text/mnist/tokenizer/bench）)（5 条）
@@ -550,6 +550,18 @@ GPU 后端 / GPU 引擎头文件「历史状态类注释」摘录。整改原则
 
 
 # 引擎接口 / CPU 引擎 / 精度 / 张量 / 损失 / 优化器
+
+## 代码审查整改批 RV-06/09/10/11/13 与 CI 真跑测试（2026-10-12；证据坐标 docs/todo/00-code-review-remediation.md）
+- 类型：bug 根因 + 结构收敛 + 门禁
+- 内容：① **RV-06 前置去红**：`NN_BIND_DEBUG=1 ctest` 原为红（`t1_58_test` / `ternary_gemm_test` / `model_roles_test` 三例在 `cast` 处报 "unbound input into engine"）——根因是 `matmul_q_impl`（CPU 与 GPU 两份）在边界 cast 回退里：CPU 递归调用 impl 后、GPU 用静态工厂 `Tensor::from_gpu` 造输出后，都直接调**公共** `cast`（内含 `bind_check_`）而产物尚未 stamp。两处改为 `cast(adopt(std::move(x)), P)`（`adopt` = 基类 protected 的库内 stamp 通道，与 M6 的 `to_prec` 修法同款）；本机 Release+CPU `NN_BIND_DEBUG=1 ctest` 由 37/40 转 **40/40**。CI 侧新增一轮 `NN_BIND_DEBUG=1 ctest` 作为默认门禁。② **RV-09**：环境变量读取收敛到新 `core_env.hpp`（`nn::detail::{env_flag_raw,env_string_raw,env_int_raw}` + 探针门包装；`getenv`/`_dupenv_s` 只此一处、探针门关时恒 false 且不求值）；`dsl::env_flag` 的"任意非空即真"一并对齐为"0 = 关"。③ **RV-10**：BitLinear `quantize_weights_` 与 `ternary_pack::code_of` 的判据注释精确化（严格 `|W|>0.5τ`、半值归零；与 `RoundClip` 的唯一差异在等值点），不改算法。④ **RV-11**：`precision.hpp` 加 `static_assert` 冻结"枚举值 ↔ 序列化 tag"两张映射 + `precision_from_tag(precision_tag(p))==p` 往返（改一处即编译失败）。⑤ **RV-13**：`nn::Expression` / `nn::BoolExpression` 概念从 `expr_dsl.hpp` 移到 L1 的 `algebra_span.hpp`（`expr_dsl` 经 `algebra_matrix → algebra_span` 传递可见）。另（roadmap P0-1）：CI 配置加 `-DNN_ENABLE_TESTS=ON` 并在 Linux/Windows 各跑 `ctest --output-on-failure`，打包补齐 `dataset_gen`/`dataset_convert`（应用入口 6 → 8）。**仍 Open**：RV-05、RV-07、RV-08、RV-12、RV-14（RV-05/14 需 GPU 提权环境；RV-07/08 为需单独提交并逐步过三件套的重构；RV-12 仅设计评估）。
+
+- GPU 实测补充（2026-10-12，NVIDIA CMP 40HX @ ethan@192.168.1.102，Windows + clang++，Debug，GPU 启用）：`ctest` **42/42**、`NN_BIND_DEBUG=1 ctest` **42/42**（全部 GPU 用例真跑、零 skip）。同批带出的 Windows 可移植性缺陷：`src/assert_always_test.cpp` 的裸 `std::fopen` 在 clang++ + MSVC STL + `-Werror` 下编译失败（正是 CI 的 Windows 配置，此前不编测试故未暴露）→ 改 `_MSC_VER` 下 `fopen_s`。
+
+## 代码审查整改批 RV-07/RV-08：算子分派收敛 + VK 后端拆分（2026-10-12；证据坐标 docs/todo/00-code-review-remediation.md）
+- 类型：结构收敛（纯重构，零行为变化）
+- 内容：① **RV-07**：同一个 `ExprOp` 的分派原先散在约 9 处（CPU 引擎 3 处 switch + `expr_spec` 语义校验 + `expr_opt` 常量折叠 + GLSL emitter 6 处）。新增 `expr_op_table.hpp` 作**唯一真源**——以 `nn::ops::*::apply` 为 CPU 语义，每算子一行元数据（元数 / 归约标志 / 可折叠 / 一元·二元标量函数指针 / GLSL 发射形态 + 符号 + 向量比较内建名），末尾 `consteval` 断言强制与 `expr_spec` 的 `expr_instr_num_operands`/`expr_op_is_reduce`/`expr_op_reduces_cols` 逐项一致。CPU 三处 switch、`expr_eval_const_fold` switch、emitter 的 `glsl_binary_op`/`glsl_unary_op` 与 6 处指令发射块全部改为查表（新增 `glsl_alu_expr` 单一发射器，`b`/`c` 惰性回调）。**新增一个逐元素算子只需表里一行**。② **RV-08**：42 个 `get_*_spirv()` 的手写 `#ifdef` 函数体 + 42 个 `#define NN_*_SPV_EMBEDDED` 删除，改为文件头探测块把字节码函数绑到 `NN_SPV_FN_<name>` + `NN_SPV_GETTER_LIST` X 宏一次展开（新增 shader 只改探测块与列表各一处，调用点零改）。`GpuBackend`（成员体 ~5375 行）拆为 4 个**片段**文件 `backend/compute_vk_backend_{destroy,frame,pipelines,ops}.inc`，由主文件在 class 体内**按序** `#include`（片段不可单独编译）——主文件 6397 → **1055 行**。
+- 验收：CPU `ctest` 40/40；**融合 shader 字节锚**用「RV-07 前 / 后」两侧源码各编 `scan_exprs` 生成后 `diff -rq` → 805 个产物（`fused_registry.hpp` + 402 组 `.comp`/`.spv`）**零差异**；拆分的正确性用脚本比对「主文件头 + 4 片段 + 尾」与拆分前文件**逐行相同**；40HX（102）全量构建 + `ctest` **42/42**、`NN_BIND_DEBUG=1 ctest` **42/42**；`bench/doc_inventory.ps1`（`L2-VIOLATIONS: 0`/`HANDWRITTEN-RESIDUE: 0`）与 `bench/doc_align_audit.ps1` 均 exit 0。**仍 Open**：RV-05、RV-12、RV-14。
+- 脚注：片段内 `#include` 是本仓首次使用的「单类跨文件」手法（`GpuBackend` 是单一类，纯移动只能如此）。若日后倾向「拆成多个协作类」须单独立项（非纯移动，会改访问边界）。
 
 ## f16 次正规转换守卫的移位 UB（原位置 include/neuralnet.cpp/precision.hpp:197，整改前行号）
 - 类型：bug 根因

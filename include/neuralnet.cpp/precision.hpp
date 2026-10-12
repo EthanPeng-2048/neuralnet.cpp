@@ -163,6 +163,33 @@ enum class Precision : std::uint8_t
     }
 }
 
+// ── RV-11：冻结两张映射（枚举值 + 序列化 tag）────────────────────────────
+// 二者**刻意不同**：枚举序是 F16<F32（提升序语义），tag 沿用 v4 数值
+// （0=f32 / 2=f16，为的是 v4 文件不被误读，见上方注释）。目前唯一把它们绑在一起
+// 的约束是下面这组 static_assert——**只改一处**（枚举值或 tag 表）会直接
+// **编译失败**，强制同步，避免"悄悄改了枚举值、序列化文件却按老 tag 读回来"。
+//
+// 注：GPU 侧用 static_cast<int>(P) 拼精度签名/报错文本，依赖的也是这组枚举值，
+// 故枚举值一并冻结（改它 = 改精度签名口径）。
+static_assert(static_cast<int>(Precision::F16) == 0, "enum 冻结：F16=0（precision_tag 与 GPU 精度签名均依赖）");
+static_assert(static_cast<int>(Precision::F32) == 1, "enum 冻结：F32=1");
+static_assert(static_cast<int>(Precision::BF16) == 2, "enum 冻结：BF16=2");
+static_assert(static_cast<int>(Precision::F64) == 3, "enum 冻结：F64=3");
+static_assert(static_cast<int>(Precision::T1_58) == 4, "enum 冻结：T1_58=4");
+
+static_assert(precision_tag(Precision::F32) == 0, "tag 冻结：f32=0（v4 兼容）");
+static_assert(precision_tag(Precision::F64) == 1, "tag 冻结：f64=1（v4 占位）");
+static_assert(precision_tag(Precision::F16) == 2, "tag 冻结：f16=2（v4 兼容）");
+static_assert(precision_tag(Precision::BF16) == 3, "tag 冻结：bf16=3（保留）");
+static_assert(precision_tag(Precision::T1_58) == 4, "tag 冻结：t1_58=4（P2）");
+
+// 往返：对每个已定义精度 p，precision_from_tag(precision_tag(p)) == p。
+static_assert(precision_from_tag(precision_tag(Precision::F16)) == Precision::F16, "往返：f16");
+static_assert(precision_from_tag(precision_tag(Precision::F32)) == Precision::F32, "往返：f32");
+static_assert(precision_from_tag(precision_tag(Precision::BF16)) == Precision::BF16, "往返：bf16");
+static_assert(precision_from_tag(precision_tag(Precision::F64)) == Precision::F64, "往返：f64");
+static_assert(precision_from_tag(precision_tag(Precision::T1_58)) == Precision::T1_58, "往返：t1_58");
+
 // ══════════════════════════════════════════════════════════════════════════
 // CPU f16 硬件能力（编译期常量，§7.1）
 //

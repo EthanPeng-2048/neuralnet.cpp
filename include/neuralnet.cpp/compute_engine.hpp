@@ -57,6 +57,7 @@
 
 #include "core_config.hpp"
 #include "core_errors.hpp"
+#include "core_env.hpp"       // RV-09：环境变量读取唯一入口
 #include "core_profile.hpp"   // 训练 step 剖析（NN_PROFILE=1 门控；默认零开销）
 #include "compute_tensor.hpp"
 #include "expr_opt.hpp"   // canonicalize_expr_spec（trace 归因用，与 gen_fused 同源 key）
@@ -1797,18 +1798,8 @@ protected:
     // 错误带调用点 source_location（默认参在调用处求值）与张量形状。
     [[nodiscard]] static bool bind_debug_enabled_()
     {
-        static const bool on = [] {
-#if defined(_MSC_VER)
-            char* buf = nullptr; std::size_t len = 0;
-            _dupenv_s(&buf, &len, "NN_BIND_DEBUG");
-            const bool v = (buf != nullptr && buf[0] != '\0' && buf[0] != '0');
-            std::free(buf);
-            return v;
-#else
-            const char* v = std::getenv("NN_BIND_DEBUG");
-            return v != nullptr && v[0] != '\0' && v[0] != '0';
-#endif
-        }();
+        // 行为开关（探针门的既有例外，AGENTS §2）：读一次 + 缓存（RV-09）。
+        static const bool on = ::nn::detail::env_flag_raw("NN_BIND_DEBUG");
         return on;
     }
 
@@ -2074,45 +2065,17 @@ protected:
 
     [[nodiscard]] static bool prec_trace_enabled_()
     {
-#if !NN_PROBES_ENABLED
-        return false;
-#else
-        static const bool on = [] {
-#if defined(_MSC_VER)
-            char* buf = nullptr; std::size_t len = 0;
-            _dupenv_s(&buf, &len, "NN_PREC_TRACE");
-            const bool v = (buf != nullptr && buf[0] != '\0' && buf[0] != '0');
-            std::free(buf);
-            return v;
-#else
-            const char* v = std::getenv("NN_PREC_TRACE");
-            return v != nullptr && v[0] != '\0' && v[0] != '0';
-#endif
-        }();
+        // 诊断变体归因开关：探针门下的**读一次 + 缓存**（core_env 已含门控）。
+        static const bool on = ::nn::detail::probe_flag_raw("NN_PREC_TRACE");
         return on;
-#endif
     }
 
-    // 通用环境变量开关（原 nn::dsl::env_flag 同语义：每次 getenv、零缓存；
-    // compute_engine.hpp 不能反向依赖 expr_dsl.hpp，故保留同款实现）。
-    // 探针门：默认构建恒 false（不求值 getenv），"NN_F16_DEBUG" 等诊断开关失效。
+    // 通用诊断开关（RV-09：实现收敛到 core_env.hpp，不再各写 getenv/_dupenv_s）。
+    // 每次读取、零缓存（与 dsl::env_flag 同语义）；探针门：默认构建恒 false
+    // （**不求值 getenv**），"NN_F16_DEBUG" 等诊断开关失效。
     [[nodiscard]] static bool prec_env_flag(const char* name)
     {
-#if !NN_PROBES_ENABLED
-        (void)name;
-        return false;
-#else
-#if defined(_MSC_VER)
-        char* buf = nullptr; std::size_t len = 0;
-        _dupenv_s(&buf, &len, name);
-        const bool v = (buf != nullptr && buf[0] != '\0' && buf[0] != '0');
-        std::free(buf);
-        return v;
-#else
-        const char* v = std::getenv(name);
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
-#endif
-#endif
+        return ::nn::detail::probe_flag_raw(name);
     }
 
     // 诊断（NN_PREC_TRACE=1）：请求了非零精度签名却**没有命中带类型变体** —— 这是
