@@ -635,6 +635,23 @@ inline void run_gen_jobs(const std::string& glslc, std::vector<GenJob>& jobs)
                         n_skipped_all_f16, n_var_fail);
     }
 
+    // ── 变体发射目标（V0 + 每个静态非 f32 特化变体）─────────────────────────
+    // 网格粒度变体（#f/#ks/#kr）与批量变体（#b）都以**"已选变体键 + 后缀"**
+    // 为查表键（运行期 run_fused_gpu / run_fused_gpu_batch），所以每个静态
+    // 特化变体都要有自己的那一份条目。
+    struct MmGridTarget
+    {
+        const nn::ExprSpec* spec;
+        std::string key;    // 基础结构 key 或变体键（`key#s` / `key#xxxx`）
+        nn::ExprPrecSig sig = 0;
+    };
+    std::vector<MmGridTarget> mm_grid_targets;
+    for (const auto& spec : reg.specs)
+        mm_grid_targets.push_back(MmGridTarget{&spec, nn::expr_spec_key(spec), 0u});
+    for (const auto& ve : emitted_variants)
+        if (!ve.alu && !nn::expr_prec_sig_is_dispatch(ve.sig) && ve.sig != 0u)
+            mm_grid_targets.push_back(MmGridTarget{ve.spec, ve.vkey, ve.sig});
+
     // ── P3 跨链批量派发变体（键 = key#b）──────────────────────────────────
     //
     // 资格与运行期分组同源（expr_spec_batchable）：纯逐元素（无归约/fold/
@@ -648,16 +665,30 @@ inline void run_gen_jobs(const std::string& glslc, std::vector<GenJob>& jobs)
         const nn::ExprSpec* spec;
         std::string vkey;     // "key#b"（注册表键）
         std::string suffix;   // "key_b"（标识符与文件名，不含 '#'）
+        nn::ExprPrecSig sig = 0;   // 变体身份签名（0 = V0 全 f32）
     };
     std::vector<BatchedEmit> emitted_batched;
     std::unordered_set<std::string> emitted_bkeys;
+    // 发射目标 = V0（含 extras 复合）+ 每个**extras 为空**的静态非 f32 特化变体
+    //（优化器在 f16 下的 4 个结构全是单输出 → 覆盖到；带 extras 的 f16 结构
+    //  仍逐 kernel 降级，理由见 emitter 接口注释）。
+    std::vector<MmGridTarget> batch_targets;
     for (const auto& spec : reg.specs)
+        batch_targets.push_back(MmGridTarget{&spec, nn::expr_spec_key(spec), 0u});
+    for (const auto& ve : emitted_variants)
+        if (!ve.alu && !nn::expr_prec_sig_is_dispatch(ve.sig) && ve.sig != 0u &&
+            ve.spec->extras.empty())
+            batch_targets.push_back(MmGridTarget{ve.spec, ve.vkey, ve.sig});
+    for (const MmGridTarget& tgt : batch_targets)
     {
+        const nn::ExprSpec& spec = *tgt.spec;
         if (!is_fusable(spec) || !nn::expr_spec_batchable(spec))
             continue;
-        const std::string key = nn::expr_spec_key(spec);
-        const std::string vkey = key + nn::EXPR_BATCH_SUFFIX;
-        const std::string suffix = key + "_b";
+        const std::string vkey = tgt.key + nn::EXPR_BATCH_SUFFIX;
+        std::string suffix = vkey;
+        for (char& ch : suffix)
+            if (ch == '#')
+                ch = '_';
         if (!emitted_bkeys.insert(vkey).second)
             continue;   // 同 vkey 幂等（重复会生成重复 kSpirv_ 标识符）
         auto emitter = nn::emitter_registry::make("glsl");
@@ -666,7 +697,8 @@ inline void run_gen_jobs(const std::string& glslc, std::vector<GenJob>& jobs)
             std::fprintf(stderr, "[FAIL] 无法创建 GLSL emitter（IR-D 注册表异常）\n");
             return false;
         }
-        const std::string glsl = emitter->generate_batched("fused_" + suffix, spec);
+        const std::string glsl =
+            emitter->generate_batched("fused_" + suffix, spec, tgt.sig);
         if (glsl.empty())
         {
             // 资格判据与生成器同一函数 → 正常不可达；保底可见（不静默）。
@@ -678,7 +710,7 @@ inline void run_gen_jobs(const std::string& glslc, std::vector<GenJob>& jobs)
                               out_dir + "/fused_" + suffix + ".comp",
                               out_dir + "/fused_" + suffix + ".spv",
                               glsl, {}, false});
-        emitted_batched.push_back(BatchedEmit{&spec, vkey, suffix});
+        emitted_batched.push_back(BatchedEmit{&spec, vkey, suffix, tgt.sig});
     }
 
     // ── matmul 细 tile 变体（键 = key#f，P0 wgrad 网格饥饿）─────────────────
@@ -704,18 +736,6 @@ inline void run_gen_jobs(const std::string& glslc, std::vector<GenJob>& jobs)
     // 细 tile / K 切分的发射目标 = V0（sig 0）+ 每个**静态非 f32**特化变体。
     // 运行期 `run_fused_gpu` 用"当前已选变体键 + 后缀"查表（`#ks` 还要求
     // `!is_disp`），所以变体键必须逐条有对应条目。
-    struct MmGridTarget
-    {
-        const nn::ExprSpec* spec;
-        std::string key;    // 基础结构 key 或变体键（`key#s` / `key#xxxx`）
-        nn::ExprPrecSig sig = 0;
-    };
-    std::vector<MmGridTarget> mm_grid_targets;
-    for (const auto& spec : reg.specs)
-        mm_grid_targets.push_back(MmGridTarget{&spec, nn::expr_spec_key(spec), 0u});
-    for (const auto& ve : emitted_variants)
-        if (!ve.alu && !nn::expr_prec_sig_is_dispatch(ve.sig) && ve.sig != 0u)
-            mm_grid_targets.push_back(MmGridTarget{ve.spec, ve.vkey, ve.sig});
     for (const MmGridTarget& tgt : mm_grid_targets)
     {
         const nn::ExprSpec& spec = *tgt.spec;
@@ -892,7 +912,7 @@ inline void run_gen_jobs(const std::string& glslc, std::vector<GenJob>& jobs)
           << "-1, 0, "
           << nn::expr_spec_runtime_view_param_count(spec) << ", "
           << nn::expr_spec_runtime_param_count(spec) << ", "
-          << "1u, 0u },\n";
+          << "1u, " << be.sig << "u },\n";
     }
     // matmul 细 tile 变体行（键 = key#f）：元数据与基础结构完全同源
     // （reduce_axis / has_matmul / vp / rparam / vec_width / prec_sig=0）——

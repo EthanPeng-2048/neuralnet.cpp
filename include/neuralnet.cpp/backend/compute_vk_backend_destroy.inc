@@ -733,7 +733,8 @@
             const std::string_view key_sv(fs.key);
             std::string_view grid_stripped = key_sv;
             for (std::string_view suf :
-                 {std::string_view(nn::EXPR_MM_KSPLIT_REDUCE_SUFFIX),
+                 {std::string_view(nn::EXPR_BATCH_SUFFIX),
+                  std::string_view(nn::EXPR_MM_KSPLIT_REDUCE_SUFFIX),
                   std::string_view(nn::EXPR_MM_KSPLIT_SUFFIX),
                   std::string_view(nn::EXPR_MM_FINE_SUFFIX)})
             {
@@ -746,9 +747,8 @@
             }
             const bool needs_16bit_storage =
                 key_sv.find('#') != std::string_view::npos &&
-                !(is_batch ||
-                  ((is_fine || is_ks || is_kr) &&
-                   grid_stripped.find('#') == std::string_view::npos));
+                !((is_batch || is_fine || is_ks || is_kr) &&
+                  grid_stripped.find('#') == std::string_view::npos);
             if (needs_16bit_storage && !device_.has_16bit_storage())
                 continue;
             // `#b` 批量变体需要 buffer device address（实例表按 64 位地址解引用
