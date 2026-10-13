@@ -134,7 +134,7 @@ P2 = 3–6 月的结构优化；P3 = 择机（trigger 未到就不排期）。
 |---|---|---|---|
 | **P0** | 5 | CI 真跑测试、文档一致性回正、BatchNorm 禁止静默回落（**✅ 已完成**）、CMake install/export + presets、推理采样 top-k/top-p | 无（P0-1 是所有人的前置） |
 | **P1** | 6 | `text_train` 模块化、checkpoint 优化器状态、危险精度组合启动期告警（细则见 [`24`](24-f16-training-defects.md)）、`gpt_test` flaky、CI 冒烟扩 MSVC Debug、**自定义层使用文档 + 精度自检**（P1-6） | P0-1；P1-6 无依赖 |
-| **P2** | 9 | `.bin` 校验和、Adafactor、RAPT/CNN f16、Dataset/DataLoader、Python/C 绑定、GUI 两项、header 拆分、F16C、**step 内固定 I/O 开销（P2-9）** | P0-1；P2-7 另需 P1-5；P2-6 另需 P0-5 |
+| **P2** | 10 | `.bin` 校验和、Adafactor、RAPT/CNN f16、Dataset/DataLoader、Python/C 绑定、GUI 两项、header 拆分、F16C、step 内固定 I/O 开销（P2-9）、**原生 f16 算术用足（P2-10）** | P0-1；P2-7 另需 P1-5；P2-6 另需 P0-5 |
 | **P3** | 8 | 由 §6 触发条件启动（含 CUDA、分布式） | 各自触发条件 |
 
 **串行约束（不可并行推进的组合）**：
@@ -183,6 +183,7 @@ P2 = 3–6 月的结构优化；P3 = 择机（trigger 未到就不排期）。
 | **P2-7 超大 header 拆分** | backend 拆 fence / staging / dispatch / 算子为独立 TU；`compute_vk_backend.hpp` 瘦身 | 拆分前后 build 全绿 + ctest 全绿 + CPU/GPU 字节锚逐位一致 | 中–大 | **前置 = 先补编译/链接期冒烟**（P0-1 + P1-5），否则拆分无回归网 |
 | **P2-8 F16C 半精度转换快路径** | `_cvtss_sh` 快路径 + 批量转换，替代纯软件位操作 | CPUID 探测 + `NN_ENABLE_NATIVE` ON/OFF 两态；`f16_cpu_probe` 全量对拍逐位一致 | 中 | **条件触发**（§6） |
 | **P2-9 训练 step 内固定 I/O 开销归因与消除** | `NN_PROFILE` 实测（850M，`d64/h4/L4/ff256/seq128/b8`，2026-10-13）：每步约 **20% step 墙钟在 `copy_from`**（`fwd.blk#3` 作用域内，**与精度无关**——f32/f16 同现）。疑似 CE 每步 `upload_span` 上传 labels/mask 走 `from_matrix → create_tensor + copy_from`，而 `copy_from`（`write`/`from_matrix` 的 GPU 路径）带**录制窗口 drain** 语义 → 每步多次打断 GPU 流水线。**先定位**（per-key 表 + 调用点 + drain 次数）再定方案（labels/mask 张量缓存复用 / 预分配 buffer / 不入 drain 的上传路径） | 定位到具体调用点与每步 drain 次数；消除后同口径 e2e step 时间下降，且数值/字节锚逐位不变 | 小–中 | 无（与 F4 重叠但**独立**——该开销与精度无关，见 [`24`](24-f16-training-defects.md) §4.4） |
+| **P2-10 原生 f16 算术（`shaderFloat16`）用足** | 允许且推进原生 f16：`#a`（V2b native16）已生成 **43 条**、运行期优先级高于 `#x`（`find_prec_variant_` 先试 `#a`），但结构谓词 `expr_prec_sig_native16` **排除 `fold` / `matmul` / 任何 reduce / 带 `rparams`** 的表达式 → 最重的几条链（CE 的 logsumexp fold、归约、matmul 融合段）永远拿不到原生 f16。**目标** = 把 native16 资格扩到 reduce/fold/matmul（**累加必须保持 f32**），逐条守住索引精度 / `rparam` 微值 flush-to-0 / 常量 <6e-8 三类禁忌；保留 `NN_VULKAN_NO_16BIT_ALU` 逃生阀 | 40HX 上 `--f16` step ≤ f32，且 `NN_VULKAN_NO_16BIT_ALU=1/0` 配对 A/B 显示原生开更快；数值与 storage-only 路径容差内一致 | 中 | [`26`](26-f16-speedup-plan.md) 的 **S5**；建议在 S0/S1 之后做（否则收益被固定开销吞掉） |
 
 ### 4.4 P3（择机）
 
