@@ -680,6 +680,30 @@ void run_profile_matrix(nn::ComputeEngine& eng, bool verbose)
 }
 
 // ── 9. CE loss 标量归约在 stable=f16 下不得溢出（docs/todo/24 §2 / 14 号台账）──
+// ── 10. 四字段全 f16（含 optimizer=f16）可训练（F5）────────────────────────
+// 关键修复（2026-10-14）：Adam 的二阶矩 v ≈ (1-β2)·g² 在 f16 下**下溢为 0**
+// （g~1e-5 ⇒ v~1e-10），而一阶矩 m ~1e-8 仍在次正规区 ⇒ `m/(√v+eps)` 退化、
+// 更新量暴涨 → 实测第 1 步后即 NaN。修法 = 进入状态更新的梯度放大 S=4096
+// （见 `Adam::optimizer_state_scale_`），并把 eps 同倍放大以保持"eps 相对 v"
+// 的比例 → **更新量在数学上不变**，但 m/v 都回到 f16 正常区。
+// 本段是全 f16 的**可训练性门禁**：loss 必须逐步有限且下降。
+void test_full_f16_training(nn::ComputeEngine& eng)
+{
+    const char* saved = g_label;
+    g_label = "fullf16";
+    nn::PrecisionProfile full = nn::profile_f16();
+    full.stable    = nn::Precision::F16;
+    full.optimizer = nn::Precision::F16;
+    const TrainResult r = train_tiny_gpt(eng, full, /*steps=*/20, /*lr=*/3e-3f,
+                                         /*verbose=*/false);
+    CHECK(!r.losses.empty(), "full-f16：训练未产出 loss");
+    for (const float l : r.losses)
+        CHECK(std::isfinite(l), "full-f16：loss 必须有限（NaN/inf = optimizer=f16 退化）");
+    if (r.losses.size() >= 2)
+        CHECK(r.losses.back() < r.losses.front(), "full-f16：loss 应下降");
+    g_label = saved;
+}
+
 // 大 token 数下 Σ log_prob ≈ -log(vocab)·N 会远超 f16 上限 65504。若 loss_sum
 // 的 (1,1) 归约**输出**按 stable=f16 落盘 → ±inf，打印的 loss 恒为 inf / 常数
 // （14 号台账 GPU stable=f16「回读冻结 4.0137」= 该溢出在部分硬件上饱和为 f16
@@ -752,6 +776,7 @@ void run_suite(const char* label, nn::ComputeEngine& raw, nn::ComputeEngine& ada
     run_profile_matrix(adapter, /*verbose=*/false);
     // stable=f16 下 CE loss 标量归约不得溢出（14 号台账 GPU 冻结真因）
     test_ce_loss_stable_f16_no_overflow(adapter);
+    test_full_f16_training(adapter);
 }
 
 } // namespace
