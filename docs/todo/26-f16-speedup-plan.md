@@ -244,7 +244,7 @@ matmul 核是 f32 累加循环主导（同一事实也解释了 S5 的收益上�
 - **验收**：数值与 S1 逐位一致；`eval_expr*` 项耗时或「事务数」下降（用 S1 的计数器）。
 - **风险**：中——尾部/奇偶元素与对齐需按既有 `create_f16_tensor` 奇数保护口径处理。
 
-### S3 — f16 GEMM（storage-only，f32 累加）+ 小 N GEMV
+### S3 — f16 GEMM（storage-only，f32 累加）+ 小 N GEMV ✅ **已完成 2026-10-14**
 
 **网格粒度部分 ✅ 已完成 2026-10-14**：`#f`（细 tile）与 `#ks`/`#kr`（K 切分）原本**只对
 V0 全 f32 发射**（`generate_glsl_matmul` 对 `k_split && sig != 0` 直接拒绝）→ 网格饥饿
@@ -262,7 +262,9 @@ vs f32 的 K 切分 25 ms/块**（占该机 f16 全部残差；配对旁证 `NN_
     loss 对拍（40HX 三点）f32 8.6757/8.2646/7.8743 vs f16 8.6676/8.2569/7.8643（<0.15%）；
     `ctest` GPU 43/43。变体数：细 tile 14→46、K 切分 14→46（fused shader 617→713）。
 
-**仍未做**：小 N GEMV 的 f16 变体，以及"K 重的普通 matmul 形状全面补 f16 存储变体"。
+**小 N GEMV 与本条的关系**：f16 的小 N 路径**早已由 op-level 原语覆盖**——`matmul_gemv_f16`（`#f` 之外的"小 N GEMV f16 变体"，见 `destroy.inc` Phase C2e）在设备支持 16 位存储时即创建；本条原方案里的`matmul_q_gemv` 是三值打包 GEMM 的专属原语（T1_58，非 f16 稠密路径）。故 S3 无残余项。
+
+**K 重的普通 matmul 形状**：由 `#f`（细 tile）与 `#ks`/`#kr`（K 切分）在**静态签名变体上各发一份**覆盖（键形如 `key#10003#ks`），40HX 实测该 wgrad **f16 16.0 ms/块 < f32 25.1 ms/块**。
 
 - **做什么**：K 重的 matmul/wgrad 形状补 f16 存储变体（A/B 读 f16、算 f32、写 f16）；小 N 走
   `matmul_q_gemv` 同类 GEMV。
