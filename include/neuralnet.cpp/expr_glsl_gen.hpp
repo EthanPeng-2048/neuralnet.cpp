@@ -2218,7 +2218,16 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec,
     // P3 批量变体（键 = key#b）：纯逐元素 + 仅 V0 全 f32。其余形态返回空串
     // （上层 [skip]，运行期逐 kernel 降级，不是错误）。资格判据与
     // fused_generate / execute_fused_graph 同源（expr_spec_batchable）。
-    if (batched && (sig != 0 || native16 || !expr_spec_batchable(spec)))
+    // 批量变体（键 = key#b，或叠加在精度特化变体上 = key#xxxx#b）：
+    // 资格同 V0（纯逐元素、无 fold/matmul/reduce）；sig 为静态签名（0 = V0）。
+    // ⚠ **带 extras 的结构仅支持 V0 全 f32**：extras 的元素类型不在
+    //   ExprPrecSig 里（它只描述输入 + 主输出），运行期又无法在构建期枚举，
+    //   故 f16 批量变体只对 **extras 为空**的结构发射（实测优化器在 f16 下的
+    //   4 个结构全是单输出 → 覆盖到）；带 extras 的 f16 结构仍逐 kernel 降级。
+    //   运行期分派哨兵不叠加批量变体。
+    if (batched && (expr_prec_sig_is_dispatch(sig) || native16 ||
+                    !expr_spec_batchable(spec) ||
+                    (sig != 0 && !spec.extras.empty())))
         return {};
     if (mm_fine)
     {
@@ -2323,17 +2332,31 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec,
         // `ib` 必须是模块级变量：gr_r<i> 辅助函数也经宏访问实例表。
         L << "// P3 批量派发：实例表槽位 = 输入…、输出…、(count,cols)；"
              "stride S = " << (n_inputs + 2 + spec.extras.size()) << "\n";
+        // 实例表的地址是类型无关的；元素类型由**注入签名**在编译期定死
+        //（f16 槽走 float16_t 的 buffer reference）。extras 只在 sig==0
+        //（V0）时存在 → 其引用类型恒 F32BufW（见上方资格拒绝）。
+        const bool b_sign_f16 = (sig != 0);
+        const bool b_out_f16 = b_sign_f16 && expr_prec_sig_out_f16(sig);
         L << "layout(buffer_reference, std430) readonly buffer F32BufR "
              "{ float d[]; };\n";
+        if (b_sign_f16)
+            L << "layout(buffer_reference, std430) readonly buffer F16BufR "
+                 "{ float16_t d[]; };\n";
         L << "layout(buffer_reference, std430) buffer F32BufW "
              "{ float d[]; };\n";
+        if (b_out_f16)
+            L << "layout(buffer_reference, std430) buffer F16BufW "
+                 "{ float16_t d[]; };\n";
         L << "layout(std430, binding = 0) readonly buffer Inst "
              "{ uvec2 inst[]; };\n";
         L << "uint ib;   // 模块级 per-invocation 私有（gr_r<> 辅助函数也用）\n";
         for (std::size_t i = 0; i < n_inputs; ++i)
-            L << "#define b" << i << " (F32BufR(inst[ib + " << i
-              << "u]).d)\n";
-        L << "#define bout (F32BufW(inst[ib + " << n_inputs << "u]).d)\n";
+            L << "#define b" << i << " ("
+              << ((b_sign_f16 && expr_prec_sig_in_f16(sig, i)) ? "F16BufR"
+                                                                : "F32BufR")
+              << "(inst[ib + " << i << "u]).d)\n";
+        L << "#define bout (" << (b_out_f16 ? "F16BufW" : "F32BufW")
+          << "(inst[ib + " << n_inputs << "u]).d)\n";
         for (std::size_t k = 0; k < spec.extras.size(); ++k)
             L << "#define bex" << k << " (F32BufW(inst[ib + "
               << (n_inputs + 1 + k) << "u]).d)\n";
@@ -3370,8 +3393,9 @@ public:
     // （实例表 + buffer device address）。不支持的形态返回空串 → 上层跳过
     // 该变体，运行期逐 kernel 降级（见 expr_spec_batchable）。
     [[nodiscard]] std::string generate_batched(
-        const std::string& name_, const ExprSpec& spec) const override
-    { return nn::generate_glsl(name_, spec, /*sig=*/0, /*native16=*/false,
+        const std::string& name_, const ExprSpec& spec,
+        ExprPrecSig sig = 0) const override
+    { return nn::generate_glsl(name_, spec, sig, /*native16=*/false,
                                /*batched=*/true); }
 
     // matmul 细 tile 变体（键 = key#f，P0 wgrad 网格饥饿）：输出块 16×16、
