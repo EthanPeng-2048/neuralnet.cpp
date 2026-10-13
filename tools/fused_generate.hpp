@@ -684,9 +684,11 @@ inline void run_gen_jobs(const std::string& glslc, std::vector<GenJob>& jobs)
     // ── matmul 细 tile 变体（键 = key#f，P0 wgrad 网格饥饿）─────────────────
     //
     // 资格 = 纯 matmul 形态（spec.matmul、无 fold、raxis<0；与
-    // run_fused_gpu 的细 tile 派发分支同源），仅 V0 全 f32。元数据与基础
-    // 结构同源（reduce_axis、has_matmul、vp/rparam 槽、vec_width、
-    // prec_sig=0）——block 不进 PC、不进 key，只是同一结构的第二种网格
+    // run_fused_gpu 的细 tile 派发分支同源），**V0 全 f32 与静态签名特化
+    // 变体各一份**（sig 进注册行；运行期按"已选变体键 + #f"查表 → 特化
+    // 变体也要有自己的 #f，否则饥饿形状在 f16 下无细 tile 可派发）。
+    // 元数据与基础结构同源（reduce_axis、has_matmul、vp/rparam 槽、vec_width、
+    // prec_sig）——block 不进 PC、不进 key，只是同一结构的第二种网格
     // 粒度（输出块 16×16 vs 64×64，见 EXPR_MATMUL_BLOCK_FINE）。运行期在
     // 64-tile 网格工作组饥饿时选它（< EXPR_MATMUL_FINE_MIN_WGS）；未登记
     // /被 NN_MM_NO_FINE 关闭 → 留在 64-tile 路径（降级，不是错误）。
@@ -695,18 +697,37 @@ inline void run_gen_jobs(const std::string& glslc, std::vector<GenJob>& jobs)
         const nn::ExprSpec* spec;
         std::string vkey;     // "key#f"（注册表键）
         std::string suffix;   // "key_f"（标识符与文件名，不含 '#'）
+        nn::ExprPrecSig sig = 0;   // 变体身份签名（0 = V0 全 f32）
     };
     std::vector<FineEmit> emitted_fine;
     std::unordered_set<std::string> emitted_fkeys;
-    for (const auto& spec : reg.specs)
+    // 细 tile / K 切分的发射目标 = V0（sig 0）+ 每个**静态非 f32**特化变体。
+    // 运行期 `run_fused_gpu` 用"当前已选变体键 + 后缀"查表（`#ks` 还要求
+    // `!is_disp`），所以变体键必须逐条有对应条目。
+    struct MmGridTarget
     {
+        const nn::ExprSpec* spec;
+        std::string key;    // 基础结构 key 或变体键（`key#s` / `key#xxxx`）
+        nn::ExprPrecSig sig = 0;
+    };
+    std::vector<MmGridTarget> mm_grid_targets;
+    for (const auto& spec : reg.specs)
+        mm_grid_targets.push_back(MmGridTarget{&spec, nn::expr_spec_key(spec), 0u});
+    for (const auto& ve : emitted_variants)
+        if (!ve.alu && !nn::expr_prec_sig_is_dispatch(ve.sig) && ve.sig != 0u)
+            mm_grid_targets.push_back(MmGridTarget{ve.spec, ve.vkey, ve.sig});
+    for (const MmGridTarget& tgt : mm_grid_targets)
+    {
+        const nn::ExprSpec& spec = *tgt.spec;
         if (!is_fusable(spec))
             continue;
         if (!spec.matmul || spec.fold || nn::expr_spec_reduce_axis(spec) != -1)
             continue;   // 非纯 matmul 形态：无细 tile 派发分支 → 不产出
-        const std::string key = nn::expr_spec_key(spec);
-        const std::string vkey = key + nn::EXPR_MM_FINE_SUFFIX;
-        const std::string suffix = key + "_f";
+        const std::string vkey = tgt.key + nn::EXPR_MM_FINE_SUFFIX;
+        std::string suffix = vkey;
+        for (char& ch : suffix)
+            if (ch == '#')
+                ch = '_';
         if (!emitted_fkeys.insert(vkey).second)
             continue;   // 同 vkey 幂等（重复会生成重复 kSpirv_ 标识符）
         auto emitter = nn::emitter_registry::make("glsl");
@@ -715,7 +736,8 @@ inline void run_gen_jobs(const std::string& glslc, std::vector<GenJob>& jobs)
             std::fprintf(stderr, "[FAIL] 无法创建 GLSL emitter（IR-D 注册表异常）\n");
             return false;
         }
-        const std::string glsl = emitter->generate_matmul_fine("fused_" + suffix, spec);
+        const std::string glsl =
+            emitter->generate_matmul_fine("fused_" + suffix, spec, tgt.sig);
         if (glsl.empty())
         {
             // 资格判据与生成器同一分支 → 正常不可达；保底可见（不静默）。
@@ -727,7 +749,7 @@ inline void run_gen_jobs(const std::string& glslc, std::vector<GenJob>& jobs)
                               out_dir + "/fused_" + suffix + ".comp",
                               out_dir + "/fused_" + suffix + ".spv",
                               glsl, {}, false});
-        emitted_fine.push_back(FineEmit{&spec, vkey, suffix});
+        emitted_fine.push_back(FineEmit{&spec, vkey, suffix, tgt.sig});
     }
 
     // ── matmul K 切分变体（键 = key#ks）+ 伴生归约（键 = key#kr）─────────
@@ -746,21 +768,22 @@ inline void run_gen_jobs(const std::string& glslc, std::vector<GenJob>& jobs)
         const nn::ExprSpec* spec;   // #ks = 原 spec；#kr = 合成 spec
         std::string vkey;           // "key#ks" / "key#kr"（注册表键）
         std::string suffix;         // "key_ks" / "key_kr"（标识符与文件名）
+        nn::ExprPrecSig sig = 0;    // 变体身份签名（0 = V0 全 f32）
     };
     std::vector<KsEmit> emitted_ks;
     std::vector<KsEmit> emitted_kr;
     std::vector<nn::ExprSpec> owned_krs;
-    owned_krs.reserve(reg.specs.size());
+    owned_krs.reserve(mm_grid_targets.size());
     std::unordered_set<std::string> emitted_kskeys;
-    for (const auto& spec : reg.specs)
+    for (const MmGridTarget& tgt : mm_grid_targets)
     {
+        const nn::ExprSpec& spec = *tgt.spec;
         if (!is_fusable(spec))
             continue;
         if (!spec.matmul || spec.fold || nn::expr_spec_reduce_axis(spec) != -1)
             continue;   // 与细 tile 同判据：非纯 matmul 形态无 K 切分派发分支
-        const std::string key = nn::expr_spec_key(spec);
-        const std::string kskey = key + nn::EXPR_MM_KSPLIT_SUFFIX;
-        const std::string krkey = key + nn::EXPR_MM_KSPLIT_REDUCE_SUFFIX;
+        const std::string kskey = tgt.key + nn::EXPR_MM_KSPLIT_SUFFIX;
+        const std::string krkey = tgt.key + nn::EXPR_MM_KSPLIT_REDUCE_SUFFIX;
         if (!emitted_kskeys.insert(kskey).second)
             continue;   // 同 vkey 幂等（重复会生成重复 kSpirv_ 标识符）
         auto emitter = nn::emitter_registry::make("glsl");
@@ -770,7 +793,7 @@ inline void run_gen_jobs(const std::string& glslc, std::vector<GenJob>& jobs)
             return false;
         }
         const std::string glsl_ks =
-            emitter->generate_matmul_ksplit("fused_" + kskey, spec);
+            emitter->generate_matmul_ksplit("fused_" + kskey, spec, tgt.sig);
         if (glsl_ks.empty())
         {
             // 资格判据与生成器同一函数 → 正常不可达；保底可见（不静默）。
@@ -779,7 +802,7 @@ inline void run_gen_jobs(const std::string& glslc, std::vector<GenJob>& jobs)
             continue;
         }
         const std::string glsl_kr =
-            emitter->generate_matmul_ksplit_reduce("fused_" + krkey, spec);
+            emitter->generate_matmul_ksplit_reduce("fused_" + krkey, spec, tgt.sig);
         if (glsl_kr.empty())
         {
             // 配对约束：#ks 单独存在时运行期永不派发 → 一并不产出（不留死条目）。
@@ -787,8 +810,14 @@ inline void run_gen_jobs(const std::string& glslc, std::vector<GenJob>& jobs)
                          "（#ks/#kr 配对约束 → 双双不产出）\n", krkey.c_str());
             continue;
         }
-        const std::string ks_suffix = key + "_ks";
-        const std::string kr_suffix = key + "_kr";
+        std::string ks_suffix = kskey;
+        std::string kr_suffix = krkey;
+        for (char& ch : ks_suffix)
+            if (ch == '#')
+                ch = '_';
+        for (char& ch : kr_suffix)
+            if (ch == '#')
+                ch = '_';
         jobs.push_back(GenJob{ks_suffix, kskey,
                               out_dir + "/fused_" + ks_suffix + ".comp",
                               out_dir + "/fused_" + ks_suffix + ".spv",
@@ -797,10 +826,10 @@ inline void run_gen_jobs(const std::string& glslc, std::vector<GenJob>& jobs)
                               out_dir + "/fused_" + kr_suffix + ".comp",
                               out_dir + "/fused_" + kr_suffix + ".spv",
                               glsl_kr, {}, false});
-        emitted_ks.push_back(KsEmit{&spec, kskey, ks_suffix});
+        emitted_ks.push_back(KsEmit{&spec, kskey, ks_suffix, tgt.sig});
         owned_krs.push_back(spec);
         owned_krs.back().views.push_back(nn::ExprView{});   // kind = Linear（占位槽）
-        emitted_kr.push_back(KsEmit{&owned_krs.back(), krkey, kr_suffix});
+        emitted_kr.push_back(KsEmit{&owned_krs.back(), krkey, kr_suffix, tgt.sig});
     }
 
     // ── 并行 glslc：GLSL 已全部产出，这里一次性并发编译 ────────────────────
@@ -878,7 +907,7 @@ inline void run_gen_jobs(const std::string& glslc, std::vector<GenJob>& jobs)
           << nn::expr_spec_runtime_view_param_count(spec) << ", "
           << nn::expr_spec_runtime_param_count(spec) << ", "
           << fused_vec_width_for(spec, /*alu=*/false)
-          << ", 0u },\n";
+          << ", " << fe.sig << "u },\n";
     }
     // K 切分变体行（键 = key#ks）：元数据与基础结构同源（reduce_axis /
     // has_matmul=1 / vp / rparam / vec_width / prec_sig=0）；**PC 固定头 7 槽**
@@ -893,7 +922,7 @@ inline void run_gen_jobs(const std::string& glslc, std::vector<GenJob>& jobs)
           << nn::expr_spec_runtime_view_param_count(spec) << ", "
           << nn::expr_spec_runtime_param_count(spec) << ", "
           << fused_vec_width_for(spec, /*alu=*/false)
-          << ", 0u },\n";
+          << ", " << ke.sig << "u },\n";
     }
     // K 切分伴生归约行（键 = key#kr）：spec 为合成 spec（+部分和视图），
     // PC 固定头 6 槽与 matmul 同布局（has_matmul=1 → 注册侧 6，无需特判）。
@@ -907,7 +936,7 @@ inline void run_gen_jobs(const std::string& glslc, std::vector<GenJob>& jobs)
           << nn::expr_spec_runtime_view_param_count(spec) << ", "
           << nn::expr_spec_runtime_param_count(spec) << ", "
           << fused_vec_width_for(spec, /*alu=*/false)
-          << ", 0u },\n";
+          << ", " << ke.sig << "u },\n";
     }
     H << "};\n";
     H << "inline constexpr std::size_t kFusedShaderCount =\n"
