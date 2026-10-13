@@ -661,6 +661,21 @@ if(NN_ENABLE_TESTS)
         add_test(NAME cnn_test_gpu COMMAND cnn_test --gpu)
         set_tests_properties(cnn_test_gpu PROPERTIES SKIP_RETURN_CODE 77)
     endif()
+    # CNN / RAPT 的 f16 端到端变体（P2-3）：Conv2D 权重/梯度按 param、融合算子
+    # 按 compute 走 f16 → 断言"loss 有限且下降 / 梯度无 NaN"。CPU 与 GPU
+    # 各一条（GPU 才暴露精度变体的闭合世界 miss 与 f16/f32 槽位错配）。
+    if(TARGET cnn_test)
+        add_test(NAME cnn_test_f16 COMMAND cnn_test --f16)
+        add_test(NAME cnn_test_f16_gpu COMMAND cnn_test --f16 --gpu)
+        set_tests_properties(cnn_test_f16 cnn_test_f16_gpu
+                             PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
+    if(TARGET rapt_test)
+        add_test(NAME rapt_test_f16 COMMAND rapt_test --f16)
+        add_test(NAME rapt_test_f16_gpu COMMAND rapt_test --f16 --gpu)
+        set_tests_properties(rapt_test_f16 rapt_test_f16_gpu
+                             PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
     # BatchNorm 的 GPU 变体：推理态/EMA 表达式的 ExprSpec 校验只在 GPU
     # 路径发生（CPU 模板路径不校验），且闭合世界 miss 只在 GPU 运行期暴露。
     # 无 Vulkan 构建下返回 77 = SKIP。

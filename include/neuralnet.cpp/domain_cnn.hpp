@@ -54,6 +54,10 @@ struct CnnConfig
     // 旧模型文件缺 norm_place 键 → spec 读回 None → 不加（旧布局逐位一致）。
     NormType  norm_type  = NormType::BatchNorm;
     NormPlace norm_place = NormPlace::Conv;
+    // 模型级精度配置（P2-3）：默认全 F32（与历史逐位一致）。`--f16` 下由调用方
+    // 置 profile_f16() → Conv2D 权重/梯度按 param、融合算子按 compute 走 f16。
+    // 与 GptConfig::precision 同款；不进 ModelSpec（精度是运行期配置，与 GPT 一致）。
+    PrecisionProfile precision;
 };
 
 // 默认 MNIST CNN（LeNet-5 风格）：
@@ -86,6 +90,9 @@ inline const std::vector<std::size_t> MNIST_CNN_FC = {120, 10};
         cfg.norm_place != NormPlace::Head && cfg.norm_place != NormPlace::Both)
         NN_FAIL("CNN: norm_place must be none/conv/head/both (final is ViT-only)");
     Model model(engine);
+    // 精度须在 add 之前注入（权重/梯度按 param 精度创建，见 Model 的
+    // set_default_precision_profile 注释）；默认全 F32 → 历史逐位不变。
+    model.set_default_precision_profile(cfg.precision);
     std::size_t c = cfg.in_channels;
     std::size_t h = cfg.in_size;
     std::size_t w = cfg.in_size;
@@ -226,11 +233,15 @@ inline const std::vector<std::size_t> MNIST_CNN_FC = {120, 10};
 }
 
 // ── 从 ModelSpec 构建 CNN 模型（用于从二进制文件加载时自动还原） ─────────
+// precision：模型级精度配置（P2-3）。**精度是运行期配置、不进 ModelSpec**
+//（与 GPT 一致：GptConfig::precision 同样只在构建期传）——由调用方显式给。
 [[nodiscard]] inline Result<Model> build_cnn_model_from_spec(
-    ComputeEngine& engine, const ModelSpec& spec)
+    ComputeEngine& engine, const ModelSpec& spec,
+    const PrecisionProfile& precision = PrecisionProfile{})
 {
     auto cfg_r = cnn_config_from_spec(spec);
     NN_TRY_CHECK(cfg_r);
+    cfg_r->precision = precision;
     auto model = build_cnn_model(engine, *cfg_r);
     if (model)
         model->set_spec(spec);  // 记录架构规格，供 load_model 校验
