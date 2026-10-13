@@ -133,8 +133,8 @@ P2 = 3–6 月的结构优化；P3 = 择机（trigger 未到就不排期）。
 | 期 | 项数 | 项目 | 共同前置 |
 |---|---|---|---|
 | **P0** | 5 | CI 真跑测试、文档一致性回正、BatchNorm 禁止静默回落（**✅ 已完成**）、CMake install/export + presets、推理采样 top-k/top-p | 无（P0-1 是所有人的前置） |
-| **P1** | 6 | `text_train` 模块化、checkpoint 优化器状态、危险精度组合 fail-fast、`gpt_test` flaky、CI 冒烟扩 MSVC Debug、**自定义层使用文档 + 精度自检**（P1-6） | P0-1；P1-6 无依赖 |
-| **P2** | 8 | `.bin` 校验和、Adafactor、RAPT/CNN f16、Dataset/DataLoader、Python/C 绑定、GUI 两项、header 拆分、F16C | P0-1；P2-7 另需 P1-5；P2-6 另需 P0-5 |
+| **P1** | 6 | `text_train` 模块化、checkpoint 优化器状态、危险精度组合启动期告警（细则见 [`24`](24-f16-training-defects.md)）、`gpt_test` flaky、CI 冒烟扩 MSVC Debug、**自定义层使用文档 + 精度自检**（P1-6） | P0-1；P1-6 无依赖 |
+| **P2** | 9 | `.bin` 校验和、Adafactor、RAPT/CNN f16、Dataset/DataLoader、Python/C 绑定、GUI 两项、header 拆分、F16C、**step 内固定 I/O 开销（P2-9）** | P0-1；P2-7 另需 P1-5；P2-6 另需 P0-5 |
 | **P3** | 8 | 由 §6 触发条件启动（含 CUDA、分布式） | 各自触发条件 |
 
 **串行约束（不可并行推进的组合）**：
@@ -155,9 +155,9 @@ P2 = 3–6 月的结构优化；P3 = 择机（trigger 未到就不排期）。
 | **P0-4 CMake install/export + CMakePresets** ⚡ **嵌入路径已完成（用户裁定拆分）** | **已实施**：门面目标 `neuralnet::nn`（`add_subdirectory` + 一行 link + 一个 include 即用；C++26/线程/`NN_HAS_VULKAN`/SPIR-V 头/Vulkan/shader 顺序全经接口传递）、`NN_ENABLE_GPU=AUTO\|ON\|OFF`、`NN_BUILD_APPS` 嵌入默认 OFF、`nn_enable_gpu_fusion` 树外可用（`NN_LIB_SOURCE_DIR/BINARY_DIR` CACHE 跨作用域 + GPU 不可用时 stub 报错）、消费方编译选项（`-Wno-pass-failed`/`-fexperimental-library`/`/utf-8`）随门面传递；样例 `examples/downstream/`（CPU/GPU 双路径实测通过）+ 指南 `docs/usage/05-consume-as-library.md`。**剩余**：`install()`/`find_package(neuralnet.cpp)`（用户裁定本轮不做）；`CMakePresets.json` ✅ 已于 2026-10-11 落地（`cmake --preset dev/portable/cpu/probes`，历史记录见 `docs/history/history.md` 的 presets 条） | 嵌入口径 ✅：干净构建目录里 `cmake -S examples/downstream` CPU 与 GPU（`NN_ENABLE_GPU=ON`）两路径均编译、链接、运行通过（GPU 路径含 scan 收集 91 条 = 库内口径），fusion 树外调用可用；install 口径待剩余部分 | 已完成（嵌入）/ 小–中（剩余） | P0-1（preset 需进 CI 才不腐化） |
 | **P0-5 推理采样 top-k / top-p + 多轮对话闭环** | 采样器支持 top-k / top-p 截断与重复惩罚；`text_infer` 暴露对应开关；GUI GPT 推理 Tab 支持多轮上下文 | 同 prompt 在 top-k / top-p 下输出可复现（同 seed）；多轮对话示例可连续交互 N 轮不丢上下文 | 中 | 无。命名冲突提醒：`--topk` 属 `mnist_infer`（`src/mnist_infer.cpp:44`），`--top` 属 `tokenizer_infer`（`src/tokenizer_infer.cpp:46`）；`text_infer` 两者都没有，新开关命名不得与它们冲突 |
 
-> **口径说明（与本文 §4 前置清单的差异）**：任务书前置清单同时把"危险精度组合 fail-fast"
-> 列在 P0；按裁定台账（§5 与 §6）该项归 **P1**，理由是它需要先定"报错还是禁用"的语义。
-> 本文以裁定台账为准，不重复排期。
+> **口径说明（与本文 §4 前置清单的差异）**：任务书前置清单把"危险精度组合 fail-fast"列在 P0；
+> 该项归 **P1**，且口径已定为**仅告警**（不退出、不加确认开关）——细则与验收一律见
+> [`24-f16-training-defects.md`](24-f16-training-defects.md) §2.3 / §5 F1。本文以裁定台账为准，不重复排期。
 
 ### 4.2 P1（1–2 月：能力与健壮性）
 
@@ -165,7 +165,7 @@ P2 = 3–6 月的结构优化；P3 = 择机（trigger 未到就不排期）。
 |---|---|---|---|---|
 | **P1-1 `text_train` 模块化** | 抽 `train_loop` / `recovery` / `checkpoint` 模块；退出码语义修正（保存失败不得成功退出） | 现有关键路径回归逐字节一致；新增恢复路径单测；`std::exit` 只在 CLI 参数解析层出现 | 中（1746 行文件拆解，34 处 `std::exit`） | 无，但它是 P1-2 的前置 |
 | **P1-2 checkpoint 优化器状态** | `.bin` 增加可选优化器状态段（Adam m/v，`MODEL_VERSION` 5 → 6）；`Optimizer` 基类加 `save_state/load_state`；恢复路径接线 | 老文件缺段 = 冷启动语义；save→load→save SHA256 逐字节一致；TDR 模拟重启后动量非零且 loss 轨迹连续 | 中 | **P1-1**（否则恢复逻辑继续膨胀） |
-| **P1-3 危险精度组合 fail-fast** | 启动期拒绝 `optimizer=f16` / 四字段全 f16 的组合，或明确要求显式确认开关（拟新增，名字待定） | 危险组合直接退出并打印原因；`--f16` 与合法 `--precision-*` 组合不受影响；新增 CLI 断言测试 | 小 | 无。依据 `docs/development/05-mixed-precision.md` §12.5 的实测结论 |
+| **P1-3 危险精度组合启动期告警** ✅ **已完成 2026-10-13** | **不单独定义**——需求、口径、验收一律引用 [`24-f16-training-defects.md`](24-f16-training-defects.md) §2.3 / §5 F1（口径：仅警告，不退出、不加确认开关）。**落地**：`include/neuralnet.cpp/cli/cli_precision_warning.hpp`（`nn::cli::dangerous_precision_warning`）+ `text_train`/`mnist_train` 调用点 + 门禁 `src/cli_precision_warning_test.cpp`（单测组合矩阵 + 子进程捕获 stderr 断言退出码不变） | 见 24 号台账 F1 验收口径 | 小 | 无 |
 | **P1-4 `gpt_test` flaky 定位** | 复现并消除偶发失败（或定位为已知资源边界并加显式 skip/重试语义） | 连续大样本直跑零失败；定位结论写入 `docs/history/history.md` | 小–中（复现成本不确定） | P0-1（需要 CI 反复跑才有样本） |
 | **P1-5 CI 冒烟扩到 MSVC Debug + 权重变化断言** | Debug 构建冒烟；训练 N 步后断言参数**确实变化**（防"loss 不动"类静默失败） | CI 中 MSVC Debug 目标编译通过；权重变化断言可检出冻结；大 TU 若触发 C1128 再出 `/bigobj` | 中 | P0-1。可复用 `f16_writeback_probe` 的"8 步 Adam 参数必须移动"思路 |
 | **P1-6 自定义层使用文档 + 精度自检**（文档部分 **✅ 已完成 2026-10-11**；精度自检 R2 仍 Open） | ① 文档：已落 `docs/development/write-a-custom-layer.md`（层骨架模板 + 可复制 gradcheck 片段 + 七条契约 + GPU checklist；示例层经数值梯度检查实测通过 `max|num−an| = 4.7e-06`、50 步 Adam 收敛）——落在 `development/` 而非原计划的 `usage/06`（该分册定位即"写自定义层"，见 `docs/README.md` §1.1）；② 代码（未做）：`Layer::init` NVI 处加"`profile.param == F16` ⇒ `parameters()` 全为 F16 存储"的统一自检 | 文档：按模板能写出可训练的自定义层（已由指南 §1/§3 的实测代码满足）；自检：C7 形态的硬编码 F32 层被启动期拒绝，新增断言测试 | 小 | 无。问题清单与逐条坐标见 `docs/development/20-custom-layer-ergonomics.md` §2，修复建议 §4（R1 已完成 / R2 待做） |
@@ -182,6 +182,7 @@ P2 = 3–6 月的结构优化；P3 = 择机（trigger 未到就不排期）。
 | **P2-6 GUI 声明式字段表 + 绘制节流** | dataclass 元数据自动生成 UI 行与 `collect_args`；画布 motion 按帧节流、dirty 标志跳过空帧 | 现有 Tab 参数零遗漏（`bench/gui_cli_audit.py` 退出码 0）；拖动帧率回升 | 小–中（两项同批） | P0-5（采样新开关先定型，避免二次改字段表） |
 | **P2-7 超大 header 拆分** | backend 拆 fence / staging / dispatch / 算子为独立 TU；`compute_vk_backend.hpp` 瘦身 | 拆分前后 build 全绿 + ctest 全绿 + CPU/GPU 字节锚逐位一致 | 中–大 | **前置 = 先补编译/链接期冒烟**（P0-1 + P1-5），否则拆分无回归网 |
 | **P2-8 F16C 半精度转换快路径** | `_cvtss_sh` 快路径 + 批量转换，替代纯软件位操作 | CPUID 探测 + `NN_ENABLE_NATIVE` ON/OFF 两态；`f16_cpu_probe` 全量对拍逐位一致 | 中 | **条件触发**（§6） |
+| **P2-9 训练 step 内固定 I/O 开销归因与消除** | `NN_PROFILE` 实测（850M，`d64/h4/L4/ff256/seq128/b8`，2026-10-13）：每步约 **20% step 墙钟在 `copy_from`**（`fwd.blk#3` 作用域内，**与精度无关**——f32/f16 同现）。疑似 CE 每步 `upload_span` 上传 labels/mask 走 `from_matrix → create_tensor + copy_from`，而 `copy_from`（`write`/`from_matrix` 的 GPU 路径）带**录制窗口 drain** 语义 → 每步多次打断 GPU 流水线。**先定位**（per-key 表 + 调用点 + drain 次数）再定方案（labels/mask 张量缓存复用 / 预分配 buffer / 不入 drain 的上传路径） | 定位到具体调用点与每步 drain 次数；消除后同口径 e2e step 时间下降，且数值/字节锚逐位不变 | 小–中 | 无（与 F4 重叠但**独立**——该开销与精度无关，见 [`24`](24-f16-training-defects.md) §4.4） |
 
 ### 4.4 P3（择机）
 
@@ -261,7 +262,7 @@ ZiPT 恢复、LRLA、CUDA、分布式。
 1. **CI 必须执行 ctest**：日志需出现 23 个用例；77 = skip 不算失败（P0-1）。
 2. **开发文档不得出现 ctest 计数的旧写法**：统一写实测 23（P0-2）。
 3. **BatchNorm 行为门禁**：构造 batchnorm 规格必须有可观测结果（报错或正确层），不允许静默降级（P0-3）。**✅ 已满足**：真层 + `batchnorm_test` 工厂断言。
-4. **危险精度组合门禁**：危险组合必须启动期失败（P1-3）。
+4. **危险精度组合**：启动期**告警**（仅警告、不失败、不改退出码）——口径与细则见 [`24-f16-training-defects.md`](24-f16-training-defects.md) §2.3 / §5 F1（P1-3）。
 5. **审计覆盖补强**：`bench/doc_align_audit.ps1` 的 [A] 需扩展到 markdown 链接目标（E8），或由 P0-2 直接修掉已知死链。
 
 ### 8.3 验收纪律
@@ -278,6 +279,13 @@ ZiPT 恢复、LRLA、CUDA、分布式。
    不覆盖的，由自动化测试兜底（新增断言测试优于文档数字）。
 4. **裁定要留反例**：凡"不做"必须写清触发条件或反例（如 H4 的 RAPT 残差相加），否则后人无法判断能否重新立项。
 5. **与 13 的关系已终结**：13 号文档已删除（内容全在本文与 `docs/history/history.md`），新增条目只进本文。
+
+### 8.5 大版本发布要求
+
+**大版本**升级（`1.x.y → 1.(x+1).0`，次版本号 +1、修订号归零）在常规门禁之上还要走一遍
+[`25-release-requirements.md`](25-release-requirements.md) 的必做清单：① 端到端模型训练测试
+（这类测试**不进默认 ctest**，太费时）；② 发布文档；③ 完整 ctest + **Debug** 构建；
+④ 多编译器 × 标准库（≥4 组）全新构建 + ctest。小 / 修订号升级不强制。
 
 ## 9. 仍然生效的工程教训（原 13 §9 承接）
 

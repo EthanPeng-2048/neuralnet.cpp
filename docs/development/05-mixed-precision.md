@@ -395,7 +395,7 @@ loss = ce.forward_sparse(engine, logits, labels, mask, vocab,
 
 （`stable` 可放宽为 F16，用户自担溢出风险，见 §12.4。）
 
-**注意区分**：`--f16` 只把 **param/compute** 设为 F16，stable/optimizer 留 F32；**四字段全 F16 实测不可用于训练**（optimizer=F16 状态下溢、stable=F16 时 CE 链 NaN，见 §12.5），仅供显式实验。同理 `--t1_58` 只把 **param** 换成三值（`T1_58` 只描述权重、不是存储精度）：compute/stable/optimizer 与 `--f16` 逐字段相同；字面"四槽全 f16 + 三值权重"= `--t1_58 --precision-stable f16 --precision-optimizer f16`。
+**注意区分**：`--f16` 只把 **param/compute** 设为 F16，stable/optimizer 留 F32；**四字段全 F16 实测不可用于训练**（`optimizer=F16` 状态下溢爆炸；`stable=F16` 的 CE 溢出**已修**、见 §12.5，但该配方仍因 optimizer 槽不可训练），仅供显式实验。同理 `--t1_58` 只把 **param** 换成三值（`T1_58` 只描述权重、不是存储精度）：compute/stable/optimizer 与 `--f16` 逐字段相同；字面"四槽全 f16 + 三值权重"= `--t1_58 --precision-stable f16 --precision-optimizer f16`。
 
 ---
 
@@ -520,7 +520,7 @@ loss = ce.forward_sparse(engine, logits, labels, mask, vocab,
 
 ### 12.4 已知限制（显式，写入用户预期）
 
-1. **无 loss scaling**：f16 范围 65504，f16 matmul 输出 / 大归约可能溢出 inf。`stable = F32` 把 loss / softmax / LayerNorm 移出 f16 是第一道防线；训练侧应监控 inf/nan；loss scaling 列 Phase 2。
+1. **无 loss scaling**：f16 范围 65504，f16 matmul 输出 / 大归约可能溢出 inf。`stable = F32` 把 softmax / LayerNorm 移出 f16 是第一道防线；训练侧应监控 inf/nan；loss scaling 列 Phase 2。**注**：CE 的 (1,1) loss 标量归约输出**已恒 F32**（2026-10-13；不再随 `stable` 落 f16——它是跨 `batch×seq` 的求和，量级 ∝ N，按 f16 落盘必溢出）。其它**聚合类标量**若按 f16 落盘需各自评估（同一条不变量：f16 只适合量级有界的中间量）。
 2. **CPU f16（无 f16 ISA）省内存不省时间**（逐元素 decode/encode 开销）。
 3. **跨设备 f16 容差内相等，不字节一致**（§11.2）——不要写"CPU f16 与 GPU f16 逐字节对拍"的测试。
 4. **bf16 / f64 未实现**，使用 → 清晰报错。
@@ -544,7 +544,8 @@ loss = ce.forward_sparse(engine, logits, labels, mask, vocab,
 **机制结论（当前有效）**
 
 - **边界 cast 的代价**：适配层对**每个**未命中变体的算子把 f16 入参抬成 f32 副本（再按 P 落回）。被 k 个算子读取的张量要 k 份 f32 副本——典型是 `(vocab, batch·seq)` 量级的 logits 被 loss 链读 4~6 次。**LM head 计算精度固定为 `stable`（F32）** → logits 与 f32 基线同构、loss 链零 cast。结论：**边界 cast 只能拿"存储减半"，拿不到"峰值下降"**（训练峰值由 transient 决定）——这是 in-kernel f16（§12.6 起）的存在理由；变体命中时不再走该路径（§11.1 三条路径）。
-- **数值结论（当前）**：GPU 上 `profile_f16`（param+compute f16）与 f32 **轨迹一致**——同初值/同超参 3.4776→3.1822 vs 3.4776→3.1803，最大相对偏差 **6e-4**（§7.2 语义成立）。**四字段全 f16（`profile_all_f16`）不可用于训练**：`optimizer=F16` 时 Adam 的 v≈g²~1e-10 下溢到 0 → 更新爆炸（loss 7.9→3.6e4）；`stable=F16` 时 CE 链 ~200 步 NaN；两者同时 f16 时 loss 恒定（更新被 f16 舍入吃光）。故 CLI `--f16` = `profile_f16()` = {param:F16, compute:F16, stable:F32, optimizer:F32}（§9.4）。
+- **数值结论（当前）**：GPU 上 `profile_f16`（param+compute f16）与 f32 **轨迹一致**——同初值/同超参 3.4776→3.1822 vs 3.4776→3.1803，最大相对偏差 **6e-4**（§7.2 语义成立）。**四字段全 f16（`profile_all_f16`）不可用于训练**：`optimizer=F16` 时 Adam 的 v≈g²~1e-10 下溢到 0 → 更新爆炸（loss 7.9→3.6e4）；两者同时 f16 时 loss 恒定（更新被 f16 舍入吃光）。故 CLI `--f16` = `profile_f16()` = {param:F16, compute:F16, stable:F32, optimizer:F32}（§9.4）。
+  **订正（2026-10-13）**：原记的「`stable=F16` 时 CE 链 ~200 步 NaN」**根因是 CE 的 (1,1) loss 归约按 `stable=f16` 落盘溢出**（大 token 数下 Σ≈ -log(vocab)·N 超 f16 上限 65504 → ±inf，进而 NaN），**已修**：`compute_loss.hpp` 两条链的 (1,1) 归约输出恒 F32。修复后 GPU `--precision-stable f16`（param/compute/stable f16）连跑 120 步健康（8208 vocab、seq 256、batch 8：6.9→5.76）。`optimizer=F16` 的爆炸**照旧**（不属本修）。详见 [`../todo/24-f16-training-defects.md`](../todo/24-f16-training-defects.md) §2.1/§3.1。
 - 边界 cast 期的分阶段实测 A/B 与探针数据（f32 3069 MiB / f16 4124 MiB 等）见 `docs/history/history.md`；**当前峰值数字见 §12.11**。
 
 **已知问题（当前）**

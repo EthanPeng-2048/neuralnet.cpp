@@ -538,9 +538,12 @@ inline constexpr PrecisionProfile profile_master_weights() noexcept
 // GPT d64/h4/L4/ff256、vocab 8208、seq 256、batch 8、adam lr 1e-3）：
 //   · optimizer=F16（Adam 的 m/v 存 f16）：v ≈ g² ~ 1e-10 **下溢到 0** →
 //     delta = lr·m/(√0+eps) 爆炸 → loss 从 7.9 发散到 3.6e4；
-//   · stable=F16：CE 链在 f16 下 ~200 步后出现 NaN（f16 范围 65504 / 10 位
-//     尾数不足以承载 vocab 级 log-sum-exp 与 log_softmax）；
-//   · 两者同时 F16（profile_all_f16）：loss 恒定在 32.1（更新被 f16 舍入吃光）。
+//   · stable=F16：CE 链曾在 f16 下 ~200 步后 NaN —— 根因是 CE 的 (1,1) loss
+//     归约**输出**按 stable 落盘、大 token 数下溢出 65504（**已修**：该标量
+//     输出恒 F32，见 compute_loss.hpp / docs 05 §12.5）。但 stable=F16 仍使
+//     softmax/LayerNorm 中间量走 f16（10 位尾数），收益有限、精度有损；
+//   · 两者同时 F16（profile_all_f16）：不可训练 —— optimizer 槽爆炸，且 f16
+//     参数的更新量常被舍入吃光（数值性冻结）。
 // 全四字段 f16 需要 loss scaling + in-kernel f16 归约（docs 05 §12.3），
 // 当前不具备 → 保留 profile_all_f16() 供显式实验，不作 CLI 默认。
 inline constexpr PrecisionProfile profile_f16() noexcept

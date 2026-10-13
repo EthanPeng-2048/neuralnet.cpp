@@ -2,7 +2,12 @@
 
 > **读者**：项目开发者（本仓内部工作文档）。本分册定位见 [`README.md`](README.md)；历史归档在 [`../history.md`](../history/history.md)。
 
-> 状态：**未修复（Open）** · 环境：Windows + clang++ 22（Release `-O3`）+ NVIDIA CMP 40HX（Vulkan）· HEAD `4a12876`
+> 状态：**✅ 已修复（2026-10-13）——根因订正：不是「loss 回读链」问题，而是 CE 的 (1,1) loss
+> 归约按 `stable=f16` 落盘溢出（详见 [`24`](24-f16-training-defects.md) §3.1）**。
+> 修复 = `compute_loss.hpp` 的 CE 稀疏/稠密两条链 (1,1) 归约输出恒 F32；回归用例
+> `f16_precision_test::test_ce_loss_stable_f16_no_overflow`。下文为原始报告（未删改，仅本行与
+> §0 表首行加订正标注）。
+> 原环境：Windows + clang++ 22（Release `-O3`）+ NVIDIA CMP 40HX（Vulkan）· HEAD `4a12876`
 > 发现途径：`docs/benchmarks/*-vulkan-vs-cuda.md`（Vulkan vs CUDA 基准文档）全量重跑（nn 侧）。本报告只记录事实与证据，不实施修复。
 > 关联：issue #13 P0-②（MSVC f16 权重冻结，3c2b9e8 已修，**本缺陷与之不同**）；`docs/development/05-mixed-precision.md` §12.5（四字段全 f16 历史即不可训练）。
 
@@ -10,11 +15,19 @@
 
 | 问题 | 结论 |
 |---|---|
-| 症状 | GPU + `--precision-stable f16` 时，`text_train` 打印的 loss **冻结为常数**（step 5–45 恒 `4.0137`），跨 epoch、跨数据集、跨进程逐位相同 |
+| 症状 | GPU + `--precision-stable f16` 时，`text_train` 打印的 loss **冻结为常数**（step 5–45 恒 `4.0137`），跨 epoch、跨数据集、跨进程逐位相同。**根因订正（2026-10-13）**：`4.0137 ≈ 65504/num_valid` = CE 的 (1,1) loss 归约按 `stable=f16` 落盘**饱和到 f16 上限**的表现（溢出/饱和与数据无关 → 逐位相同）；本机 850M 同口径则直接溢出为 `inf`。**不是**回读链读到陈旧值 |
 | 触发条件 | **仅 `stable=f16`**（GPU）；与 `optimizer` 字段无关；**CPU 同配置健康**；推荐路径 `--f16`（stable=f32）**完全健康** |
 | 权重是否冻结 | **没有**——同一次运行 epoch1-end vs epoch2-end 模型快照 63% 参数字节不同；冻结发生在 **loss 回读/报告链** |
 | 训练质量 | **无法验证**（loss 打印不可信，无 ground truth）；库级测试全绿但**不覆盖该配置**（见 §3） |
 | 与 bench 的关系 | §2「双方全 f16」主对比的 nn 侧 loss/稳定性数据失效（**计时数据仍有效**）；bench 改为 f32 优先，见基准文档 |
+
+> **订正与修复（2026-10-13）**：上面「冻结发生在 loss 回读/报告链」是**原始结论，已否定**。
+> 实际根因 = CE 的 (1,1) loss 和（≈ `-log(vocab)·token 数`）按 `p_.stable = F16` 落盘，大 token 数
+> 下超出 f16 上限 65504（部分硬件饱和为 f16 max → `4.0137`；本机 850M 溢出为 `inf`）。**回读路径
+> 本身正确**（`ce_fusion_test` 的「异步标量回读 vs 同步下载」用例、迭代 24 轮 > 槽位 8，持续通过）。
+> 修复 = `compute_loss.hpp` 两条 CE 链的 (1,1) 归约输出恒 F32；本机（850M）复测 `stable=f16`
+> 由 `inf` 转为正常下降（`9.0056 → 8.6922`），CPU/GPU 回归用例均通过。详见
+> [`24`](24-f16-training-defects.md) §2.1/§3.1 与 §5 的 F3。
 
 ## 1. 复现
 
@@ -93,6 +106,11 @@ bench/raw/f16_ep2.bin  (2,971,754 B)  ← epoch2 结束时
 | `f16_precision_test` 的 profile 单字段矩阵（`f16_precision_test.cpp:639-646`） | 覆盖 stable=f16，但仅含 `{F32,F32,F16,F32}` 单字段形态 | **① 只在 CPU 跑**（`main()` CPU 块，`f16_precision_test.cpp:691-700`）；**② 藏在 `NN_F16_DEBUG` 环境变量之后**，默认 ctest 不执行；**③ 无 param/compute=f16+stable=f16 组合形态** |
 
 ⇒ 缺口一句话：**「GPU + stable=f16（含全 f16）」没有任何自动化用例**——测试全绿与 bench 冻结因此可以并存。
+
+> **已补（2026-10-13，[`24`](24-f16-training-defects.md) §5 F2）**：`f16_precision_test` 的 profile
+> 组合矩阵补 `all=f16` 行、并入默认 ctest（CPU + GPU 两分支都跑）；另加
+> `test_ce_loss_stable_f16_no_overflow`（大 token 数下 `stable=f16` 的 CE loss 必须有限且与 f32
+> 参考一致）——正是本缺陷的回归用例。GPU 全量 ctest 43/43 通过。
 
 ## 4. 与已修缺陷的区分
 
