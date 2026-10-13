@@ -34,15 +34,17 @@ bool cnn_all_finite(const nn::Matrix& m)
 int main(int argc, char* argv[])
 {
     bool use_gpu = false;
+    bool use_f16 = false;
     std::size_t steps = 20;
     for (int i = 1; i < argc; ++i)
     {
         const std::string a = argv[i];
         if (a == "--gpu") use_gpu = true;
+        else if (a == "--f16") use_f16 = true;
         else if (a == "--steps" && i + 1 < argc) steps = static_cast<std::size_t>(std::atoi(argv[++i]));
         else if (a == "--help")
         {
-            std::cout << "用法: cnn_smoke_test [--gpu] [--steps N]\n";
+            std::cout << "用法: cnn_smoke_test [--gpu] [--f16] [--steps N]\n";
             return 0;
         }
     }
@@ -63,9 +65,16 @@ int main(int argc, char* argv[])
     cfg.pool        = 2;
     cfg.convs       = {{4, 3, 1, 0}, {8, 3, 1, 0}};   // {out_channels, kernel, stride, padding}
     cfg.fc_dims     = {16, 10};                        // flatten(8) → 16 → 10
+    // P2-3：`--f16` 走 profile_f16()（Conv2D 权重/梯度按 param=f16 建，
+    // 融合算子按 compute=f16）
+    if (use_f16)
+    {
+        cfg.precision = nn::profile_f16();
+        std::cout << "精度: --f16（param/compute=f16）\n";
+    }
 
     auto spec = nn::make_cnn_spec(cfg.in_channels, cfg.in_size, cfg.pool, cfg.convs, cfg.fc_dims);
-    auto model_r = nn::build_cnn_model_from_spec(eng, spec);
+    auto model_r = nn::build_cnn_model_from_spec(eng, spec, cfg.precision);
     NN_EXIT(model_r, 1, "build_cnn_model_from_spec 失败: ");
     nn::Model& model = *model_r;
 
@@ -197,6 +206,8 @@ int main(int argc, char* argv[])
     NN_EXIT(optimizer, 1, "optimizer 创建失败\n");
 
     nn::CrossEntropyLoss ce;
+    if (use_f16)
+        ce.set_precision_profile(nn::profile_f16());
     nn::Scalar first_loss = 0, last_loss = 0;
     for (std::size_t step = 0; step < steps; ++step)
     {

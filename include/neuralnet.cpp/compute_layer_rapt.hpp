@@ -149,8 +149,11 @@ private:
     {
         const Scalar inv_dk = Scalar{1} / static_cast<Scalar>(dk);
         const Scalar eps = Scalar{1e-5};
-        // RV-02：分配失败原因直接上抛
-        NN_TRY(output_r, engine.try_create_tensor(BH * dk, seq));
+        // RV-02：分配失败原因直接上抛。
+        // P2-3：输出精度必须**与本函数内部的 DSL 求值精度一致**（`p_.compute`）
+        // ——此前默认 F32，而内部逐头 op 在 `--f16` 下产 f16 → `insert_rows`
+        // 的 dst/src 精度错配（dst 按自己精度选槽位，src 是另一种 → 断言）。
+        NN_TRY(output_r, engine.try_create_tensor(BH * dk, seq, p_.compute));
         Tensor output = std::move(*output_r);
         // rms_inv_out == nullptr（checkpoint 模式）：不收集逐头 1/rms 缓存，
         // backward 由 forward_recompute 重建；同时省掉 BH 次 GPU→CPU 下载。
@@ -166,11 +169,11 @@ private:
             // 的形态（GPU 侧会静默错值，见 GpuEngine::eval_expr_reduce 的显式
             // 拒绝）；1/dk、eps 由 RParam 承载 → 值不进 expr_spec_key。
             auto s = dsl::compute_reduce(engine,
-                dsl::col_reduce_sum(dsl::leaf(*x) * dsl::leaf(*x)), dk, seq);
+                dsl::col_reduce_sum(dsl::leaf(*x) * dsl::leaf(*x)), dk, seq, p_.compute);
             NN_TRY_CHECK(s);
             auto ri = dsl::compute(engine,
                 dsl::rsqrt(dsl::leaf(*s) * dsl::rparam(inv_dk) + dsl::rparam(eps)),
-                s->rows(), s->cols());
+                s->rows(), s->cols(), p_.compute);
             NN_TRY_CHECK(ri);
             if (rms_inv_out)
             {
@@ -179,7 +182,7 @@ private:
                     rms_v[bh * seq + t] = (*ri_v)[t];
             }
             auto n = dsl::compute(engine,
-                dsl::leaf(*x) * dsl::col_broadcast(*ri), dk, seq);
+                dsl::leaf(*x) * dsl::col_broadcast(*ri), dk, seq, p_.compute);
             NN_TRY_CHECK(n);
             NN_TRY(ins, engine.insert_rows(output, bh * dk, *n));
         }
@@ -202,8 +205,8 @@ private:
         std::size_t BH, std::size_t dk, std::size_t seq)
     {
         const Scalar inv_dk = Scalar{1} / static_cast<Scalar>(dk);
-        // RV-02：分配失败原因直接上抛
-        NN_TRY(output_r, engine.try_create_tensor(BH * dk, seq));
+        // RV-02：分配失败原因直接上抛（同前向：精度与内部 DSL 一致，P2-3）
+        NN_TRY(output_r, engine.try_create_tensor(BH * dk, seq, p_.compute));
         Tensor output = std::move(*output_r);
         for (std::size_t bh = 0; bh < BH; ++bh)
         {
@@ -213,17 +216,17 @@ private:
             // m = (1/dk) · col_reduce_sum(gy * y)  → (1, seq)
             // 归约与后处理分两步（原因同上：归约融合 shader 不支持归约后后处理）
             auto m_raw = dsl::compute_reduce(engine,
-                dsl::col_reduce_sum(dsl::leaf(*gy) * dsl::leaf(*y)), dk, seq);
+                dsl::col_reduce_sum(dsl::leaf(*gy) * dsl::leaf(*y)), dk, seq, p_.compute);
             NN_TRY_CHECK(m_raw);
             auto m = dsl::compute(engine,
                 dsl::leaf(*m_raw) * dsl::rparam(inv_dk),
-                m_raw->rows(), m_raw->cols());
+                m_raw->rows(), m_raw->cols(), p_.compute);
             NN_TRY_CHECK(m);
             // grad_x = (gy − m·y) · rms_inv：三式合一，单次遍历、无中间张量
             auto gx = dsl::compute(engine,
                 (dsl::leaf(*gy) - dsl::col_broadcast(*m) * dsl::leaf(*y))
                     * dsl::col_broadcast(*ri),
-                dk, seq);
+                dk, seq, p_.compute);
             NN_TRY_CHECK(gx);
             NN_TRY(ins, engine.insert_rows(output, bh * dk, *gx));
         }
@@ -408,10 +411,10 @@ public:
             NN_TRY(kr, pos_->apply_qk(engine, K, seq, false));
         }
         auto Qp = dsl::compute(engine,
-            dsl::max(dsl::leaf(Q), Scalar{0}), Q.rows(), Q.cols());
+            dsl::max(dsl::leaf(Q), Scalar{0}), Q.rows(), Q.cols(), p_.compute);
         NN_TRY_CHECK(Qp);
         auto Kp = dsl::compute(engine,
-            dsl::max(dsl::leaf(K), Scalar{0}), K.rows(), K.cols());
+            dsl::max(dsl::leaf(K), Scalar{0}), K.rows(), K.cols(), p_.compute);
         NN_TRY_CHECK(Kp);
 
         // O(L·d_k²) 运行态前缀和扫描（消除 O(L²) 得分矩阵物化）。
@@ -460,7 +463,7 @@ public:
         // den = q'·z + ε；out = num / den（逐元素链融合为单 kernel：num/(u+ε)）
         auto div_r = dsl::compute(engine,
             dsl::leaf(*BP_r) / (dsl::leaf(*u_r) + Scalar{1e-4}),
-            (*BP_r).rows(), (*BP_r).cols());
+            (*BP_r).rows(), (*BP_r).cols(), p_.compute);
         NN_TRY_CHECK(div_r);
         Tensor out_t = std::move(*div_r);
 
@@ -571,7 +574,7 @@ public:
         NN_TRY_CHECK(z2_r);
         auto z_inv_r = dsl::compute(engine,
             dsl::leaf(*z2_r) * dsl::rparam(Scalar{1} / static_cast<Scalar>(d_k_)),
-            z2_r->rows(), z2_r->cols());
+            z2_r->rows(), z2_r->cols(), p_.compute);
         NN_TRY_CHECK(z_inv_r); // z = [2)/dk
 
         // ── pass 1：主扫描，读出 B^T·g 和 r = g·(B·q) ────────────
@@ -592,19 +595,19 @@ public:
         const std::size_t cRows = (*u_r).rows(), cCols = (*u_r).cols();
         auto gnum_r = dsl::compute(engine,
             dsl::leaf(gcr) / (dsl::leaf(*u_r) + Scalar{1e-4}),
-            cRows, cCols);
+            cRows, cCols, p_.compute);
         NN_TRY_CHECK(gnum_r);
         auto scale_r = dsl::compute(engine,
             dsl::neg(dsl::leaf(*r_r))
                 / ((dsl::leaf(*u_r) + Scalar{1e-4}) * (dsl::leaf(*u_r) + Scalar{1e-4})),
-            cRows, cCols);
+            cRows, cCols, p_.compute);
         NN_TRY_CHECK(scale_r); // -r/den²（标量重复 dk 次）
 
         // ── gQ = B^T·gnum + scale·z（全链融合为单 kernel） ─────────────
         auto gQt_r = dsl::compute(engine,
             dsl::leaf(*BTR_r) / (dsl::leaf(*u_r) + Scalar{1e-4})
                 + dsl::leaf(*scale_r) * dsl::leaf(*z_inv_r),
-            cRows, cCols);
+            cRows, cCols, p_.compute);
         NN_TRY_CHECK(gQt_r);
         Tensor gQt = std::move(*gQt_r);
 
@@ -633,7 +636,7 @@ public:
             NN_TRY(suffix_sq_r, engine.slice_rows(*SZ_r, 0, BHdk));
             auto gk_r = dsl::compute(engine,
                 dsl::leaf(*gK_B_r) + dsl::leaf(*suffix_sq_r),
-                gK_B_r->rows(), gK_B_r->cols());
+                gK_B_r->rows(), gK_B_r->cols(), p_.compute);
             NN_TRY_CHECK(gk_r);
             gKt = std::move(*gk_r);
         }
@@ -643,7 +646,7 @@ public:
             // 归约步用 dsl::compute_reduce
             auto dB_sum_r = dsl::compute_reduce(engine,
                 dsl::row_reduce_sum(dsl::leaf(*dB_r)),
-                dB_r->rows(), dB_r->cols());
+                dB_r->rows(), dB_r->cols(), p_.compute);
             NN_TRY_CHECK(dB_sum_r);
             // Bb = row_broadcast(dB_sum)：单条表达式一次 dispatch 完成，
             // 不物化中间张量。
@@ -652,7 +655,7 @@ public:
             // （RParam，编译期无法被常量折叠掉）相加，使表达式合法且语义不变。
             auto Bb_r = dsl::compute(engine,
                 dsl::row_broadcast(*dB_sum_r) + dsl::rparam(Scalar{0}),
-                BHdk * d_k_, seq);
+                BHdk * d_k_, seq, p_.compute);
             NN_TRY_CHECK(Bb_r);
             auto SBc_r = engine.scan_suffix_outer(*Bb_r, Kp_cache_, V_re_cache_,
                                                   d_k_, num_heads_, false,
@@ -666,13 +669,13 @@ public:
             // dispatch，不物化 scale_q 中间张量）
             auto tsq_r = dsl::compute_reduce(engine,
                 dsl::row_reduce_sum(dsl::leaf(*scale_r) * dsl::leaf(Qp_cache_)),
-                BHdk, seq);
+                BHdk, seq, p_.compute);
             NN_TRY_CHECK(tsq_r);
             // gk = gK_B + row_broadcast(tsq)：单条表达式一次 dispatch 完成
             // （不物化中间张量）
             auto gk_r = dsl::compute(engine,
                 dsl::leaf(*gK_B_r) + dsl::row_broadcast(*tsq_r),
-                gK_B_r->rows(), gK_B_r->cols());
+                gK_B_r->rows(), gK_B_r->cols(), p_.compute);
             NN_TRY_CHECK(gk_r);
             gKt = std::move(*gk_r);
         }
@@ -681,12 +684,12 @@ public:
         auto gq_relu = dsl::compute(engine,
             dsl::select(dsl::leaf(Qp_cache_) > Scalar{0},
                         dsl::leaf(gQt), Scalar{0}),
-            gQt.rows(), gQt.cols());
+            gQt.rows(), gQt.cols(), p_.compute);
         NN_TRY_CHECK(gq_relu);
         auto gk_relu = dsl::compute(engine,
             dsl::select(dsl::leaf(Kp_cache_) > Scalar{0},
                         dsl::leaf(gKt), Scalar{0}),
-            gKt.rows(), gKt.cols());
+            gKt.rows(), gKt.cols(), p_.compute);
         NN_TRY_CHECK(gk_relu);
 
         // ── RoPE 反向（旋转正交，逆 = 反角；非 RoPE 策略 = 恒等）──────
@@ -763,10 +766,10 @@ public:
             NN_TRY(kr, pos_->apply_qk_step(engine, K, pos, false));
         }
         auto Qp = dsl::compute(engine,
-            dsl::max(dsl::leaf(Q), Scalar{0}), Q.rows(), Q.cols());
+            dsl::max(dsl::leaf(Q), Scalar{0}), Q.rows(), Q.cols(), p_.compute);
         NN_TRY_CHECK(Qp);
         auto Kp = dsl::compute(engine,
-            dsl::max(dsl::leaf(K), Scalar{0}), K.rows(), K.cols());
+            dsl::max(dsl::leaf(K), Scalar{0}), K.rows(), K.cols(), p_.compute);
         NN_TRY_CHECK(Kp);
         const std::size_t H = num_heads_;
         const std::size_t dk = d_k_;
@@ -775,7 +778,7 @@ public:
         // dsl::matmul(batch)：纯 {0,1} 结构（attention backward 已登记同 key）
         auto B_add_r = dsl::compute(engine,        // v·k'^T → (H*dk, dk)
             dsl::matmul(V, *Kp, false, true, H),
-            V.rows(), Kp->rows() / H);
+            V.rows(), Kp->rows() / H, p_.compute);
         NN_TRY_CHECK(B_add_r);
         { auto r = dsl::compute_into(engine,
               dsl::leaf(B_state) + dsl::leaf(*B_add_r), B_state);
@@ -788,7 +791,7 @@ public:
         // dsl::matmul(batch)：纯 {0,0} 结构（scan 手工登记同 key）
         auto num_r = dsl::compute(engine,
             dsl::matmul(B_state, *Qp, false, false, H),
-            B_state.rows(), Qp->cols());
+            B_state.rows(), Qp->cols(), p_.compute);
         NN_TRY_CHECK(num_r);
 
         // den = q'·z：逐头标量点积（通过宿主桥在 CPU 上计算，17 §3 D11；
@@ -815,7 +818,7 @@ public:
         // GPU 闭合世界可命中。
         auto out_r = dsl::compute(engine,
             dsl::leaf(*num_r) / (dsl::leaf(*den_t) + Scalar{1e-4}),
-            (*num_r).rows(), (*num_r).cols());
+            (*num_r).rows(), (*num_r).cols(), p_.compute);
         NN_TRY_CHECK(out_r);
         return w_o_.forward(*out_r);
     }
@@ -962,12 +965,14 @@ public:
     {
         ComputeEngine& engine = engine_ref();
         // 两个残差分支（与 GPTBlock/TransformerEncoderLayer 同骨架）。
-        // 残差相加历史上未传 profile（恒 F32）——显式传以保持逐位不变。
+        // P2-3：残差相加的精度实参改为 `p_.compute`（此前硬编码 F32）——
+        // 与 GPTBlock / TransformerEncoderLayer 同口径；默认 profile 的
+        // compute = F32 → 逐位不变，`--f16` 下残差走 f16 存储。
         auto r1 = prenorm_residual_forward_(engine, input, *norm1_, attn_,
-                                            Precision::F32);
+                                            p_.compute);
         NN_TRY_CHECK(r1);
         return prenorm_residual_forward_(engine, *r1, *norm2_, ff_,
-                                         Precision::F32);
+                                         p_.compute);
     }
 
     [[nodiscard]] Result<Tensor> backward(
@@ -980,10 +985,10 @@ public:
             NN_TRY(im, offloader_.import_activations(engine));
         }
         // 两处残差分流 + 子层反向（与 GPTBlock / TransformerEncoderLayer 同一骨架）。
-        // 残差相加历史上未传 profile（恒 F32）——显式传 Precision::F32 保持逐位不变。
+        // P2-3：精度实参改为 `p_.compute`（同前向；默认 profile 逐位不变）。
         return prenorm_residual_backward_(engine, grad_output,
                                           *norm1_, attn_, *norm2_, ff_,
-                                          Precision::F32);
+                                          p_.compute);
     }
 
     // 增量推理：单 token → norm1 → RLA-2 运行态注意力 → 残差 → norm2 → FFN → 残差
@@ -996,13 +1001,13 @@ public:
         NN_TRY(a, attn_.forward_step(engine, *n1, B_state, z_state, pos));
         auto r1 = dsl::compute(engine,
             dsl::leaf(input) + dsl::leaf(*a),
-            input.rows(), input.cols());
+            input.rows(), input.cols(), p_.compute);
         NN_TRY_CHECK(r1);
         NN_TRY(n2, norm2_->forward(*r1));
         NN_TRY(f, ff_.forward(*n2));
         return dsl::compute(engine,
             dsl::leaf(*r1) + dsl::leaf(*f),
-            r1->rows(), r1->cols());
+            r1->rows(), r1->cols(), p_.compute);
     }
 };
 
@@ -1092,11 +1097,11 @@ public:
     {
         // 初始化 token_emb_——M2 声明式：N(0, 0.02) 层算参数、引擎填数
         constexpr Scalar emb_init_std = 0.02;
-        token_emb_ = engine.create_tensor(vocab_size_, d_model_, Precision::F32,
+        token_emb_ = engine.create_tensor(vocab_size_, d_model_, p_.param,
                                           InitSpec::normal(0, emb_init_std, kInitSeed));
         if (!token_emb_.valid())
             NN_FAIL("RAPTModel: token_emb 初始化失败");
-        grad_token_emb_ = engine.create_tensor(vocab_size_, d_model_, Precision::F32,
+        grad_token_emb_ = engine.create_tensor(vocab_size_, d_model_, p_.param,
                                                InitSpec::zero());
         if (!grad_token_emb_.valid())
             NN_FAIL("RAPTModel: token_emb 梯度缓冲初始化失败");

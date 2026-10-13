@@ -144,15 +144,16 @@ public:
         const std::size_t fan_in = in_channels_ * kernel_ * kernel_;
 
         // ── 声明式初始化（M2，17 §4.4）：He 风格均匀分布，层算 limit、引擎
-        // 填数。参数/梯度精度保持 F32（与原 from_matrix 默认口径一致）。
+        // 填数。参数/梯度精度 = `p_.param`（P2-3：此前硬编码 F32，导致 Conv2D
+        // 在 `--f16` 下权重仍是 f32；默认 profile 的 param = F32 → 逐位不变）。
         const Scalar limit = std::sqrt(6.0 / static_cast<Scalar>(fan_in + out_channels_));
-        w_ = engine.create_tensor(out_channels_, fan_in, Precision::F32,
+        w_ = engine.create_tensor(out_channels_, fan_in, p_.param,
                                   InitSpec::uniform(-limit, limit, kInitSeed));
         if (!w_.valid()) NN_FAIL("Conv2D: 权重初始化失败");
-        b_ = engine.create_tensor(out_channels_, 1, Precision::F32, InitSpec::zero());
+        b_ = engine.create_tensor(out_channels_, 1, p_.param, InitSpec::zero());
         if (!b_.valid()) NN_FAIL("Conv2D: 偏置初始化失败");
-        grad_w_ = engine.create_tensor(out_channels_, fan_in, Precision::F32, InitSpec::zero());
-        grad_b_ = engine.create_tensor(out_channels_, 1, Precision::F32, InitSpec::zero());
+        grad_w_ = engine.create_tensor(out_channels_, fan_in, p_.param, InitSpec::zero());
+        grad_b_ = engine.create_tensor(out_channels_, 1, p_.param, InitSpec::zero());
         if (!grad_w_.valid() || !grad_b_.valid())
             NN_FAIL("Conv2D: 梯度缓冲初始化失败");
         return {};
@@ -199,7 +200,7 @@ public:
         //    matmul_with_bias 同一结构）。
         auto Z = dsl::compute(engine,
             dsl::matmul(w_, *col, false, false) + dsl::row_broadcast(b_),
-            out_channels_, batch * P);
+            out_channels_, batch * P, p_.compute);
         NN_TRY_CHECK(Z);
 
         // 3) 布局转换 (C_out, P*B) → (C_out*P, B)（rearrange_3d + gather 置换）
@@ -239,7 +240,8 @@ public:
         // 3) grad_b += row_reduce_sum(gZ) → (C_out, 1)（对全部位置与样本求和）
         //    归约步用 dsl::compute_reduce、累加步用 dsl::compute_into（同 Linear）
         auto gb = dsl::compute_reduce(engine,
-            dsl::row_reduce_sum(dsl::leaf(*gZ)), gZ->rows(), gZ->cols());
+            dsl::row_reduce_sum(dsl::leaf(*gZ)), gZ->rows(), gZ->cols(),
+            p_.compute);
         NN_TRY_CHECK(gb);
         auto r2 = dsl::compute_into(engine,
             dsl::leaf(grad_b_) + dsl::leaf(*gb), grad_b_);
@@ -249,7 +251,7 @@ public:
         //    纯 matmul 段由 dsl::compute 直写（scan 的 Conv2D backward dry-run 自动登记）
         auto gcol = dsl::compute(engine,
             dsl::matmul(w_, *gZ, true, false),
-            w_.cols(), gZ->cols());
+            w_.cols(), gZ->cols(), p_.compute);
         NN_TRY_CHECK(gcol);
         return engine.col2im(*gcol, in_channels_, in_h_, in_w_,
                              kernel_, stride_, padding_, out_h_, out_w_);
