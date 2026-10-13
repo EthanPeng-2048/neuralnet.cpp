@@ -630,32 +630,101 @@ void test_f16_model_e2e(nn::ComputeEngine& raw, nn::ComputeEngine& eng)
     }
 }
 
-// ── 8. NN_F16_DEBUG：profile 单字段矩阵诊断（CPU f16 发散定位用）────────
-// 逐字段拆开跑同一个小 GPT：哪个字段单独开就 NaN，根因就在该字段触达的路径。
-void debug_profile_matrix(nn::ComputeEngine& eng)
+// ── 8. profile 组合矩阵：默认门禁廉价断言 + NN_F16_DEBUG 逐阶段诊断 ───────
+// 逐字段拆开跑同一个小 GPT（初值/数据/步数全固定 → 确定性）。cases 含此前缺失的
+// 「全 f16」= {F16,F16,F16,F16}（docs/todo/24 §2.4 覆盖缺口 / §5 F2）：
+//   · 健康组合（f32 / param / compute / stable / --f16）：loss 全程有限且末步不高于首步；
+//   · 危险组合（opt=f16 / 全 f16，24 §2 已定位机制）：只断言"能跑完"——数值形态由
+//     机制说明 + 下方轨迹打印披露，**不作健康断言**（否则 F5 修好它们时本测试反红）。
+// 默认（verbose=false）在 CPU 与 GPU 两分支都跑：廉价断言进默认门禁；NN_F16_DEBUG
+// 时 verbose=true 额外逐阶段扫描首个非有限值（f16 发散定位用）。
+void run_profile_matrix(nn::ComputeEngine& eng, bool verbose)
 {
     using P = nn::Precision;
-    struct Case { const char* name; nn::PrecisionProfile prof; };
+    struct Case { const char* name; nn::PrecisionProfile prof; bool healthy; };
     const Case cases[] = {
-        {"f32",       nn::profile_f32()},
-        {"param=f16", {P::F16, P::F32, P::F32, P::F32}},
-        {"compute=f16", {P::F32, P::F16, P::F32, P::F32}},
-        {"stable=f16", {P::F32, P::F32, P::F16, P::F32}},
-        {"opt=f16",   {P::F32, P::F32, P::F32, P::F16}},
-        {"f16(CLI)",  nn::profile_f16()},
+        {"f32",         nn::profile_f32(),                 true},
+        {"param=f16",   {P::F16, P::F32, P::F32, P::F32},  true},
+        {"compute=f16", {P::F32, P::F16, P::F32, P::F32},  true},
+        {"stable=f16",  {P::F32, P::F32, P::F16, P::F32},  true},
+        {"opt=f16",     {P::F32, P::F32, P::F32, P::F16},  false},
+        {"all=f16",     nn::profile_all_f16(),             false},
+        {"f16(CLI)",    nn::profile_f16(),                 true},
     };
     const char* saved = g_label;
     for (const auto& c : cases)
     {
         g_label = c.name;
-        const auto r = train_tiny_gpt(eng, c.prof, 20, 3e-3f, /*verbose=*/true);
+        const auto r = train_tiny_gpt(eng, c.prof, 20, 3e-3f, verbose);
         std::printf("  [dbg %-11s] ok=%d traj:", c.name, r.ok ? 1 : 0);
         for (std::size_t i = 0; i < r.losses.size(); ++i)
             std::printf(" %.4f", r.losses[i]);
         std::printf("\n");
         std::fflush(stdout);
+
+        // 每个组合都必须"跑得完"（引擎算子可用 / 闭世界不 miss）
+        CHECK(r.ok, (std::string("profile 组合 ") + c.name + " 训练应能跑完").c_str());
+        // 健康组合：loss 全程有限且末步不高于首步（低容差）
+        if (c.healthy && !r.losses.empty())
+        {
+            bool all_finite = true;
+            for (double v : r.losses)
+                if (!std::isfinite(v)) all_finite = false;
+            CHECK(all_finite,
+                  (std::string("profile ") + c.name + " 健康组合 loss 必须全程有限").c_str());
+            CHECK(r.losses.back() <= r.losses.front(),
+                  (std::string("profile ") + c.name + " 健康组合 loss 不应上升").c_str());
+        }
     }
     g_label = saved;
+}
+
+// ── 9. CE loss 标量归约在 stable=f16 下不得溢出（docs/todo/24 §2 / 14 号台账）──
+// 大 token 数下 Σ log_prob ≈ -log(vocab)·N 会远超 f16 上限 65504。若 loss_sum
+// 的 (1,1) 归约**输出**按 stable=f16 落盘 → ±inf，打印的 loss 恒为 inf / 常数
+// （14 号台账 GPU stable=f16「回读冻结 4.0137」= 该溢出在部分硬件上饱和为 f16
+// 上限的表现）。修复后该标量输出恒 F32：有限且与 f32 参考一致。
+//
+// 设计：每 token 的损失项保持在 f16 可表示范围内（logits∈[-2,2]、lse≈ln(C)），
+// 只让**求和**越过 65504 —— 从而把「输出溢出」与「元素级溢出」区分开。
+void test_ce_loss_stable_f16_no_overflow(nn::ComputeEngine& eng)
+{
+    constexpr std::size_t C = 100;      // 词表：lse ≈ ln(100) ≈ 4.6
+    constexpr std::size_t N = 20000;    // token：Σ ≈ -4.6·20000 ≈ -92000 > 65504
+    nn::Matrix logits(C, N);
+    std::mt19937 rng(777);
+    std::uniform_real_distribution<float> dist(-2.0f, 2.0f);
+    for (std::size_t r = 0; r < C; ++r)
+        for (std::size_t c = 0; c < N; ++c)
+            logits.set_value_unchecked(r, c, dist(rng));
+    std::vector<std::size_t> labels(N);
+    for (std::size_t i = 0; i < N; ++i)
+        labels[i] = rng() % C;
+
+    auto t = eng.from_matrix(logits);
+    CHECK(t.has_value(), "ce-f16-overflow: from_matrix(logits)");
+    if (!t) return;
+
+    nn::CrossEntropyLoss ce32;
+    ce32.set_precision_profile(nn::profile_f32());
+    auto ref = ce32.forward_sparse(eng, *t, labels, {}, C);
+    CHECK(ref.has_value(), "ce-f16-overflow: f32 参考 forward_sparse");
+    if (!ref) return;
+
+    nn::CrossEntropyLoss ce16;
+    ce16.set_precision_profile({nn::Precision::F32, nn::Precision::F32,
+                                nn::Precision::F16, nn::Precision::F32});
+    auto got = ce16.forward_sparse(eng, *t, labels, {}, C);
+    CHECK(got.has_value(), "ce-f16-overflow: stable=f16 forward_sparse");
+    if (!got) return;
+
+    std::fprintf(stderr, "    [%s] ce loss: f32 %.4f ; stable=f16 %.4f\n",
+                 g_label, static_cast<double>(*ref), static_cast<double>(*got));
+    CHECK(std::isfinite(static_cast<double>(*got)),
+          "stable=f16 的 loss 必须有限（(1,1) 归约输出不得落 f16 溢出为 ±inf）");
+    CHECK(std::fabs(static_cast<double>(*got) - static_cast<double>(*ref)) <=
+              0.02 * std::fabs(static_cast<double>(*ref)) + 1e-3,
+          "stable=f16 的 loss 与 f32 参考一致（<2%）");
 }
 
 void run_suite(const char* label, nn::ComputeEngine& raw, nn::ComputeEngine& adapter,
@@ -679,6 +748,10 @@ void run_suite(const char* label, nn::ComputeEngine& raw, nn::ComputeEngine& ada
     }
     // Layer/Model 级：CPU/GPU 都跑（结构均来自已登记的 Layer 表达式）
     test_f16_model_e2e(raw, adapter);
+    // profile 组合矩阵（含全 f16）：廉价断言进默认门禁，CPU/GPU 都跑
+    run_profile_matrix(adapter, /*verbose=*/false);
+    // stable=f16 下 CE loss 标量归约不得溢出（14 号台账 GPU 冻结真因）
+    test_ce_loss_stable_f16_no_overflow(adapter);
 }
 
 } // namespace
@@ -694,8 +767,8 @@ int main()
         run_suite("cpu", cpu, adapter, /*allow_arbitrary_expr=*/true);
         if (env_flag("NN_F16_DEBUG"))
         {
-            std::printf("── NN_F16_DEBUG: CPU profile 单字段矩阵 ──\n");
-            debug_profile_matrix(adapter);
+            std::printf("── NN_F16_DEBUG: CPU profile 组合矩阵（逐阶段扫描）──\n");
+            run_profile_matrix(adapter, /*verbose=*/true);
         }
     }
 

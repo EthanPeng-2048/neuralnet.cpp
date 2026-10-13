@@ -20,7 +20,7 @@
 - [GPU 后端与 GPU 引擎（backend/*, compute_gpu_engine.hpp）](#GPU 后端与 GPU 引擎（backend/*, compute_gpu_engine.hpp）)（17 条）
 - [注意力 / ZiPT / Transformer / FeedForward 层](#注意力 / ZiPT / Transformer / FeedForward 层)（16 条）
 - [RAPT / CNN / MLP / Softmax / GPT 层](#RAPT / CNN / MLP / Softmax / GPT 层)（13 条）
-- [引擎接口 / CPU 引擎 / 精度 / 张量 / 损失 / 优化器](#引擎接口 / CPU 引擎 / 精度 / 张量 / 损失 / 优化器)（21 条）
+- [引擎接口 / CPU 引擎 / 精度 / 张量 / 损失 / 优化器](#引擎接口 / CPU 引擎 / 精度 / 张量 / 损失 / 优化器)（22 条）
 - [代数层 / 基础设施 / 模型容器与序列化](#代数层 / 基础设施 / 模型容器与序列化)（15 条）
 - [领域模型工厂与 CLI 公共头](#领域模型工厂与 CLI 公共头)（3 条）
 - [src 应用入口（text/mnist/tokenizer/bench）](#src 应用入口（text/mnist/tokenizer/bench）)（5 条）
@@ -693,6 +693,12 @@ GPU 后端 / GPU 引擎头文件「历史状态类注释」摘录。整改原则
 - **保留形参（＝15 §3.3 "Layer 之后"的两档，本轮裁定不动，见 17 §8）**：`Loss::forward/forward_sparse`（**Loss 没有天然绑定时机**：默认构造、`zipt_consistency_test` 里同一作用域并存 `ce_cpu/ce_gpu` 两个引擎——要删须先裁定构造签名 `CrossEntropyLoss(engine)` 或 `Loss::bind`）；DSL 入口（15 明确保留）；`PositionEncoder`/`RotaryEmbedding`（`apply/apply_step/backward`）、`ActivationOffloader`、`nn_dbg_scan` 与层内私有 helper（由方法体的局部 `engine` 转传，签名不动）。
 - **验收**（本机 Debug+Ninja+clang）：① build 122/122 零告警（`-Werror`）；② ctest 20/20；③ **`NN_BIND_DEBUG=1 ctest` 20/20（门禁）**；④ CPU `--steps 20` hash=`6f8849f14da23110` **逐位不变**；⑤ **GPU dev2 hash=`8ef51b2927253c50` 逐位不变**（`engine_ref()` 只是绑定读取，不进数值路径）；⑥ `--init-hash` 六模型与 M2 锚全同（`a22e807ee05ec3ac`/`4020958a14160bbd`/`04a72d865624042a`/`8efa936ac5c8c9b2`/`f90bf8c8783c2f89`/`b037632f75b7159c`）；⑦ scan 双 hash 不变（`expr_specs.bin`=bdc3a442…a58360、`fused_registry.hpp`=7a10412c…——**dry-run 收集的是表达式结构，与引擎绑定无关**）；⑧ `--io-roundtrip` CPU+GPU PASS；⑨ L2 分层审计 0。
 - **性能 A/B（配对 + 逆序复测，M2 同款方法）**：pre = `git worktree add` @ `4ce5884` 独立构建 layer_bench，feedforward/swiglu/linear 各 4 轮 PRE/POST 交错：feedforward fwd/train **+4.1%/+4.5%**、swiglu -0.7%/+0.9%、linear fwd **+8.5%**/train +3.8%（linear fwd 为 0.8ms 亚毫秒项）。**逆序复测**（POST 先跑，3 轮）：feedforward **-0.7%/+0.4%**、linear +5.6%/-6.9% → 正序的 +4% 系**运行窗口/机器状态**（同窗 PRE 绝对值本身较上一轮高约 18%）与 -O0 二进制重排所致，**方向混合、无系统性回退**。
+
+## CE 的 (1,1) loss 归约输出恒 F32——修 `stable=f16` 溢出（2026-10-13，原位置 include/neuralnet.cpp/compute_loss.hpp 的 `softmax_cols_`/`forward`(步骤4+5)/`fused_forward_sparse_`）
+- 类型：bug 根因 / 已修复勘误（[`docs/todo/24`](../todo/24-f16-training-defects.md) §2.1/§3.1/§5 的 F2/F3；[`docs/todo/14`](../todo/14-f16-stable-gpu-loss-frozen.md)）
+- 内容：`CrossEntropyLoss` 的两条链都把最终 **(1,1) loss 和**按 `p_.stable` 落盘。该标量 = 跨 `batch×seq` 的 log_prob 求和（≈ `-log(vocab)·token 数`），**大 token 数下必然超 f16 上限 65504**：部分硬件溢出为 ±inf，部分饱和为 f16 max。**这就解释了 14 号台账的 GPU `stable=f16`「loss 恒 4.0137」**——`4.0137 ≈ 65504/num_valid`，饱和值与权重/数据无关，故「跨 epoch/数据集/进程逐位相同」；原报告归因的「loss 回读链（`cast`/异步槽位读陈旧）」**被否定**（`ce_fusion_test` 的「异步标量回读 vs 同步下载」用例、迭代 24 轮 > 槽位 8，持续通过）。**修法**：两条链的 (1,1) 归约 `Precision::F32`（归约内部本就恒 f32 累加，输出改 F32 即得正确值；调用方随后本就 `cast` 到 F32 回读，等于顺手去掉一次 cast）。**触发范围 = 大 token 数**（本机 GPU 实测：`seq128×b8`=1024 token 健康；`seq256×b32`=8192 token 时 `stable=f16` 打印 `inf`、`stable=f32` 正常 9.0→8.7；修复后 `stable=f16` 9.0056→8.6922 正常下降）。
+- **不变量**：f16 存储的**聚合标量**（跨 N 个元素求和、量级 ∝ N）不得按 f16 落盘；f16 只适合量级有界的逐元素/归一化中间量（`col_sum`/`log_softmax`/`lse` 保持 `p_.stable` 不变）。`optimizer=f16` 的爆炸（Adam 二阶矩下溢）与四字段全 f16 的数值性冻结**不属本修**——仍由 24 §2.3 的启动期告警覆盖（F1），根治留给 F5。
+- **验收**：本机 CPU（build-ab，Release+tests）ctest **41/41**；本机 GPU（build/gpu，Release+tests+probes+850M/Intel）ctest **43/43**（含全部 `*_gpu` 变体与 `ce_fusion_test`）。新增回归：`f16_precision_test` 的 profile 组合矩阵（补 `all=f16` 行、提为默认门禁、CPU+GPU 都跑）+ `test_ce_loss_stable_f16_no_overflow`（`C=100,N=20000`，CPU/GPU 实测 `f32 5.1876 = stable=f16 5.1876`）。
 
 ---
 

@@ -43,6 +43,7 @@
 | [`08-pitfalls-and-lessons.md`](08-pitfalls-and-lessons.md) | **踩坑警示录，改代码前读**：分级 bug 与跨领域根因模式 |
 | [`14-f16-stable-gpu-loss-frozen.md`](14-f16-stable-gpu-loss-frozen.md) | **未修故障报告**：GPU `--precision-stable f16` 训练 loss 打印冻结（权重不冻结）——触发矩阵、覆盖缺口、证据 |
 | [`24-f16-training-defects.md`](24-f16-training-defects.md) | **f16 训练缺陷台账**：全 f16 NaN（`stable=f16` CE 溢出 + `optimizer=f16` 二阶矩下溢）、loss 冻结（GPU 回读 `14` + 数值泛化）、`--f16` 降速——含报告核对与立项 F1–F5 |
+| [`25-release-requirements.md`](25-release-requirements.md) | **大版本发布要求**（`1.x.y → 1.(x+1).0`）：端到端模型训练测试 / 发布文档 / 完整 ctest + Debug 构建 / 多编译器 × 标准库矩阵 |
 
 ## 相关（相邻分册 / 总档）
 

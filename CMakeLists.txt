@@ -604,6 +604,12 @@ if(NN_BUILD_APPS OR NN_ENABLE_TESTS)
     nn_add_executable(assert_always_test src/assert_always_test.cpp)
     list(APPEND NN_TEST_TARGETS assert_always_test)
 
+    # ── F1：危险精度组合启动期告警（仅警告，不拒绝；docs/todo/24 §2.3）────
+    # [1][2] 头文件函数组合矩阵（含 all=f16）单测；[3] 子进程跑 text_train/
+    # mnist_train，捕获 stderr 断言告警出现 + 退出码不变；二进制缺失 → 77 = SKIP
+    nn_add_executable(cli_precision_warning_test src/cli_precision_warning_test.cpp)
+    list(APPEND NN_TEST_TARGETS cli_precision_warning_test)
+
     # ── RV-04 优化器元数据表（唯一真源 ↔ 工厂）+ RV-03 同目标写序回归 ──────
     # [1] 表内每个 name 都能被 create_optimizer 构造、名单文本与表一致；
     # [2] AdamW（wd≠0）单步 vs 手写参考 + 顺序对调的负例；

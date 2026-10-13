@@ -23,6 +23,7 @@
 #include <neuralnet.cpp/cli/cli_lr_scheduler.hpp>
 #include <neuralnet.cpp/cli/cli_mnist_io.hpp>
 #include <neuralnet.cpp/cli/cli_train_common.hpp>
+#include <neuralnet.cpp/cli/cli_precision_warning.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -537,6 +538,13 @@ nn::ModelSpec build_spec(const TrainConfig &cfg)
 int main(int argc, char *argv[])
 {
     TrainConfig cfg = parse_args(argc, argv);
+
+    // ── 危险精度组合启动期告警（仅警告，不拒绝；docs/todo/24 §2.3 F1）────
+    // optimizer=f16（含四字段全 f16）只打印一次到 stderr：不改变退出码、不阻断
+    // 训练、不静默降级；`--f16` 与合法组合返回空串（静默）。
+    if (const std::string warn = nn::cli::dangerous_precision_warning(cfg.precision);
+        !warn.empty())
+        std::cerr << warn;
 
     // ── 构建规格 ─────────────────────────────────────────────
     nn::ModelSpec spec = build_spec(cfg);
