@@ -258,7 +258,14 @@ vs f32 的 K 切分 25 ms/块**（占该机 f16 全部残差；配对旁证 `NN_
 - **验收**：`layer_bench --op matmul --f16` ≤ f32（**850M 上**）；40HX 上 e2e `--f16` ≤ f32。
 - **风险**：中——`matmul_tiled` 的轴向/分块不变量（AGENTS §4.2 ③）须逐条守。
 
-### S4 — CPU 侧：F16C 打包转换（= P2-8）
+### S4 — CPU 侧：F16C 打包转换（= P2-8）✅ **已完成 2026-10-14**
+
+`detail::float_to_half_bits` / `half_bits_to_float` 增 `#if defined(__F16C__)` 快路径（运行时硬件单指令；
+常量求值与 `NN_ENABLE_NATIVE=OFF` 仍走软件位操作）。**实测（CPU，GPT d64/L2/seq64/b4，10 步）**：
+f16 **3.6 s → 1.9 s**（f32 1.9 s）—— CPU 侧 f16 从"慢 2×"变为**不慢于 f32**。逐位一致性由
+`precision_test` 新增段守（编译期软件路径 vs 运行期硬件路径，38 条边界值全等）。
+
+#### （原方案，保留备查）
 
 - **做什么**：`_cvtss_sh`/打包转换替代软件位操作（`18-roadmap` P2-8）。
 - **为什么**：CPU 无 f16 ISA 时 f16 只省内存不省时间（`05-mixed-precision.md` §12.4）；F16C 让
