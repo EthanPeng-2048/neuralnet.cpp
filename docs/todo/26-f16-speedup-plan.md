@@ -3,7 +3,8 @@
 > **读者**：项目开发者（本仓内部工作文档）。本册定位见 [`README.md`](README.md)；
 > 历史归档在 [`../history/history.md`](../history/history.md)。
 
-> 状态：**方案（未实施）**。来源 = [`24-f16-training-defects.md`](24-f16-training-defects.md) §4/§5 的
+> 状态：**部分实施**——**S1s/S1t（编译期特化）已落地并实测**（§4 S1s），S0/S1/S2–S5 待做。
+> 来源 = [`24-f16-training-defects.md`](24-f16-training-defects.md) §4/§5 的
 > **F4「f16 提速兑现」**（原口径「40HX 上 `--f16` ≤ f32」）。
 > 关联：[`24`](24-f16-training-defects.md) §4（复现数据 / 候选来源）、`docs/development/05-mixed-precision.md`
 > §12.4/§12.5/§12.11、[`18-roadmap.md`](18-roadmap.md) **P2-8（F16C）/ P2-9（step 内固定 I/O）**。
@@ -15,7 +16,14 @@
 f16 原生算术（`shaderFloat16`，40HX 有、850M 无）**另立 S5 正式推进**——允许、且要把它用足，
 但它**不是 S0–S4 的验收前提**。
 
-三条关键判断（证据见 §1/§2）：
+四条关键判断（证据见 §1/§2/§4 S1s）：
+
+0. **最大的一笔 f16 开销根本不是"f16"**：`#x` 是"一个 shader 覆盖任意精度签名"的运行期
+   分派载体，热循环里每次读写都带 `((prec >> i & 1u) ? float(bNh[…]) : bN[…])` 三元。
+   实测（850M，GPT `d64/h4/L4/ff256/seq256/b16`，15 步 `NN_PROFILE=1`，仅换 shader）：
+   CE 融合注意力 kernel **146.1 → 120.0 ms**（−18%；同机 f32 基线 117.2 ms）。换成
+   **编译期特化**（ggml/torch 的 per-type kernel 做法）即可拿到，且**不需要**
+   `shaderFloat16` → 任意设备成立。这是 S1s/S1t（已实施）。
 
 1. **当前 f16 慢，主因不是缺 f16 ALU，而是步内被「与精度无关」的框架固定开销主导**——本机 850M
    实测 `flush_batch` + `begin_batch` + `copy_from` ≈ **88% step 墙钟**；根因是 `start_frame()` 复用
@@ -81,8 +89,16 @@ f16 原生算术（`shaderFloat16`，40HX 有、850M 无）**另立 S5 正式推
 
 ### 2.1 固定开销掩盖（§1.2/§1.3）
 
-计算只占 <10%，且被 88% 的帧同步/绑定开销盖住。**任何**纯计算侧的优化（含 f16）在当前步结构下
-都测不出效果——这是 F4 一直「兑现不了」的第一原因，也是**与设备无关**的原因（850M/40HX 同病）。
+计算侧的 `eval_expr*` 只占个位数百分比，`flush_batch`+`begin_batch`+`copy_from` 合计 ≈88% 的
+**host 侧墙钟**。但 —— **订正（2026-10-13，S1s 实测）**：这 88% 主要是 **host 在等 GPU**
+（`start_frame` 复用帧槽时阻塞等 fence），而**设备忙率已达 95.9%/96%**（f32/f16 同）。
+即 GPU 才是瓶颈，host 侧的 `flush_batch` 时长不是"GPU 空转的浪费"，而是"host 被 GPU 拖住"。
+因此：
+  · **kernel 侧的优化是可测的**（S1s 把 f16 设备时间从 2163 拉到 1962 ms，墙钟同幅下降）；
+  · S0（降帧数/去 drain）的天花板 = `墙钟 − 设备 kernel`（本机 ≈90 ms ≈ 4.4%），
+    且**对 f32/f16 同幅**——它能拉快两条路径，但**不会**改变 f16↔f32 的相对关系。
+原判断（"固定开销会把任何计算侧收益吞掉"）**不成立**，S0 的定位从"先决阻塞项"改为
+**独立的通用提速项**（[`18`](18-roadmap.md) P2-9）。
 
 ### 2.2 主导张量仍是 f32（本节是「f16 本该省字节却没省」的核心）
 
@@ -122,6 +138,37 @@ f16 原生算术（`shaderFloat16`，40HX 有、850M 无）**另立 S5 正式推
 
 **S0–S4** 每期都给出「为什么能在**任意设备**（含无 `shaderFloat16` 的 850M）生效」；**S5** 是
 capable 设备（有原生 f16 ALU）的额外项。
+
+### S1s / S1t（✅ **已实施 2026-10-13**）— 编译期特化：去掉热循环里的运行期精度分派
+
+- **做什么**：把"精度是运行期参数"（`#x` 分派）在**热路径**上换回"精度是编译期常量"。
+  两条新变体，与 `#x` 数值逐字等价（同一 `load→float()→f32 算术→float16_t()` 链），
+  只需 `storageBuffer16BitAccess`（**不需要** `shaderFloat16`）：
+  - **`key#s`（V1s）**：签名固定为"全输入 f16 + 输出 f16"，对每个可融合结构**无条件发射**
+    （`expr_spec.hpp` 的 `EXPR_PREC_STORAGE_SUFFIX`）；
+  - **`key#xxxx`（V1t）**：构建期扫描**真实观察到的签名**——`scan_exprs` 的 dry-run 与
+    模型 pass **各跑 f32 + f16 两遍**，`dsl::compute*`（`scan_register`）与
+    `eval_expr*`（CPU 引擎入口，覆盖 fold / 直接求值）按**真实张量精度 + 真实 P** 记入
+    `ExprRegistry::variants`，生成阶段为每条发一份静态特化 shader。
+    **纯优化**：未枚举到的签名照旧落 `#x`（语义兜底不变）。
+- **为什么设备无关**：不碰数值、不碰 ALU 特性，只把"运行期三元"变成"编译期常量"。
+- **实测（850M，无 `shaderFloat16`，GPT `d64/h4/L4/ff256/seq256/b16`，15 步，3 轮回合）**：
+  | 口径 | f32 | `--f16`（特化前） | `--f16`（特化后） |
+  |---|---|---|---|
+  | step 墙钟（平均） | 2037 ms | 2260 ms（**+10.6%**） | **2055 ms（+0.9%）** |
+  | 设备 kernel 合计 | 1949 ms | 2163 ms | **1962 ms** |
+  | 峰值显存（`nvidia-smi` 采样） | 818 MiB | — | **606 MiB（−26%）** |
+  | CE 融合注意力 kernel | 117.2 ms | 146.1 ms（`#x`） | **120.0 ms**（`#s`/`#10007`） |
+  分项：`c2aca8a29eb4617f`（LM head）154.4→`#0005`137.4（f32 137.1）；`71733007a831714a`
+  （wgrad）143.9→`#10001`138.8（f32 140.6）；`6996c1ccdb7656fc` 117.1→`#0001`112.2
+  （f32 111.5）。**唯一残留的 f16 正差 = 优化器**（f16 退化为 4 个逐 kernel 融合
+  ≈ +12.6 ms/15 步 ≈ 0.6%，因 `#b` 批量派发变体**只发 V0 全 f32**）→ 另立 **P2-12**。
+- **回归**：`ctest` CPU **41/41**、GPU **43/43**（含 `f16_precision_test` / `ce_fusion_test` /
+  `expr_fuse_test` / `bitwise` 类字节锚）全绿；构建期融合结构 126 条 / 精度变体 **377** 条
+  （`#x` 124 + `#s` 124 + `#xxxx` 89 + `#a` 41；110 条观察签名里 22 条全 f16 与 `#s` 同 shader
+  故跳过）。构建时间影响：`glslc` 并行，fused shader 由 402 增到 **617** 份（`text_train` 单目标
+  Release 冷构建含 scan + glslc 实测 ≈2m35s，另有 ccache 命中路径）。
+- **风险**：低——新增变体与 `#x` 同源同值；特化集合缺失时自动回退。
 
 ### S0（先决，阻塞其余所有项）— 去掉 step 内固定开销
 
@@ -197,6 +244,11 @@ capable 设备（有原生 f16 ALU）的额外项。
 | 门禁（存储路径 S0–S4） | ① f32 不回归（字节锚/轨迹）；② **`--f16` step ≤ f32**（**三设备都要，含无 `shaderFloat16` 的 850M**）；③ f16 峰值显存更低；④ `ctest` 全绿（含 `*_gpu`、`ce_fusion_test`、`f16_precision_test`）；⑤ `NN_BIND_DEBUG=1 ctest` 全绿 |
 | 门禁（原生 f16，S5） | 在 capable 设备（40HX）额外要求：native16 已启用且有增益 —— `NN_VULKAN_NO_16BIT_ALU=1/0` 配对 A/B 显示 `=0`（原生开）更快；数值与 storage-only 路径容差内一致 |
 
+**已达成（2026-10-13，S1s/S1t）**：850M（**无 `shaderFloat16`**）`--f16` **step 墙钟 2055 ms vs
+f32 2037 ms（+0.9%，特化前 +10.6%）**、设备 kernel 1962 vs 1949 ms、**峰值显存 606 vs 818 MiB
+（−26%）**；② 项"≤ f32"**尚未完全达成**（差 0.9%，且其中 ≈0.6% 是可修的优化器退化，见 P2-12）。
+40HX（capable）的对照见 [`24`](24-f16-training-defects.md) §4.5。
+
 > 口径变化（相对 [`24`](24-f16-training-defects.md) §5 F4 原文「40HX 上 ≤ f32」）：① 按用户要求改为
 > **「任意设备」**（存储路径）；② **原生 f16 不被排除**——它为 **S5 正式立项**，在 capable 设备上
 > 额外验收，但**不允许**用它解释存储路径（S0–S4）的收益。
@@ -224,4 +276,4 @@ capable 设备（有原生 f16 ALU）的额外项。
 | `docs/development/05-mixed-precision.md` §12.5/§12.11 | 边界 cast 代价、op-level f16 GEMM 现状 |
 | [`18-roadmap.md`](18-roadmap.md) | P2-8（F16C）/ P2-9（step 内固定 I/O）/ **P2-10（原生 f16 算术用足）** |
 | `include/neuralnet.cpp/expr_spec.hpp` | `expr_prec_sig_native16`：native16 结构谓词（排除 fold/matmul/reduce/rparams） |
-| `build/<cfg>/generated/fused_registry.hpp` | `#a`（native16，43 条）与 `#x`（运行期精度分派，126 条）的注册表头注释 |
+| `build/<cfg>/generated/fused_registry.hpp` | 注册表头注释：`#x`（运行期精度分派）/ `#s`（全 f16 特化）/ `#xxxx`（扫描签名特化）/ `#a`（native16）等各变体 |

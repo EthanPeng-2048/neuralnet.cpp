@@ -16,7 +16,7 @@
 
 ## 目录
 
-- [表达式 DSL / 融合 IR（expr_*.hpp）](#表达式 DSL / 融合 IR（expr_*.hpp）)（15 条）
+- [表达式 DSL / 融合 IR（expr_*.hpp）](#表达式 DSL / 融合 IR（expr_*.hpp）)（16 条）
 - [GPU 后端与 GPU 引擎（backend/*, compute_gpu_engine.hpp）](#GPU 后端与 GPU 引擎（backend/*, compute_gpu_engine.hpp）)（17 条）
 - [注意力 / ZiPT / Transformer / FeedForward 层](#注意力 / ZiPT / Transformer / FeedForward 层)（16 条）
 - [RAPT / CNN / MLP / Softmax / GPT 层](#RAPT / CNN / MLP / Softmax / GPT 层)（13 条）
@@ -57,6 +57,32 @@
 expr_opt / expr_registry / expr_spec）「历史状态类注释」摘录。整改原则：注释只记录当前实现的
 原理、契约与理由；本文件保存被移出的历史叙事（bug 根因、被否决方案、性能 A/B 过程、
 删除清单），供追溯用。
+
+## 精度特化回归：扫描期签名 → 编译期特化 shader（2026-10-13，分支 `dev/f16_fix`）
+
+- 类型：性能 A/B / 演进记录（**部分回退** 2026-10-01 那条"签名从身份降级为参数"的取舍）
+- **背景（被本条目修正的判断）**：2026-10-01 的取舍把"每个 (结构, 签名) 一份 shader"改成"一个
+  `#x` 覆盖任意签名"，理由是构建期不必枚举签名、显存不涨。代价当时**未量**：`#x` 的热循环里每次
+  读写都带 `((prec >> i & 1u) ? float(bNh[…]) : bN[…])` 三元，编译器无法化简成单条路径。
+- **实测（850M，`d64/h4/L4/ff256/seq256/b16`，15 步 `NN_PROFILE=1`；只换 shader、不改任何数值口径）**：
+  CE 融合注意力 `f7e6c2bd8e35af36` **146.1 → 120.0 ms**（f32 基线 117.2）；LM head
+  `c2aca8a29eb4617f` 154.4 → 137.4（f32 137.1）；wgrad `71733007a831714a` 143.9 → 138.8
+  （f32 140.6）。端到端：`--f16` step 墙钟 **2260 → 2055 ms**（f32 2037；即 **+10.6% → +0.9%**），
+  峰值显存 **818 → 606 MiB（−26%）**。
+- **落地**：生成期追加两类**静态签名**变体——`key#s`（全输入 f16 + 输出 f16，无条件发射）与
+  `key#xxxx`（扫描期**真实观察到的签名**：dry-run **与模型 pass 各跑 f32 + f16 两遍**，
+  `scan_register` + CPU 引擎 `eval_expr*` 入口按真实张量精度 + 真实 P 记入 `ExprRegistry::variants`）。
+  运行期查找序 = `#a` → `#xxxx` → `#s` → `#x` → 边界 cast。观察 110 条签名 → 发射 88 条
+  （22 条全 f16 与 `#s` 同 shader 跳过）；精度变体总数 289 → 377。
+- **与 2026-10-01 的差别（为什么不冲突）**：签名**仍不是身份**（`#x` 保留为任意签名的兜底，
+  未枚举到的签名照旧命中它），特化集合只是**性能优化清单**。因此旧的"无需回填清单 / 端到端
+  `[prec][miss]=0` / 新增调用点零改动"结论全部继续成立。
+- **已知缺口（立项，不在本条修复范围）**：`#f`（细 tile）与 `#ks`/`#kr`（K 切分）按设计只发 V0
+  全 f32 → 网格饥饿形状（大 batch 的 wgrad）在 f16 下掉回 64-tile：40HX 实测 25 → 79 ms/块（×4）。
+  **40HX 因此仍是 `--f16` +30%**（其余结构 f16 反而更快，净 −50 ms）→ P2-13；优化器批量派发
+  `#b` 同样只发 f32 → P2-12。
+- **回归**：`ctest` CPU 41/41 + GPU 43/43（`f16_precision_test` / `ce_fusion_test` / `expr_fuse_test`
+  全绿）。
 
 ## 精度签名从构建期枚举 → 运行期参数（2026-10-01，分支 `feat/fused-runtime-prec-dispatch`）
 

@@ -698,7 +698,8 @@
 #ifdef NN_FUSED_REGISTRY_EMBEDDED
         // 16. 注册 AOT 融合 shader pipelines（构建期 scan_exprs 收集 +
         //     fused_generate.hpp 合成）。条目形态：
-        //       · V0 / V2（键 `key` / `key#a`）：N 输入 + 1 输出 binding；
+        //       · V0 / V2 / V1s / V1t（键 `key` / `key#a` / `key#s` /
+        //         `key#xxxx` 特化签名）：N 输入 + 1 输出 binding；
         //       · V1 运行期精度分派（键 `key#x`）：2N + 2 binding（每个输入/输出
         //         各绑 f32 与 f16 两个视图）；PC 固定头末尾多一个 `prec` 槽。
         //     push constants = 固定头（count/cols/…）+ vp 槽 + 常量池 + rp 槽。

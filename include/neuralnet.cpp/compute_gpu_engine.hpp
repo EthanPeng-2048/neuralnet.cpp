@@ -1497,6 +1497,18 @@ public:
         if (nn::expr_prec_sig_native16(spec, psig))
             if (const auto* fs = hit(key + nn::EXPR_PREC_ALU_SUFFIX))
                 return fs;
+        // V1t/V1s：storage-only **编译期特化**（热循环里没有 `prec` 三元）。
+        // 与 V1 分派变体数值逐字等价；只需要 16 位存储，无 shaderFloat16 的
+        // 设备（Maxwell）同样命中。优先于 V1。
+        //   ① `key#xxxx`（V1t）：构建期扫描**观察到的签名**（dry-run + 模型
+        //      pass 各跑 f32/f16 两遍，见 scan_exprs / ExprRegistry::add_variant）；
+        //   ② `key#s`（V1s）："全输入 f16 + 输出 f16"兜底——始终发射，覆盖
+        //      扫描没走到的路径（特化集合只是优化，`#x` 仍是语义兜底）。
+        if (const auto* fs = hit(nn::expr_prec_sig_key(key, psig)))
+            return fs;
+        if (nn::expr_prec_sig_all_f16(spec, psig))
+            if (const auto* fs = hit(key + nn::EXPR_PREC_STORAGE_SUFFIX))
+                return fs;
         // V1：运行期精度分派
         const std::string xkey = key + nn::EXPR_PREC_DISPATCH_SUFFIX;
         if (const auto* fs = hit(xkey))

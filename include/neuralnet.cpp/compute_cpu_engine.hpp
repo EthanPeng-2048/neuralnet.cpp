@@ -78,6 +78,21 @@ public:
         return {};
     }
 
+    // 构建期扫描：记录 (结构, 精度签名) → 生成**编译期特化**变体（键 key#xxxx，
+    // 见 ExprRegistry::add_variant）。eval_expr* 路径（fold / 直接求值）**不经**
+    // dsl::compute 的 scan_register，必须在引擎入口补记——注意力 fold、CE 的
+    // online-softmax fold、归约链都走这里；漏记 = 这些结构拿不到特化 shader，
+    // 运行时退回带 `prec` 三元的 `#x`（实测注意力 kernel 慢 18%）。
+    static void scan_record_variant_(const ExprSpec& spec,
+                                     std::span<const Tensor> inputs, Precision P)
+    {
+#ifdef NN_EXPR_SCAN
+        fused::global_registry().add_variant(spec, expr_prec_sig_of(inputs, P));
+#else
+        (void)spec; (void)inputs; (void)P;
+#endif
+    }
+
     // ── 张量工厂（统一接口，§6.4, §6.5）────────────────────────────────
     // P 由调用方显式指定（§8.5）：无隐式推导，无 Auto
     // RV-02：分配在宿主直配上不会失败（失败 = bad_alloc → abort），故恒成功；
@@ -1637,6 +1652,7 @@ public:
         std::size_t rows, std::size_t cols,
         Precision P = Precision::F32) override
     {
+        scan_record_variant_(spec, inputs, P);
         trace_variant_(spec, inputs, P);
         // CPU 无带类型融合变体：任何非 f32（输入或输出精度）都走边界 cast
         if (P != Precision::F32 || !all_f32(inputs))
@@ -1668,6 +1684,7 @@ public:
         std::size_t rows, std::size_t cols,
         Precision P = Precision::F32) override
     {
+        scan_record_variant_(spec, inputs, P);
         trace_variant_(spec, inputs, P);
         if (P != Precision::F32 || !all_f32(inputs))
         {
@@ -1703,6 +1720,7 @@ public:
         std::span<const Tensor> inputs,
         std::size_t rows, std::size_t cols, Tensor& dst) override
     {
+        scan_record_variant_(spec, inputs, dst.precision());
         // 目标传递：out 可能是 f16 —— 在 f32 空间求值后 cast_into 写回原存储
         //（out 常同时是输入之一：抬 f32 的拷贝即"读旧值"，语义正确）。
         if (dst.precision() != Precision::F32 || !all_f32(inputs))
