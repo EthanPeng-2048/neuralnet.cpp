@@ -134,7 +134,7 @@ P2 = 3–6 月的结构优化；P3 = 择机（trigger 未到就不排期）。
 |---|---|---|---|
 | **P0** | 5 | CI 真跑测试、文档一致性回正、BatchNorm 禁止静默回落（**✅ 已完成**）、CMake install/export + presets、推理采样 top-k/top-p | 无（P0-1 是所有人的前置） |
 | **P1** | 6 | `text_train` 模块化、checkpoint 优化器状态、危险精度组合启动期告警（细则见 [`24`](24-f16-training-defects.md)）、`gpt_test` flaky、CI 冒烟扩 MSVC Debug、**自定义层使用文档 + 精度自检**（P1-6） | P0-1；P1-6 无依赖 |
-| **P2** | 10 | `.bin` 校验和、Adafactor、RAPT/CNN f16、Dataset/DataLoader、Python/C 绑定、GUI 两项、header 拆分、F16C、step 内固定 I/O 开销（P2-9）、**原生 f16 算术用足（P2-10）** | P0-1；P2-7 另需 P1-5；P2-6 另需 P0-5 |
+| **P2** | 13 | `.bin` 校验和、Adafactor、RAPT/CNN f16、Dataset/DataLoader、Python/C 绑定、GUI 两项、header 拆分、F16C、step 内固定 I/O 开销（P2-9）、**原生 f16 算术用足（P2-10）**、**编译期精度特化（P2-11，已完成）**、**优化器 f16 批量派发（P2-12）**、**f16 K 切分/fine tile（P2-13）** | P0-1；P2-7 另需 P1-5；P2-6 另需 P0-5 |
 | **P3** | 8 | 由 §6 触发条件启动（含 CUDA、分布式） | 各自触发条件 |
 
 **串行约束（不可并行推进的组合）**：
@@ -184,6 +184,14 @@ P2 = 3–6 月的结构优化；P3 = 择机（trigger 未到就不排期）。
 | **P2-8 F16C 半精度转换快路径** | `_cvtss_sh` 快路径 + 批量转换，替代纯软件位操作 | CPUID 探测 + `NN_ENABLE_NATIVE` ON/OFF 两态；`f16_cpu_probe` 全量对拍逐位一致 | 中 | **条件触发**（§6） |
 | **P2-9 训练 step 内固定 I/O 开销归因与消除** | `NN_PROFILE` 实测（850M，`d64/h4/L4/ff256/seq128/b8`，2026-10-13）：每步约 **20% step 墙钟在 `copy_from`**（`fwd.blk#3` 作用域内，**与精度无关**——f32/f16 同现）。疑似 CE 每步 `upload_span` 上传 labels/mask 走 `from_matrix → create_tensor + copy_from`，而 `copy_from`（`write`/`from_matrix` 的 GPU 路径）带**录制窗口 drain** 语义 → 每步多次打断 GPU 流水线。**先定位**（per-key 表 + 调用点 + drain 次数）再定方案（labels/mask 张量缓存复用 / 预分配 buffer / 不入 drain 的上传路径） | 定位到具体调用点与每步 drain 次数；消除后同口径 e2e step 时间下降，且数值/字节锚逐位不变 | 小–中 | 无（与 F4 重叠但**独立**——该开销与精度无关，见 [`24`](24-f16-training-defects.md) §4.4） |
 | **P2-10 原生 f16 算术（`shaderFloat16`）用足** | 允许且推进原生 f16：`#a`（V2b native16）已生成 **43 条**、运行期优先级高于 `#x`（`find_prec_variant_` 先试 `#a`），但结构谓词 `expr_prec_sig_native16` **排除 `fold` / `matmul` / 任何 reduce / 带 `rparams`** 的表达式 → 最重的几条链（CE 的 logsumexp fold、归约、matmul 融合段）永远拿不到原生 f16。**目标** = 把 native16 资格扩到 reduce/fold/matmul（**累加必须保持 f32**），逐条守住索引精度 / `rparam` 微值 flush-to-0 / 常量 <6e-8 三类禁忌；保留 `NN_VULKAN_NO_16BIT_ALU` 逃生阀 | 40HX 上 `--f16` step ≤ f32，且 `NN_VULKAN_NO_16BIT_ALU=1/0` 配对 A/B 显示原生开更快；数值与 storage-only 路径容差内一致 | 中 | [`26`](26-f16-speedup-plan.md) 的 **S5**；建议在 S0/S1 之后做（否则收益被固定开销吞掉） |
+| **P2-11 编译期精度特化（去运行期分派三元）** | ✅ **已完成 2026-10-13**。把"精度是运行期参数"（`#x`）在热路径换回"精度是编译期常量"：新增 `key#s`（全输入 f16 + 输出 f16，无条件发射）与 `key#xxxx`（扫描期**真实观察到的签名**：`scan_exprs` 的 dry-run/模型 pass 各跑 f32+f16 两遍，`scan_register` + CPU 引擎 `eval_expr*` 按真实张量精度 + 真实 P 记入 `ExprRegistry::variants`）；运行期查找顺序 `#a` → `#xxxx`/`#s` → `#x`（未枚举到的签名照旧兜底）。**只需 16 位存储，不需要 `shaderFloat16`** | 850M：`--f16` 2260 → **2055 ms/15 步**（f32 2037，+10.6% → **+0.9%**），峰值显存 818 → **606 MiB**；`ctest` CPU 41/41 + GPU 43/43；构建期 110 条签名 → 88 条特化 | 无 | ✅ **已完成**（[`26`](26-f16-speedup-plan.md) §4 S1s、[`24`](24-f16-training-defects.md) §4.5） |
+| **P2-12 优化器 f16 批量派发（`#b`）** | 优化器的批量派发变体 `#b` 按设计**只发 V0 全 f32** → `--f16` 下优化器退化为 4 个逐 kernel 融合（980 次调用/个）vs f32 的 1 个批量 kernel | f16 下优化器回落批量派发；850M 上省 ≈12.6 ms/15 步（≈0.6% 墙钟）；数值与字节锚不变 | P2-11 | 低 | 待做（[`24`](24-f16-training-defects.md) §4.5） |
+| **P2-13 f16 的 K 切分 / fine tile 变体** | `#f`（细 tile）与 `#ks`/`#kr`（K 切分）**按设计只发 V0 全 f32**（`generate_glsl_matmul` 对 `k_split && sig != 0` 直接拒绝）。于是**网格饥饿形状**（大 batch 的 wgrad）在 f16 下没有 K 切分可用 → 掉回 64-tile。**实测（40HX，b64）**：`71733007a831714a@fused_mm@bwd.blk#*` f32 `#ks` **25 ms/块** vs f16 **79 ms/块**（+368 ms/15 步，占 40HX 全部 f16 残差）；配对旁证 `NN_MM_NO_KSPLIT=1` → 细 tile 84 ms/块（细 tile 不够，**只有 K 切分能救**）。方案 = 把 sig 穿进 `#f`/`#ks`/`#kr` 生成路径（部分和缓冲建议保持 f32，末段按 sig 落盘），逐条守 K 切分的轴向不变量与"移动字节锚"裁定 | 40HX 上 `--f16` step ≤ f32（当前 +30%，修此项后预计 **< f32**）；850M 不回归 | 中 | 待做（[`24`](24-f16-training-defects.md) §4.5 的四段式证据） |
+
+> **原生 f16 口径（2026-10-13 确认）**：`shaderFloat16` 通路**允许启用、不排除**——`#a` 变体
+> 在运行期查找序里**优先级最高**，设备能力经 `shaderFloat16` 查询 + 启用，逃生阀
+> `NN_VULKAN_NO_16BIT_ALU` 可关；40HX 实测已有 **9 条结构命中 `#a`**。**P2-10 的开放部分是
+> "把资格扩到 fold / matmul / reduce"**（累加必须保持 f32），不是"是否允许原生 f16"。
 
 ### 4.4 P3（择机）
 

@@ -459,11 +459,15 @@ int main(int argc, char* argv[])
 
     };   // dry_run 结束
 #if !defined(NN_SCAN_NO_DRYRUN)
-    // ⚠ 只跑 f32 一遍：**实测 f16 遍对结构贡献为 0**（NN_SCAN_F32_ONLY 探针：
-    // 跳过 f16 遍后签名 66 → 0，结构恒 84）。f16 遍存在的唯一理由是发现精度
-    // 签名，而签名已不再是构建期集合（生成阶段对每个结构发运行期分派 shader，
-    // 键 key#x，运行期按真实精度填 PC `prec`）→ 该遍删除，扫描工作量减半。
+    // 跑两遍：f32 定**结构**，f16 定**精度签名**。
+    //   · 结构（与精度无关）：f16 遍对结构贡献为 0（实测），保留 f32 一遍即可。
+    //   · 签名（构建期特化变体 `key#xxxx` 的输入）：只有真跑 f16 profile 才
+    //     观察得到。签名不再是"身份"（运行期 `key#x` 仍覆盖任意签名），但
+    //     编译期特化能去掉热循环里的 `prec` 三元——实测把 CE 融合注意力从
+    //     146 ms 降到 120 ms（f32 基线 117 ms，850M/f16）。故 f16 遍重新启用，
+    //     只为**收集签名**（收集侧零成本：dry-run 不真算）。
     dry_run(raw_engine, nn::profile_f32());   // 结构（与精度无关）
+    dry_run(raw_engine, nn::profile_f16());   // 精度签名（供 key#xxxx 特化）
 #endif
     // 分项台账快照（末尾合并时打印；见"结构来源"行）
     const std::size_t n_after_dry = nn::fused::global_registry().specs.size();
@@ -740,6 +744,15 @@ int main(int argc, char* argv[])
         std::fprintf(stderr,
                      "[scan][FAIL] 模型 pass 失败 → 注册表不完整，中止构建"
                      "（闭合世界：缺结构只在 GPU 运行期报错）\n");
+        return 1;
+    }
+    // f16 模型 pass：同为**签名**来源（整模型路径的精度组合与 per-layer
+    // dry-run 不同——例如 LM head 的"f16 输入 + f32 输出"只在这里出现）。
+    // 结构对结构是第一遍的重复（注册表按 key 去重），只有签名是新信息。
+    if (!model_pass(raw_engine, nn::profile_f16()))
+    {
+        std::fprintf(stderr,
+                     "[scan][FAIL] f16 模型 pass 失败 → 特化签名不完整，中止构建\n");
         return 1;
     }
 #endif
