@@ -6,6 +6,9 @@
 
 #include <cstdio>
 #include <iostream>
+#include <string>
+
+#include <neuralnet.cpp/cli/cli_engine_factory.hpp>
 
 #define main test_rapt_gradcheck
 #include "rapt_gradcheck.cpp"
@@ -21,6 +24,20 @@
 
 int main(int argc, char* argv[])
 {
+    // --gpu 用例的可用性预检（与 cnn_test 同款约定）：GPU 不可用（未编译
+    // Vulkan / 初始化失败）→ 77，依 ctest SKIP 约定记 Skipped 而非假红。
+    // 子测试本身在引擎创建失败时返回 1，没有 77 语义，故在这里统一预检。
+    // （本次因新增 rapt_test_f16_gpu 用例才暴露此前缺这层预检。）
+    for (int i = 1; i < argc; ++i)
+    {
+        if (std::string(argv[i]) != "--gpu") continue;
+        nn::cli::EngineConfig ec;
+        ec.use_gpu = true;
+        auto probe = nn::cli::create_engine(ec);
+        NN_EXIT(probe, 77, "GPU 不可用，跳过: ");
+        break;
+    }
+
     int failures = 0;
 
     std::puts("=== rapt_gradcheck (RLA core + block) ===");
