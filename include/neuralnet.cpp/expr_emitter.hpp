@@ -73,23 +73,26 @@ public:
     // （R=2：网格摊满 SM × 线程内 ILP=4 的甜点，取舍数据见
     // EXPR_MATMUL_BLOCK_FINE），供 64-tile 网格工作组过少的大 K 反传形状
     // 派发；每输出元素 K 累加序与 64-tile 变体逐位一致。
-    // 资格 = 纯 matmul 形态（spec.matmul、无 fold、raxis<0）、仅 V0 全 f32。
+    // 资格 = 纯 matmul 形态（spec.matmul、无 fold、raxis<0）；sig = 变体身份
+    // 签名（0 = V0 全 f32；具体签名 = 该结构的静态特化变体，见
+    // EXPR_PREC_STORAGE_SUFFIX / expr_prec_sig_key）。运行期分派哨兵不支持。
     // 默认返回空串 = 该后端不支持 → 构建期不产出条目、运行期留在 64-tile
     // 路径（降级，不是错误）。
     [[nodiscard]] virtual std::string generate_matmul_fine(
-        const std::string&, const ExprSpec&) const { return {}; }
+        const std::string&, const ExprSpec&, ExprPrecSig = 0) const { return {}; }
 
     // matmul K 切分变体 kernel 源码（键 = key#ks，wgrad 二次归约）：
     // 细 tile 网格仍低于 EXPR_MATMUL_KSPLIT_MIN_WGS 时，把求和维 K 切成
     // S 段、dispatch x × S——每 WG 只跑一段 K 并写 (S·rows, cols) 部分和
     // （**不跑尾链**：尾链非线性，须在求和之后统一执行）。PC 比 V0 多一槽
     // ks_span（16 对齐）。⚠ 跨段 K 累加序与未切分不逐位一致 → 移动 GPU
-    // 字节锚（已裁定放行）。资格 = 细 tile 同判据（纯 matmul、V0 全 f32），
+    // 字节锚（已裁定放行）。资格 = 细 tile 同判据（纯 matmul、静态签名）,
+    // **输出恒 f32**（写的是部分和缓冲，与 sig 的输出精度无关），
     // 由伴生 #kr（generate_matmul_ksplit_reduce）完成二次归约 + 尾链。
     // 默认返回空串 = 该后端不支持 → 构建期不产出条目、运行期留细 tile
     // 路径（降级，不是错误）。
     [[nodiscard]] virtual std::string generate_matmul_ksplit(
-        const std::string&, const ExprSpec&) const { return {}; }
+        const std::string&, const ExprSpec&, ExprPrecSig = 0) const { return {}; }
 
     // K 切分伴生归约 kernel 源码（键 = key#kr）：绑定 = 原输入 0..N-1 +
     // 部分和（binding N）+ 输出（binding N+1）；读段数经 PC（mm_k 槽位）。
@@ -97,7 +100,7 @@ public:
     // 与 generate_matmul_ksplit 配对产出（有 #ks 才有 #kr）。
     // 默认返回空串 = 该后端不支持 → 构建期不产出条目（#ks 同步不产出）。
     [[nodiscard]] virtual std::string generate_matmul_ksplit_reduce(
-        const std::string&, const ExprSpec&) const { return {}; }
+        const std::string&, const ExprSpec&, ExprPrecSig = 0) const { return {}; }
 };
 
 // ── 简单注册表：按后端名选择 emitter 工厂 ────────────────────────────────
