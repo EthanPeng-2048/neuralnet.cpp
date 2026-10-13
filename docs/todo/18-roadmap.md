@@ -78,13 +78,14 @@
 | # | 现象 | 坐标 | 影响面 |
 |---|---|---|---|
 | C1 | GPU `stable=f16` 训练 loss 回读冻结（权重照常更新） | `docs/todo/14-f16-stable-gpu-loss-frozen.md` | GPU f16 训练的 loss 曲线不可观测；无对应 ctest 用例 |
-| C2 | `optimizer=f16` 无 loss scaling 即更新爆炸、`stable=f16` 约 200 步 NaN | `docs/development/05-mixed-precision.md` §12.5；`src/text_train.cpp` 解析处只赋值不校验 | 用户可组合出必崩配置，且无任何启动期提示 |
+| C2 | `optimizer=f16` 无 loss scaling 即更新爆炸、`stable=f16` 约 200 步 NaN | `docs/development/05-mixed-precision.md` §12.5；`src/text_train.cpp` 解析处只赋值不校验；核对与立项见 [`24-f16-training-defects.md`](24-f16-training-defects.md) | 用户可组合出必崩配置，且无任何启动期提示 |
 | C3 | `NormType::BatchNorm` **静默回落**到 LayerNorm | `compute_layer_mlp.hpp:782`（`make_norm_layer`）；`README.md:248` 声称支持；`gui.py:60` 把 `batchnorm` 列为可选项；`model_spec.hpp:43` 保留枚举 | 模型规格写 batchnorm、实际跑 layernorm，无告警、无日志。**✅ 已解决**：真正实现 `BatchNorm` 层（P0-3），`make_norm_layer` 真分支，见 `docs/history/history.md` |
 | C4 | checkpoint（`.bin`）不存 Adam m/v | `model_serialization.hpp`（`MODEL_VERSION = 5`，见该文件版本常量注释）；`compute_optimizer.hpp` 无 `save_state/load_state` | TDR 重启 / `--resume` 后动量归零，续训轨迹不连续 |
 | C5 | `.bin` 无整文件校验和与尾部完整性标记 | `model_serialization.hpp` 版本常量附近的注释（明示"若引入需升 MODEL_VERSION"） | 截断/损坏的模型文件无法与合法文件区分 |
 | C6 | `gpt_test` 偶发失败未定位 | 13 原条目 §9.5（62 次直跑 1 次失败、日志被覆盖） | CI 化之后会成为随机红 |
 | C7 | RAPT / CNN 未接 f16：`Conv2D` 权重/偏置/梯度硬编码 `Precision::F32` | `compute_layer_conv.hpp:148`（权重）、`:151`（偏置）、`:154`/`:155`（权重/偏置梯度）；RAPT 头内 32 处 `dsl::compute*` 调用未接精度实参 | f16 只覆盖 MLP/GPT 路径，CNN/RAPT 用户得不到显存收益 |
 | C8 | `host_bridge_uses` 计数与文档不一致（实测 40，13/17 记 41） | `pwsh -File bench/doc_inventory.ps1` 第 [4] 节 | 审计数字失去可比性（仅披露项，不是违规） |
+| C9 | f16 训练**降速**：`--f16` 同窗比 f32 慢 11–17%（118.4 vs 101.0 / 107.1 ms/step），与「f16 省带宽应更快」预期相反 | [`24-f16-training-defects.md`](24-f16-training-defects.md) §4；`docs/benchmarks/2026-09-25-vulkan-vs-cuda.md`、`2026-10-06-vulkan-vs-torch.md`；`docs/history/history.md`「设备侧 kernel 表按阶段归因」 | f16 只兑现了显存（低于 f32），没兑现速度；wgrad 派发饥饿（部分已修）之外的剩余来源未归因 |
 
 ### 3.2 工程化
 
