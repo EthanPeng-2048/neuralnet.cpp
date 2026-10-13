@@ -263,6 +263,22 @@ public:
         return {};
     }
 
+    // ── D7：精度下传（P2-3，2026-10-14）──────────────────────────────────
+    // 本层**自持** 4 个 `Linear` 成员与 1 个位置编码器（非 layer 树子节点），
+    // 因此必须显式转发 profile —— 否则 `--f16` 下这 4 个 Linear 仍按各自默认
+    // （f32）建立**权重**，"f16 省字节"在注意力投影上完全落空（数值仍对，属
+    // **静默降级**）。由 `Layer::init` 的 `check_param_precision_()`（P1-6 R2）
+    // 兜底发现：该自检在扫描期直接报出本层 (16x16)f32 与 param=f16 不符。
+    void set_precision_profile(const PrecisionProfile& profile) override
+    {
+        Layer::set_precision_profile(profile);
+        w_q_.set_precision_profile(profile);
+        w_k_.set_precision_profile(profile);
+        w_v_.set_precision_profile(profile);
+        w_o_.set_precision_profile(profile);
+        if (pos_) pos_->set_precision_profile(profile);
+    }
+
     std::vector<TensorRef> parameters() override
     {
         auto p = w_q_.parameters();
@@ -855,9 +871,9 @@ public:
     [[nodiscard]] const char* layer_name() const noexcept override { return "RAPTBlock"; }
 
     // ── D3(a)：块内下传 ──────────────────────────────────────────────────
-    // 注意：`attn_`（ReLULinearAttention）内部还持有 4 个 Linear，但它自身没有
-    // set_precision_profile override → 内层 Linears 仍按各自默认（f32）建立。
-    // 这是**既有状态**（roadmap P2「RAPT/CNN f16」未落地），本步不改动它。
+    // `attn_`（ReLULinearAttention）自持 4 个 Linear + 1 个位置编码器 →
+    // **它自己有 set_precision_profile override**（P2-3，2026-10-14 补），
+    // 否则 `--f16` 下注意力投影的权重会静默留在 f32（原注释记录的既有状态）。
     void set_precision_profile(const PrecisionProfile& profile) override
     {
         Layer::set_precision_profile(profile);

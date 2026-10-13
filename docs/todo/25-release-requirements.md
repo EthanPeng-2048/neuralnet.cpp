@@ -17,7 +17,7 @@
 
 | # | 项目 | 要求 | 证据（记入 release note 或 PR） |
 |---|---|---|---|
-| 1 | **端到端模型训练测试** | 至少一条**真实规模**训练跑通且健康（loss 收敛、无 NaN / 无冻结、权重确实移动），并覆盖关键配方（f16 / 三值 / GPU 视当期改动而定）。**这类测试不进默认 ctest**（见 §2），只在本清单实跑一次。**注（2026-10-13）**：`stable=f16` 的「loss 冻结/inf」根因已修（[`24`](24-f16-training-defects.md) §3.1 = CE 的 (1,1) 归约按 f16 落盘溢出），故本项的「无冻结」判据现对 `stable=f16` 也可测；四字段全 f16 仍因 `optimizer=f16` 不可训练（由 [`24`](24-f16-training-defects.md) §2.3 的启动期告警覆盖） | 训练命令 + 步数 + loss 起止值（必要时轨迹）+ 产物 |
+| 1 | **端到端模型训练测试** | 至少一条**真实规模**训练跑通且健康（loss 收敛、无 NaN / 无冻结、权重确实移动），并覆盖关键配方（f16 / 三值 / GPU 视当期改动而定）。**这类测试不进默认 ctest**（见 §2），只在本清单实跑一次。**注（2026-10-13）**：`stable=f16` 的「loss 冻结/inf」根因已修（[`24`](24-f16-training-defects.md) §3.1 = CE 的 (1,1) 归约按 f16 落盘溢出），故本项的「无冻结」判据现对 `stable=f16` 也可测；**注（2026-10-14）**：`optimizer=f16` 的 NaN 根因（Adam 二阶矩在 f16 下下溢为 0）已修（[`24`](24-f16-training-defects.md) §4.6 = 优化器状态缩放），故**四字段全 f16 现已可训练**（实测 GPU 500 步 6.05→4.05 无 NaN），本项的「无 NaN/无冻结、权重确实移动」判据对全 f16 同样适用；启动期精度告警（F1）继续作为"显式实验档"的提示保留 | 训练命令 + 步数 + loss 起止值（必要时轨迹）+ 产物 |
 | 2 | **发布文档** | 落 `docs/release-notes/v1.(x+1).0.md`：发布范围（上一 tag → 本 tag）、主题、**破坏性变更 + 迁移指南**、验收基线 | release-note 文件 |
 | 3 | **完整 ctest + Debug 构建** | `Debug` 配置下构建并跑**完整 ctest**、全绿（需 GPU 的用例按退出码 77 记 skip）；Release 全套 ctest 同样绿 | `cmake --preset debug`（或 `-DCMAKE_BUILD_TYPE=Debug -DNN_ENABLE_TESTS=ON`）+ `ctest` 输出 |
 | 4 | **多编译器 × 标准库编译测试** | 至少 **4 组**「编译器 × 标准库」**各自全新构建 + ctest**：clang + libc++、g++ + libstdc++、clang + MSVC STL、cl.exe + MSVC STL。MSVC 必须带 `/Zc:preprocessor`（已写进 `CMakeLists.txt` 的目录级与接口选项） | 每组 configure / build / ctest 结果（口径见 `AGENTS.md` §2） |

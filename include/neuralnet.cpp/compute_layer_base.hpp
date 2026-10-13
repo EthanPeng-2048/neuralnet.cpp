@@ -552,7 +552,37 @@ public:
     {
         engine_ = &engine;
         NN_TRY_CHECK(check_precision_support_());
-        return init_impl(engine);
+        NN_TRY_CHECK(init_impl(engine));
+        NN_TRY_CHECK(check_param_precision_());
+        return {};
+    }
+
+    // ── P1-6 R2：参数存储精度自检（2026-10-14）────────────────────────────
+    // `init` 之后逐个校验"层声明的 param 槽"与"参数张量的实际存储精度"一致。
+    // 防的是一类**静默降级**：层把权重/梯度硬编码成 `Precision::F32`（或忘了
+    // 用 `p_.param`），于是 `--f16` 下该层参数仍是 f32 —— 训练照跑、数值也不会
+    // 错，但"f16 省字节"在其上完全落空（P2-3 在 Conv2D / RAPT 修的就是这一族：
+    // Conv2D 的 w_/b_、RAPT 的 token_emb_）。**只查 `param` 槽**：compute/stable
+    // 只影响中间量、不要求与参数存储同精度；optimizer 槽作用于状态张量（不在
+    // `parameters()` 里）。复合层（GPTModel 等）的 `parameters()` 会递归下探
+    // 子层，故每个子层各自校验一次即可、不会漏。`precision_bytes(p_.param) == 0`
+    // 的情形（T1_58 等非存储精度声明）跳过——那时参数形态由层自定（BitLinear
+    // 的 latent 恒 f32）。
+    [[nodiscard]] Result<void> check_param_precision_()
+    {
+        if (precision_bytes(p_.param) == 0)
+            return {};
+        for (const TensorRef& ref : parameters())
+        {
+            const Tensor& t = ref.get();
+            if (t.precision() != p_.param)
+                NN_FAIL(std::string("参数存储精度与 param 槽不一致: 层 ")
+                        + layer_name() + " 的 " + t.shape_str() + " 实际 "
+                        + precision_name(t.precision()) + "，但 param="
+                        + precision_name(p_.param)
+                        + "（硬编码 F32 会让 --f16 在该层静默失效；见 docs/todo/18 P1-6 R2）");
+        }
+        return {};
     }
 
 protected:
