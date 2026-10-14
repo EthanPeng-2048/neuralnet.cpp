@@ -73,7 +73,34 @@ public:
         owner.reset();
         auto kernels = fuse_expr_graph(g);
         for (auto& k : kernels)
+        {
             fused::global_registry().add(k.spec);
+            // 复合 kernel（≥2 成员）的**运行期精度签名**在 scan 侧没有别的登记
+            // 入口：单节点结构由 `dsl::compute` 的 scan_register / `eval_expr*`
+            // 入口按真实张量精度登记，而**融合结构**只在 GPU 的 end_expr 才被
+            // 实际执行（并算出签名）。缺这一条 ⇒ 复合结构在 `--f16` 下只剩
+            // V0/`#s`/`#x` 三种载体：拿不到 `key#xxxx` 静态特化（回落带 `prec`
+            // 三元的 `#x`），也拿不到 `key#xxxx#b` 批量变体（优化器整步回落
+            // 逐 kernel 派发）。这里按与运行期**同源**的口径补记：每个输入
+            // 张量的真实存储精度 + tail 节点的输出精度（= 运行期
+            // `expr_prec_sig_of(d.ins, out.precision())`）。
+            std::uint32_t in_bits = 0;
+            std::size_t slot = 0;
+            for (const auto& in : k.inputs)
+            {
+                // 内部依赖输入（node>=0）此时未绑定张量 → 该视图按 f32 记；
+                // 纯逐元素复合的成员引用经寄存器直替、不进 views，故正常构图
+                // 下这里的每个槽都是外部输入。
+                if (slot < 32u && in.external.valid() &&
+                    in.external.precision() == Precision::F16)
+                    in_bits |= (1u << slot);
+                ++slot;
+            }
+            if (k.members.size() > 1)
+                fused::global_registry().add_variant(
+                    k.spec, expr_prec_sig_make(in_bits,
+                                               k.prec == Precision::F16));
+        }
 #endif
         return {};
     }

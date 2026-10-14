@@ -181,10 +181,20 @@ int main(int argc, char* argv[])
         {
             nn::Tensor p = scan_tensor(R, C);
             nn::Tensor g = scan_tensor(R, C);
+            // 精度配置与运行期同源（`text_train` 把 `cfg.precision` 透传给
+            // create_optimizer）：优化器的状态/参数槽精度决定 K3 更新量
+            // （`upd_prec = p_.param`）与写目标的存储精度 → 直接决定该结构的
+            // 运行期精度签名。漏传 = scan 只按默认 f32 profile 登记优化器，
+            // `--f16` 下 K3 的 `#10000`（F32 输入 + F16 输出）签名不被观察
+            // ⇒ 无 `key#10000` 特化变体 ⇒ 逐成员派发回退 `#x` 且拿不到
+            // `key#10000#b` 批量变体（P2-12 残差的结构性根因之一）。
+            const nn::PrecisionProfile opt_prof = scan_prof;
             auto opt = nn::create_optimizer(meta.name, engine,
                                             std::vector<nn::TensorRef>{p},
                                             std::vector<nn::TensorRef>{g},
-                                            nn::Scalar{1e-3f});
+                                            nn::Scalar{1e-3f},
+                                            /*weight_decay=*/nn::Scalar{0},
+                                            /*precision=*/opt_prof);
             if (opt)
             {
                 (void)opt->step();
