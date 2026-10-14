@@ -133,8 +133,8 @@ w_o_: (d_model,          d_model)
 **实现：显式展开 K/V 头**
 
 ```
-forward:  K_kv (n_kv*d_k, N) --gather_rows(expand_idx)--> K (n_head*d_k, N) → [既有流程]
-backward: grad_K (n_head*d_k, N) --scatter_add_rows(expand_idx)--> grad_K_kv → w_k_.backward
+forward:  K_kv (n_kv*d_k, N) → gather_rows(expand_idx) → K (n_head*d_k, N) → [既有流程]
+backward: grad_K (n_head*d_k, N) → scatter_add_rows(expand_idx) → grad_K_kv → w_k_.backward
 ```
 
 `expand_idx` 是长度为 `n_head*d_k` 的宿主常量向量（`src_row = (h / n_rep) * d_k + r`），

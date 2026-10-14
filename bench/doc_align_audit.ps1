@@ -36,7 +36,8 @@ $historicalFiles = @('compute_cuda_engine.hpp','compute_cuda_backend.hpp','cuda_
                      'expr_fuse_test.cpp','expr_graph_test.cpp','expr_spec_test.cpp','matmul_fusion_test.cpp',
                      'offload_primitive_test.cpp','offload_test.cpp','broadcast.comp',
                      'compute_precision_engine.hpp',   # P-1 随 PrecisionEngine 下沉删除
-                     'compute_layer_zipt.hpp','domain_zipt.hpp')  # ZiPT 移除（分支 legacy/zipt）
+                     'compute_layer_zipt.hpp','domain_zipt.hpp',   # ZiPT 移除（分支 legacy/zipt）
+                     'ternary_deploy.hpp')  # NNQT 独立部署格式，随库级清理（docs/todo/23）删除
 
 # ── [A] 文档引用的文件是否存在 ──────────────────────────────────────────
 Write-Host '=== [A] 文档引用但仓库中不存在的文件 ==='
@@ -122,7 +123,9 @@ $cmText = Get-Content CMakeLists.txt -Raw
 $externalFlags = @('--test-dir','--parallel','--target-env','--dtype','--adam-eps','--device',
                    '--task','--compress','--list','--image','--list-backends',
                    '--summary',   # vulkaninfo（16 §复现命令）
-                   '--include')   # grep（16 §复现命令）
+                   '--include',   # grep（16 §复现命令）
+                   # cmake / ctest / cpack 自带选项（文档复现命令用，非本仓 CLI）
+                   '--preset','--workflow','--list-presets','--output-on-failure')
 # 已在文档中明确标注"已移除"的历史参数
 #   --memory-tokens / --window : ZiPT(AttnZip) 专用，随 ZiPT 移除
 #   --osc-guard/-window/-threshold : mnist_train 的幽灵选项（帮助声明、解析不存在），已清除
@@ -205,8 +208,10 @@ $missTests = 0
 $histTests = 0
 # 历史/已并入的测试名（历史交付表中的当时目标名，勿再报警）
 #   zipt_* : 随 ZiPT 移除（历史文档提及属正常）
+#   ternary_deploy_test : NNQT 部署格式测试，随库级清理（docs/todo/23）删除（并入 model_roles_test）
 $historicalTests = @('expr_fuse_test','expr_graph_test','expr_spec_test','matmul_fusion_test','offload_primitive_test',
-                    'zipt_test','zipt_gradcheck','zipt_smoke_test','zipt_consistency_test','zipt_doc_test')
+                    'zipt_test','zipt_gradcheck','zipt_smoke_test','zipt_consistency_test','zipt_doc_test',
+                    'ternary_deploy_test')
 foreach ($t in ($tests.Keys | Sort-Object)) {
     $inCm = $cmText -match [regex]::Escape($t)
     $inSrc = $realFiles.ContainsKey("$t.cpp")

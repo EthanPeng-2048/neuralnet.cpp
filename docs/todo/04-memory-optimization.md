@@ -40,7 +40,7 @@
 - 接入：`text_train` 的 `--checkpoint-every N` 与每 step 末尾 `release_idle_pool_blocks()`（end_batch 提交完成、延迟销毁已 flush 后调用，安全）。
 - 回归：仅 GPU 内存管理路径，不影响 CPU 数值；L1 相关 gradcheck 全绿。
 
-**L3（自动融合 + 优化器降内存）— 待立项**
+**L3（自动融合 + 优化器降内存）— 待立项**（2026-10-14 登记为 [`18-roadmap.md`](18-roadmap.md) **P4-3**）
 
 ### 基准配置与峰值显存
 
