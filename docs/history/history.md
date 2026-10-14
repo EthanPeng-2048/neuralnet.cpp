@@ -16,16 +16,16 @@
 
 ## 目录
 
-- [表达式 DSL / 融合 IR（expr_*.hpp）](#表达式 DSL / 融合 IR（expr_*.hpp）)（15 条）
+- [表达式 DSL / 融合 IR（expr_*.hpp）](#表达式 DSL / 融合 IR（expr_*.hpp）)（16 条）
 - [GPU 后端与 GPU 引擎（backend/*, compute_gpu_engine.hpp）](#GPU 后端与 GPU 引擎（backend/*, compute_gpu_engine.hpp）)（17 条）
 - [注意力 / ZiPT / Transformer / FeedForward 层](#注意力 / ZiPT / Transformer / FeedForward 层)（16 条）
 - [RAPT / CNN / MLP / Softmax / GPT 层](#RAPT / CNN / MLP / Softmax / GPT 层)（13 条）
-- [引擎接口 / CPU 引擎 / 精度 / 张量 / 损失 / 优化器](#引擎接口 / CPU 引擎 / 精度 / 张量 / 损失 / 优化器)（21 条）
+- [引擎接口 / CPU 引擎 / 精度 / 张量 / 损失 / 优化器](#引擎接口 / CPU 引擎 / 精度 / 张量 / 损失 / 优化器)（23 条）
 - [代数层 / 基础设施 / 模型容器与序列化](#代数层 / 基础设施 / 模型容器与序列化)（15 条）
 - [领域模型工厂与 CLI 公共头](#领域模型工厂与 CLI 公共头)（3 条）
 - [src 应用入口（text/mnist/tokenizer/bench）](#src 应用入口（text/mnist/tokenizer/bench）)（5 条）
 - [GPU 手写原语 shader（shaders/*.comp）](#GPU 手写原语 shader（shaders/*.comp）)（12 条）
-- [构建期工具 / 基准脚本 / 对拍脚本](#构建期工具 / 基准脚本 / 对拍脚本)（12 条）
+- [构建期工具 / 基准脚本 / 对拍脚本](#构建期工具 / 基准脚本 / 对拍脚本)（13 条）
 - [表达式与融合测试](#表达式与融合测试)（18 条）
 - [层 / 模型测试](#层 / 模型测试)（14 条）
 - [精度 / RAPT / ZiPT / 分词器测试与探针](#精度 / RAPT / ZiPT / 分词器测试与探针)（11 条）
@@ -57,6 +57,71 @@
 expr_opt / expr_registry / expr_spec）「历史状态类注释」摘录。整改原则：注释只记录当前实现的
 原理、契约与理由；本文件保存被移出的历史叙事（bug 根因、被否决方案、性能 A/B 过程、
 删除清单），供追溯用。
+
+## step 内固定 I/O 开销归因：实测推翻"固定开销掩盖"（2026-10-14，P2-9 / 26 号 S0 归档）
+
+- 类型：性能 A/B / 否决方案（**已评估-不做**）
+- **被测前提**：`NN_PROFILE` 显示每步约 20% 墙钟在 `copy_from`、`flush_batch`+`begin_batch`+`copy_from`
+  ≈88% host 墙钟 ⇒ 判断为"可消除的固定开销，且会把计算侧收益吞掉"（26 号 S0 曾因此被定为先决项）。
+- **实测（850M，`d64/h4/L4/ff256/seq256/b16`，15 步）**：
+  ① 把 staging ring `64MB×4` → `8MB×16`（消除 `StagingRing::acquire` 的 fence 阻塞）：
+     `copy_from` **392 → 3 ms**，但 `flush_batch` **955 → 1213 ms**，两者之和恒 ≈1347 ms；
+     墙钟 3 轮 2200/2059/2053 vs 原 2044（噪声内）→ **改动已回退**。
+  ② `--flush-interval 1 → 4`（每步 flush 105 → 20 次）：墙钟 **2044 → 2096 ms（+2.5%）**。
+  ③ 设备忙率 **95.9%** ⇒ host 的时间几乎全在等 GPU，等待点可互相搬家。
+- **结论**：`copy_from` 不是额外成本、减少帧数反而更慢；真天花板 = `墙钟 − 设备 kernel`
+  ≈ **86 ms/15 步 ≈ 4.2%**（f32/f16 同幅）。**另一条推论**：26 号"S0 未完成前任何计算侧收益
+  都不可信"的前提同时作废——S1s 在 S0 未做时已实测拿到 `--f16` +10.6% → +0.9%。
+- **保留证据**：`--flush-interval` 默认值的"1 更快"注释由此获得独立复现。
+
+## f16 网格粒度变体叠加到精度特化签名（2026-10-14，分支 `dev/f16_fix`）
+
+- 类型：性能 A/B / 演进记录（P2-13）
+- **背景（缺口）**：`#f`（细 tile）与 `#ks`/`#kr`（K 切分）**只对 V0 全 f32 发射**
+  （`generate_glsl_matmul` 对 `k_split && sig != 0` 直接拒绝）。于是**网格饥饿形状**
+  （大 batch 的 wgrad）在 f16 下没有 K 切分可派发 → 掉回 64-tile。
+- **实测（40HX，b64）**：`71733007a831714a@fused_mm@bwd.blk#*` f32 `#ks` **25 ms/块**、
+  f16 掉回 64-tile **79 ms/块**（4 块 +368 ms = 该机 f16 的全部残差，其余结构 f16 更快）。
+  配对旁证 `NN_MM_NO_KSPLIT=1` → 细 tile **84 ms/块** ⇒ 细 tile 不够，**只有 K 切分能救**。
+- **修法**：sig 穿进三条生成路径，为每个**静态签名变体**各发一份网格变体（键
+  `key#10003#ks`）。**部分和缓冲恒 f32**（后端 `use_ks` 分支按 f32 分配）→ `#ks` 的输出
+  声明钉成 `float` 并写原始部分和，注入 sig **只决定 A/B 读取类型**；`#kr` 跨段升序求和后
+  再按 sig 落盘（含 RNE 预舍入）。**两条易错点**：① 后缀分层 ⇒ 后端"网格变体无需 16 位
+  存储"的豁免必须收窄到**纯 V0 键**（`key#10003#ks` 里仍有 `float16_t` 缓冲，误豁免会在
+  无 16 位存储的设备上建出非法 pipeline）；② `#kr` 里 `glsl_f16_store` 依赖 `nn_f16_rne`
+  声明，漏发即 glslc 编译失败（已补）。运行期 `#x` 哨兵**不**叠加网格变体。
+- **验收**：40HX 该 wgrad **f16 16.0 ms/块 < f32 25.1 ms/块**；端到端 40HX `--f16`
+  **1013 vs f32 1027 ms（−1.4%）**、850M（b16）**2005 vs 2038 ms（−1.6%）**；loss 对拍
+  （40HX 三点）f32 8.6757/8.2646/7.8743 vs f16 8.6676/8.2569/7.8643（<0.15%，容差内）；
+  `ctest` GPU 43/43。变体数：细 tile 14→**46**、K 切分 14→**46**（fused shader 617→713）。
+- **K 切分的数值口径不变**：跨段累加序仍 ≠ 逐 k 串联 → 仍属"移动 GPU 字节锚"的既有裁定
+  范围（torch 同样不保证等价浮点计算逐位一致）；本次**未**新增逐位口径变化（部分和仍 f32）。
+
+## 精度特化回归：扫描期签名 → 编译期特化 shader（2026-10-13，分支 `dev/f16_fix`）
+
+- 类型：性能 A/B / 演进记录（**部分回退** 2026-10-01 那条"签名从身份降级为参数"的取舍）
+- **背景（被本条目修正的判断）**：2026-10-01 的取舍把"每个 (结构, 签名) 一份 shader"改成"一个
+  `#x` 覆盖任意签名"，理由是构建期不必枚举签名、显存不涨。代价当时**未量**：`#x` 的热循环里每次
+  读写都带 `((prec >> i & 1u) ? float(bNh[…]) : bN[…])` 三元，编译器无法化简成单条路径。
+- **实测（850M，`d64/h4/L4/ff256/seq256/b16`，15 步 `NN_PROFILE=1`；只换 shader、不改任何数值口径）**：
+  CE 融合注意力 `f7e6c2bd8e35af36` **146.1 → 120.0 ms**（f32 基线 117.2）；LM head
+  `c2aca8a29eb4617f` 154.4 → 137.4（f32 137.1）；wgrad `71733007a831714a` 143.9 → 138.8
+  （f32 140.6）。端到端：`--f16` step 墙钟 **2260 → 2055 ms**（f32 2037；即 **+10.6% → +0.9%**），
+  峰值显存 **818 → 606 MiB（−26%）**。
+- **落地**：生成期追加两类**静态签名**变体——`key#s`（全输入 f16 + 输出 f16，无条件发射）与
+  `key#xxxx`（扫描期**真实观察到的签名**：dry-run **与模型 pass 各跑 f32 + f16 两遍**，
+  `scan_register` + CPU 引擎 `eval_expr*` 入口按真实张量精度 + 真实 P 记入 `ExprRegistry::variants`）。
+  运行期查找序 = `#a` → `#xxxx` → `#s` → `#x` → 边界 cast。观察 110 条签名 → 发射 88 条
+  （22 条全 f16 与 `#s` 同 shader 跳过）；精度变体总数 289 → 377。
+- **与 2026-10-01 的差别（为什么不冲突）**：签名**仍不是身份**（`#x` 保留为任意签名的兜底，
+  未枚举到的签名照旧命中它），特化集合只是**性能优化清单**。因此旧的"无需回填清单 / 端到端
+  `[prec][miss]=0` / 新增调用点零改动"结论全部继续成立。
+- **已知缺口（立项，不在本条修复范围）**：`#f`（细 tile）与 `#ks`/`#kr`（K 切分）按设计只发 V0
+  全 f32 → 网格饥饿形状（大 batch 的 wgrad）在 f16 下掉回 64-tile：40HX 实测 25 → 79 ms/块（×4）。
+  **40HX 因此仍是 `--f16` +30%**（其余结构 f16 反而更快，净 −50 ms）→ P2-13；优化器批量派发
+  `#b` 同样只发 f32 → P2-12。
+- **回归**：`ctest` CPU 41/41 + GPU 43/43（`f16_precision_test` / `ce_fusion_test` / `expr_fuse_test`
+  全绿）。
 
 ## 精度签名从构建期枚举 → 运行期参数（2026-10-01，分支 `feat/fused-runtime-prec-dispatch`）
 
@@ -551,6 +616,10 @@ GPU 后端 / GPU 引擎头文件「历史状态类注释」摘录。整改原则
 
 # 引擎接口 / CPU 引擎 / 精度 / 张量 / 损失 / 优化器
 
+## P2-12：复合 kernel 的运行期精度签名在 scan 侧无登记入口（2026-10-14；原位置 include/neuralnet.cpp/compute_cpu_engine.hpp:71）
+- 类型：覆盖缺口 → 修复（构建期扫描补记）
+- 内容：`scan_exprs` 模式下的 CPU `end_expr` 只做了 `global_registry().add(k.spec)`（登记**结构** V0），没有登记**融合 kernel 的运行期精度签名**——单节点结构的签名由 `dsl::compute` 的 `scan_register` 与引擎 `eval_expr*` 入口按真实张量精度登记，而**融合结构只在 GPU 的 `end_expr` 执行时才算出签名**。后果：`--f16` 下复合结构只有 V0/`#s`/`#x` 三种载体 ⇒ ① 拿不到 `key#xxxx` 静态特化（回落带 `prec` 三元的 `#x`）；② 拿不到 `key#xxxx#b` 批量变体（即便 `#b` 已对每个静态签名变体发射）。修法 = 在 scan 的 `end_expr` 里对 `members.size() > 1` 的 kernel 用**与运行期同源**的口径补记 `add_variant(k.spec, expr_prec_sig_make(输入张量 f16 位图, k.prec == F16))`（等价于运行期 `expr_prec_sig_of(d.ins, out.precision())`；内部依赖输入未绑定张量 → 该槽按 f32 记，纯逐元素复合的成员引用经寄存器直替、不进 views，故正常构图下每槽都是外部输入）。生效后 Adam 复合结构拿到 `#10004` + `#10004#b`；实测（40HX/f16/b64/20 步，配对 `329f8f1` vs `5bb6a51`）：`[ir-c][degrade]` 70 → 0/步、优化器派发 138.7 → 8.55 calls/步（−94%）、优化器 host 阶段 −34%，但端到端墙钟在 GPU-bound（忙率 95.5%）下无可见收益。**边界**：只覆盖 scan 真跑过的 profile（f32 + `--f16`），其它显式组合仍按设计回落降级（构建期 2^4 精度枚举不可取）。
+
 ## 代码审查整改批 RV-06/09/10/11/13 与 CI 真跑测试（2026-10-12；证据坐标 docs/todo/00-code-review-remediation.md）
 - 类型：bug 根因 + 结构收敛 + 门禁
 - 内容：① **RV-06 前置去红**：`NN_BIND_DEBUG=1 ctest` 原为红（`t1_58_test` / `ternary_gemm_test` / `model_roles_test` 三例在 `cast` 处报 "unbound input into engine"）——根因是 `matmul_q_impl`（CPU 与 GPU 两份）在边界 cast 回退里：CPU 递归调用 impl 后、GPU 用静态工厂 `Tensor::from_gpu` 造输出后，都直接调**公共** `cast`（内含 `bind_check_`）而产物尚未 stamp。两处改为 `cast(adopt(std::move(x)), P)`（`adopt` = 基类 protected 的库内 stamp 通道，与 M6 的 `to_prec` 修法同款）；本机 Release+CPU `NN_BIND_DEBUG=1 ctest` 由 37/40 转 **40/40**。CI 侧新增一轮 `NN_BIND_DEBUG=1 ctest` 作为默认门禁。② **RV-09**：环境变量读取收敛到新 `core_env.hpp`（`nn::detail::{env_flag_raw,env_string_raw,env_int_raw}` + 探针门包装；`getenv`/`_dupenv_s` 只此一处、探针门关时恒 false 且不求值）；`dsl::env_flag` 的"任意非空即真"一并对齐为"0 = 关"。③ **RV-10**：BitLinear `quantize_weights_` 与 `ternary_pack::code_of` 的判据注释精确化（严格 `|W|>0.5τ`、半值归零；与 `RoundClip` 的唯一差异在等值点），不改算法。④ **RV-11**：`precision.hpp` 加 `static_assert` 冻结"枚举值 ↔ 序列化 tag"两张映射 + `precision_from_tag(precision_tag(p))==p` 往返（改一处即编译失败）。⑤ **RV-13**：`nn::Expression` / `nn::BoolExpression` 概念从 `expr_dsl.hpp` 移到 L1 的 `algebra_span.hpp`（`expr_dsl` 经 `algebra_matrix → algebra_span` 传递可见）。另（roadmap P0-1）：CI 配置加 `-DNN_ENABLE_TESTS=ON` 并在 Linux/Windows 各跑 `ctest --output-on-failure`，打包补齐 `dataset_gen`/`dataset_convert`（应用入口 6 → 8）。**仍 Open**：RV-05、RV-07、RV-08、RV-12、RV-14（RV-05/14 需 GPU 提权环境；RV-07/08 为需单独提交并逐步过三件套的重构；RV-12 仅设计评估）。
@@ -693,6 +762,12 @@ GPU 后端 / GPU 引擎头文件「历史状态类注释」摘录。整改原则
 - **保留形参（＝15 §3.3 "Layer 之后"的两档，本轮裁定不动，见 17 §8）**：`Loss::forward/forward_sparse`（**Loss 没有天然绑定时机**：默认构造、`zipt_consistency_test` 里同一作用域并存 `ce_cpu/ce_gpu` 两个引擎——要删须先裁定构造签名 `CrossEntropyLoss(engine)` 或 `Loss::bind`）；DSL 入口（15 明确保留）；`PositionEncoder`/`RotaryEmbedding`（`apply/apply_step/backward`）、`ActivationOffloader`、`nn_dbg_scan` 与层内私有 helper（由方法体的局部 `engine` 转传，签名不动）。
 - **验收**（本机 Debug+Ninja+clang）：① build 122/122 零告警（`-Werror`）；② ctest 20/20；③ **`NN_BIND_DEBUG=1 ctest` 20/20（门禁）**；④ CPU `--steps 20` hash=`6f8849f14da23110` **逐位不变**；⑤ **GPU dev2 hash=`8ef51b2927253c50` 逐位不变**（`engine_ref()` 只是绑定读取，不进数值路径）；⑥ `--init-hash` 六模型与 M2 锚全同（`a22e807ee05ec3ac`/`4020958a14160bbd`/`04a72d865624042a`/`8efa936ac5c8c9b2`/`f90bf8c8783c2f89`/`b037632f75b7159c`）；⑦ scan 双 hash 不变（`expr_specs.bin`=bdc3a442…a58360、`fused_registry.hpp`=7a10412c…——**dry-run 收集的是表达式结构，与引擎绑定无关**）；⑧ `--io-roundtrip` CPU+GPU PASS；⑨ L2 分层审计 0。
 - **性能 A/B（配对 + 逆序复测，M2 同款方法）**：pre = `git worktree add` @ `4ce5884` 独立构建 layer_bench，feedforward/swiglu/linear 各 4 轮 PRE/POST 交错：feedforward fwd/train **+4.1%/+4.5%**、swiglu -0.7%/+0.9%、linear fwd **+8.5%**/train +3.8%（linear fwd 为 0.8ms 亚毫秒项）。**逆序复测**（POST 先跑，3 轮）：feedforward **-0.7%/+0.4%**、linear +5.6%/-6.9% → 正序的 +4% 系**运行窗口/机器状态**（同窗 PRE 绝对值本身较上一轮高约 18%）与 -O0 二进制重排所致，**方向混合、无系统性回退**。
+
+## CE 的 (1,1) loss 归约输出恒 F32——修 `stable=f16` 溢出（2026-10-13，原位置 include/neuralnet.cpp/compute_loss.hpp 的 `softmax_cols_`/`forward`(步骤4+5)/`fused_forward_sparse_`）
+- 类型：bug 根因 / 已修复勘误（[`docs/todo/24`](../todo/24-f16-training-defects.md) §2.1/§3.1/§5 的 F2/F3；[`docs/todo/14`](../todo/14-f16-stable-gpu-loss-frozen.md)）
+- 内容：`CrossEntropyLoss` 的两条链都把最终 **(1,1) loss 和**按 `p_.stable` 落盘。该标量 = 跨 `batch×seq` 的 log_prob 求和（≈ `-log(vocab)·token 数`），**大 token 数下必然超 f16 上限 65504**：部分硬件溢出为 ±inf，部分饱和为 f16 max。**这就解释了 14 号台账的 GPU `stable=f16`「loss 恒 4.0137」**——`4.0137 ≈ 65504/num_valid`，饱和值与权重/数据无关，故「跨 epoch/数据集/进程逐位相同」；原报告归因的「loss 回读链（`cast`/异步槽位读陈旧）」**被否定**（`ce_fusion_test` 的「异步标量回读 vs 同步下载」用例、迭代 24 轮 > 槽位 8，持续通过）。**修法**：两条链的 (1,1) 归约 `Precision::F32`（归约内部本就恒 f32 累加，输出改 F32 即得正确值；调用方随后本就 `cast` 到 F32 回读，等于顺手去掉一次 cast）。**触发范围 = 大 token 数**（本机 GPU 实测：`seq128×b8`=1024 token 健康；`seq256×b32`=8192 token 时 `stable=f16` 打印 `inf`、`stable=f32` 正常 9.0→8.7；修复后 `stable=f16` 9.0056→8.6922 正常下降）。
+- **不变量**：f16 存储的**聚合标量**（跨 N 个元素求和、量级 ∝ N）不得按 f16 落盘；f16 只适合量级有界的逐元素/归一化中间量（`col_sum`/`log_softmax`/`lse` 保持 `p_.stable` 不变）。`optimizer=f16` 的爆炸（Adam 二阶矩下溢）与四字段全 f16 的数值性冻结**不属本修**——仍由 24 §2.3 的启动期告警覆盖（F1），根治留给 F5。
+- **验收**：本机 CPU（build-ab，Release+tests）ctest **41/41**；本机 GPU（build/gpu，Release+tests+probes+850M/Intel）ctest **43/43**（含全部 `*_gpu` 变体与 `ce_fusion_test`）。新增回归：`f16_precision_test` 的 profile 组合矩阵（补 `all=f16` 行、提为默认门禁、CPU+GPU 都跑）+ `test_ce_loss_stable_f16_no_overflow`（`C=100,N=20000`，CPU/GPU 实测 `f32 5.1876 = stable=f16 5.1876`）。
 
 ---
 
@@ -881,6 +956,10 @@ GPU 后端 / GPU 引擎头文件「历史状态类注释」摘录。整改原则
 # 构建期工具 / 基准脚本 / 对拍脚本
 
 > 本文件摘录 `tools/`、`bench/`、`compare_with_torch/` 注释整改中移出的历史状态记录（原位置为整改前行号）。
+
+## P2-12 残差：优化器 dry-run 未透传 precision profile（2026-10-14；原位置 tools/scan_exprs.cpp:184）
+- 类型：bug 根因（构建期 scan 与运行期不同源）
+- 内容：`--f16` 下 Adam 的每参数复合 kernel `{K3,K4}` 运行期命中不到 AOT shader → 落"逐成员降级派发"（70 参数 = 140 dispatch/步），既不融合也不批量（P2-12 残差）。根因是 **scan 的优化器 dry-run 调 `create_optimizer` 时未传当前 pass 的 precision profile**（默认 `PrecisionProfile{}` = 全 f32），而真实路径 `text_train` 是透传 `cfg.precision` 的。于是 f16 pass 里 `upd_prec = p_.param` 仍取 f32 ⇒ 融合出的复合结构与运行期不同 ⇒ `composite_kernel_available_` 查不到 ⇒ 降级。修法 = 透传 `scan_prof`（f32 pass 与本改动等价，仅 f16 pass 生效）。**教训**：scan 的"结构/签名来源"必须与运行期**逐项同源**；dry-run 里任何"省略一个参数"的简化都会在运行期表现为降级（可观测但静默丢性能）。
 
 ## push-constant 固定头长度按 5 个 uint 打包的错误（原位置 tools/scan_exprs.cpp:572）
 - 类型：bug 根因

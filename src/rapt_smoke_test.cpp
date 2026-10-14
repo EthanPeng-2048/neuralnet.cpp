@@ -22,11 +22,13 @@ int main(int argc, char* argv[])
 {
     std::size_t steps = 15;
     bool use_gpu = false;
+    bool use_f16 = false;
     for (int i = 1; i < argc; ++i)
     {
         std::string a = argv[i];
         if (a == "--steps" && i + 1 < argc) steps = static_cast<std::size_t>(std::atoi(argv[++i]));
         else if (a == "--gpu") use_gpu = true;
+        else if (a == "--f16") use_f16 = true;
     }
 
     auto engine = nn::cli::create_engine(nn::cli::EngineConfig{use_gpu});
@@ -41,6 +43,12 @@ int main(int argc, char* argv[])
     cfg.num_heads  = 2;
     cfg.d_ff       = 32;
     cfg.num_layers = 2;
+    // P2-3：`--f16` 走 profile_f16()（param/compute=F16，stable/optimizer=F32）
+    if (use_f16)
+    {
+        cfg.precision = nn::profile_f16();
+        std::cout << "精度: --f16（param/compute=f16）\n";
+    }
 
     auto spec = nn::make_rapt_spec(cfg.vocab_size, cfg.d_model, cfg.seq_len,
                                    cfg.num_heads, cfg.d_ff, cfg.num_layers);
@@ -63,6 +71,8 @@ int main(int argc, char* argv[])
     NN_EXIT(optimizer, 1, "optimizer creation failed\n");
 
     nn::CrossEntropyLoss ce;
+    if (use_f16)
+        ce.set_precision_profile(nn::profile_f16());
     std::mt19937_64 rng{123};
     std::uniform_int_distribution<std::size_t> tok(0, cfg.vocab_size - 1);
 

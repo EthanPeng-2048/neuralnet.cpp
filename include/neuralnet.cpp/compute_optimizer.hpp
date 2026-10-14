@@ -300,6 +300,19 @@ protected:
     std::vector<Tensor> m_;  // 一阶矩
     std::vector<Tensor> v_;  // 二阶矩
 
+    // ── 状态缩放（F5）：只由**状态存储精度**决定 → 恒为常量、确定性 ────────
+    // f32 状态 → S = 1（逐位保持原配方）。f16 状态 → S = 4096：
+    //   · 典型 |g| ∈ [1e-4, 1e-1] ⇒ m = g·S ∈ [0.4, 400]、v = g²·S² ∈ [1.7e-4,
+    //     1.7e5] —— m 稳在 f16 正常区，v 的下缘远离次正规区（这正是要修的）；
+    //   · 上缘 1.7e5 > 65504 ⇒ **|g| ≳ 0.0625 时 v 会溢出**。该边界与
+    //     `--precision-optimizer f16` 的危险性同源，已由启动期精度告警提示
+    //     （docs/todo/24 §2）；实践上配 `--max-norm` 梯度裁剪即可约束 |g|。
+    //   · S 取 2 的幂 → 与 g 的相乘在 f16 下**无损**（指数平移），不引入额外舍入。
+    [[nodiscard]] Scalar optimizer_state_scale_() const noexcept
+    {
+        return precision_bytes(p_.optimizer) >= 4 ? Scalar{1} : Scalar{4096};
+    }
+
     // Adam 核心更新（protected，AdamW 复用）
     // inv_bc1/inv_bc2 由 step() 提前计算（每步仅一次 pow），失败时不推进 t。
     //
@@ -318,10 +331,26 @@ protected:
         const Tensor& g = grads_[i];
         const std::size_t rows = g.rows(), cols = g.cols();
 
+        // ── 状态缩放 S（F5，2026-10-14）───────────────────────────────────
+        // 动机：Adam 的二阶矩 v ≈ (1-β2)·g²。f16 存储时 g ~ 1e-5 ⇒ v ~ 1e-10
+        // **下溢为 0**，而一阶矩 m ~ 1e-8 仍在次正规区 ⇒ `m/(√v+eps)` 退化，
+        // 更新量暴涨（实测 `--precision-optimizer f16` 第 1 步后即 NaN）。
+        // 修法：把**进入状态更新的梯度**放大 S 倍 ⇒ m 放大 S、v 放大 S²（都回到
+        // f16 的正常区）。因为 Adam 的更新是**尺度不变**的
+        //     lr·(S·m̂)/(√(S²·v̂)+S·eps) = lr·m̂/(√v̂+eps)
+        // 故只需同步把 eps 放大 S（保持"eps 相对 v"的比例不变），**更新量逐位
+        // 不变**（f16 舍入内的差异）。S 只由状态存储精度决定（确定性，铁律 8），
+        // 因此 checkpoint 里存的是同一套缩放后的状态，可原样读回。
+        // ⚠ 边界：|g|·S 逼近 f16 上限 65504 时 v 会溢出 → 见
+        //    `optimizer_state_scale_` 的取值与注释。
+        const Scalar s_scale = optimizer_state_scale_();
+        const Scalar s2 = s_scale * s_scale;
+        const Scalar eps_scaled = eps_ * s_scale;
+
         // K1: m = β1*m + (1-β1)*g（单 kernel 融合；状态精度 = p_.optimizer）
         auto m_new = dsl::compute(engine_,
             dsl::leaf(m_[i]) * dsl::rparam(beta1_) +
-                dsl::leaf(g) * dsl::rparam(one_minus_beta1),
+                dsl::leaf(g) * dsl::rparam(one_minus_beta1 * s_scale),
             rows, cols, p_.optimizer);
         NN_TRY_CHECK(m_new);
         m_[i] = std::move(*m_new);
@@ -329,7 +358,7 @@ protected:
         // K2: v = β2*v + (1-β2)*g²（单 kernel 融合；状态精度 = p_.optimizer）
         auto v_new = dsl::compute(engine_,
             dsl::leaf(v_[i]) * dsl::rparam(beta2_) +
-                dsl::leaf(g) * dsl::leaf(g) * dsl::rparam(one_minus_beta2),
+                dsl::leaf(g) * dsl::leaf(g) * dsl::rparam(one_minus_beta2 * s2),
             rows, cols, p_.optimizer);
         NN_TRY_CHECK(v_new);
         v_[i] = std::move(*v_new);
@@ -349,7 +378,7 @@ protected:
               -dsl::rparam(lr_)
               * ((dsl::leaf(m_[i]) * dsl::rparam(inv_bc1))
                  / (dsl::sqrt(dsl::leaf(v_[i]) * dsl::rparam(inv_bc2))
-                    + dsl::rparam(eps_))),
+                      + dsl::rparam(eps_scaled))),
             rows, cols, upd_prec);
         NN_TRY_CHECK(delta);
         // p += delta（目标传递：原地、单 dispatch，不额外分配）

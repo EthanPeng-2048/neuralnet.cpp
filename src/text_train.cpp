@@ -27,6 +27,7 @@
 #include <neuralnet.cpp/cli/cli_lr_scheduler.hpp>
 #include <neuralnet.cpp/cli/cli_gpu_option.hpp>
 #include <neuralnet.cpp/cli/cli_help.hpp>
+#include <neuralnet.cpp/cli/cli_precision_warning.hpp>
 #include <neuralnet.cpp/core_profile.hpp>
 
 #include <algorithm>
@@ -783,6 +784,13 @@ void log_gradient_stats(nn::ComputeEngine &engine, const std::vector<nn::TensorR
 int main(int argc, char *argv[])
 {
     TrainConfig cfg = parse_args(argc, argv);
+
+    // ── 危险精度组合启动期告警（仅警告，不拒绝；docs/todo/24 §2.3 F1）────
+    // optimizer=f16（含四字段全 f16）只打印一次到 stderr：不改变退出码、不阻断
+    // 训练、不静默降级；`--f16` 与合法组合返回空串（静默）。
+    if (const std::string warn = nn::cli::dangerous_precision_warning(cfg.precision);
+        !warn.empty())
+        std::cerr << warn;
 
     // ── 打开数据集（.nndataset；token 流/掩码/词表都在生成期定好）──────
     std::cout << "加载数据集: " << cfg.text_path << " ..." << std::endl;

@@ -806,6 +806,20 @@ inline constexpr ExprPrecSig EXPR_PREC_SIG_DISPATCH = 0x00020000u;
 inline constexpr const char* EXPR_PREC_DISPATCH_SUFFIX = "#x";
 // native16（原生 f16 算术，见 expr_prec_sig_native16）变体的 key 后缀。
 inline constexpr const char* EXPR_PREC_ALU_SUFFIX = "#a";
+// storage-only **编译期特化**变体的 key 后缀（结构 key + "#s"）：签名固定为
+// "全输入 f16 + 输出 f16"，f16 存储 + **f32 算术**（load→float()→f32 算术→
+// float16_t() 往返，与 `#x` 分派变体的 f16 分支逐字等价）。
+//
+// 存在理由（相对 `#x`）：`#x` 是"一个结构一份 shader 覆盖全部签名"的载体，
+// 代价是热循环里每次读写都带 `((prec >> i & 1u) ? … : …)` 三元——编译器无法
+// 把它化简成单条路径，双向视图的取址/装载被保留。ggml/torch 的 kernel 是
+// **按类型编译期特化**（`mul_mat_f16` / `__half` 模板），热循环里没有类型分支。
+// `#s` 就是把最常见的训练签名（全 f16 激活）拿出来做同样的特化。
+//
+// 设备要求：仅 16 位存储（`storageBuffer16BitAccess`）——**不需要**
+// shaderFloat16，因此无原生 f16 ALU 的设备（如 Maxwell）同样能拿到；有
+// shaderFloat16 时 `#a`（原生 f16 算术）仍优先。
+inline constexpr const char* EXPR_PREC_STORAGE_SUFFIX = "#s";
 // P3 跨链批量派发变体的 key 后缀（结构 key + "#b"）：同结构、同参数值、
 // 互不依赖的多实例合成**一次批量派发**（实例表 + buffer device address）。
 // 仅纯逐元素结构、仅 V0 全 f32（见 expr_spec_batchable）。
@@ -880,6 +894,24 @@ inline constexpr const char* EXPR_MM_KSPLIT_REDUCE_SUFFIX = "#kr";
     s += "] out=";
     s += expr_prec_sig_out_f16(sig) ? "f16" : "f32";
     return s;
+}
+
+// ── storage-only 特化谓词：运行期签名是否恰为该变体的身份签名 ──────────────
+// `#s` 变体在构建期以固定签名 `expr_prec_sig_make(EXPR_PREC_SIG_INPUT_MASK, true)`
+// 生成（输入位掩码取满、输出位 f16）——因此运行期判定**不能**做相等比较
+// （真实签名的输入位只在 0..n-1 上置位），必须像 native16 谓词一样**逐视图**
+// 检查：结构内每个输入都是 f16 且输出 f16。含 fold / matmul / 归约 / rparams
+// 的结构同样适用（这正是 `#a` 覆盖不到、而 `#s` 要覆盖的部分）——数值语义与
+// `#x` 的 f16 分支逐字相同，所以没有任何额外的结构禁忌。
+[[nodiscard]] inline bool expr_prec_sig_all_f16(const ExprSpec& spec,
+                                                ExprPrecSig sig) noexcept
+{
+    if (sig == 0u || expr_prec_sig_is_dispatch(sig) || !expr_prec_sig_out_f16(sig))
+        return false;
+    for (std::size_t i = 0; i < spec.views.size(); ++i)
+        if (!expr_prec_sig_in_f16(sig, i))
+            return false;
+    return true;
 }
 
 // ── native16 谓词：该 (结构, 签名) 是否生成/启用"原生 f16 算术"变体 ────────

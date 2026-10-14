@@ -549,10 +549,15 @@ inline void glsl_emit_matmul_tail_fn(std::ostringstream& L, const ExprSpec& spec
     // 其余 block 值无对应计算路径 → 拒绝。
     if (block != EXPR_MATMUL_BLOCK && block != EXPR_MATMUL_BLOCK_FINE)
         return {};
-    // K 切分变体（键 #ks）：仅细 tile 网格 + 仅 V0 全 f32（sig==0 覆盖分派
-    // 哨兵 0x20000）——资格判据与 fused_generate/运行期派发分支同源，
-    // 防御性拒绝与 PC 多槽/免尾链写回不相容的精度变体。
-    if (k_split && (block != EXPR_MATMUL_BLOCK_FINE || sig != 0))
+    // K 切分变体（键 #ks）：仅细 tile 网格 + 仅**静态签名**（sig==0 或具体
+    // 签名；运行期分派哨兵 0x20000 需要 `prec` PC 槽 + 输入/输出双视图，与
+    // "免尾链 + 写部分和"的绑定/PC 形态不相容 → 防御性拒绝）。
+    // **#ks 的输出是部分和缓冲（恒 f32）**，与注入 sig 的输出精度无关：
+    // 后端按 f32 分配该缓冲（run_fused_gpu 的 use_ks 分支），故此处必须把
+    // 输出声明钉成 float、写原始 acc（不做 f16 舍入）——否则 f16 签名会按
+    // 2B/元素写进 4B/元素的缓冲（静默错值）。最终精度由伴生 #kr 落盘。
+    if (k_split && (block != EXPR_MATMUL_BLOCK_FINE ||
+                    expr_prec_sig_is_dispatch(sig)))
         return {};
     const MatmulSpec& mm = *spec.matmul;
     const std::size_t n_inputs = spec.views.size();
@@ -625,8 +630,11 @@ inline void glsl_emit_matmul_tail_fn(std::ostringstream& L, const ExprSpec& spec
           << ") writeonly buffer BufOuth { float16_t bout16[]; };\n";
     }
     else
+        // k_split 时输出 = 部分和缓冲（后端按 f32 分配）→ 声明恒 float
+        //（见本函数头 k_split 段：写的是原始部分和，不做精度落盘）。
         L << "layout(std430, binding = " << n_inputs
-          << ") writeonly buffer BufOut { " << (out_f16 ? "float16_t" : "float")
+          << ") writeonly buffer BufOut { "
+          << ((out_f16 && !k_split) ? "float16_t" : "float")
           << " bout[]; };\n";
     // vec4 别名视图（A/B 全局快路径专用；同 binding 双声明 std430，op 级
     // matmul_tiled 同款）。a_slot==b_slot 时不发别名、快路径整体关闭。
@@ -996,7 +1004,9 @@ inline void glsl_emit_matmul_tail_fn(std::ostringstream& L, const ExprSpec& spec
         {
             // #ks：写**原始部分和**到 (S·rows, cols) 部分和缓冲的段行
             // slice*rows + grow（不跑尾链——尾链非线性，须在 #kr 跨段求和
-            // 之后统一执行）。k_split 恒 V0/f32（上方资格拒绝），无 disp/f16 分支。
+            // 之后统一执行）。部分和缓冲恒 f32（后端 use_ks 分支分配），
+            // 故此处不做任何精度落盘、`bout` 声明恒 float —— 与注入的 sig
+            // 无关（sig 只决定 A/B 的读取类型）。
             L << "                    bout[(slice * rows + batch * m_per + rr) * cols + cc] =\n";
             L << "                        accs[i * 2u + j];\n";
         }
@@ -1081,28 +1091,43 @@ inline void glsl_emit_matmul_tail_fn(std::ostringstream& L, const ExprSpec& spec
 [[nodiscard]] inline std::string generate_glsl_matmul_ksplit_reduce(
     const std::string& name, const ExprSpec& spec, ExprPrecSig sig = 0)
 {
-    // 资格 = 与 #ks/细 tile 同源：纯 matmul、无 fold、raxis<0、V0 全 f32、
-    // 无 extras（多输出结构不产 K 切分变体）。防御性拒绝，返回空 → 上层
-    // [skip]，运行期留在细 tile 路径（降级，不是错误）。
-    if (sig != 0 || spec.fold || !spec.matmul ||
+    // 资格 = 与 #ks/细 tile 同源：纯 matmul、无 fold、raxis<0、**静态签名**
+    // （sig==0 或具体签名；运行期分派哨兵与 #ks 同款被拒——它的 `prec` PC
+    // 槽 + 双视图与"部分和缓冲恒 f32"的绑定形态不相容）、无 extras（多输出
+    // 结构不产 K 切分变体）。防御性拒绝，返回空 → 上层 [skip]，运行期留在
+    // 细 tile 路径（降级，不是错误）。
+    if (expr_prec_sig_is_dispatch(sig) || spec.fold || !spec.matmul ||
         expr_spec_reduce_axis(spec) != -1 || !spec.extras.empty())
         return {};
     const std::size_t n_inputs = spec.views.size();
     if (n_inputs + 2 > EXPR_MAX_INPUTS + 2)
         return {};
 
+    // 输入/输出按注入签名选元素类型；**部分和缓冲恒 f32**（后端 use_ks 分支
+    // 按 f32 分配，与 sig 的输出精度无关）。尾链的读取表达式由
+    // glsl_emit_matmul_tail_fn(sig) 同源产出 → 两处声明必须逐槽一致。
+    const bool sign_f16 = (sig != 0);
+    const bool out_f16 = sign_f16 && expr_prec_sig_out_f16(sig);
+
     std::ostringstream L;
     L << "// ── 自动生成（AOT 算子融合 · matmul K 切分二次归约），请勿手动编辑 ──\n";
     L << "// 表达式: " << name << "   [K 切分归约 #kr：段升序求和 + 尾链]\n";
     L << "#version 450\n\n";
+    if (sign_f16)
+        L << "#extension GL_EXT_shader_16bit_storage : require\n\n";
+    if (out_f16)
+        L << glsl_f16_rne_source();   // glsl_f16_store 依赖（RNE 预舍入）
     L << "layout(local_size_x = 256) in;\n\n";
     for (std::size_t i = 0; i < n_inputs; ++i)
         L << "layout(std430, binding = " << i << ") readonly buffer Buf" << i
-          << " { float b" << i << "[]; };\n";
+          << " { "
+          << ((sign_f16 && expr_prec_sig_in_f16(sig, i)) ? "float16_t" : "float")
+          << " b" << i << "[]; };\n";
     L << "layout(std430, binding = " << n_inputs
       << ") readonly buffer BufPart { float bpart[]; };\n";
     L << "layout(std430, binding = " << (n_inputs + 1)
-      << ") writeonly buffer BufOut { float bout[]; };\n";
+      << ") writeonly buffer BufOut { " << (out_f16 ? "float16_t" : "float")
+      << " bout[]; };\n";
     L << "\n";
     // 分组归约视图辅助（尾链含 GroupedReduce 视图时需要；纯 Linear 时为空）
     glsl_emit_grouped_reduce_helpers(L, spec, sig, /*f16_native=*/false);
@@ -1137,7 +1162,10 @@ inline void glsl_emit_matmul_tail_fn(std::ostringstream& L, const ExprSpec& spec
     L << "    float acc = bpart[grow * cols + col];\n";
     L << "    for (uint s = 1u; s < ks_slices; ++s)\n";
     L << "        acc += bpart[(s * rows + grow) * cols + col];\n";
-    L << "    bout[gi] = eval_tail(acc, rr, col, batch);\n";
+    L << "    bout[gi] = "
+      << (out_f16 ? glsl_f16_store("eval_tail(acc, rr, col, batch)")
+                  : std::string("eval_tail(acc, rr, col, batch)"))
+      << ";\n";
     L << "}\n";
     return L.str();
 }
@@ -2190,29 +2218,40 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec,
     // P3 批量变体（键 = key#b）：纯逐元素 + 仅 V0 全 f32。其余形态返回空串
     // （上层 [skip]，运行期逐 kernel 降级，不是错误）。资格判据与
     // fused_generate / execute_fused_graph 同源（expr_spec_batchable）。
-    if (batched && (sig != 0 || native16 || !expr_spec_batchable(spec)))
+    // 批量变体（键 = key#b，或叠加在精度特化变体上 = key#xxxx#b）：
+    // 资格同 V0（纯逐元素、无 fold/matmul/reduce）；sig 为静态签名（0 = V0）。
+    // ⚠ **带 extras 的结构仅支持 V0 全 f32**：extras 的元素类型不在
+    //   ExprPrecSig 里（它只描述输入 + 主输出），运行期又无法在构建期枚举，
+    //   故 f16 批量变体只对 **extras 为空**的结构发射（实测优化器在 f16 下的
+    //   4 个结构全是单输出 → 覆盖到）；带 extras 的 f16 结构仍逐 kernel 降级。
+    //   运行期分派哨兵不叠加批量变体。
+    if (batched && (expr_prec_sig_is_dispatch(sig) || native16 ||
+                    !expr_spec_batchable(spec) ||
+                    (sig != 0 && !spec.extras.empty())))
         return {};
     if (mm_fine)
     {
-        // 细 tile 变体（键 = key#f）：资格与 run_fused_gpu 的派发分支同源
-        // （纯 matmul：无 fold、raxis<0、V0 全 f32）。PC 布局与 V0 完全一致
-        // （block 不进 PC）→ 同一固定头、同一绑定数。
-        if (sig != 0 || native16 || batched || spec.fold || !spec.matmul ||
-            expr_spec_reduce_axis(spec) != -1)
+        // 细 tile 变体（键 = key#f；**可叠加**在精度特化变体上 = key#xxxx#f）。
+        // 资格与 run_fused_gpu 的派发分支同源（纯 matmul：无 fold、raxis<0）。
+        // PC 布局与 V0 完全一致（block 不进 PC）→ 同一固定头、同一绑定数，
+        // 所以 sig 只是把"输入/输出读写的元素类型"静态化，不引入新槽。
+        // 运行期分派哨兵不支持（它多一个 `prec` 槽且绑定翻倍，网格变体不叠加）。
+        if (expr_prec_sig_is_dispatch(sig) || native16 || batched || spec.fold ||
+            !spec.matmul || expr_spec_reduce_axis(spec) != -1)
             return {};
-        return generate_glsl_matmul(name, spec, /*sig=*/0,
-                                    EXPR_MATMUL_BLOCK_FINE);
+        return generate_glsl_matmul(name, spec, sig, EXPR_MATMUL_BLOCK_FINE);
     }
     if (mm_ksplit)
     {
         // K 切分变体（键 = key#ks）：资格与 run_fused_gpu 的 K 切分派发
-        // 分支同源（纯 matmul：无 fold、raxis<0、V0 全 f32）。block 恒取
-        // 细 tile 16（K 切分只在细 tile 网格仍饥饿时派发）；PC 比 V0 多一
-        // 槽 ks_span（见 generate_glsl_matmul 的 k_split 分支）。
-        if (sig != 0 || native16 || batched || spec.fold || !spec.matmul ||
-            expr_spec_reduce_axis(spec) != -1)
+        // 分支同源（纯 matmul：无 fold、raxis<0）。block 恒取细 tile 16
+        //（K 切分只在细 tile 网格仍饥饿时派发）；PC 比 V0 多一槽 ks_span
+        //（见 generate_glsl_matmul 的 k_split 分支）。sig 同上：0 = V0，
+        // 具体签名 = 静态特化变体（**部分和缓冲恒 f32**，与 sig 输出精度无关）。
+        if (expr_prec_sig_is_dispatch(sig) || native16 || batched || spec.fold ||
+            !spec.matmul || expr_spec_reduce_axis(spec) != -1)
             return {};
-        return generate_glsl_matmul(name, spec, /*sig=*/0,
+        return generate_glsl_matmul(name, spec, sig,
                                     EXPR_MATMUL_BLOCK_FINE, /*k_split=*/true);
     }
     if (native16 && !expr_prec_sig_native16(spec, sig))
@@ -2293,17 +2332,31 @@ inline std::string generate_glsl(const std::string& name, const ExprSpec& spec,
         // `ib` 必须是模块级变量：gr_r<i> 辅助函数也经宏访问实例表。
         L << "// P3 批量派发：实例表槽位 = 输入…、输出…、(count,cols)；"
              "stride S = " << (n_inputs + 2 + spec.extras.size()) << "\n";
+        // 实例表的地址是类型无关的；元素类型由**注入签名**在编译期定死
+        //（f16 槽走 float16_t 的 buffer reference）。extras 只在 sig==0
+        //（V0）时存在 → 其引用类型恒 F32BufW（见上方资格拒绝）。
+        const bool b_sign_f16 = (sig != 0);
+        const bool b_out_f16 = b_sign_f16 && expr_prec_sig_out_f16(sig);
         L << "layout(buffer_reference, std430) readonly buffer F32BufR "
              "{ float d[]; };\n";
+        if (b_sign_f16)
+            L << "layout(buffer_reference, std430) readonly buffer F16BufR "
+                 "{ float16_t d[]; };\n";
         L << "layout(buffer_reference, std430) buffer F32BufW "
              "{ float d[]; };\n";
+        if (b_out_f16)
+            L << "layout(buffer_reference, std430) buffer F16BufW "
+                 "{ float16_t d[]; };\n";
         L << "layout(std430, binding = 0) readonly buffer Inst "
              "{ uvec2 inst[]; };\n";
         L << "uint ib;   // 模块级 per-invocation 私有（gr_r<> 辅助函数也用）\n";
         for (std::size_t i = 0; i < n_inputs; ++i)
-            L << "#define b" << i << " (F32BufR(inst[ib + " << i
-              << "u]).d)\n";
-        L << "#define bout (F32BufW(inst[ib + " << n_inputs << "u]).d)\n";
+            L << "#define b" << i << " ("
+              << ((b_sign_f16 && expr_prec_sig_in_f16(sig, i)) ? "F16BufR"
+                                                                : "F32BufR")
+              << "(inst[ib + " << i << "u]).d)\n";
+        L << "#define bout (" << (b_out_f16 ? "F16BufW" : "F32BufW")
+          << "(inst[ib + " << n_inputs << "u]).d)\n";
         for (std::size_t k = 0; k < spec.extras.size(); ++k)
             L << "#define bex" << k << " (F32BufW(inst[ib + "
               << (n_inputs + 1 + k) << "u]).d)\n";
@@ -3340,32 +3393,36 @@ public:
     // （实例表 + buffer device address）。不支持的形态返回空串 → 上层跳过
     // 该变体，运行期逐 kernel 降级（见 expr_spec_batchable）。
     [[nodiscard]] std::string generate_batched(
-        const std::string& name_, const ExprSpec& spec) const override
-    { return nn::generate_glsl(name_, spec, /*sig=*/0, /*native16=*/false,
+        const std::string& name_, const ExprSpec& spec,
+        ExprPrecSig sig = 0) const override
+    { return nn::generate_glsl(name_, spec, sig, /*native16=*/false,
                                /*batched=*/true); }
 
     // matmul 细 tile 变体（键 = key#f，P0 wgrad 网格饥饿）：输出块 16×16、
     // 每线程 2×2 输出（R=2）的同结构 shader。不支持的形态（非纯 matmul）
     // 返回空串 → 上层跳过该变体，运行期留在 64-tile 路径（降级，不是错误）。
     [[nodiscard]] std::string generate_matmul_fine(
-        const std::string& name_, const ExprSpec& spec) const override
-    { return nn::generate_glsl(name_, spec, /*sig=*/0, /*native16=*/false,
+        const std::string& name_, const ExprSpec& spec,
+        ExprPrecSig sig = 0) const override
+    { return nn::generate_glsl(name_, spec, sig, /*native16=*/false,
                                /*batched=*/false, /*mm_fine=*/true); }
 
     // matmul K 切分变体（键 = key#ks）：细 tile 网格上把 K 切成 S 段，每 WG
     // 一段写部分和（不跑尾链）。不支持的形态（非纯 matmul/非 V0）返回空串
     // → 上层跳过该变体，运行期留在细 tile 路径（降级，不是错误）。
     [[nodiscard]] std::string generate_matmul_ksplit(
-        const std::string& name_, const ExprSpec& spec) const override
-    { return nn::generate_glsl(name_, spec, /*sig=*/0, /*native16=*/false,
+        const std::string& name_, const ExprSpec& spec,
+        ExprPrecSig sig = 0) const override
+    { return nn::generate_glsl(name_, spec, sig, /*native16=*/false,
                                /*batched=*/false, /*mm_fine=*/false,
                                /*mm_ksplit=*/true); }
 
     // K 切分伴生归约（键 = key#kr）：跨段升序求和 + 同一条尾链。
     // 资格判据在 generate_glsl_matmul_ksplit_reduce 内，与 #ks 同源。
     [[nodiscard]] std::string generate_matmul_ksplit_reduce(
-        const std::string& name_, const ExprSpec& spec) const override
-    { return nn::generate_glsl_matmul_ksplit_reduce(name_, spec); }
+        const std::string& name_, const ExprSpec& spec,
+        ExprPrecSig sig = 0) const override
+    { return nn::generate_glsl_matmul_ksplit_reduce(name_, spec, sig); }
 };
 
 // 登记到 emitter 注册表（静态初始化；重复包含无害——同名拒绝覆盖）

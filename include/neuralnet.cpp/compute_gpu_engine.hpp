@@ -1497,6 +1497,18 @@ public:
         if (nn::expr_prec_sig_native16(spec, psig))
             if (const auto* fs = hit(key + nn::EXPR_PREC_ALU_SUFFIX))
                 return fs;
+        // V1t/V1s：storage-only **编译期特化**（热循环里没有 `prec` 三元）。
+        // 与 V1 分派变体数值逐字等价；只需要 16 位存储，无 shaderFloat16 的
+        // 设备（Maxwell）同样命中。优先于 V1。
+        //   ① `key#xxxx`（V1t）：构建期扫描**观察到的签名**（dry-run + 模型
+        //      pass 各跑 f32/f16 两遍，见 scan_exprs / ExprRegistry::add_variant）；
+        //   ② `key#s`（V1s）："全输入 f16 + 输出 f16"兜底——始终发射，覆盖
+        //      扫描没走到的路径（特化集合只是优化，`#x` 仍是语义兜底）。
+        if (const auto* fs = hit(nn::expr_prec_sig_key(key, psig)))
+            return fs;
+        if (nn::expr_prec_sig_all_f16(spec, psig))
+            if (const auto* fs = hit(key + nn::EXPR_PREC_STORAGE_SUFFIX))
+                return fs;
         // V1：运行期精度分派
         const std::string xkey = key + nn::EXPR_PREC_DISPATCH_SUFFIX;
         if (const auto* fs = hit(xkey))
@@ -2016,6 +2028,8 @@ private:
             bool        batchable = false;  // P3 批量资格（含 `key#b` 已登记）
             std::string bkey;               // 组键（结构 key + 参数值序列）
             ExprSpec    bspec;              // canonical spec（批量派发参数来源）
+            ExprPrecSig b_sig = 0;          // 组内统一精度签名（0 = 全 f32）
+            std::string b_prefix;           // 批量变体前缀（不含 `#b`）
         };
         std::vector<DispatchItem> items(kernels.size());
         // P3 逃生阀：NN_IRC_NO_BATCH=1 关闭批量派发（A/B 对照用；每次调用读取，
@@ -2088,19 +2102,30 @@ private:
                 batch_enabled &&
                 (k.rows == 0 || k.cols <= UINT32_MAX / k.rows))
             {
-                bool f32_gpu = true;
+                // 组内统一的精度签名：输入 + 主输出（extras 不在签名编码里
+                // → 带 extras 的结构只走 V0 全 f32，见 batch_variant_available_
+                // 命中条件与 fused_generate 的发射目标）。
+                bool gpu_ok = true;
                 for (const Tensor& t : d.ins)
-                    f32_gpu = f32_gpu && t.valid() && t.is_gpu() &&
-                              t.precision() == Precision::F32;
+                    gpu_ok = gpu_ok && t.valid() && t.is_gpu();
                 for (const Tensor& t : d.extras)
-                    f32_gpu = f32_gpu && t.valid() && t.is_gpu() &&
+                    gpu_ok = gpu_ok && t.valid() && t.is_gpu() &&
                               t.precision() == Precision::F32;
-                f32_gpu = f32_gpu && d.out.valid() && d.out.is_gpu() &&
-                          d.out.precision() == Precision::F32;
-                if (f32_gpu && batch_variant_available_(bspec))
+                gpu_ok = gpu_ok && d.out.valid() && d.out.is_gpu();
+                const nn::ExprPrecSig b_sig =
+                    (gpu_ok && d.ins.size() < 16u)
+                        ? nn::expr_prec_sig_of(d.ins, d.out.precision())
+                        : 0u;
+                const std::string b_prefix =
+                    (gpu_ok && (b_sig == 0u || d.extras.empty()))
+                        ? batch_variant_prefix_(bspec, b_sig)
+                        : std::string{};
+                if (!b_prefix.empty())
                 {
                     d.batchable = true;
-                    d.bkey = batch_group_key_(bspec);
+                    d.b_sig = b_sig;
+                    d.b_prefix = b_prefix;
+                    d.bkey = batch_group_key_(b_prefix, bspec);
                 }
             }
         }
@@ -2198,17 +2223,27 @@ private:
                                      gr.members.size(), gr.key.c_str());
                     std::vector<FusedBatchInst> insts;
                     insts.reserve(gr.members.size());
+                    // 取实例缓冲：**必须按张量自己的精度**取槽位
+                    //（`gpu_tensor()` 默认模板实参是 F32 → f16 张量会命中
+                    // "无 P 精度存储" 断言）。批量变体的元素类型是编译期定死的
+                    // （组键里带签名），所以这里只需拿地址。
+                    const auto gpu_buf = [](const Tensor& t) -> const GpuBuffer*
+                    {
+                        return t.precision() == Precision::F16
+                            ? &t.gpu_tensor<Precision::F16>().buffer()
+                            : &t.gpu_tensor<Precision::F32>().buffer();
+                    };
                     for (const std::size_t m : gr.members)
                     {
                         const DispatchItem& dm = items[m];
                         FusedBatchInst bi;
                         bi.inputs.reserve(dm.ins.size());
                         for (const Tensor& t : dm.ins)
-                            bi.inputs.push_back(&t.gpu_tensor().buffer());
-                        bi.out = &dm.out.gpu_tensor().buffer();
+                            bi.inputs.push_back(gpu_buf(t));
+                        bi.out = gpu_buf(dm.out);
                         bi.extra_outs.reserve(dm.extras.size());
                         for (const Tensor& t : dm.extras)
-                            bi.extra_outs.push_back(&t.gpu_tensor().buffer());
+                            bi.extra_outs.push_back(gpu_buf(t));
                         bi.count = static_cast<std::uint32_t>(
                             kernels[m].rows * kernels[m].cols);
                         bi.cols = static_cast<std::uint32_t>(kernels[m].cols);
@@ -2216,7 +2251,8 @@ private:
                     }
                     const ExprSpec& s = items[gr.members.front()].bspec;
                     auto br = backend_.run_fused_gpu_batch(
-                        nn::expr_spec_key(s) + nn::EXPR_BATCH_SUFFIX, insts,
+                        items[gr.members.front()].b_prefix + nn::EXPR_BATCH_SUFFIX,
+                        insts,
                         s.consts, nn::expr_spec_runtime_view_params(s), s.rparams);
                     NN_TRY_CHECK(br);
                     continue;
@@ -2426,15 +2462,33 @@ private:
     // ── P3：`key#b` 批量变体可用性（注册表 + pipeline 双命中）──────────────
     // 设备无 buffer device address 时注册期即跳过 `#b` → 此处恒 false →
     // 调用方逐 kernel 降级（闭合世界降级，不是错误）。
-    [[nodiscard]] bool batch_variant_available_(const ExprSpec& spec) const
+    // sig = 组内统一精度签名（0 = 全 f32；非 0 = 静态特化批量变体，键 =
+    // `key#xxxx#b`，见 fused_generate 的批量发射目标）。
+    // **返回命中的批量变体"前缀"**（`key` / `key#xxxx` / `key#s`，不含 `#b`）
+    // ——组键与派发键都必须用它，否则"精确签名未发射、退回 `#s`"的一类会被
+    // 派发到不存在的键上。未命中返回空串（→ 调用方逐 kernel 降级）。
+    [[nodiscard]] std::string batch_variant_prefix_(const ExprSpec& spec,
+                                                    nn::ExprPrecSig sig) const
     {
 #ifdef NN_FUSED_REGISTRY_EMBEDDED
-        const std::string bkey = nn::expr_spec_key(spec) + nn::EXPR_BATCH_SUFFIX;
-        const nn::fused::FusedShader* fs = nn::fused::find_fused(bkey);
-        return fs != nullptr && backend_.has_fused_shader(fs->key);
+        const std::string key = nn::expr_spec_key(spec);
+        const auto hit = [this](const std::string& k) {
+            const nn::fused::FusedShader* fs = nn::fused::find_fused(k);
+            return fs != nullptr && backend_.has_fused_shader(fs->key);
+        };
+        // 与 find_prec_variant_ 同序：精确签名键 → 全 f16 兜底（`key#s`，
+        // 全 f16 签名不重复发射 `key#xxxx` 变体）。
+        const std::string exact = nn::expr_prec_sig_key(key, sig);
+        if (hit(exact + nn::EXPR_BATCH_SUFFIX))
+            return exact;
+        if (nn::expr_prec_sig_all_f16(spec, sig) &&
+            hit(key + nn::EXPR_PREC_STORAGE_SUFFIX + nn::EXPR_BATCH_SUFFIX))
+            return key + nn::EXPR_PREC_STORAGE_SUFFIX;
+        return {};
 #else
         (void)spec;
-        return false;
+        (void)sig;
+        return {};
 #endif
     }
 
@@ -2442,11 +2496,15 @@ private:
     // 批量派发共享一份 push constants → 值必须逐位一致才可同组（值不进结构
     // key，但进组键）。按 32 位位型（%08x）而非十进制串接：同值同键、异位型
     // 必异键（NaN 载荷 / -0.0 不合并——PC 是逐位 memcpy，合并即改数值）。
-    [[nodiscard]] static std::string batch_group_key_(const ExprSpec& spec)
+    [[nodiscard]] static std::string batch_group_key_(const std::string& b_prefix,
+                                                      const ExprSpec& spec)
     {
         static_assert(sizeof(Scalar) == sizeof(std::uint32_t),
                       "batch_group_key_ 按 32 位位型编码标量");
-        std::string s = nn::expr_spec_key(spec);
+        // 组键 = 批量变体前缀（结构 key + 精度签名身份） + 参数值位型序列：
+        // **精度必须进组键** —— 批量变体的元素类型是编译期定死的（f16 槽走
+        // float16_t 的 buffer reference），同一组内混签名会把 f16 缓冲按 f32 读。
+        std::string s = b_prefix;
         const auto feed_u32 = [&s](std::uint32_t v)
         {
             char buf[9];

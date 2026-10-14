@@ -1444,13 +1444,20 @@ struct FoldAnchor
 
 // ── 构建期扫描的单点登记（三个 dsl 入口共用）────────────────────────────
 // 折叠表达式 → 校验 → 登记进全局注册表，并返回折叠出的 spec（compute_reduce
-// 还要用它判定归约轴）。**只登记结构**：精度签名已不是构建期集合
-// （生成阶段对每个结构发运行期精度分派 shader `key#x`）。
+// 还要用它判定归约轴）。
+// 登记两项：
+//   ① **结构**（按 canonical key 去重）——运行期闭合世界的键；
+//   ② **观察到的精度签名**（真实张量精度 + 真实 P）——生成阶段据此发
+//      **编译期特化** shader（键 `key#xxxx`，f16 存储 + f32 算术）。这是一个
+//      纯优化：热循环里不带 `prec` 三元（实测 CE 融合注意力 −18%）；
+//      未枚举到的签名仍由运行期分派变体 `key#x` 兜底。
 // 锚点（FusedAnchor，按**类型**登记）由本函数统一 odr-use，保证三个入口的
 // 锚点覆盖行为一致（此前三处各写一遍，漏一处 = 该入口的调用点失去编译期可达
-// 覆盖，且只在 GPU 闭合世界报错时才暴露）。
+// 覆盖，且只在 GPU 闭合世界报错时才暴露）。锚点路径的输入是**符号占位张量**
+// （默认 f32）→ 其签名恒 0，不会污染特化集合。
 template <class Expr>
-[[nodiscard]] inline ExprSpec scan_register(const Expr& e)
+[[nodiscard]] inline ExprSpec scan_register(const Expr& e,
+                                            Precision P = Precision::F32)
 {
 #if !defined(NN_SCAN_NO_ANCHOR)
     (void)FusedAnchor<Expr>::reg;
@@ -1459,6 +1466,18 @@ template <class Expr>
     if (auto v = validate_expr_spec(spec, inputs.size()); !v)
         scan_reject(v.error());
     fused::global_registry().add(spec);
+    // 签名位：bit i = 第 i 个输入是 f16，bit16 = 输出是 f16（与运行时
+    // expr_prec_sig_of / 生成阶段同源）。这里就地算，避免依赖 compute_engine
+    // 的 include 顺序（expr_dsl 被 compute_engine 包含）。
+    {
+        std::uint32_t bits = 0;
+        const std::size_t n = inputs.size() < 16u ? inputs.size() : 16u;
+        for (std::size_t i = 0; i < n; ++i)
+            if (inputs[i].precision() == Precision::F16)
+                bits |= (1u << i);
+        fused::global_registry().add_variant(
+            spec, expr_prec_sig_make(bits, P == Precision::F16));
+    }
     return spec;
 }
 
@@ -1502,7 +1521,7 @@ template <typename E>
     // 符号实例与运行期实例可能折叠出不同 key，双保险；注册表按 key 去重，
     // 冗余无害。P2 教训：只入图不登记会让未融合回退/单节点 kernel 闭合世界
     // miss），录制段内再入图（end_expr 时融合并登记复合 spec）。
-    const ExprSpec reg_spec = scan_register(e);
+    const ExprSpec reg_spec = scan_register(e, P);
     if (auto* g = fused::recording_graph())
     {
         auto [spec, inputs] = to_expr_spec(e);
@@ -1618,7 +1637,7 @@ template <typename E>
     // 锚点自登记在 scan_register 内统一处理
     (void)eng;
     // 个体结构恒登记（录制段内也登记，双保险——见 compute 的说明）
-    (void)scan_register(e);
+    (void)scan_register(e, dst.precision());
     // IR-C（P2）：录制段内作为目标传递节点入图（输出 = dst 既有张量，
     // end_expr 的复合 kernel 写回其存储）
     if (auto* g = fused::recording_graph())
@@ -1703,7 +1722,7 @@ template <typename E>
     // 锚点自登记在 scan_register 内统一处理。
     (void)eng;
     // 个体结构恒登记（录制段内也登记，双保险——见 compute 的说明）
-    const ExprSpec reg_spec = scan_register(e);
+    const ExprSpec reg_spec = scan_register(e, P);
     // IR-C：录制段内加入图（归约向量占位 + tag）
     if (auto* g = fused::recording_graph())
     {
