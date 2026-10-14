@@ -39,19 +39,19 @@
 
 | 维度 | 实测 | 复现 |
 |---|---|---|
-| `include/` | **58 个 `.hpp` / 35637 行**（非空 32594） | `Get-ChildItem include -Recurse -Filter *.hpp` + 逐文件 `Get-Content` 计数 |
-| `src/` | **55 个 `.cpp` / 17873 行** | 同上换 `src -Filter *.cpp` |
-| `shaders/` | **19 个 `.comp`** | `Get-ChildItem shaders -Recurse -Filter *.comp` |
-| `docs/` | **29 篇 `.md`**（含 `history/history.md` 与 `release-notes/`） | `Get-ChildItem docs -Recurse -Filter *.md` |
-| 最大源文件 | `compute_vk_backend.hpp` **5161** 行、`expr_glsl_gen.hpp` **2806**、`compute_cpu_engine.hpp` **2309**、`compute_engine.hpp` **2003**、`gui.py` **1662**（非空约 1470）、`src/text_train.cpp` **1493** | 逐文件 `(Get-Content $f).Count` |
-| ctest | **27 个测试** = 24 个测试目标（`list(APPEND NN_TEST_TARGETS` 计数）+ `cnn_test_gpu`（= `cnn_test --gpu`）+ `batchnorm_test_gpu`（= `batchnorm_test --gpu`）+ `fusion_custom_layer_example`（AOT 融合端到端） | `ctest --test-dir build -N` |
-| 引擎接口 | **52 个 virtual 方法**；`L2-VIOLATIONS: 0`；宿主桥 40 处（仅披露） | `pwsh -File bench/doc_inventory.ps1` |
-| 版本 | git tag **v1.7.0**；`CMakeLists.txt` 的 `project(... VERSION 1.7.0)`（与 tag 对齐；口径仍为 **git tag 是版本权威**）；`release-notes/` 有 `v1.5.0.md`、`v1.6.0.md`、`v1.7.0.md`（v1.5.1 / v1.6.1 无独立发布说明，v1.6.1 的用户可见变化补记于 v1.7.0.md §7） | `git describe` + 读 `CMakeLists.txt` |
-| CI | 仅 `.github/workflows/cmake-single-platform.yml`：clang++ / Ninja / Release / `NN_ENABLE_NATIVE=OFF`，Linux + Windows；**不开 `NN_ENABLE_TESTS`、不跑 ctest** | 读该 workflow |
+| `include/` | **74 个 `.hpp` / 41247 行** | `Get-ChildItem include -Recurse -Filter *.hpp` + 逐文件 `Get-Content` 计数 |
+| `src/` | **75 个 `.cpp` / 26614 行** | 同上换 `src -Filter *.cpp` |
+| `shaders/` | **22 个 `.comp`** | `Get-ChildItem shaders -Recurse -Filter *.comp` |
+| `docs/` | **43 篇 `.md`**（含 `history/history.md` 与 `release-notes/`） | `Get-ChildItem docs -Recurse -Filter *.md` |
+| 最大源文件 | `expr_glsl_gen.hpp` **3435** 行、`compute_cpu_engine.hpp` **2788**、`compute_engine.hpp` **2217**、`src/text_train.cpp` **1808**、`gui.py` **1735**、`backend/compute_vk_backend.hpp` **1055**（v1.8.1 拆 4 片段后回落） | 逐文件 `(Get-Content $f).Count` |
+| ctest | **47 个测试** = 34 个测试目标（`list(APPEND NN_TEST_TARGETS` 计数）+ 13 个变体/附加（`cnn_test_gpu`、`cnn_test_f16`、`cnn_test_f16_gpu`、`rapt_test_f16`、`rapt_test_f16_gpu`、`batchnorm_test_gpu`、`t1_58_test_gpu`、`bitnet_struct_test_gpu`、`write_epoch_test_gpu`、`ternary_gemm_test_gpu`、`adam_quant_test_gpu`、`fusion_custom_layer_example`、`expr_fuse_test`） | `ctest --test-dir build -N` |
+| 引擎接口 | **52 个 virtual 方法**；`L2-VIOLATIONS: 0`；宿主桥 41 处（仅披露） | `pwsh -File bench/doc_inventory.ps1` |
+| 版本 | git tag **v1.8.2**；`CMakeLists.txt` 的 `project(... VERSION 1.8.2)`（与 tag 对齐；口径仍为 **git tag 是版本权威**）；`release-notes/` 有 `v1.5.0.md`、`v1.6.0.md`、`v1.7.0.md`、`v1.8.1.md`、`v1.8.2.md`（v1.5.1 / v1.6.1 / v1.7.1 / v1.8.0 无独立发布说明） | `git describe` + 读 `CMakeLists.txt` |
+| CI | `.github/workflows/cmake-single-platform.yml`：clang++ / Ninja / Release / `NN_ENABLE_NATIVE=OFF`，Linux + Windows；**开 `NN_ENABLE_TESTS` 并跑 ctest**（普通 + `NN_BIND_DEBUG=1` 各一轮，P0-1） | 读该 workflow |
 
 > 口径说明：表中行数均为**总行数**（实测刷新）。
-> `27` 是当前唯一正确计数。文档中其它 ctest 计数写法属**计数口径不同**
-> （是否含 `cnn_test_gpu`、以及后来新增的目标，见 §3 工程化第 4 条），
+> `47` 是当前唯一正确计数。文档中其它 ctest 计数写法属**计数口径不同**
+> （是否含各 GPU/f16 变体、以及后来新增的目标，见 §3 工程化第 4 条），
 > 以本文与 `AGENTS.md` 的计数为准。
 
 ### 2.1 已经稳固的底座（本轮不再动）
@@ -125,7 +125,8 @@
 ## 4. 路线图分期
 
 优先级判据：**P0 = 低成本高价值且不修就有实际风险**；P1 = 1–2 月内的能力与健壮性；
-P2 = 3–6 月的结构优化；P3 = 择机（trigger 未到就不排期）。
+P2 = 3–6 月的结构优化；P3 = 择机（trigger 未到就不排期）；
+P4 = 持续优化方向（底座已稳后继续加杠杆，2026-10-14 立项，见 §4.5）。
 每项固定四栏：目标 / 验收口径 / 成本量级 / 依赖。
 
 ### 4.0 排期总览
@@ -136,6 +137,7 @@ P2 = 3–6 月的结构优化；P3 = 择机（trigger 未到就不排期）。
 | **P1** | 6 | `text_train` 模块化、checkpoint 优化器状态、危险精度组合启动期告警（细则见 [`24`](24-f16-training-defects.md)）、`gpt_test` flaky、CI 冒烟扩 MSVC Debug、**自定义层使用文档 + 精度自检**（P1-6） | P0-1；P1-6 无依赖 |
 | **P2** | 13 | `.bin` 校验和、Adafactor、RAPT/CNN f16、Dataset/DataLoader、Python/C 绑定、GUI 两项、header 拆分、F16C、step 内固定 I/O 开销（P2-9）、**原生 f16 算术用足（P2-10）**、**编译期精度特化（P2-11，已完成）**、**优化器 f16 批量派发（P2-12）**、**f16 K 切分/fine tile（P2-13）** | P0-1；P2-7 另需 P1-5；P2-6 另需 P0-5 |
 | **P3** | 8 | 由 §6 触发条件启动（含 CUDA、分布式） | 各自触发条件 |
+| **P4** | 4 | 性能利用率 / 算子性能 / 显存开销的**持续提升** + API 易用性与 **Fold 表达式自动化扫描**（见 §4.5） | 各自见 §4.5 |
 
 **串行约束（不可并行推进的组合）**：
 
@@ -198,6 +200,20 @@ P2 = 3–6 月的结构优化；P3 = 择机（trigger 未到就不排期）。
 P3 不排期，只由 §6 的触发条件启动：IR-C 图融合、S6 自动窗口、M7 存储多态、IR-D 第二 emitter、
 ZiPT 恢复、LRLA、CUDA、分布式。
 
+### 4.5 P4（持续优化方向，2026-10-14 立项）
+
+> **来源**：用户 2026-10-14 指定的四条长期方向。**不是新里程碑，而是"底座已稳后继续加杠杆"的常设项**——
+> 每条都按"同窗配对 A/B + 字节锚逐位不变"验收，避免"继续提升"退化成无口径的口号。
+> **与既有裁定的关系**：P2-9（step 内固定 I/O）已证**无可回收收益** ⇒ P4-1 **不再从"搬 I/O 位置"找收益**；
+> P2-10（原生 f16 资格扩张）已评估不做 ⇒ P4-2 **不含"扩 native16 覆盖"**。凡与 §5/§7 冲突的做法先改裁定再实施。
+
+| 项目 | 现状（实测锚） | 方向 | 验收口径 | 成本 | 关联 |
+|---|---|---|---|---|---|
+| **P4-1 性能利用率继续提升** | GPU 忙率 ~95.5%（40HX f16）/ ~95.9%（850M）；`墙钟 − 设备 kernel ≈ 4.2%`（P2-9，f32/f16 同幅、与精度无关） | ① 把剩余 4.2% 归因到 host 录制 / driver 提交 / fence 等待三处；② 提高设备端并行（帧环深度、descriptor 复用、队列提交粒度）；③ CPU 线程池利用率（小算子并行度与分块） | `NN_PROFILE=1` 同窗配对 A/B：墙钟下降 ≥3% 且 busy% 上升；字节锚逐位不变 | 中 | P2-9（**已否决**的搬 I/O 不重复）；`core_profile.hpp` |
+| **P4-2 算子性能继续提升** | `layer_bench` 已提供 op 级配对 A/B；重型 kernel = fold / matmul / reduce / `matmul_q`（三值打包 GEMM） | 按 op 逐项调参（tile / occupancy / 网格粒度）与算法（三值 GEMV、扫描原语）；**不含**扩 native16 覆盖（P2-10 已裁定不做） | `layer_bench --op <name>` 配对 A/B 提效、无系统性回退（噪声 ±6%）；端到端不回归 | 中 | P2-11/P2-13（已完成的特化/粒度变体）；`docs/todo/02` |
+| **P4-3 显存开销继续压低** | 04 号 L1（激活重计算）/L2（池归还）已实施；三值权重已压 param 侧（4 B → <2 B）；峰值显存（850M f16）606 MiB | 立项 04 号 **L3**：① Adafactor 类无 m/v 优化器（= P2-2）；② 注意力/softmax 子图进一步融合、消除 Q/K/V 激活集物化；③ 优化器状态低精度（`AdamWQuant` 已存在，4 B → 与三值同量级） | 同任务峰值显存下降，loss 曲线与基线一致（gradcheck 全绿） | 中–大 | `docs/todo/04`（L3 待立项）；P2-2 |
+| **P4-4 API 易用性 + Fold 表达式自动化扫描** | fold **值构造**已经 `FoldAnchor` 自登记（`make_fold_logsumexp` 即此形态，新构造无需改 scan）；但**注意力 fold 的 5 组合仍由 `scan_exprs.cpp` 显式登记块覆盖**（`make_fold_attn_o` 直调 `engine.eval_expr`、不经 DSL 钩子），**漏登记任一组合 = GPU 闭合世界硬报错** | ① 把注意力 fold 组合改为自登记（对齐 `FoldAnchor` / `FusedAnchor` 机制），消除"手写登记块漏项"这一类风险；② API 摩擦点收敛（`dsl::compute` 无 2 参重载、GUI 声明式字段表 = P2-6、CLI/GUI/文档一致性） | 新增 fold 构造 / 掩码组合**无需改 `scan_exprs`** 即被扫描（`NN_SCAN_DUMP_SOURCES=1` 逐条来源可观测）；结构数不丢（来源逐条对比）；`bench/gui_cli_audit.py` 退出码 0 | 小–中 | `docs/todo/02`（fold 登记机制）；P2-6 |
+
 ## 5. 13 号清单逐条裁定表
 
 条目编号沿用 13 号原文的章节号（13 号文档本身已于 2026-10-11 删除）。
@@ -257,13 +273,13 @@ ZiPT 恢复、LRLA、CUDA、分布式。
 | 基线 | 口径 | 当前值 / 复现 |
 |---|---|---|
 | build | 全绿、零告警（`-Werror`） | `cmake -B build -G Ninja -DNN_ENABLE_TESTS=ON && cmake --build build` |
-| ctest | **实测 23**（20 目标 + `cnn_test_gpu` + `batchnorm_test_gpu` + `fusion_custom_layer_example`）；需 Vulkan 用例退出码 77 = skip | `ctest --test-dir build` |
-| L2 分层审计 | `L2-VIOLATIONS: 0`（宿主桥用量只披露） | `pwsh -File bench/doc_inventory.ps1` 第 [4] 节（实测：virtual 49 / host_bridge 40） |
+| ctest | **实测 47**（34 目标 + 13 变体/附加）；需 Vulkan 用例退出码 77 = skip | `ctest --test-dir build` |
+| L2 分层审计 | `L2-VIOLATIONS: 0`（宿主桥用量只披露） | `pwsh -File bench/doc_inventory.ps1` 第 [4] 节（实测：virtual 52 / host_bridge 41） |
 | CPU 字节锚 | `--steps 20` hash = `6f8849f14da23110` | 逐位一致 |
 | GPU 字节锚 | dev2 hash = `8ef51b2927253c50` | 逐位一致（GPU 档位按 17 §6 容差规则） |
 | scan 产物 | `fused_registry.hpp`（**唯一产物**；`expr_specs.bin` 已随构建期单步删除） | `tools/scan_exprs.cpp` + `tools/fused_generate.hpp` 产物 |
 | 初值锚 | `gpu_stability_probe --init-hash` 各模型跨进程一致 | 见 `AGENTS.md` §12 当前锚 |
-| 文档对齐 | `pwsh -File bench/doc_align_audit.ps1`：[A][B][D][E][F] 可行动项为 0 | 实测：可行动 0 / 历史白名单跳过 11 |
+| 文档对齐 | `pwsh -File bench/doc_align_audit.ps1`：[A][B][D][E][F] 可行动项为 0 | 实测：[A][B][D][E][F] 可行动均为 0（历史归档提及按白名单跳过） |
 | 行为回归 | `layer_bench` 同窗交错 + 配对 A/B，无系统性回退（噪声 ±6%） | `build/layer_bench` |
 
 ### 8.2 本轮新增门禁（P0 后生效）

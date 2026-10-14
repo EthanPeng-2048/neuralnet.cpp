@@ -591,7 +591,7 @@ graph TB
 
 | 配方 | latent/权重 | 梯度 | 量化缓冲 `wq_` | 合计 |
 |---|---|---|---|---|
-| `--f32`（Linear） | f32 4 | f32 4 | — | **8** |
+| f32（默认，无 flag）（Linear） | f32 4 | f32 4 | — | **8** |
 | `--f16`（Linear） | f16 2 | f16 2 | — | **4** |
 | `--t1_58`（BitLinear） | **恒 f32** 4 | **恒 f32** 4 | f16 2 | **10** |
 
@@ -601,7 +601,7 @@ graph TB
 
 **实测（`bench/run_with_vram.ps1`：nvidia-smi 200 ms 采样整卡峰值；同机顺序、每档 60 步、同一份 40MB `.nndataset`）**：
 
-| 模型 | `--f32` | `--f16` | `--t1_58` | t1_58 vs f16 |
+| 模型 | f32（默认，无 flag） | `--f16` | `--t1_58` | t1_58 vs f16 |
 |---|---|---|---|---|
 | 小（d64·h4·L4·ff256·seq128·b64） | 1164 MiB | **908 MiB** | 1202 MiB | **+32%** |
 | 中（d512·h8·L8·ff2048·seq256·b8） | 2858 MiB | **1882 MiB** | 2254 MiB | **+20%** |
@@ -926,7 +926,7 @@ ctest **36/36**。
 | 阶段 | 内容 | 落点 | 验收 |
 |---|---|---|---|
 | **P1 ✅（2026-10-10 落地）** 架构统一 + 功能正确<br>（**范围 = MLP 路径**，D5 建议③） | `Precision::T1_58`（含 R4 的序处理、tag 4、`check_precision_supported` 拒绝）；`PrecisionSet` + `Layer::precision_support()` + `init` 校验 + `layer_name()`；`BitLinear`（量化 forward + STE backward）；D3 的 (a)+(b)（§4.3.2）；`scan_exprs` 补 dry-run；spec 的 `weight_quant` 字段；2 个 CLI × 4 flag 的词法 + GUI + `gui_cli_audit` | `precision.hpp` / `compute_layer_base.hpp` / 新 `compute_layer_bitlinear.hpp` / `tools/scan_exprs.cpp` / `model_spec.hpp` / `src/*` / `gui.py` | ① 不兼容组合**初始化期报错**（含 `param=T1_58` + 普通 `Linear` 的反例用例）✅；② latent 权重的 STE 梯度 = 解析式（量化器不可微 → 不做数值 gradcheck，改与宿主参考逐项对拍）✅；③ CPU/GPU 各一个端到端小训练收敛（loss 0.981→0.025，两端逐位相同）✅；④ 既有 ctest 全绿（本机唯一不稳定 = 软件 Vulkan teardown）、L2 审计 0 ✅。**逐文件清单见 §7；逐条差异见 §4.9** |
-| **P2 ✅（2026-10-11 落地，见 §4.12 + §4.14 + §4.15）** 真性能与部署格式：2-bit 定长打包 + `matmul_q`/`matmul_q_t`（CPU/GPU 双端）+ **分块解码 GEMM（轴向修复）+ 窄 N 打包 GEMV + 训练/解码统一走打包 + `layer_bench --op matmul_q` 配对 A/B + CPU 行块解码复用稠密微内核 + base-3（1.6 bpw）部署编码 + `.nnmodel` 只读推理角色（v7 单一格式 + 参数形态协议）** | **剩余 = 免 latent 构建**（载入期瞬时峰值：模型仍按架构规格建 latent 再被部署条目接管 → 2B4T 上是 GB 级瞬时；方案 = `ModelSpec.deploy_packed` + `make_linear_layer(..., inference_only)`）+ 激活 int8 / 整数点积（P3，打包在 GPU 上"打赢"稠密的前提） | 同左（`compute_tensor.hpp` 的 M7 张量 qparam 仍未做：当前容器是"f32 张量当原始字"，够用但没类型约束） | ① `layer_bench` 配对 A/B ✅（`matmul_q`/`matmul_q_t`/`matmul_q_bw` + `--f16`/`--inner`：宽 N 持平~+13%、窄 N 1.1–2.3×、权重 0.25 B/权重）；② 打包往返逐位 ✅（`ternary_gemm_test` [1][2]）；③ 数值与 f16 缓冲路径一致 ✅（同测试 [3][4][5][6][7]，含跨形状对拍）；④ 与 BitNet `pack_weight.py` 的位宽/码值对齐（**只对编码/解码**；不采用其 CUDA interleave 置换）；⑤ 端到端：训练 2.0 s 持平 / 训练显存 −8.4% / 解码 −30% / 推理显存 −13.6% / CPU 与 f16 稠密打平（§4.14）；⑥ `.nnmodel` 明显更小、载入后前向逐位一致、三值层只读（`model_roles_test`，§4.15） |
+| **P2 ✅（2026-10-11 落地，见 §4.12 + §4.14 + §4.15）** 真性能与部署格式：2-bit 定长打包 + `matmul_q`/`matmul_q_t`（CPU/GPU 双端）+ **分块解码 GEMM（轴向修复）+ 窄 N 打包 GEMV + 训练/解码统一走打包 + `layer_bench --op matmul_q` 配对 A/B + CPU 行块解码复用稠密微内核 + base-3（1.6 bpw）部署编码 + `.nnmodel` 只读推理角色（v7 单一格式 + 参数形态协议）** | **剩余 = 免 latent 构建**（载入期瞬时峰值：模型仍按架构规格建 latent 再被部署条目接管 → 2B4T 上是 GB 级瞬时；方案 = `ModelSpec.deploy_packed` + `make_linear_layer(..., inference_only)`）+ 激活 int8 / 整数点积（P3，打包在 GPU 上"打赢"稠密的前提） | 同左（`compute_tensor.hpp` 的 M7 张量 qparam 仍未做：当前容器是"f32 张量当原始字"，够用但没类型约束） | ① `layer_bench` 配对 A/B ✅（`matmul_q`/`matmul_q_t`/`matmul_q_bw` + `--f16`/`--inner`：宽 N 持平~+13%、窄 N 1.1–2.3×、权重 0.25 B/权重）；② 打包往返逐位 ✅（`ternary_gemm_test` [1][2]）；③ 数值与 f16 缓冲路径一致 ✅（同测试 [3][4][5][6][7]，含跨形状对拍）；④ 与 BitNet `gpu/pack_weight.py` 的位宽/码值对齐（**只对编码/解码**；不采用其 CUDA interleave 置换）；⑤ 端到端：训练 2.0 s 持平 / 训练显存 −8.4% / 解码 −30% / 推理显存 −13.6% / CPU 与 f16 稠密打平（§4.14）；⑥ `.nnmodel` 明显更小、载入后前向逐位一致、三值层只读（`model_roles_test`，§4.15） |
 | **P1.5 ✅（2026-10-10 落地）** GPT 接入<br>（**范围 = GPT**，RAPT/ViT 见 §4.10 边界） | `make_linear_layer` + `unique_ptr<Layer>` 替换 GPT 侧全部 `Linear` 成员：`AttentionBase` 4 投影、`FeedForward` fc1/fc2、`GPTModel` LM head；`TernaryProfileSplit` 分流规则；`effective_weight_quant` 唯一判据；规格/CLI/扫描同步 | `compute_layer_base.hpp` / `compute_layer_attention.hpp` / `compute_layer_feedforward.hpp` / `compute_layer_gpt.hpp` / `domain_gpt.hpp` / `src/text_train.cpp` / `tools/scan_exprs.cpp` | ① 三值 GPT 端到端训练（2B4T 形状 3.469→0.018；MLP 之外的路径首次可用）✅；② 参数张量形状与 f32 基线逐一相同 + 梯度非零 ✅；③ 既有 f32/f16 路径零回归（`split` 恒等 + ctest 30/30）✅；④ **RAPT/ViT 明确拒绝**而非静默半三值 ✅。逐条记录见 §4.10 |
 | **P3** 计算侧收益<br>**起步（2026-10-11，见 §4.16）**：设备 int8 点积能力探测（引擎私有谓词；对外只经 `describe().int8_dot`/`describe().int8_dot_accelerated` 披露）已落地，**102/40HX 实测两者皆 true** | **剩余 = 配对微基准（`matmul_q` vs `matmul_q_i8`）→ `quantize_act_i8`（per-列 absmax + round/clamp + 4×int8 打包）→ `matmul_q_i8`（DP4A 整数累加 + τ·s 双向量缩放）→ 数值/收敛对拍**；DSL 的 `round`/`clamp` **降级为可选**（手写原语不需要） | `include/neuralnet.cpp/expr_spec.hpp` / `expr_dsl.hpp` / `expr_glsl_gen.hpp`（仅当走 DSL 路线）、新 `.comp` + `compute_*_engine.hpp` 原语 | ① 设备能力探测 ✅（§4.16）；② **准入门槛 = 微基准量出解码折叠 + 激活减半的指令/带宽收益**（DP4A 算力与 vec4 FMA 同量级，且 Vulkan/Turing 无张量核 → 收益上限低于 BitNet 官方）；③ 与 f16 累加路径的 loss 同量级 + 跨形状对拍 |
 

@@ -151,7 +151,7 @@ BitLinear 的量化缓存静默用旧权重**（`src/write_epoch_test.cpp` 逐�
 （`quantize_calls()` 可观测），覆盖梯度累积 / 逐 token 生成 / 激活重计算三种重复调用。
 ② **打包权重（P2）**：`trit_pack` / `matmul_q` / `matmul_q_t` 是 **op-level 引擎原语**
 （不进 DSL 闭合世界、不需 scan 登记），布局 = 2 bit/权重 + 4 权重/字节 + 码值 = 三值 + 2
-（与 microsoft/BitNet `pack_weight.py` 一致；不做其 CUDA interleave），容器是 f32 张量
+（与 microsoft/BitNet `gpu/pack_weight.py` 一致；不做其 CUDA interleave），容器是 f32 张量
 当原始字（布局/编解码唯一来源 `ternary_pack.hpp`；**base-3 1.6 bpw 只是 `.nnmodel`
 的盘上编码**，读盘后一律转回 2-bit 容器）。引擎是否具备打包路径是**引擎私有事实**
 （GPU = 两条 pipeline 都在；对外只经 `describe().ternary_gemm` 披露，见铁律 13）。
@@ -316,7 +316,7 @@ optimizer.step();
 |------|--------|
 | `README.md` | **文档总索引与分册定位**（含 2026-10-11 整理记录） |
 | `history/history.md` | **全仓唯一的历史状态归档**：演进记录 / 已修复勘误 / 被否决方案 / 性能 A/B 过程。代码注释与其他文档只记录当前状态；查"为什么当初这么改、旧数字是多少"只来这里。**原 `development/15`（ComputeEngine Refresh 设计）与 `16`（P0 盘点）、已删的 `13`（重构清单）均归档在本文** |
-| `release-notes/v*.md` | 面向使用者的版本变更说明（破坏性 API 变更 + 迁移指南 + 验收基线）。当前为 `release-notes/v1.8.1.md`（v1.8.0 → **代码审查整改 RV-06…RV-13**：算子分派单一表 + VK 后端拆分 + 环境变量单一入口 + 精度映射护栏 + CI 真跑测试与 `NN_BIND_DEBUG` 门禁 + ccache×PCH 提速，无破坏性 API；上一版 v1.7.0.md = v1.6.1 → **统一数据集**：`.nndataset`/`.nnvocab`/KVRecord v2 + `nn::Dataset` + 模型 v6 + 错误处理宏族，ctest 24 → 27） |
+| `release-notes/v*.md` | 面向使用者的版本变更说明（破坏性 API 变更 + 迁移指南 + 验收基线）。当前为 `release-notes/v1.8.2.md`（v1.8.1 → **f16 训练缺陷修复（F1–F5，含"全 f16 可训练"）+ f16 提速（编译期精度特化 / 批量派发 / 网格粒度变体 / F16C / f16 GEMM）+ RAPT/CNN f16 接线 + `Layer::init` 参数精度自检**，无破坏性 API；上一版 v1.8.1.md = v1.8.0 → **代码审查整改 RV-06…RV-13**：算子分派单一表 + VK 后端拆分 + 环境变量单一入口 + 精度映射护栏 + CI 真跑测试与 `NN_BIND_DEBUG` 门禁 + ccache×PCH 提速，无破坏性 API；再上一版 v1.7.0.md = v1.6.1 → **统一数据集**：`.nndataset`/`.nnvocab`/KVRecord v2 + `nn::Dataset` + 模型 v6 + 错误处理宏族） |
 
 ### 介绍类（docs/introduction/）
 
@@ -352,10 +352,10 @@ optimizer.step();
 | `todo/04-memory-optimization.md` | 显存优化：L1 激活重计算（梯度检查点）/ L2 内存池整块归还（均已实施）；L3 远期 |
 | `todo/08-pitfalls-and-lessons.md` | **踩坑警示录，改代码前读** |
 | `todo/10-development-standards.md` | C++ 编码规范全文 |
-| `todo/12-compute-engine-inventory.md` | **引擎接口盘点（复现：`bench/doc_inventory.ps1`）：52 个 virtual 方法、Layer 直调 23 个（基础设施/数据搬运/状态扫描/fold 登记/IR-C 录制段开合）、两套 CPU 求值机制（DSL 模板 + IR 解释器）、ctest 29 个测试；演进记录见 `docs/history/history.md`** |
+| `todo/12-compute-engine-inventory.md` | **引擎接口盘点（复现：`bench/doc_inventory.ps1`）：52 个 virtual 方法、Layer 直调 27 个（基础设施/数据搬运/状态扫描/fold 登记/IR-C 录制段开合/三值打包/张量形变）、两套 CPU 求值机制（DSL 模板 + IR 解释器）、ctest 47 个测试；演进记录见 `docs/history/history.md`** |
 | `todo/14-f16-stable-gpu-loss-frozen.md` | **故障报告（2026-09-26；2026-10-13 ✅ 已修/根因订正）：GPU `stable=f16` 训练 loss 打印冻结（权重不冻结）——真因 = CE 的 (1,1) loss 归约按 `stable=f16` 落盘溢出，非回读链；触发矩阵、测试覆盖缺口、证据与复现** |
 | `todo/17-unified-tensor-engine.md` | **统一 Tensor/ComputeEngine/MemoryPool 底层架构总纲（2026-09-30 裁定；M1-M6 全部已实施 2026-09-30，仅 M7 未立项）：访问不变量（Tensor 存储私有、一切经引擎，已立为铁律 #11）、InitSpec 声明式初始化、批量 read/write、Matrix 降级为宿主 I/O 载体（L2+ 禁用 = 铁律 #12）、内存池契约统一、`import` 跨设备拉取、Layer 删每调用 engine 形参（M6 段 C，Loss/DSL/辅助对象保留形参见 §8）；吸收原 15 未实施的 P2-P6（改期 M1-M7）。立项前先读本文件 + §5 分期 + §8** |
-| `todo/18-roadmap.md` | **未来方向路线图 + 未完成项裁定台账（2026-10-01，13 号清单的承接者）：P0-P3 分期、13 号逐条裁定（做/条件触发/不做）、触发式立项条件、非目标、门禁与验收口径。要规划下一步、查某件事该不该做、避免重复立项时读本文** |
+| `todo/18-roadmap.md` | **未来方向路线图 + 未完成项裁定台账（2026-10-01，13 号清单的承接者）：P0-P4 分期（P4 = 持续优化方向，2026-10-14 立项）、13 号逐条裁定（做/条件触发/不做）、触发式立项条件、非目标、门禁与验收口径。要规划下一步、查某件事该不该做、避免重复立项时读本文** |
 | `todo/19-unified-dataset.md` | **统一数据集格式与加载（`.nndataset`/`.nnvocab`/KVRecord v2，2026-10-05 设计定稿、阶段一~三已实施）：裁决记录、KVRecord v2 规范、文件布局、`nn::Dataset`/`dataset_gen`/`dataset_convert`/模型 v6 分期落地与兼容迁移。接数据集相关任务前读本文** |
 | `todo/21-quantized-weights.md` | **三值（1.58-bit）量化权重与 BitLinear（2026-10-09 设计定稿 → 2026-10-10 **P1 已实施**，分支 `dev/t1_58`）：`Precision::T1_58` + `Layer::precision_support()`（按槽声明、`init` 期校验）+ `BitLinear`（量化 forward / STE backward）；含 Lumina-Engine `TQ1_0` 参考实现拆解、`§4.9` 实现与设计的差异、`§8` 架构图、`§10` 提交清单。**已裁定**：尺度 = absmean + per-row（absmax 只剩 0.13~1.29 bit 信息，实测见 `research/ternary_scale/`）、打包 = `TQ1_0` 编码 + 行级块、命名 `T1_58` / CLI 无别名 / 层名 `BitLinear`、D3 = (a)+(b)、D5 = ③（P1 只覆盖 MLP；GPT 侧由 P1.5 补齐，RAPT/ViT 仍拒绝）；**仍待定** D6（P2 行步长/对齐）。前置证据 `research/ternary_ste/`**；验收 `src/t1_58_test.cpp`（+`--gpu` 变体） |
 | `todo/22-bitnet-2b4t-architecture.md` | **BitNet b1.58 2B4T 的结构对齐（2026-10-10 立项 + **S1/S2/S3 三步已实施并提交**，分支 `dev/t1_58`）：三项结构差距 = SubLN / GQA / tied embedding，均为**可选开关、默认关**。**已裁定**：SubLN 封装在子层内部（`AttentionBase`/`FeedForward` 的可选 `unique_ptr<Layer>`，**不是** `NormType` 新值、**不是** block 的第三个 norm）、类型跟随 `norm_type`；GQA 头映射 = `kv = h/(n_head/n_head_kv)`（llama.cpp FA 与 HF `repeat_kv` 互证）+ 显式展开 K/V 头（前向 `gather_rows` / 反向 `scatter_add_rows`，fold 与 AOT 注册表零改动）；tied embedding 在 `GPTModel` 内一个开关（梯度**累加**进 `grad_token_emb_`）；**不加 CLI 预设**（GUI 留待以后）；`ModelSpec` 追加 `subln`/`n_head_kv`/`tie_embeddings` 三键（缺键 = 旧语义，不升 MODEL_VERSION）。**验收 `src/bitnet_struct_test.cpp`（+`--gpu`）**：GQA 退化与 MHA 逐位一致、GQA↔按块映射复制成 MHA 前向差 0、tied 梯度累加差 0；102 上全量 ctest 30/30。**实施记录见本文 §10**。**待定**：FFN 激活 ReLU²（需确认官方 `hidden_act`；llama.cpp 对 gated squared relu `GGML_ABORT`，无对拍）、GQA in-kernel 版（P2）、HF 权重转换器。**结构侧**与 21 号（权重侧 `T1_58`/`BitLinear`）是两条正交的腿** |
@@ -393,7 +393,7 @@ optimizer.step();
 - **多精度**：`Precision`/`PrecisionProfile{param,compute,stable,optimizer}`；f16 走基类 NVI 边界 cast + 引擎 in-kernel f16 变体 + op-level f16 GEMM（`-DNN_SHADER_F16=1` 编第二份 SPIR-V）；`--f16` = `{param:F16, compute:F16, stable:F32, optimizer:F32}`。语义契约 `docs/development/05`。
 - **训练性能**：matmul 细 tile + K 切分二次归约（`#ks`/`#kr`，逃生阀 `NN_MM_NO_KSPLIT`/`NN_MM_KSPLIT_S`）、录制窗口排空隐藏（`copy_from` fresh 上传，逃生阀 `NN_COPY_FROM_DRAIN=1`）、`SpecBuilder` 输入槽去重、CE online-softmax 单趟 fold（P4）。⚠ **去重的覆盖约定**：含重复同张量输入的表达式**必须有 dry-run/模型 pass 覆盖**，否则运行期去重后的新 key 未登记 = 闭合世界硬报错（`Softmax::backward` 中招先例见 history）。
 - **训练 step 剖析器**（`NN_PROFILE=1` 门控，`core_profile.hpp`）：阶段/原语/设备 kernel/busy%/per-key 归因 + `NN_PROFILE_TRACE` Chrome trace；默认关闭零开销。
-- **训练显存 / 稳定性**：梯度检查点 `set_checkpoint_every`、activation offload `set_activation_offload`（两者可混用）、文档掩码 `set_doc_ids`、batch flush `set_flush_interval`、防 NaN 跳步。引擎侧 API = `create_offload_buffer`/`offload_save`/`offload_restore`（**无 `set_offload_enabled`**）。
+- **训练显存 / 稳定性**：梯度检查点 `set_checkpoint_every`、activation offload `set_activation_offload`（两者可混用）、文档掩码 `set_doc_ids`、batch flush `set_flush_interval`、防 NaN 跳步。引擎侧 API = `create_offload_buffer`/`offload_save`/`offload_restore`（**不存在 `set_offload_enabled`**）。
 - **归一化**：`--norm auto|layernorm|rmsnorm|batchnorm`（全架构通用）× `--norm-place auto|none|conv|head|both|final`（位置）；`auto` = 按架构默认（MLP/ViT=LayerNorm、CNN=BatchNorm@conv、ViT=LayerNorm@final）。`BatchNorm` 双态（`set_training` 转发）+ `extra_state()` 序列化。旧文件缺 `norm_place` 键 → `none`（旧布局）。
 - **位置编码**：`PositionEncoder` 多态基类（Learned/Sinusoidal/RoPE/ALiBi/None），注入点分三组、所有权按注入点划分（模型持嵌入侧、注意力层自持注意力侧）；ALiBi 偏置是**掩码之后的独立一步**（不融进掩码表达式）。
 - **注意力单 fold kernel**：`FoldSpec` 分块流式（S 不物化），**掩码 `AttnMaskKind` × 位置偏置** 两正交维度。

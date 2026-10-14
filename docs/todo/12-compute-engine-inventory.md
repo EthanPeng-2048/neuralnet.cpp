@@ -6,9 +6,9 @@
 > 目的：把当前代码里实际并存的计算 API 与遗留物列清楚，作为事实底座；全部结论来自
 > 当前工作树的源码与构建配置，复现命令见 `bench/doc_inventory.ps1` 与 §9。
 >
-> **当前数字**：引擎 virtual **52 个方法**（`bench/doc_inventory.ps1` 口径。注意 `grep -c "\bvirtual\b"` 原始计 **54** 处 = 52 方法 + 析构 1 + 注释里的词 1，勿混用口径）；Layer/Loss/Optimizer 直调 **22 个**（含 `begin_expr`——由 `Adam::step`/`AdamW::step` 打开 IR-C 录制段；其余 30 个
+> **当前数字**：引擎 virtual **52 个方法**（`bench/doc_inventory.ps1` 口径。注意 `grep -c "\bvirtual\b"` 原始计 **54** 处 = 52 方法 + 析构 1 + 注释里的词 1，勿混用口径）；Layer/Loss/Optimizer 直调 **27 个**（含 `begin_expr`——由 `Adam::step`/`AdamW::step` 打开 IR-C 录制段；其余 25 个
 > 只服务 DSL lowering / 序列化 / CLI / 适配层 / 测试，见 §2）；CPU 求值机制 **2 套**
-> （DSL 模板路径 + IR 解释器，见 §3）；ctest **29** 个测试（**25** 个测试目标 + `cnn_test_gpu`
+> （DSL 模板路径 + IR 解释器，见 §3）；ctest **47** 个测试（**34** 个测试目标 + `cnn_test_gpu`
 > = `cnn_test --gpu` + `batchnorm_test_gpu` = `batchnorm_test --gpu` + `fusion_custom_layer_example`
 > = 库外使用者形态的 AOT 融合端到端门禁 + `expr_fuse_test` = IR-C 图融合 GPU 端到端，
 > 见 `AGENTS.md` §7。其中 `fused_gpu_test` = 融合 shader **逐形态** GPU 对拍；`expr_graph_test` = IR-C 图融合分析（CPU 12 用例）；`error_macro_test`
@@ -35,7 +35,7 @@
 |------|------|
 | 纯 Matrix（无 Tensor） | `algebra_*` 在用，是 `Tensor` 的底层存储 + CPU 手写 kernel |
 | `forward_gpu` / `backward_gpu` 双实现 | 不存在（仅注释残留） |
-| eager（直接调引擎算子） | Layer 仍直调 **21 个**算子，且全部是基础设施 / 数据搬运 / 状态扫描 / fold 显式登记（见 §2.1）；计算类原语一律走 DSL |
+| eager（直接调引擎算子） | Layer 仍直调 **27 个**算子，且全部是基础设施 / 数据搬运 / 状态扫描 / fold 显式登记 / 三值打包 / 张量形变（见 §2.1）；计算类原语一律走 DSL |
 | `begin_expr` / `end_expr`（IR-C 录制图） | ✅ 现行（P1 机制 + P2 写穿多输出；`expr_graph.hpp`，见 §4.2/§4.3） |
 | `dsl::compute` | ✅ 当前主推，被 Layer 大量使用 |
 
@@ -60,31 +60,34 @@
 多精度 Phase 2 加入 `cast_into`/`copy_into`/`supports_native_data_move`/
 `supports_expr_precision_variant` 与 `Precision P` 参数的运算类原语。
 
-### 2.1 被 Layer / Loss / Optimizer **直接调用**的算子：22 个
+### 2.1 被 Layer / Loss / Optimizer **直接调用**的算子：27 个
 
 （统计口径：`compute_layer*.hpp` + `compute_loss.hpp` + `compute_optimizer.hpp` +
-`model_container.hpp` 中出现的 `engine.<op>(`，排除 `engine_.reset(...)` 这类非算子调用；
+`model_container.hpp` + `compute_position_encoding.hpp` 中出现的 `engine.<op>(`，排除
+`engine_.reset(...)` 这类非算子调用；
 复现：`bench/doc_inventory.ps1`）
 
 ```
 begin_batch, begin_expr, clone, col2im, create_offload_buffer, create_tensor,
-end_batch, eval_expr, flush_batch, gather_rows, im2col,
-insert_rows, offload_restore, offload_save, outer_col, rearrange_3d,
-scan_prefix_outer, scan_suffix_outer, scatter_add_rows, slice_rows,
-transpose, zero
+end_batch, eval_expr, flush_batch, gather_rows, im2col, insert_rows,
+matmul_q, matmul_q_t, offload_restore, offload_save, outer_col, rearrange_3d,
+reshape, scan_prefix_outer, scan_suffix_outer, scatter_add_rows, slice_rows,
+transpose, trit_pack, try_create_tensor, zero
 ```
 （10 个计算类原语不在此列：`matmul`/`matmul_with_bias`/`batched_matmul`/
 `row_reduce_sum`/`col_reduce_sum`/`col_reduce_max`/`grouped_reduce_sum`/
 `grouped_reduce_max`/`add_inplace`/`scale_inplace`/`accumulate` 一律不经 Layer 直调
 ——Layer 写 `dsl::compute`/`compute_into`/`compute_reduce`（归类见 §7.2）。
-这 23 个按设计保留：**基础设施**（begin/end/flush_batch、create/offload_*、
-clone、reshape、zero）、**数据搬运**（transpose/slice_rows/insert_rows/
+这 27 个按设计保留：**基础设施 / 张量形变**（begin/end/flush_batch、create/offload_*、
+clone、reshape、try_create_tensor、zero）、**数据搬运**（transpose/slice_rows/insert_rows/
 rearrange_3d/gather_rows/scatter_add_rows/im2col/col2im——DSL 表达式是"每输出元素
 独立计算"模型，搬运类的不规则索引/原子累加不属于它）、**状态扫描**（scan_prefix_outer/
 scan_suffix_outer/outer_col——顺序状态机，DSL 无此语义）、`eval_expr`（fold 登记：
 值构造经 `FoldAnchor` 自登记、注意力 5 组合由 scan 显式登记块覆盖，均属 AOT 设计
 而非旁路）、`begin_expr`（IR-C
 录制段入口：`Adam::step`/`AdamW::step` 打开图录制，`ExprSegment` 守卫收口）。
+**三值打包**（`matmul_q`/`matmul_q_t`/`trit_pack`——`BitLinear` 的打包 GEMM 与打包，
+op-level 引擎原语，不进 DSL 闭合世界、无需 scan 登记，见 `docs/todo/21` §4.12）。
 **`from_matrix`/`to_matrix` 自 M4 起退出本列**（铁律 #12：L2+ 禁用 Matrix 型 I/O
 动词），层自算辅助数据改走 `detail::upload_span/download_span/download_vector`
 （自由函数，不进 `engine.<op>(` 统计）。）
@@ -210,7 +213,7 @@ DSL 表达式，见 §2.1/§7.2），eager 只剩基础设施、不可约原语�
 
 | 差距 | 现状 | 说明 |
 |------|------|------|
-| A. Layer 直调算子 | **22 个**（全部为基础设施/数据搬运/状态扫描/fold 显式登记/IR-C 录制段开合） | ✅ **计算类原语已全部退出 Layer 直调**：Layer 只写 DSL；保留的 22 个按 §7.2 分类属"必须保留为层可见原语"（见 §2.1）；M4 起 `from_matrix`/`to_matrix` 也已退出 L2 |
+| A. Layer 直调算子 | **27 个**（全部为基础设施/张量形变/数据搬运/状态扫描/fold 显式登记/IR-C 录制段开合/三值打包） | ✅ **计算类原语已全部退出 Layer 直调**：Layer 只写 DSL；保留的 27 个按 §7.2 分类属"必须保留为层可见原语"（见 §2.1）；M4 起 `from_matrix`/`to_matrix` 也已退出 L2 |
 | B. 求值机制 | **CPU 2 套 + GPU AOT** | ⚠️ 目标只剩 DSL + 引擎 lowering；余量 = 含归约/matmul 表达式仍走串行解释器（机制 2），即 §7.5 的 CPU lowering 缺口 |
 | C. 融合世代 | eager / dsl 并存 | eager 中待收敛的重复逐元素路径已清空，只剩 §7.2 ③ 不可约原语按设计公开；IR-C（图录制融合）现行（见 §4.2 与 `03-ir-optimization.md` §5.3） |
 | D. 死代码 | 无 | 无调用点接口已清空（历史清单见 `docs/history/history.md`） |
@@ -264,7 +267,7 @@ L3  后端     : SIMD / 线程池 / GLSL kernel
 1. 每次直调 = 一次 kernel dispatch（GPU）/ 一次 Tensor 物化——**这正是 DSL 被造出来要消灭的东西**
    （对比 `eval_expr` 一次 dispatch 完成整条链）。
 2. 与 DSL 重复的逐元素 eager 路径若保留，就会在 CPU 上造成多套求值机制并存——重复部分
-   已清空：当前 CPU 求值只剩 §3 的两套，Layer 直调的 22 个全属基础设施 / 数据搬运 /
+   已清空：当前 CPU 求值只剩 §3 的两套，Layer 直调的 27 个全属基础设施 / 数据搬运 /
    状态扫描 / 不可约原语 / IR-C 录制段开合。
 
 好处（必须承认）：
