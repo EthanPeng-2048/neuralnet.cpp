@@ -78,13 +78,14 @@
 | # | 现象 | 坐标 | 影响面 |
 |---|---|---|---|
 | C1 | GPU `stable=f16` 训练 loss 回读冻结（权重照常更新） | `docs/todo/14-f16-stable-gpu-loss-frozen.md` | GPU f16 训练的 loss 曲线不可观测；无对应 ctest 用例 |
-| C2 | `optimizer=f16` 无 loss scaling 即更新爆炸、`stable=f16` 约 200 步 NaN | `docs/development/05-mixed-precision.md` §12.5；`src/text_train.cpp` 解析处只赋值不校验 | 用户可组合出必崩配置，且无任何启动期提示 |
+| C2 | `optimizer=f16` 无 loss scaling 即更新爆炸、`stable=f16` 约 200 步 NaN | `docs/development/05-mixed-precision.md` §12.5；`src/text_train.cpp` 解析处只赋值不校验；核对与立项见 [`24-f16-training-defects.md`](24-f16-training-defects.md) | 用户可组合出必崩配置，且无任何启动期提示 |
 | C3 | `NormType::BatchNorm` **静默回落**到 LayerNorm | `compute_layer_mlp.hpp:782`（`make_norm_layer`）；`README.md:248` 声称支持；`gui.py:60` 把 `batchnorm` 列为可选项；`model_spec.hpp:43` 保留枚举 | 模型规格写 batchnorm、实际跑 layernorm，无告警、无日志。**✅ 已解决**：真正实现 `BatchNorm` 层（P0-3），`make_norm_layer` 真分支，见 `docs/history/history.md` |
 | C4 | checkpoint（`.bin`）不存 Adam m/v | `model_serialization.hpp`（`MODEL_VERSION = 5`，见该文件版本常量注释）；`compute_optimizer.hpp` 无 `save_state/load_state` | TDR 重启 / `--resume` 后动量归零，续训轨迹不连续 |
 | C5 | `.bin` 无整文件校验和与尾部完整性标记 | `model_serialization.hpp` 版本常量附近的注释（明示"若引入需升 MODEL_VERSION"） | 截断/损坏的模型文件无法与合法文件区分 |
 | C6 | `gpt_test` 偶发失败未定位 | 13 原条目 §9.5（62 次直跑 1 次失败、日志被覆盖） | CI 化之后会成为随机红 |
 | C7 | RAPT / CNN 未接 f16：`Conv2D` 权重/偏置/梯度硬编码 `Precision::F32` | `compute_layer_conv.hpp:148`（权重）、`:151`（偏置）、`:154`/`:155`（权重/偏置梯度）；RAPT 头内 32 处 `dsl::compute*` 调用未接精度实参 | f16 只覆盖 MLP/GPT 路径，CNN/RAPT 用户得不到显存收益 |
 | C8 | `host_bridge_uses` 计数与文档不一致（实测 40，13/17 记 41） | `pwsh -File bench/doc_inventory.ps1` 第 [4] 节 | 审计数字失去可比性（仅披露项，不是违规） |
+| C9 | f16 训练**降速**：`--f16` 同窗比 f32 慢 11–17%（118.4 vs 101.0 / 107.1 ms/step），与「f16 省带宽应更快」预期相反 | [`24-f16-training-defects.md`](24-f16-training-defects.md) §4；`docs/benchmarks/2026-09-25-vulkan-vs-cuda.md`、`2026-10-06-vulkan-vs-torch.md`；`docs/history/history.md`「设备侧 kernel 表按阶段归因」 | f16 只兑现了显存（低于 f32），没兑现速度；wgrad 派发饥饿（部分已修）之外的剩余来源未归因 |
 
 ### 3.2 工程化
 
@@ -132,8 +133,8 @@ P2 = 3–6 月的结构优化；P3 = 择机（trigger 未到就不排期）。
 | 期 | 项数 | 项目 | 共同前置 |
 |---|---|---|---|
 | **P0** | 5 | CI 真跑测试、文档一致性回正、BatchNorm 禁止静默回落（**✅ 已完成**）、CMake install/export + presets、推理采样 top-k/top-p | 无（P0-1 是所有人的前置） |
-| **P1** | 6 | `text_train` 模块化、checkpoint 优化器状态、危险精度组合 fail-fast、`gpt_test` flaky、CI 冒烟扩 MSVC Debug、**自定义层使用文档 + 精度自检**（P1-6） | P0-1；P1-6 无依赖 |
-| **P2** | 8 | `.bin` 校验和、Adafactor、RAPT/CNN f16、Dataset/DataLoader、Python/C 绑定、GUI 两项、header 拆分、F16C | P0-1；P2-7 另需 P1-5；P2-6 另需 P0-5 |
+| **P1** | 6 | `text_train` 模块化、checkpoint 优化器状态、危险精度组合启动期告警（细则见 [`24`](24-f16-training-defects.md)）、`gpt_test` flaky、CI 冒烟扩 MSVC Debug、**自定义层使用文档 + 精度自检**（P1-6） | P0-1；P1-6 无依赖 |
+| **P2** | 13 | `.bin` 校验和、Adafactor、RAPT/CNN f16、Dataset/DataLoader、Python/C 绑定、GUI 两项、header 拆分、F16C、step 内固定 I/O 开销（P2-9）、**原生 f16 算术用足（P2-10）**、**编译期精度特化（P2-11，已完成）**、**优化器 f16 批量派发（P2-12）**、**f16 K 切分/fine tile（P2-13）** | P0-1；P2-7 另需 P1-5；P2-6 另需 P0-5 |
 | **P3** | 8 | 由 §6 触发条件启动（含 CUDA、分布式） | 各自触发条件 |
 
 **串行约束（不可并行推进的组合）**：
@@ -154,9 +155,9 @@ P2 = 3–6 月的结构优化；P3 = 择机（trigger 未到就不排期）。
 | **P0-4 CMake install/export + CMakePresets** ⚡ **嵌入路径已完成（用户裁定拆分）** | **已实施**：门面目标 `neuralnet::nn`（`add_subdirectory` + 一行 link + 一个 include 即用；C++26/线程/`NN_HAS_VULKAN`/SPIR-V 头/Vulkan/shader 顺序全经接口传递）、`NN_ENABLE_GPU=AUTO\|ON\|OFF`、`NN_BUILD_APPS` 嵌入默认 OFF、`nn_enable_gpu_fusion` 树外可用（`NN_LIB_SOURCE_DIR/BINARY_DIR` CACHE 跨作用域 + GPU 不可用时 stub 报错）、消费方编译选项（`-Wno-pass-failed`/`-fexperimental-library`/`/utf-8`）随门面传递；样例 `examples/downstream/`（CPU/GPU 双路径实测通过）+ 指南 `docs/usage/05-consume-as-library.md`。**剩余**：`install()`/`find_package(neuralnet.cpp)`（用户裁定本轮不做）；`CMakePresets.json` ✅ 已于 2026-10-11 落地（`cmake --preset dev/portable/cpu/probes`，历史记录见 `docs/history/history.md` 的 presets 条） | 嵌入口径 ✅：干净构建目录里 `cmake -S examples/downstream` CPU 与 GPU（`NN_ENABLE_GPU=ON`）两路径均编译、链接、运行通过（GPU 路径含 scan 收集 91 条 = 库内口径），fusion 树外调用可用；install 口径待剩余部分 | 已完成（嵌入）/ 小–中（剩余） | P0-1（preset 需进 CI 才不腐化） |
 | **P0-5 推理采样 top-k / top-p + 多轮对话闭环** | 采样器支持 top-k / top-p 截断与重复惩罚；`text_infer` 暴露对应开关；GUI GPT 推理 Tab 支持多轮上下文 | 同 prompt 在 top-k / top-p 下输出可复现（同 seed）；多轮对话示例可连续交互 N 轮不丢上下文 | 中 | 无。命名冲突提醒：`--topk` 属 `mnist_infer`（`src/mnist_infer.cpp:44`），`--top` 属 `tokenizer_infer`（`src/tokenizer_infer.cpp:46`）；`text_infer` 两者都没有，新开关命名不得与它们冲突 |
 
-> **口径说明（与本文 §4 前置清单的差异）**：任务书前置清单同时把"危险精度组合 fail-fast"
-> 列在 P0；按裁定台账（§5 与 §6）该项归 **P1**，理由是它需要先定"报错还是禁用"的语义。
-> 本文以裁定台账为准，不重复排期。
+> **口径说明（与本文 §4 前置清单的差异）**：任务书前置清单把"危险精度组合 fail-fast"列在 P0；
+> 该项归 **P1**，且口径已定为**仅告警**（不退出、不加确认开关）——细则与验收一律见
+> [`24-f16-training-defects.md`](24-f16-training-defects.md) §2.3 / §5 F1。本文以裁定台账为准，不重复排期。
 
 ### 4.2 P1（1–2 月：能力与健壮性）
 
@@ -164,10 +165,10 @@ P2 = 3–6 月的结构优化；P3 = 择机（trigger 未到就不排期）。
 |---|---|---|---|---|
 | **P1-1 `text_train` 模块化** | 抽 `train_loop` / `recovery` / `checkpoint` 模块；退出码语义修正（保存失败不得成功退出） | 现有关键路径回归逐字节一致；新增恢复路径单测；`std::exit` 只在 CLI 参数解析层出现 | 中（1746 行文件拆解，34 处 `std::exit`） | 无，但它是 P1-2 的前置 |
 | **P1-2 checkpoint 优化器状态** | `.bin` 增加可选优化器状态段（Adam m/v，`MODEL_VERSION` 5 → 6）；`Optimizer` 基类加 `save_state/load_state`；恢复路径接线 | 老文件缺段 = 冷启动语义；save→load→save SHA256 逐字节一致；TDR 模拟重启后动量非零且 loss 轨迹连续 | 中 | **P1-1**（否则恢复逻辑继续膨胀） |
-| **P1-3 危险精度组合 fail-fast** | 启动期拒绝 `optimizer=f16` / 四字段全 f16 的组合，或明确要求显式确认开关（拟新增，名字待定） | 危险组合直接退出并打印原因；`--f16` 与合法 `--precision-*` 组合不受影响；新增 CLI 断言测试 | 小 | 无。依据 `docs/development/05-mixed-precision.md` §12.5 的实测结论 |
+| **P1-3 危险精度组合启动期告警** ✅ **已完成 2026-10-13** | **不单独定义**——需求、口径、验收一律引用 [`24-f16-training-defects.md`](24-f16-training-defects.md) §2.3 / §5 F1（口径：仅警告，不退出、不加确认开关）。**落地**：`include/neuralnet.cpp/cli/cli_precision_warning.hpp`（`nn::cli::dangerous_precision_warning`）+ `text_train`/`mnist_train` 调用点 + 门禁 `src/cli_precision_warning_test.cpp`（单测组合矩阵 + 子进程捕获 stderr 断言退出码不变） | 见 24 号台账 F1 验收口径 | 小 | 无 |
 | **P1-4 `gpt_test` flaky 定位** | 复现并消除偶发失败（或定位为已知资源边界并加显式 skip/重试语义） | 连续大样本直跑零失败；定位结论写入 `docs/history/history.md` | 小–中（复现成本不确定） | P0-1（需要 CI 反复跑才有样本） |
 | **P1-5 CI 冒烟扩到 MSVC Debug + 权重变化断言** | Debug 构建冒烟；训练 N 步后断言参数**确实变化**（防"loss 不动"类静默失败） | CI 中 MSVC Debug 目标编译通过；权重变化断言可检出冻结；大 TU 若触发 C1128 再出 `/bigobj` | 中 | P0-1。可复用 `f16_writeback_probe` 的"8 步 Adam 参数必须移动"思路 |
-| **P1-6 自定义层使用文档 + 精度自检**（文档部分 **✅ 已完成 2026-10-11**；精度自检 R2 仍 Open） | ① 文档：已落 `docs/development/write-a-custom-layer.md`（层骨架模板 + 可复制 gradcheck 片段 + 七条契约 + GPU checklist；示例层经数值梯度检查实测通过 `max|num−an| = 4.7e-06`、50 步 Adam 收敛）——落在 `development/` 而非原计划的 `usage/06`（该分册定位即"写自定义层"，见 `docs/README.md` §1.1）；② 代码（未做）：`Layer::init` NVI 处加"`profile.param == F16` ⇒ `parameters()` 全为 F16 存储"的统一自检 | 文档：按模板能写出可训练的自定义层（已由指南 §1/§3 的实测代码满足）；自检：C7 形态的硬编码 F32 层被启动期拒绝，新增断言测试 | 小 | 无。问题清单与逐条坐标见 `docs/development/20-custom-layer-ergonomics.md` §2，修复建议 §4（R1 已完成 / R2 待做） |
+| **P1-6 自定义层使用文档 + 精度自检**（文档部分 **✅ 已完成 2026-10-11**；精度自检 R2 **✅ 已完成 2026-10-14**） | ① 文档：已落 `docs/development/write-a-custom-layer.md`（层骨架模板 + 可复制 gradcheck 片段 + 七条契约 + GPU checklist；示例层经数值梯度检查实测通过 `max|num−an| = 4.7e-06`、50 步 Adam 收敛）。② 代码（**已完成**）：`Layer::init` NVI 在 `init_impl` 之后统一执行 `check_param_precision_()`——层声明的 `param` 槽是存储精度时，逐个校验 `parameters()` 的张量实际存储精度与之相同（`precision_bytes == 0` 的 T1_58 等非存储精度声明跳过）。**它当场抓到了 3 处真实静默降级**：Conv2D 的 w_/b_、RAPT 的 token_emb_、以及 `ReLULinearAttention` **从未把 profile 转发给它自持的 4 个 Linear**（RAPT 注意力投影权重在 `--f16` 下一直是 f32）——前两处在 P2-3 修掉，第三处由本自检在扫描期报错后发现并修复（现 47/47 全绿） | 文档：按模板能写出可训练的自定义层；自检：硬编码 F32 的层在 init 期被拒绝 | 小 | ✅ **已完成 2026-10-14** |
 
 ### 4.3 P2（3–6 月：结构优化）
 
@@ -175,12 +176,22 @@ P2 = 3–6 月的结构优化；P3 = 择机（trigger 未到就不排期）。
 |---|---|---|---|---|
 | **P2-1 `.bin` 整文件校验和 + 尾部完整性标记** | 版本段之后加校验和；按注释约定升 `MODEL_VERSION` | 截断文件明确报错；合法文件 round-trip SHA256 一致 | 小–中 | P1-2（同一版本段改动，合并做省一次升版） |
 | **P2-2 Adafactor 类无 m/v 优化器** | 新增不物化二阶矩的优化器，训练更大模型 | 同任务对比 Adam 的显存下降与收敛曲线；`create_optimizer` 可创建 | 中 | 无 |
-| **P2-3 RAPT / CNN f16 接线** | RAPT 的 `dsl::compute*` 调用接精度实参；`Conv2D` 权重/梯度去 `Precision::F32` 硬编码 | f16 下 CNN/RAPT 训练健康收敛；CPU/GPU 字节锚按计划内变化流程重立 | 中 | 无（C2 的 fail-fast 先落地，防用户踩坑） |
+| **P2-3 RAPT / CNN f16 接线** | ✅ **已完成 2026-10-14**。① RAPT：**27 处** `dsl::compute*` 补精度实参 `p_.compute`（此前全部落默认 F32）；两个残差分支从硬编码 `Precision::F32` 改为 `p_.compute`（与 GPTBlock/TransformerEncoderLayer 同口径）；`token_emb_`/`grad_token_emb_` 改 `p_.param`；`rms_norm_forward_/backward_` 的输出张量从默认 F32 改 `p_.compute`（**否则 dst/src 精度错配 → `insert_rows` 断言**）。② Conv2D：`w_`/`b_`/`grad_w_`/`grad_b_` 改 `p_.param`，4 处 `dsl::compute*` 补 `p_.compute`。③ `CnnConfig` 增 `precision` 字段，`build_cnn_model(_from_spec)` 在 add 之前注入（新增可选 profile 形参）。**门禁**：`cnn_smoke_test`/`rapt_smoke_test` 增 `--f16`；ctest 新增 4 条 `cnn_test_f16(_gpu)` / `rapt_test_f16(_gpu)`（断言 loss 有限且下降、梯度无 NaN） | f16 下 CNN/RAPT 训练健康收敛；默认 profile 的 f32 逐位不变（param/compute 默认 F32） | 中 | ✅ **已完成**（ctest 47/47） |
 | **P2-4 Dataset / DataLoader 抽象 + 流式文本**（**前半 Dataset 已落地** = 19 号设计阶段一~三；本条只剩**流式后半**：DataLoader/分块迭代 `for_each_chunk`，不再把语料整段读进内存） | 流式加载（Dataset 格式与统一只读类见 `docs/todo/19-unified-dataset.md`） | 大文件训练内存曲线平稳；`dataset_test` 逐位一致口径回归 | 中 | 无 |
 | **P2-5 Python / C 绑定** | 提供稳定 C ABI 或 pybind 绑定，供生态集成 | 绑定层跑通训练/推理最小示例；ABI 报错信息可读 | 中–大 | **条件触发**（§6） |
 | **P2-6 GUI 声明式字段表 + 绘制节流** | dataclass 元数据自动生成 UI 行与 `collect_args`；画布 motion 按帧节流、dirty 标志跳过空帧 | 现有 Tab 参数零遗漏（`bench/gui_cli_audit.py` 退出码 0）；拖动帧率回升 | 小–中（两项同批） | P0-5（采样新开关先定型，避免二次改字段表） |
 | **P2-7 超大 header 拆分** | backend 拆 fence / staging / dispatch / 算子为独立 TU；`compute_vk_backend.hpp` 瘦身 | 拆分前后 build 全绿 + ctest 全绿 + CPU/GPU 字节锚逐位一致 | 中–大 | **前置 = 先补编译/链接期冒烟**（P0-1 + P1-5），否则拆分无回归网 |
-| **P2-8 F16C 半精度转换快路径** | `_cvtss_sh` 快路径 + 批量转换，替代纯软件位操作 | CPUID 探测 + `NN_ENABLE_NATIVE` ON/OFF 两态；`f16_cpu_probe` 全量对拍逐位一致 | 中 | **条件触发**（§6） |
+| **P2-8 F16C 半精度转换快路径** | ✅ **已完成 2026-10-14**。`detail::float_to_half_bits` / `half_bits_to_float` 增加 `#if defined(__F16C__)` 快路径：**运行时**走硬件单指令（`_cvtss_sh`/`_cvtsh_ss`，imm8 = `_MM_FROUND_TO_NEAREST_INT` → 与 MXCSR 无关、恒 RNE），**常量求值**与 `NN_ENABLE_NATIVE=OFF` 的可移植构建仍走软件位操作（`std::is_constant_evaluated()` 分流；两条路径语义同源 ⇒ constexpr 求值不受影响）。**新增门禁**：`precision_test` 增「快路径一致性」段——用 23 条 f32→f16（±0 / 次正规 / 2^-25 平局 / 65504/65519/65520/2^16 上溢边界 / ±inf / NaN 负载）与 15 条 f16→f32 位型，把**编译期软件路径**与**运行期硬件路径**逐位对比。**实测**：CPU GPT f16 训练 10 步 **3.6 s → 1.9 s**（f32 1.9 s，即 CPU f16 不再慢于 f32）；`NN_ENABLE_NATIVE=ON`（F16C）与 `OFF`（portable）两态均通过；ctest 47/47 | CPUID 探测 + 两态构建 + 逐位对拍 | 小 | ✅ **已完成** |
+| **P2-9 训练 step 内固定 I/O 开销归因与消除** | ❌ **已评估-不做（2026-10-14，实测推翻前提）**。原判断"每步约 20% 墙钟在 `copy_from` ⇒ 可消除的固定开销"不成立：① **host 等待总量不变、只是位置可移**——把 staging ring 从 `64MB×4` 改成 `8MB×16`（消除 acquire 阻塞）后 `copy_from` **392 → 3 ms**，但 `flush_batch` 同步从 **955 → 1213 ms**，两者之和恒 ≈1347 ms；② 设备忙率 95.9%，host 本就在等 GPU，减少等待点不缩短墙钟（改后 3 轮墙钟 2200/2059/2053，与原 2044 在噪声内，故**已回退该改动**）；③ "减少每步帧数"方向相反——`--flush-interval 1 → 4`（flush 次数 105 → 20）墙钟 **2044 → 2096 ms（+2.5%）**，因为大帧降低 host 录制与 GPU 执行的overlap（默认 1 已是实测最优，见 text_train 注释）；④ 真正的天花板 = `墙钟 − 设备 kernel` ≈ **86 ms/15 步 ≈ 4.2%**，且 f32/f16 同幅、与精度无关。结论：该项**没有可回收的收益**；保留默认配置。 | 归因到具体调用点与每步 drain 次数（✅ 已完成，见左）；消除后 e2e step 下降（❌ 实测无收益） | 无 | 低 | ❌ **已评估-不做**（证据见左；[`26`](26-f16-speedup-plan.md) §4 S0） |
+| **P2-10 原生 f16 算术（`shaderFloat16`）用足** | 🟡 **已评估-不再扩张（2026-10-14，附实测）**。口径：原生 f16 **允许启用、不排除**——`#a` 在运行期查找序里**优先级最高**，能力经 `shaderFloat16` 查询 + 启用（逃生阀 `NN_VULKAN_NO_16BIT_ALU`），**40HX 实测已有 9 条结构命中 `#a`**。**实测增益**（40HX，`d64/h4/L4/ff256/seq256/b64`，f16，15 步 ×3 轮，`NN_VULKAN_NO_16BIT_ALU=1/0` 配对）：ALU 开 **1005 ms** vs 关 **1021 ms** ⇒ 现有 native16 覆盖贡献 **≈1.5%**。**为什么不再把资格扩到 fold / matmul / reduce**：① 这三类的耗时主体是**归约累加循环**，而累加按数值要求必须保持 f32（本仓 §7.2 与业界 fp16 GEMM 同口径）⇒ 扩资格只能覆盖其中的**逐元素**片段，量级与已覆盖的 9 条同构（≈1%）；② 其余排除项（`rparams` / 微常量 / 行-列-批索引值）**是原则性的**——rparam 恒 f32 传递（放宽会把整链隐式提升回 f32，收益归零），微常量与索引在 f16 下会 flush/失精（放宽即静默错值）；③ 因此原判断"最重的几条链永远拿不到原生 f16 ⇒ 收益大"**不成立**：那几条链的成本在 f32 累加循环里，不在 f16 可用片段里。**保留**：`#a` 优先级、`NN_VULKAN_NO_16BIT_ALU` A/B 逃生阀、单元与端到端回归全部不变（`f16_precision_test` / 40HX 的 `#a` 命中实测） | 40HX 上 `--f16` step ≤ f32（✅ 已达成：1013 vs 1027）；原生开更快（✅ 实测 +1.5%，但扩张收益有界 → 不做） | [`26`](26-f16-speedup-plan.md) 的 **S5** | 低 | 🟡 **已评估-不再扩张** |
+| **P2-11 编译期精度特化（去运行期分派三元）** | ✅ **已完成 2026-10-13**。把"精度是运行期参数"（`#x`）在热路径换回"精度是编译期常量"：新增 `key#s`（全输入 f16 + 输出 f16，无条件发射）与 `key#xxxx`（扫描期**真实观察到的签名**：`scan_exprs` 的 dry-run/模型 pass 各跑 f32+f16 两遍，`scan_register` + CPU 引擎 `eval_expr*` 按真实张量精度 + 真实 P 记入 `ExprRegistry::variants`）；运行期查找顺序 `#a` → `#xxxx`/`#s` → `#x`（未枚举到的签名照旧兜底）。**只需 16 位存储，不需要 `shaderFloat16`** | 850M：`--f16` 2260 → **2055 ms/15 步**（f32 2037，+10.6% → **+0.9%**），峰值显存 818 → **606 MiB**；`ctest` CPU 41/41 + GPU 43/43；构建期 110 条签名 → 88 条特化 | 无 | ✅ **已完成**（[`26`](26-f16-speedup-plan.md) §4 S1s、[`24`](24-f16-training-defects.md) §4.5） |
+| **P2-12 优化器 f16 批量派发（`#b`）** | ✅ **已完成 2026-10-14**（两段：`#b` 变体发射 + "scan 与运行期同源"修复）。① `#b` 对**每个 extras 为空的静态签名变体**各发一份（键形如 `key#0002#b`；extras 的元素类型不在 `ExprPrecSig` 编码里 → 带 extras 的 f16 结构仍逐 kernel 降级）；运行期组键带精度身份、实例缓冲按 `t.precision()` 取槽位。② **残差收口**：Adam 复合 kernel 在 `--f16` 下逐成员降级的根因是 **scan 与运行期不同源**（不是派发器）——(a) scan 的优化器 dry-run 把当前 pass 的 precision profile 透传给 `create_optimizer`（否则 f16 pass 融合出的复合结构与运行期不同 ⇒ 命中不到 ⇒ 降级）；(b) scan 的 CPU `end_expr` 为**复合 kernel** 补记运行期精度签名（单节点有 `scan_register`/`eval_expr*` 入口，融合结构只在 GPU `end_expr` 才算出签名）。**实测（40HX，f16，`d64/h4/L4/ff256/seq256/b64`，20 步，`329f8f1` vs `5bb6a51` 配对）**：`[ir-c][degrade]` **70 → 0**/步；优化器派发 **138.7 → 8.55 calls/步（−94%）**（每步恰 3 组批量：K1 `#0002#b` / K2 `#0002#b` / 复合 `#10004#b`，各 32+32+6 实例）；优化器 host 阶段 **9.94 → 6.51 ms/步（−34%）**；f16 loss 轨迹与 f32 同步（850M 9.009→8.594 vs 9.006→8.591）。**端到端墙钟无可见收益**（1320.95 → 1324.08 ms，噪声内）——设备忙率 95.5%，host 节省被 overlap 吃掉。字节锚（cpu/40HX/AMD iGPU）逐位不变。**边界**：只覆盖 scan 真跑过的 profile（f32 + `--f16`）；其它显式组合（`stable=f16`+`optimizer=f16`）仍按设计回落降级 | f16 下优化器回落批量派发；残差收口后**每步 0 降级、派发 −94%**（e2e 收益在 GPU-bound 下不可测） | P2-11 | 低 | ✅ **已完成 2026-10-14** |
+| **P2-13 f16 的 K 切分 / fine tile 变体** | ✅ **已完成 2026-10-14**。把 sig 穿进 `#f`/`#ks`/`#kr` 生成路径：每个**静态签名变体**各发一份网格粒度变体（键形如 `key#10003#ks`）；**部分和缓冲恒 f32**（后端按 f32 分配 → `#ks` 输出声明钉成 `float`，sig 只决定 A/B 读取类型），末段由 `#kr` 按 sig 落盘；后端"网格变体无需 16 位存储"的豁免收窄到**纯 V0 键**。**实测**：40HX（b64）该 wgrad **f16 16.0 ms/块 vs f32 25.1 ms/块**（此前 f16 79 ms/块）；40HX 端到端 `--f16` **1013 ms vs f32 1027 ms（−1.4%）**，850M（b16）`--f16` **2005 vs f32 2038 ms（−1.6%）** | 40HX 上 `--f16` step ≤ f32；850M 不回归 | 中 | ✅ **已完成**（[`24`](24-f16-training-defects.md) §4.5、[`26`](26-f16-speedup-plan.md) §4 S3） |
+
+> **原生 f16 口径（2026-10-13 确认）**：`shaderFloat16` 通路**允许启用、不排除**——`#a` 变体
+> 在运行期查找序里**优先级最高**，设备能力经 `shaderFloat16` 查询 + 启用，逃生阀
+> `NN_VULKAN_NO_16BIT_ALU` 可关；40HX 实测已有 **9 条结构命中 `#a`**。**P2-10 的开放部分是
+> "把资格扩到 fold / matmul / reduce"**（累加必须保持 f32），不是"是否允许原生 f16"。
 
 ### 4.4 P3（择机）
 
@@ -260,7 +271,7 @@ ZiPT 恢复、LRLA、CUDA、分布式。
 1. **CI 必须执行 ctest**：日志需出现 23 个用例；77 = skip 不算失败（P0-1）。
 2. **开发文档不得出现 ctest 计数的旧写法**：统一写实测 23（P0-2）。
 3. **BatchNorm 行为门禁**：构造 batchnorm 规格必须有可观测结果（报错或正确层），不允许静默降级（P0-3）。**✅ 已满足**：真层 + `batchnorm_test` 工厂断言。
-4. **危险精度组合门禁**：危险组合必须启动期失败（P1-3）。
+4. **危险精度组合**：启动期**告警**（仅警告、不失败、不改退出码）——口径与细则见 [`24-f16-training-defects.md`](24-f16-training-defects.md) §2.3 / §5 F1（P1-3）。
 5. **审计覆盖补强**：`bench/doc_align_audit.ps1` 的 [A] 需扩展到 markdown 链接目标（E8），或由 P0-2 直接修掉已知死链。
 
 ### 8.3 验收纪律
@@ -277,6 +288,13 @@ ZiPT 恢复、LRLA、CUDA、分布式。
    不覆盖的，由自动化测试兜底（新增断言测试优于文档数字）。
 4. **裁定要留反例**：凡"不做"必须写清触发条件或反例（如 H4 的 RAPT 残差相加），否则后人无法判断能否重新立项。
 5. **与 13 的关系已终结**：13 号文档已删除（内容全在本文与 `docs/history/history.md`），新增条目只进本文。
+
+### 8.5 大版本发布要求
+
+**大版本**升级（`1.x.y → 1.(x+1).0`，次版本号 +1、修订号归零）在常规门禁之上还要走一遍
+[`25-release-requirements.md`](25-release-requirements.md) 的必做清单：① 端到端模型训练测试
+（这类测试**不进默认 ctest**，太费时）；② 发布文档；③ 完整 ctest + **Debug** 构建；
+④ 多编译器 × 标准库（≥4 组）全新构建 + ctest。小 / 修订号升级不强制。
 
 ## 9. 仍然生效的工程教训（原 13 §9 承接）
 

@@ -698,7 +698,8 @@
 #ifdef NN_FUSED_REGISTRY_EMBEDDED
         // 16. 注册 AOT 融合 shader pipelines（构建期 scan_exprs 收集 +
         //     fused_generate.hpp 合成）。条目形态：
-        //       · V0 / V2（键 `key` / `key#a`）：N 输入 + 1 输出 binding；
+        //       · V0 / V2 / V1s / V1t（键 `key` / `key#a` / `key#s` /
+        //         `key#xxxx` 特化签名）：N 输入 + 1 输出 binding；
         //       · V1 运行期精度分派（键 `key#x`）：2N + 2 binding（每个输入/输出
         //         各绑 f32 与 f16 两个视图）；PC 固定头末尾多一个 `prec` 槽。
         //     push constants = 固定头（count/cols/…）+ vp 槽 + 常量池 + rp 槽。
@@ -722,12 +723,33 @@
                 std::string_view(fs.key).ends_with(nn::EXPR_MM_KSPLIT_SUFFIX);
             const bool is_kr =
                 std::string_view(fs.key).ends_with(nn::EXPR_MM_KSPLIT_REDUCE_SUFFIX);
-            // 带 '#' 的 f16 变体（#x/#a）需要 SSBO 16 位存储；设备未启用 →
-            // 跳过注册（运行时查不到 `#x`/`#a` → 基类 NVI 入口回退边界 cast）。
-            // `#b`/`#f`/`#ks`/`#kr` 全 f32 无此要求（不得被这条误伤）。
-            if (!is_batch && !is_fine && !is_ks && !is_kr &&
-                std::string_view(fs.key).find('#') != std::string_view::npos &&
-                !device_.has_16bit_storage())
+            // 带 '#' 的 f16 变体（#x / #s / #xxxx 特化 / #a）需要 SSBO 16 位
+            // 存储；设备未启用 → 跳过注册（运行时查不到 → 基类 NVI 入口回退
+            // 边界 cast）。`#b` 与**纯 V0 的** `#f`/`#ks`/`#kr` 全 f32 无此
+            // 要求（不得被这条误伤）。
+            // ⚠ 后缀**可叠加**：`key#10003#ks` = f16 特化的 K 切分，其 shader
+            //   里有 float16_t 缓冲 → 仍需要 16 位存储。判据 = 去掉网格粒度
+            //   尾后缀（#kr/#ks/#f）之后是否仍含 '#'。
+            const std::string_view key_sv(fs.key);
+            std::string_view grid_stripped = key_sv;
+            for (std::string_view suf :
+                 {std::string_view(nn::EXPR_BATCH_SUFFIX),
+                  std::string_view(nn::EXPR_MM_KSPLIT_REDUCE_SUFFIX),
+                  std::string_view(nn::EXPR_MM_KSPLIT_SUFFIX),
+                  std::string_view(nn::EXPR_MM_FINE_SUFFIX)})
+            {
+                if (grid_stripped.size() > suf.size() &&
+                    grid_stripped.ends_with(suf))
+                {
+                    grid_stripped.remove_suffix(suf.size());
+                    break;
+                }
+            }
+            const bool needs_16bit_storage =
+                key_sv.find('#') != std::string_view::npos &&
+                !((is_batch || is_fine || is_ks || is_kr) &&
+                  grid_stripped.find('#') == std::string_view::npos);
+            if (needs_16bit_storage && !device_.has_16bit_storage())
                 continue;
             // `#b` 批量变体需要 buffer device address（实例表按 64 位地址解引用
             // 各实例缓冲）；未启用 → 跳过注册 → 运行期逐 kernel 降级（可观测）。

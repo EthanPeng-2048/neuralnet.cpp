@@ -77,6 +77,7 @@
 - `todo/00-code-review-remediation.md` — **2026-10-11 代码审查整改立项台账**（本批新增）。
 - `todo/18-roadmap.md` — "下一步该做什么"的唯一入口。
 - `todo/12` / `todo/17` / `todo/19` / `todo/21` / `todo/22` / `todo/23` — 现行设计/盘点。
+- `todo/24` / `todo/25` — f16 训练缺陷台账 / **大版本发布要求**（`1.x.y → 1.(x+1).0`）。
 
 ### 总档
 
@@ -89,7 +90,7 @@
 | [`../CMakePresets.json`](../CMakePresets.json) | 预设构建（`cmake --preset dev` 等）——见 CONTRIBUTING §1 |
 | [`benchmarks/2026-09-25-vulkan-vs-cuda.md`](benchmarks/2026-09-25-vulkan-vs-cuda.md) | Vulkan 后端 vs CUDA（torch）基准 |
 | [`benchmarks/2026-10-06-vulkan-vs-torch.md`](benchmarks/2026-10-06-vulkan-vs-torch.md) | 第二轮复测 |
-| `release-notes/v1.5.0.md` … `v1.8.1.md` | 版本变更说明 |
+| `release-notes/v1.5.0.md` … `v1.8.1.md` | 版本变更说明（**大版本发布要求**见 [`todo/25-release-requirements.md`](todo/25-release-requirements.md)） |
 
 ## 3. 2026-10-11 文档整理记录
 

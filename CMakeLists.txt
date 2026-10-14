@@ -604,6 +604,12 @@ if(NN_BUILD_APPS OR NN_ENABLE_TESTS)
     nn_add_executable(assert_always_test src/assert_always_test.cpp)
     list(APPEND NN_TEST_TARGETS assert_always_test)
 
+    # ── F1：危险精度组合启动期告警（仅警告，不拒绝；docs/todo/24 §2.3）────
+    # [1][2] 头文件函数组合矩阵（含 all=f16）单测；[3] 子进程跑 text_train/
+    # mnist_train，捕获 stderr 断言告警出现 + 退出码不变；二进制缺失 → 77 = SKIP
+    nn_add_executable(cli_precision_warning_test src/cli_precision_warning_test.cpp)
+    list(APPEND NN_TEST_TARGETS cli_precision_warning_test)
+
     # ── RV-04 优化器元数据表（唯一真源 ↔ 工厂）+ RV-03 同目标写序回归 ──────
     # [1] 表内每个 name 都能被 create_optimizer 构造、名单文本与表一致；
     # [2] AdamW（wd≠0）单步 vs 手写参考 + 顺序对调的负例；
@@ -654,6 +660,21 @@ if(NN_ENABLE_TESTS)
     if(TARGET cnn_test)
         add_test(NAME cnn_test_gpu COMMAND cnn_test --gpu)
         set_tests_properties(cnn_test_gpu PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
+    # CNN / RAPT 的 f16 端到端变体（P2-3）：Conv2D 权重/梯度按 param、融合算子
+    # 按 compute 走 f16 → 断言"loss 有限且下降 / 梯度无 NaN"。CPU 与 GPU
+    # 各一条（GPU 才暴露精度变体的闭合世界 miss 与 f16/f32 槽位错配）。
+    if(TARGET cnn_test)
+        add_test(NAME cnn_test_f16 COMMAND cnn_test --f16)
+        add_test(NAME cnn_test_f16_gpu COMMAND cnn_test --f16 --gpu)
+        set_tests_properties(cnn_test_f16 cnn_test_f16_gpu
+                             PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
+    if(TARGET rapt_test)
+        add_test(NAME rapt_test_f16 COMMAND rapt_test --f16)
+        add_test(NAME rapt_test_f16_gpu COMMAND rapt_test --f16 --gpu)
+        set_tests_properties(rapt_test_f16 rapt_test_f16_gpu
+                             PROPERTIES SKIP_RETURN_CODE 77)
     endif()
     # BatchNorm 的 GPU 变体：推理态/EMA 表达式的 ExprSpec 校验只在 GPU
     # 路径发生（CPU 模板路径不校验），且闭合世界 miss 只在 GPU 运行期暴露。

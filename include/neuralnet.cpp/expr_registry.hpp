@@ -30,16 +30,31 @@
 namespace nn::fused
 {
 
-// ── 注册表：收集折叠出的 ExprSpec **结构**，按规范 key 去重 ───────────────
+// ── 注册表：收集折叠出的 ExprSpec **结构**（按规范 key 去重）+ 观察到的
+//    **精度签名**（供编译期特化变体 `key#xxxx` 的生成；见 add_variant）──
 //
-// 只装**结构**：精度签名已不是构建期集合（生成阶段对每个结构发运行期精度
-// 分派 shader，键 `key#x`；见 expr_spec.hpp 的 EXPR_PREC_SIG_DISPATCH）。
-// 历史上有过 `variants`（(结构, 签名) 表）与 `contains_variant`——随签名
-// 降级为运行期参数一并删除（docs/history/history.md）。
+// 结构仍是身份：运行期进度签名有兜底载体 `key#x`（一个 shader 覆盖任意
+// 签名）。但 `#x` 的代价是热循环里每次读写都带 `prec` 三元——实测（850M，
+// GPT d64/h4/L4/ff256/seq256/b16，f16）把 CE 融合注意力从 146 ms 降到
+// 120 ms（=−18%，f32 基线 117 ms）**只**因为换了编译期特化 shader。
+// 因此这里额外收集"扫描期真实出现过的 (结构, 签名)"，生成阶段为每条发一份
+// 静态特化 variant（f16 存储 + f32 算术，键 = `key#xxxx`，与 ggml/torch 的
+// per-type kernel 特化同思路）。**它是纯优化**：未枚举到的签名照旧落 `#x`。
+//
+// 历史：早期有过 `variants` 表，随"签名降级为运行期参数"一并删除；本次
+// 以"特化优化（非身份）"的名义恢复，语义与那时不同（那时是唯一载体）。
 struct ExprRegistry
 {
-    std::vector<ExprSpec>       specs;
+    struct VariantRef
+    {
+        std::string  key;   // 结构 key（canonical 形态）
+        ExprPrecSig  sig;   // 观察到的精度签名（≠0、≠ EXPR_PREC_SIG_DISPATCH）
+    };
+
+    std::vector<ExprSpec>           specs;
     std::unordered_set<std::string> keys;
+    std::vector<VariantRef>         variants;
+    std::unordered_set<std::string> variant_keys;
 
     void add(const ExprSpec& s)
     {
@@ -50,6 +65,20 @@ struct ExprRegistry
         const std::string k = expr_spec_key(canon);
         if (keys.insert(k).second)
             specs.push_back(canon);
+    }
+
+    // 记录"某结构在某签名下真的被调用过"（扫描期 = dry-run / 模型 pass /
+    // 显式 pass，均为真实张量精度 + 真实 P）。全 f32（sig==0）与分派哨兵
+    // 不记：前者与 V0 共用条目，后者不是签名。
+    void add_variant(const ExprSpec& s, ExprPrecSig sig)
+    {
+        if (sig == 0u || expr_prec_sig_is_dispatch(sig))
+            return;
+        const ExprSpec canon = canonicalize_expr_spec(s);
+        const std::string k = expr_spec_key(canon);
+        const std::string vk = expr_prec_sig_key(k, sig);
+        if (variant_keys.insert(vk).second)
+            variants.push_back(VariantRef{k, sig});
     }
 };
 

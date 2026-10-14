@@ -73,9 +73,51 @@ public:
         owner.reset();
         auto kernels = fuse_expr_graph(g);
         for (auto& k : kernels)
+        {
             fused::global_registry().add(k.spec);
+            // 复合 kernel（≥2 成员）的**运行期精度签名**在 scan 侧没有别的登记
+            // 入口：单节点结构由 `dsl::compute` 的 scan_register / `eval_expr*`
+            // 入口按真实张量精度登记，而**融合结构**只在 GPU 的 end_expr 才被
+            // 实际执行（并算出签名）。缺这一条 ⇒ 复合结构在 `--f16` 下只剩
+            // V0/`#s`/`#x` 三种载体：拿不到 `key#xxxx` 静态特化（回落带 `prec`
+            // 三元的 `#x`），也拿不到 `key#xxxx#b` 批量变体（优化器整步回落
+            // 逐 kernel 派发）。这里按与运行期**同源**的口径补记：每个输入
+            // 张量的真实存储精度 + tail 节点的输出精度（= 运行期
+            // `expr_prec_sig_of(d.ins, out.precision())`）。
+            std::uint32_t in_bits = 0;
+            std::size_t slot = 0;
+            for (const auto& in : k.inputs)
+            {
+                // 内部依赖输入（node>=0）此时未绑定张量 → 该视图按 f32 记；
+                // 纯逐元素复合的成员引用经寄存器直替、不进 views，故正常构图
+                // 下这里的每个槽都是外部输入。
+                if (slot < 32u && in.external.valid() &&
+                    in.external.precision() == Precision::F16)
+                    in_bits |= (1u << slot);
+                ++slot;
+            }
+            if (k.members.size() > 1)
+                fused::global_registry().add_variant(
+                    k.spec, expr_prec_sig_make(in_bits,
+                                               k.prec == Precision::F16));
+        }
 #endif
         return {};
+    }
+
+    // 构建期扫描：记录 (结构, 精度签名) → 生成**编译期特化**变体（键 key#xxxx，
+    // 见 ExprRegistry::add_variant）。eval_expr* 路径（fold / 直接求值）**不经**
+    // dsl::compute 的 scan_register，必须在引擎入口补记——注意力 fold、CE 的
+    // online-softmax fold、归约链都走这里；漏记 = 这些结构拿不到特化 shader，
+    // 运行时退回带 `prec` 三元的 `#x`（实测注意力 kernel 慢 18%）。
+    static void scan_record_variant_(const ExprSpec& spec,
+                                     std::span<const Tensor> inputs, Precision P)
+    {
+#ifdef NN_EXPR_SCAN
+        fused::global_registry().add_variant(spec, expr_prec_sig_of(inputs, P));
+#else
+        (void)spec; (void)inputs; (void)P;
+#endif
     }
 
     // ── 张量工厂（统一接口，§6.4, §6.5）────────────────────────────────
@@ -1637,6 +1679,7 @@ public:
         std::size_t rows, std::size_t cols,
         Precision P = Precision::F32) override
     {
+        scan_record_variant_(spec, inputs, P);
         trace_variant_(spec, inputs, P);
         // CPU 无带类型融合变体：任何非 f32（输入或输出精度）都走边界 cast
         if (P != Precision::F32 || !all_f32(inputs))
@@ -1668,6 +1711,7 @@ public:
         std::size_t rows, std::size_t cols,
         Precision P = Precision::F32) override
     {
+        scan_record_variant_(spec, inputs, P);
         trace_variant_(spec, inputs, P);
         if (P != Precision::F32 || !all_f32(inputs))
         {
@@ -1703,6 +1747,7 @@ public:
         std::span<const Tensor> inputs,
         std::size_t rows, std::size_t cols, Tensor& dst) override
     {
+        scan_record_variant_(spec, inputs, dst.precision());
         // 目标传递：out 可能是 f16 —— 在 f32 空间求值后 cast_into 写回原存储
         //（out 常同时是输入之一：抬 f32 的拷贝即"读旧值"，语义正确）。
         if (dst.precision() != Precision::F32 || !all_f32(inputs))

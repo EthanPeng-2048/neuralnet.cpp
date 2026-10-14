@@ -31,6 +31,9 @@
 // ─────────────────────────────────────────────────────────────────────────
 
 #include <bit>       // std::bit_cast
+#if defined(__F16C__)
+#include <immintrin.h>   // F16C 快路径（P2-8，见 detail::float_to_half_bits）
+#endif
 #include <cstddef>
 #include <cstdint>
 #include <type_traits>
@@ -239,6 +242,13 @@ static_assert(precision_from_tag(precision_tag(Precision::T1_58)) == Precision::
 // ══════════════════════════════════════════════════════════════════════════
 
 // ── 位级转换（round-half-to-even，constexpr 可求值）──────────────────────
+// ── F16C 快路径（P2-8，2026-10-14）─────────────────────────────────────
+// 目标指令集含 F16C 时（`-march=native` 且 CPU 支持 ⇒ `__F16C__` 已定义），
+// **运行时**走硬件单指令转换（VCVTPS2PH / VCVTPH2PS）；**常量求值**与不含
+// F16C 的可移植构建（`NN_ENABLE_NATIVE=OFF`）仍走下方软件位操作。
+// 两条路径**逐位一致**：RNE 舍入口径相同、NaN 规范化到 0x7E00（软件路径本就
+// 丢弃负载）、上下溢边界同判（|v| ≥ 2^16 → ±inf；<  2^-25 → ±0）。
+// 该一致性由 `precision_test` / `f16_cpu_probe` 的全量对拍守（P2-8 的验收项）。
 namespace detail
 {
 
@@ -246,6 +256,15 @@ namespace detail
 // 溢出 → ±inf；underflow 边界 2^-25 按 tie-to-even 舍入到 0。
 [[nodiscard]] constexpr std::uint16_t float_to_half_bits(float f) noexcept
 {
+#if defined(__F16C__)
+    if (!std::is_constant_evaluated())
+        // imm8 = _MM_FROUND_TO_NEAREST_INT（0）：**与 MXCSR 舍入模式无关**，
+        // 恒 RNE —— 确定性（铁律 8）要求不随宿主舍入模式漂移。
+        // 注：`_cvtss_sh` 的返回类型随实现而异（Clang/libc++ 为 `unsigned
+        // short`，MSVC 为 `__m128i`）→ 统一经 `static_cast` 收窄，两种都成立。
+        return static_cast<std::uint16_t>(
+            _cvtss_sh(f, _MM_FROUND_TO_NEAREST_INT));
+#endif
     const std::uint32_t bits = std::bit_cast<std::uint32_t>(f);
     const std::uint32_t sign = (bits >> 16) & 0x8000u;
     const std::int32_t exp = static_cast<std::int32_t>((bits >> 23) & 0xFF) - 127;  // 非偏置
@@ -319,6 +338,10 @@ namespace detail
 // f16 位型 → f32（无损、精确）
 [[nodiscard]] constexpr float half_bits_to_float(std::uint16_t h) noexcept
 {
+#if defined(__F16C__)
+    if (!std::is_constant_evaluated())
+        return _cvtsh_ss(h);   // 无损精确转换（含次正规/±inf/NaN）
+#endif
     const std::uint32_t sign = (static_cast<std::uint32_t>(h) & 0x8000u) << 16;
     const std::uint32_t e = (static_cast<std::uint32_t>(h) >> 10) & 0x1Fu;
     const std::uint32_t m = static_cast<std::uint32_t>(h) & 0x3FFu;
@@ -538,9 +561,12 @@ inline constexpr PrecisionProfile profile_master_weights() noexcept
 // GPT d64/h4/L4/ff256、vocab 8208、seq 256、batch 8、adam lr 1e-3）：
 //   · optimizer=F16（Adam 的 m/v 存 f16）：v ≈ g² ~ 1e-10 **下溢到 0** →
 //     delta = lr·m/(√0+eps) 爆炸 → loss 从 7.9 发散到 3.6e4；
-//   · stable=F16：CE 链在 f16 下 ~200 步后出现 NaN（f16 范围 65504 / 10 位
-//     尾数不足以承载 vocab 级 log-sum-exp 与 log_softmax）；
-//   · 两者同时 F16（profile_all_f16）：loss 恒定在 32.1（更新被 f16 舍入吃光）。
+//   · stable=F16：CE 链曾在 f16 下 ~200 步后 NaN —— 根因是 CE 的 (1,1) loss
+//     归约**输出**按 stable 落盘、大 token 数下溢出 65504（**已修**：该标量
+//     输出恒 F32，见 compute_loss.hpp / docs 05 §12.5）。但 stable=F16 仍使
+//     softmax/LayerNorm 中间量走 f16（10 位尾数），收益有限、精度有损；
+//   · 两者同时 F16（profile_all_f16）：不可训练 —— optimizer 槽爆炸，且 f16
+//     参数的更新量常被舍入吃光（数值性冻结）。
 // 全四字段 f16 需要 loss scaling + in-kernel f16 归约（docs 05 §12.3），
 // 当前不具备 → 保留 profile_all_f16() 供显式实验，不作 CLI 默认。
 inline constexpr PrecisionProfile profile_f16() noexcept

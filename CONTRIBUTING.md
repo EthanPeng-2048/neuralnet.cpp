@@ -192,6 +192,10 @@ clang-format -i path/to/new_file.hpp
 
 > 本地复现 CI 的三条门禁：`ctest --preset dev`、`NN_BIND_DEBUG=1 ctest --test-dir build`（都应全绿）。
 
+**大版本发布**（版本号 `1.x.y → 1.(x+1).0`）在 CI 门禁之上还有一份必做清单——端到端模型训练测试
+（这类测试**不进默认 ctest**）、发布文档、完整 ctest + **Debug** 构建、多编译器 × 标准库矩阵——
+见 [`docs/todo/25-release-requirements.md`](docs/todo/25-release-requirements.md)。
+
 ---
 
 ## 7. 文档贡献
