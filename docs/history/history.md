@@ -20,12 +20,12 @@
 - [GPU 后端与 GPU 引擎（backend/*, compute_gpu_engine.hpp）](#GPU 后端与 GPU 引擎（backend/*, compute_gpu_engine.hpp）)（17 条）
 - [注意力 / ZiPT / Transformer / FeedForward 层](#注意力 / ZiPT / Transformer / FeedForward 层)（16 条）
 - [RAPT / CNN / MLP / Softmax / GPT 层](#RAPT / CNN / MLP / Softmax / GPT 层)（13 条）
-- [引擎接口 / CPU 引擎 / 精度 / 张量 / 损失 / 优化器](#引擎接口 / CPU 引擎 / 精度 / 张量 / 损失 / 优化器)（22 条）
+- [引擎接口 / CPU 引擎 / 精度 / 张量 / 损失 / 优化器](#引擎接口 / CPU 引擎 / 精度 / 张量 / 损失 / 优化器)（23 条）
 - [代数层 / 基础设施 / 模型容器与序列化](#代数层 / 基础设施 / 模型容器与序列化)（15 条）
 - [领域模型工厂与 CLI 公共头](#领域模型工厂与 CLI 公共头)（3 条）
 - [src 应用入口（text/mnist/tokenizer/bench）](#src 应用入口（text/mnist/tokenizer/bench）)（5 条）
 - [GPU 手写原语 shader（shaders/*.comp）](#GPU 手写原语 shader（shaders/*.comp）)（12 条）
-- [构建期工具 / 基准脚本 / 对拍脚本](#构建期工具 / 基准脚本 / 对拍脚本)（12 条）
+- [构建期工具 / 基准脚本 / 对拍脚本](#构建期工具 / 基准脚本 / 对拍脚本)（13 条）
 - [表达式与融合测试](#表达式与融合测试)（18 条）
 - [层 / 模型测试](#层 / 模型测试)（14 条）
 - [精度 / RAPT / ZiPT / 分词器测试与探针](#精度 / RAPT / ZiPT / 分词器测试与探针)（11 条）
@@ -616,6 +616,10 @@ GPU 后端 / GPU 引擎头文件「历史状态类注释」摘录。整改原则
 
 # 引擎接口 / CPU 引擎 / 精度 / 张量 / 损失 / 优化器
 
+## P2-12：复合 kernel 的运行期精度签名在 scan 侧无登记入口（2026-10-14；原位置 include/neuralnet.cpp/compute_cpu_engine.hpp:71）
+- 类型：覆盖缺口 → 修复（构建期扫描补记）
+- 内容：`scan_exprs` 模式下的 CPU `end_expr` 只做了 `global_registry().add(k.spec)`（登记**结构** V0），没有登记**融合 kernel 的运行期精度签名**——单节点结构的签名由 `dsl::compute` 的 `scan_register` 与引擎 `eval_expr*` 入口按真实张量精度登记，而**融合结构只在 GPU 的 `end_expr` 执行时才算出签名**。后果：`--f16` 下复合结构只有 V0/`#s`/`#x` 三种载体 ⇒ ① 拿不到 `key#xxxx` 静态特化（回落带 `prec` 三元的 `#x`）；② 拿不到 `key#xxxx#b` 批量变体（即便 `#b` 已对每个静态签名变体发射）。修法 = 在 scan 的 `end_expr` 里对 `members.size() > 1` 的 kernel 用**与运行期同源**的口径补记 `add_variant(k.spec, expr_prec_sig_make(输入张量 f16 位图, k.prec == F16))`（等价于运行期 `expr_prec_sig_of(d.ins, out.precision())`；内部依赖输入未绑定张量 → 该槽按 f32 记，纯逐元素复合的成员引用经寄存器直替、不进 views，故正常构图下每槽都是外部输入）。生效后 Adam 复合结构拿到 `#10004` + `#10004#b`；实测（40HX/f16/b64/20 步，配对 `329f8f1` vs `5bb6a51`）：`[ir-c][degrade]` 70 → 0/步、优化器派发 138.7 → 8.55 calls/步（−94%）、优化器 host 阶段 −34%，但端到端墙钟在 GPU-bound（忙率 95.5%）下无可见收益。**边界**：只覆盖 scan 真跑过的 profile（f32 + `--f16`），其它显式组合仍按设计回落降级（构建期 2^4 精度枚举不可取）。
+
 ## 代码审查整改批 RV-06/09/10/11/13 与 CI 真跑测试（2026-10-12；证据坐标 docs/todo/00-code-review-remediation.md）
 - 类型：bug 根因 + 结构收敛 + 门禁
 - 内容：① **RV-06 前置去红**：`NN_BIND_DEBUG=1 ctest` 原为红（`t1_58_test` / `ternary_gemm_test` / `model_roles_test` 三例在 `cast` 处报 "unbound input into engine"）——根因是 `matmul_q_impl`（CPU 与 GPU 两份）在边界 cast 回退里：CPU 递归调用 impl 后、GPU 用静态工厂 `Tensor::from_gpu` 造输出后，都直接调**公共** `cast`（内含 `bind_check_`）而产物尚未 stamp。两处改为 `cast(adopt(std::move(x)), P)`（`adopt` = 基类 protected 的库内 stamp 通道，与 M6 的 `to_prec` 修法同款）；本机 Release+CPU `NN_BIND_DEBUG=1 ctest` 由 37/40 转 **40/40**。CI 侧新增一轮 `NN_BIND_DEBUG=1 ctest` 作为默认门禁。② **RV-09**：环境变量读取收敛到新 `core_env.hpp`（`nn::detail::{env_flag_raw,env_string_raw,env_int_raw}` + 探针门包装；`getenv`/`_dupenv_s` 只此一处、探针门关时恒 false 且不求值）；`dsl::env_flag` 的"任意非空即真"一并对齐为"0 = 关"。③ **RV-10**：BitLinear `quantize_weights_` 与 `ternary_pack::code_of` 的判据注释精确化（严格 `|W|>0.5τ`、半值归零；与 `RoundClip` 的唯一差异在等值点），不改算法。④ **RV-11**：`precision.hpp` 加 `static_assert` 冻结"枚举值 ↔ 序列化 tag"两张映射 + `precision_from_tag(precision_tag(p))==p` 往返（改一处即编译失败）。⑤ **RV-13**：`nn::Expression` / `nn::BoolExpression` 概念从 `expr_dsl.hpp` 移到 L1 的 `algebra_span.hpp`（`expr_dsl` 经 `algebra_matrix → algebra_span` 传递可见）。另（roadmap P0-1）：CI 配置加 `-DNN_ENABLE_TESTS=ON` 并在 Linux/Windows 各跑 `ctest --output-on-failure`，打包补齐 `dataset_gen`/`dataset_convert`（应用入口 6 → 8）。**仍 Open**：RV-05、RV-07、RV-08、RV-12、RV-14（RV-05/14 需 GPU 提权环境；RV-07/08 为需单独提交并逐步过三件套的重构；RV-12 仅设计评估）。
@@ -952,6 +956,10 @@ GPU 后端 / GPU 引擎头文件「历史状态类注释」摘录。整改原则
 # 构建期工具 / 基准脚本 / 对拍脚本
 
 > 本文件摘录 `tools/`、`bench/`、`compare_with_torch/` 注释整改中移出的历史状态记录（原位置为整改前行号）。
+
+## P2-12 残差：优化器 dry-run 未透传 precision profile（2026-10-14；原位置 tools/scan_exprs.cpp:184）
+- 类型：bug 根因（构建期 scan 与运行期不同源）
+- 内容：`--f16` 下 Adam 的每参数复合 kernel `{K3,K4}` 运行期命中不到 AOT shader → 落"逐成员降级派发"（70 参数 = 140 dispatch/步），既不融合也不批量（P2-12 残差）。根因是 **scan 的优化器 dry-run 调 `create_optimizer` 时未传当前 pass 的 precision profile**（默认 `PrecisionProfile{}` = 全 f32），而真实路径 `text_train` 是透传 `cfg.precision` 的。于是 f16 pass 里 `upd_prec = p_.param` 仍取 f32 ⇒ 融合出的复合结构与运行期不同 ⇒ `composite_kernel_available_` 查不到 ⇒ 降级。修法 = 透传 `scan_prof`（f32 pass 与本改动等价，仅 f16 pass 生效）。**教训**：scan 的"结构/签名来源"必须与运行期**逐项同源**；dry-run 里任何"省略一个参数"的简化都会在运行期表现为降级（可观测但静默丢性能）。
 
 ## push-constant 固定头长度按 5 个 uint 打包的错误（原位置 tools/scan_exprs.cpp:572）
 - 类型：bug 根因
