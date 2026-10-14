@@ -90,7 +90,7 @@
 | [`../CMakePresets.json`](../CMakePresets.json) | 预设构建（`cmake --preset dev` 等）——见 CONTRIBUTING §1 |
 | [`benchmarks/2026-09-25-vulkan-vs-cuda.md`](benchmarks/2026-09-25-vulkan-vs-cuda.md) | Vulkan 后端 vs CUDA（torch）基准 |
 | [`benchmarks/2026-10-06-vulkan-vs-torch.md`](benchmarks/2026-10-06-vulkan-vs-torch.md) | 第二轮复测 |
-| `release-notes/v1.5.0.md` … `v1.8.1.md` | 版本变更说明（**大版本发布要求**见 [`todo/25-release-requirements.md`](todo/25-release-requirements.md)） |
+| `release-notes/v1.5.0.md` … `v1.8.2.md` | 版本变更说明（**大版本发布要求**见 [`todo/25-release-requirements.md`](todo/25-release-requirements.md)） |
 
 ## 3. 2026-10-11 文档整理记录
 
