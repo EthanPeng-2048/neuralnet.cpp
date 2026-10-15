@@ -180,7 +180,7 @@ P4 = 持续优化方向（底座已稳后继续加杠杆，2026-10-14 立项，�
 
 | 项目 | 目标 | 验收口径 | 成本 | 依赖 |
 |---|---|---|---|---|
-| **P1-1 `text_train` 模块化** | 抽 `train_loop` / `recovery` / `checkpoint` 模块；退出码语义修正（保存失败不得成功退出） | 现有关键路径回归逐字节一致；新增恢复路径单测；`std::exit` 只在 CLI 参数解析层出现 | 中（1746 行文件拆解，34 处 `std::exit`） | 无，但它是 P1-2 的前置 |
+| **P1-1 `text_train` 模块化** ⚡ **第一刀已落（2026-10-15）：退出码语义** | 抽 `train_loop` / `recovery` / `checkpoint` 模块；退出码语义修正（保存失败不得成功退出） | 现有关键路径回归逐字节一致；新增恢复路径单测；`std::exit` 只在 CLI 参数解析层出现 | 中（1746 行文件拆解，34 处 `std::exit`） | 无，但它是 P1-2 的前置 **已做**：`--save-interval` 的 .nnckpt 写失败从"只打印警告、照常 exit 0"改为**记账 + 收尾非零退出**（推理模型仍写出，错误行明确列出失败次数）；实测：把 ckpt 路径占成目录 ⇒ 退出码 1 + 错误行，正常路径仍 0（`/tmp/nn_exit_bad2` 口径）。**未做**：`train_loop`/`recovery`/`checkpoint` 的模块抽取与 `std::exit` 收敛（现 1808 行、~40 处 std::exit，其中绝大多数在 `parse_args` 属允许层，loop/recovery 内的需随模块化一起改）。 |
 | **P1-2 checkpoint 优化器状态** | `.bin` 增加可选优化器状态段（Adam m/v，`MODEL_VERSION` 5 → 6）；`Optimizer` 基类加 `save_state/load_state`；恢复路径接线 | 老文件缺段 = 冷启动语义；save→load→save SHA256 逐字节一致；TDR 模拟重启后动量非零且 loss 轨迹连续 | 中 | **P1-1**（否则恢复逻辑继续膨胀） |
 | **P1-3 危险精度组合启动期告警** ✅ **已完成 2026-10-13** | **不单独定义**——需求、口径、验收一律引用 [`24-f16-training-defects.md`](24-f16-training-defects.md) §2.3 / §5 F1（口径：仅警告，不退出、不加确认开关）。**落地**：`include/neuralnet.cpp/cli/cli_precision_warning.hpp`（`nn::cli::dangerous_precision_warning`）+ `text_train`/`mnist_train` 调用点 + 门禁 `src/cli_precision_warning_test.cpp`（单测组合矩阵 + 子进程捕获 stderr 断言退出码不变） | 见 24 号台账 F1 验收口径 | 小 | 无 |
 | **P1-4 `gpt_test` flaky 定位** ✅ **已完成 2026-10-15** | **未复现（278 次直跑零失败，含 2 核超订）且同机逐字节确定** ⇒ 定性为"环境差异或进程级异常"，非测试随机性。**未加 retry/skip**（输出确定 ⇒ 失败必对应环境或代码变化）；改为加环境指纹行 + 复用 P0-1 的 `--output-on-failure` 日志留存。证据/统计口径/复现命令见 `docs/history/history.md` 的同名条目与本文 §3.1 C6 行 | 连续大样本直跑零失败 ✅；结论入 history ✅ | 小–中 | P0-1 ✅ |

@@ -4579,3 +4579,34 @@ kwargs：
 **复现**：`python bench/gui_cli_audit.py`（exit 0，五节）、`python bench/gui_draw_logic_audit.py`
 （exit 0）、`python bench/gui_cli_audit.py` 的 [3] 节同时验"控件删了引用还在"这类只在运行期
 才炸的错误。
+
+# P1-1（第一刀）：`text_train` 的退出码语义——断点写失败不得成功退出（2026-10-15）
+
+**缺陷**（docs/todo/18 §4.2 P1-1 的"退出码语义修正"）：`--save-interval` 的 `.nnckpt`
+写失败时旧代码只打印一行 `[ckpt] 保存失败: …` 就继续跑，最后照常 `return 0`——上层
+（脚本 / CI / `train_pkg`）看到的是"这轮训练完好"，而实际上**断点没落盘**，`--resume`
+会拿到旧断点或空文件。
+
+**改法**（`src/text_train.cpp`，24 行）：
+
+1. 循环内断点保存失败 → `++ckpt_save_failures`，错误行带上第几次（不中断训练：
+   磁盘抖动不该毁掉整轮）；
+2. 收尾：**只要有过断点保存失败就以 1 退出**，并打印明确错误行（推理模型文件仍写出）；
+3. 最终推理模型保存失败 → 仍然是失败退出（原来是 `NN_EXIT(..., 1)`，语义不变，
+   改写为显式 `if (!save_result) return 1;` 以便同处集中记账）。
+
+**验证（实测，850M / 2 步 / `--save-interval 1`）**：
+
+| 场景 | 结果 |
+|---|---|
+| 正常可写目录 | 退出码 **0**，`m.nnckpt` + `m.nnmodel` 均写出 |
+| 把 ckpt 路径占成**目录**（`/tmp/nn_exit_bad2/m.nnckpt/`） | 退出码 **1**，日志含 `[ckpt] 保存失败（第 1/2 次）: Cannot open file for writing: …` 与 `[错误] 本次训练有 2 次 checkpoint(.nnckpt) 保存失败（推理模型已写出）⇒ 退出码 1`；`m.nnmodel` 仍写出 |
+
+**未做（下一次接手 P1-1 的起点）**：`train_loop` / `recovery` / `checkpoint` 的**模块抽取**
+与 `std::exit` 收敛。现状盘点（2026-10-15 实测）：`src/text_train.cpp` **1808 行**、
+`std::exit` 约 **40 处**——绝大多数在 `parse_args`（属允许层），需要随模块化搬走的是
+训练循环内的四处错误分支与 `main` 里的几个前置校验。可切分的接缝（按行号区间，行号会漂移、
+以注释标题为准）：`--resume` 的角色校验 + 加载（`// 规格是加载时的权威来源` 起）、
+循环内 `// ── 定期保存 checkpoint`、收尾 `// ── 保存模型`；TDR 重启续训段
+（`// TDR 重启续训：resume 时本 epoch 内跳过已完成的前 start_step 步`）与循环状态
+（`step`/`epoch`/loss 累加器/`stop_training`）耦合最紧，抽它需要先定义状态结构。
