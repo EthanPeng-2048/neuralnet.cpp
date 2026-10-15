@@ -75,7 +75,8 @@
 见 [`todo/README.md`](todo/README.md) 的完整索引。要点：
 
 - `todo/00-code-review-remediation.md` — **2026-10-11 代码审查整改立项台账**（本批新增）。
-- `todo/18-roadmap.md` — "下一步该做什么"的唯一入口。
+- `todo/18-roadmap.md` — **"某件事该不该做"的唯一入口**（裁定台账 + 验收口径 + 现状实测；不含执行计划）。
+- `todo/27-execution-plan.md` — **执行计划（优先级象限）**："下一个先做哪个"。
 - `todo/12` / `todo/17` / `todo/19` / `todo/21` / `todo/22` / `todo/23` — 现行设计/盘点。
 - `todo/24` / `todo/25` — f16 训练缺陷台账 / **大版本发布要求**（`1.x.y → 1.(x+1).0`）。
 
