@@ -190,7 +190,7 @@ tokenizer_infer,dataset_gen,dataset_convert}`，另有 `layer_bench`（性能）
 
 ## 8. 编译耗时
 
-本工程 header-only，单 TU 首次 parse `nn.hpp`（含 36 份原语 SPIR-V 嵌入头 + AOT 融合注册表，
+本工程 header-only，单 TU 首次 parse `nn.hpp`（含 44 份原语 SPIR-V 嵌入头 + AOT 融合注册表，
 约 7MB 头文本）较慢——本机实测约 17.5s 无 PCH。已落地四项提速（默认开启，无需配置）：
 
 1. `NN_ENABLE_PCH`：`nn.hpp` 预编译一次，由编译条件相同的目标 `REUSE_FROM` 共享

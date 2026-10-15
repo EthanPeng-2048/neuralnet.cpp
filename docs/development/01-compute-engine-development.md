@@ -797,6 +797,11 @@ TEST_CASE("linear_gradcheck") {
 ```bash
 # 单算子（默认 CPU，--gpu 走 Vulkan）；调参前务必 --warmup 等时钟爬坡（见 AGENTS §12）
 ./build/layer_bench --op matmul --m 1024 --n 1024 --k 1024 --warmup 20
+
+# 状态扫描原语（RLA/RAPT）：--dk 给 head 维，--hash 打印输出的位级哈希
+# （**逐位不变**的 kernel 改写必须哈希相同；哈希刻意打在计时之后）
+./build/layer_bench --op scan_prefix,scan_suffix --gpu --batch 8 --heads 4 --dk 32 \
+    --seq 128 --iter 10 --warmup 2 --hash
 ```
 
 ### 4. GPU 特定测试

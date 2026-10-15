@@ -65,7 +65,7 @@ add_subdirectory(3rd_party/neuralnet.cpp)
 ## 3. GPU 语义（重要）
 
 - **GPU 能力随目标传递**：只要链接 `neuralnet::nn` 且配置期 GPU 启用，你的目标就自动获得
-  `NN_HAS_VULKAN` 宏、36 份原语 SPIR-V 嵌入头 + 库自身 `fused_registry.hpp` 的 include
+  `NN_HAS_VULKAN` 宏、44 份原语 SPIR-V 嵌入头 + 库自身 `fused_registry.hpp` 的 include
   目录、`Vulkan::Vulkan` 链接、以及「shader 生成先于你的 TU 编译」的顺序依赖。
   源码里 `#ifdef NN_HAS_VULKAN` 即可分支，无需自己写任何 Vulkan 相关 CMake。
 - **闭合世界**：库内层的融合 shader 在库构建期全部生成；你的目标直接跑库内层**开箱即用**。
