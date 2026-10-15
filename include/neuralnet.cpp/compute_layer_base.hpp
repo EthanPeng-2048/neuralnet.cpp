@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cstdint>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -9,6 +10,7 @@
 #include <limits>
 #include <memory>
 #include <random>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -765,7 +767,8 @@ public:
 }
 
 // ══════════════════════════════════════════════════════════════════════════
-// 采样：temperature 缩放 → 数值稳定 softmax → 随机采样 / 贪心（argmax）
+// 采样：重复惩罚 → temperature 缩放 → top-k / top-p 截断 →
+//       数值稳定 softmax → 随机采样 / 贪心（argmax）
 //
 // GPTModel / RAPTModel 的 generate() 各自逐 token 维护不同的运行态
 // （KV cache / RLA 运行态），但"从末位 logits 选下一 token"这一步两者
@@ -775,46 +778,177 @@ public:
 //   logits        就地变为概率（调用方不需要原值）
 //   temperature   >0 随机采样（1.0 = 不缩放但仍采样）；<=0 贪心
 //   消耗恰好一次 dist(rng)（仅采样分支）——RNG 消耗序与旧实现逐位一致
+//
+// P0-5（2026-10-15）：新增 top-k / top-p（核采样）/ 重复惩罚 / 种子。
+// **全部默认值 = 关闭**（top_k=0 / top_p=1 / repeat_penalty=1 / 无 history）
+// 时本函数与旧路径**逐位一致**（max / exp / 累加 / 逆 CDF 的遍历顺序、
+// RNG 消耗次数都不变），采样器单测锁这条等价性。
 // ══════════════════════════════════════════════════════════════════════════
-[[nodiscard]] inline std::size_t sample_next_token_(
-    std::vector<Scalar>& logits, Scalar temperature,
-    std::mt19937_64& rng, std::uniform_real_distribution<Scalar>& dist)
+// ── 采样配置（P0-5）───────────────────────────────────────────────────────
+// 固定顺序（可复现、与文档同源）：
+//   ① 重复惩罚：对 history 中**去重**后出现的 token（logit>0 → /=penalty，
+//      否则 *=penalty；`repeat_window` 限制只看最近 N 个，0 = 全部）
+//   ② 温度：temperature > 0 且 != 1 才缩放（<=0 = 贪心，不缩放）
+//   ③ top-k：按（值降序，下标升序）保留前 k 个（0 = 关闭）
+//   ④ 数值稳定 softmax（未截断时与旧路径逐位一致：max/exp/累加/归一化
+//      的遍历顺序都是"下标升序"）
+//   ⑤ top-p：在**保留集**上按概率降序取"累计 ≥ top_p"的最小前缀（至少 1 个），
+//      随后在保留集内重新归一化；top_p >= 1 = 关闭
+//   ⑥ temperature <= 0 → 贪心（并列取最小下标，**不消耗 RNG**）；
+//      否则逆 CDF 采样，**按下标升序**累加、恰好消耗一次 dist(rng)
+struct SamplingConfig
+{
+    Scalar temperature = 1.0; // <=0 = 贪心
+    std::size_t top_k = 0; // 0 = 关闭
+    Scalar top_p = 1.0; // >=1 = 关闭（核采样阈值）
+    Scalar repeat_penalty = 1.0; // <=1 = 关闭
+    std::size_t repeat_window = 0; // 0 = 全部 history
+    std::uint64_t seed = 0; // has_seed=false 时忽略
+    bool has_seed = false; // true = 用 seed 播种（可复现）
+};
+
+// 扩展采样器（cfg 全默认时的输出与下面 temperature 重载逐位一致）
+[[nodiscard]] inline std::size_t sample_next_token_(std::vector<Scalar>& logits,
+                                                    const SamplingConfig& cfg, std::mt19937_64& rng,
+                                                    std::uniform_real_distribution<Scalar>& dist,
+                                                    std::span<const std::size_t> history = {})
 {
     const std::size_t n = logits.size();
     // RV-01：n == 0 时下面的 `logits[0]` / max 归约都越界 → 无条件终止
     NN_ASSERT_ALWAYS(n > 0, "sample_next_token_: empty logits");
-    if (temperature > 0.0 && temperature != 1.0)
-        for (auto& v : logits) v /= temperature;
 
-    // softmax（数值稳定）
-    Scalar max_val = logits[0];
-    for (std::size_t v = 1; v < n; ++v)
-        max_val = std::max(max_val, logits[v]);
-    Scalar sum_exp = 0.0;
-    for (auto& v : logits)
+    // ── ① 重复惩罚（去重；判定只依赖 history 的内容，不依赖扫描顺序）──
+    if (cfg.repeat_penalty > 0.0 && cfg.repeat_penalty != 1.0 && !history.empty())
     {
-        v = std::exp(v - max_val);
-        sum_exp += v;
+        const std::size_t begin = (cfg.repeat_window > 0 && history.size() > cfg.repeat_window)
+                                      ? history.size() - cfg.repeat_window
+                                      : 0;
+        std::vector<std::uint8_t> seen(n, 0);
+        for (std::size_t i = begin; i < history.size(); ++i)
+        {
+            const std::size_t t = history[i];
+            if (t >= n || seen[t]) continue; // 越界 id（词表不匹配）只看不罚
+            seen[t] = 1;
+            logits[t] =
+                (logits[t] > 0.0) ? logits[t] / cfg.repeat_penalty : logits[t] * cfg.repeat_penalty;
+        }
     }
-    for (auto& v : logits) v /= sum_exp;
 
-    if (temperature > 0.0)
+    // ── ② 温度 ──
+    if (cfg.temperature > 0.0 && cfg.temperature != 1.0)
+        for (auto& v : logits)
+            v /= cfg.temperature;
+
+    // ── ③ top-k：候选集（升序；未截断时 = 全部下标）──
+    std::vector<std::size_t> cand;
+    if (cfg.top_k > 0 && cfg.top_k < n)
+    {
+        std::vector<std::size_t> order(n);
+        for (std::size_t i = 0; i < n; ++i)
+            order[i] = i;
+        std::partial_sort(order.begin(), order.begin() + cfg.top_k, order.end(),
+                          [&](std::size_t a, std::size_t b)
+                          {
+                              if (logits[a] != logits[b]) return logits[a] > logits[b];
+                              return a < b; // 并列取小下标（确定性）
+                          });
+        cand.assign(order.begin(), order.begin() + cfg.top_k);
+        std::sort(cand.begin(), cand.end()); // 回到升序（CDF 遍历顺序）
+    }
+    else
+    {
+        cand.resize(n);
+        for (std::size_t i = 0; i < n; ++i)
+            cand[i] = i;
+    }
+
+    // ── ④ softmax（遍历顺序 = 候选集升序；未截断时与旧路径逐位一致）──
+    Scalar max_val = logits[cand[0]];
+    for (std::size_t i = 1; i < cand.size(); ++i)
+        max_val = std::max(max_val, logits[cand[i]]);
+    Scalar sum_exp = 0.0;
+    for (const std::size_t v : cand)
+    {
+        logits[v] = std::exp(logits[v] - max_val);
+        sum_exp += logits[v];
+    }
+
+    // ── ⑤ top-p：概率降序找最小前缀，保留集内重新归一化 ──
+    if (cfg.top_p < 1.0 && cand.size() > 1)
+    {
+        std::vector<std::size_t> by_prob(cand);
+        std::sort(by_prob.begin(), by_prob.end(),
+                  [&](std::size_t a, std::size_t b)
+                  {
+                      if (logits[a] != logits[b]) return logits[a] > logits[b];
+                      return a < b; // 并列取小下标（确定性）
+                  });
+        const Scalar want = (cfg.top_p > 0.0) ? cfg.top_p : 0.0;
+        Scalar cum = 0.0;
+        std::size_t keep = 0;
+        for (; keep < by_prob.size(); ++keep)
+        {
+            cum += logits[by_prob[keep]] / sum_exp;
+            if (cum >= want)
+            {
+                ++keep;
+                break;
+            } // 至少保留 1 个
+        }
+        if (keep == 0) keep = 1;
+        std::vector<std::uint8_t> in_keep(n, 0);
+        for (std::size_t i = 0; i < keep; ++i)
+            in_keep[by_prob[i]] = 1;
+        Scalar kept_sum = 0.0;
+        std::vector<std::size_t> kept;
+        kept.reserve(keep);
+        for (const std::size_t v : cand) // 升序保持 CDF 遍历顺序
+            if (in_keep[v])
+            {
+                kept.push_back(v);
+                kept_sum += logits[v];
+            }
+        for (const std::size_t v : cand)
+            if (!in_keep[v]) logits[v] = 0.0;
+        cand = std::move(kept);
+        sum_exp = kept_sum;
+    }
+    for (const std::size_t v : cand)
+        logits[v] /= sum_exp;
+
+    // ── ⑥ 采样 / 贪心 ──
+    if (cfg.temperature > 0.0)
     {
         const Scalar r = dist(rng);
         Scalar cumulative = 0.0;
-        std::size_t next = n - 1;
-        for (std::size_t v = 0; v < n; ++v)
+        std::size_t next = cand.back(); // 逆 CDF 未命中时的兜底（与旧路径 n-1 一致）
+        for (const std::size_t v : cand)
         {
             cumulative += logits[v];
             if (r <= cumulative) { next = v; break; }
         }
         return next;
     }
-    std::size_t next = 0;
-    Scalar best = logits[0];
-    for (std::size_t v = 1; v < n; ++v)
-        if (logits[v] > best) { best = logits[v]; next = v; }
+    std::size_t next = cand[0];
+    Scalar best = logits[cand[0]];
+    for (std::size_t i = 1; i < cand.size(); ++i)
+        if (logits[cand[i]] > best)
+        {
+            best = logits[cand[i]];
+            next = cand[i];
+        }
     return next;
+}
+
+// 旧签名（无截断的纯 temperature 采样）：语义 = SamplingConfig 全默认
+// ⇒ 输出与旧实现逐位一致（采样器单测锁这条等价性）
+[[nodiscard]] inline std::size_t sample_next_token_(std::vector<Scalar>& logits, Scalar temperature,
+                                                    std::mt19937_64& rng,
+                                                    std::uniform_real_distribution<Scalar>& dist)
+{
+    SamplingConfig cfg;
+    cfg.temperature = temperature;
+    return sample_next_token_(logits, cfg, rng, dist, {});
 }
 
 } // namespace nn

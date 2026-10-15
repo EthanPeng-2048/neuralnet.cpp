@@ -151,6 +151,10 @@ GPT 训练需要一份文本语料（如 `datasets/llm_corpus.txt`，用 `script
 # 调节温度（0=贪心，>1=更随机）
 ./build/text_infer --model gpt_model.bin --prompt "Hello" --temperature 0.8
 
+# 采样截断 + 可复现（同 seed 同 prompt ⇒ 同输出）
+./build/text_infer --model gpt_model.bin --prompt "Hello" --seed 7 \
+    --top-k 40 --top-p 0.9 --repeat-penalty 1.2
+
 # 使用 GPU
 ./build/text_infer --model gpt_model.bin --gpu --prompt "Hello"
 ```
@@ -165,8 +169,18 @@ GPT 训练需要一份文本语料（如 `datasets/llm_corpus.txt`，用 `script
 | `--interactive` | 禁用 | 交互式生成模式 |
 | `--max-tokens <n>` | `200` | 最大生成 token 数 |
 | `--temperature <t>` | `1.0` | 温度参数（0=贪心） |
+| `--top-k <n>` | `0` | top-k 截断：只保留概率最高的 n 个候选（0=关闭） |
+| `--top-p <f>` | `1.0` | top-p 核采样阈值（0<f<=1；1.0=关闭） |
+| `--repeat-penalty <f>` | `1.0` | 重复惩罚（>1 抑制重复；1.0=关闭） |
+| `--repeat-window <n>` | `0` | 重复惩罚只看最近 n 个 token（0=全部上下文） |
+| `--seed <n>` | 空 | 随机种子（给了就固定种子 ⇒ 同 prompt 输出可复现） |
 | `--gpu <索引>` / `--gpu=<名称>` | 禁用 | 启用 Vulkan GPU 加速；可选指定计算设备（索引如 `2`，名称子串如 `--gpu=40HX`/`--gpu=NVIDIA`） |
 | `--show-tokens` | 禁用 | 显示 token ID（调试） |
+
+采样顺序固定为：重复惩罚 → 温度 → top-k → top-p（核采样，保留集内重新
+归一化）→ softmax → 采样/贪心；全部开关关闭时与旧版（仅 temperature）
+输出**逐位一致**（`sampling_test` 锁这条等价性）。`--temperature 0` 与
+`--top-k 1` 都是贪心（等价）。
 
 ---
 

@@ -15,6 +15,7 @@
 #include <neuralnet.cpp/cli/cli_help.hpp>
 
 #include <chrono>
+#include <cstdint>
 #include <iomanip>
 #include <iostream>
 #include <memory>
@@ -38,6 +39,11 @@ void print_usage(const char *prog)
     help.opt("--interactive", "交互式生成模式");
     help.opt("--max-tokens <n>", "最大生成 token 数 (默认: 200)");
     help.opt("--temperature <t>", "温度参数 (默认: 1.0；0=贪心)");
+    help.opt("--top-k <n>", "top-k 截断：只保留概率最高的 n 个候选 (默认: 0=关闭)");
+    help.opt("--top-p <f>", "top-p 核采样阈值 (0<f<=1；默认: 1.0=关闭)");
+    help.opt("--repeat-penalty <f>", "重复惩罚 (>1 抑制重复；默认: 1.0=关闭)");
+    help.opt("--repeat-window <n>", "重复惩罚只看最近 n 个 token (默认: 0=全部上下文)");
+    help.opt("--seed <n>", "随机种子 (给了就固定种子 ⇒ 同 prompt 输出可复现)");
     help.opt("--show-tokens", "显示 token ID (调试用)");
     help.opt("--gpu [索引|名称]", "启用 GPU 加速 (需要 Vulkan SDK)\n空格形式只收枚举索引；名称子串用 --gpu=<名称>，如 --gpu=NVIDIA / --gpu=40HX");
     help.opt("--help, -h", "显示此帮助信息");
@@ -51,6 +57,12 @@ struct InferConfig
     std::string prompt = "Hello";
     int max_tokens = 200;
     double temperature = 1.0;
+    std::size_t top_k = 0;
+    double top_p = 1.0;
+    double repeat_penalty = 1.0;
+    std::size_t repeat_window = 0;
+    std::uint64_t seed = 0;
+    bool has_seed = false;
     bool interactive = false;
     bool show_tokens = false;
     bool gpu_enabled = false;
@@ -89,6 +101,57 @@ InferConfig parse_args(int argc, char *argv[])
             if (!v) { std::cerr << "无效 --temperature\n"; std::exit(1); }
             cfg.temperature = *v;
         }
+        else if (arg == "--top-k" && i + 1 < argc)
+        {
+            auto v = nn::parse_number<int>(argv[++i]);
+            if (!v || *v < 0)
+            {
+                std::cerr << "--top-k 必须 >= 0\n";
+                std::exit(1);
+            }
+            cfg.top_k = static_cast<std::size_t>(*v);
+        }
+        else if (arg == "--top-p" && i + 1 < argc)
+        {
+            auto v = nn::parse_number<double>(argv[++i]);
+            if (!v || *v <= 0.0 || *v > 1.0)
+            {
+                std::cerr << "--top-p 必须在 (0, 1] 区间\n";
+                std::exit(1);
+            }
+            cfg.top_p = *v;
+        }
+        else if (arg == "--repeat-penalty" && i + 1 < argc)
+        {
+            auto v = nn::parse_number<double>(argv[++i]);
+            if (!v || *v <= 0.0)
+            {
+                std::cerr << "--repeat-penalty 必须 > 0（1.0 = 关闭）\n";
+                std::exit(1);
+            }
+            cfg.repeat_penalty = *v;
+        }
+        else if (arg == "--repeat-window" && i + 1 < argc)
+        {
+            auto v = nn::parse_number<int>(argv[++i]);
+            if (!v || *v < 0)
+            {
+                std::cerr << "--repeat-window 必须 >= 0（0 = 全部上下文）\n";
+                std::exit(1);
+            }
+            cfg.repeat_window = static_cast<std::size_t>(*v);
+        }
+        else if (arg == "--seed" && i + 1 < argc)
+        {
+            auto v = nn::parse_number<long long>(argv[++i]);
+            if (!v || *v < 0)
+            {
+                std::cerr << "--seed 必须 >= 0\n";
+                std::exit(1);
+            }
+            cfg.seed = static_cast<std::uint64_t>(*v);
+            cfg.has_seed = true;
+        }
         else if (auto gpu_dev = nn::cli::parse_gpu_option(argc, argv, i))
         {
             cfg.gpu_enabled = true;
@@ -108,11 +171,25 @@ InferConfig parse_args(int argc, char *argv[])
 }
 
 // ==================== 从 Model 提取 GPTModel 并生成 ====================
-nn::Result<std::vector<std::size_t>> generate_text(
-    nn::Model &model, nn::ComputeEngine &engine,
-    const std::vector<std::size_t> &prompt_tokens,
-    std::size_t max_new_tokens, double temperature,
-    std::size_t eos_token_id)
+// 把 CLI 字段打包成库侧采样配置（P0-5）
+nn::SamplingConfig sampling_config(const InferConfig& cfg)
+{
+    nn::SamplingConfig sc;
+    sc.temperature = static_cast<Scalar>(cfg.temperature);
+    sc.top_k = cfg.top_k;
+    sc.top_p = static_cast<Scalar>(cfg.top_p);
+    sc.repeat_penalty = static_cast<Scalar>(cfg.repeat_penalty);
+    sc.repeat_window = cfg.repeat_window;
+    sc.seed = cfg.seed;
+    sc.has_seed = cfg.has_seed;
+    return sc;
+}
+
+nn::Result<std::vector<std::size_t>> generate_text(nn::Model& model, nn::ComputeEngine& engine,
+                                                   const std::vector<std::size_t>& prompt_tokens,
+                                                   std::size_t max_new_tokens,
+                                                   const nn::SamplingConfig& sc,
+                                                   std::size_t eos_token_id)
 {
     auto &layer_ref = model.layer_at(0);
 
@@ -121,11 +198,9 @@ nn::Result<std::vector<std::size_t>> generate_text(
     // 避免模型因训练偏置一上来就输出 EOS 导致无输出。
     const std::size_t min_new = max_new_tokens / 2;
     if (auto *gpt_ptr = dynamic_cast<nn::GPTModel *>(&layer_ref))
-        return gpt_ptr->generate(engine, prompt_tokens, max_new_tokens, temperature,
-                                 eos_token_id, min_new);
+        return gpt_ptr->generate(engine, prompt_tokens, max_new_tokens, sc, eos_token_id, min_new);
     if (auto *rapt_ptr = dynamic_cast<nn::RAPTModel *>(&layer_ref))
-        return rapt_ptr->generate(engine, prompt_tokens, max_new_tokens, temperature,
-                                  eos_token_id, min_new);
+        return rapt_ptr->generate(engine, prompt_tokens, max_new_tokens, sc, eos_token_id, min_new);
     NN_FAIL("Model does not contain a GPTModel or RAPTModel layer");
 }
 
@@ -190,8 +265,8 @@ void interactive_mode(nn::Model &model, nn::ComputeEngine &engine,
         }
 
         std::cout << "生成中...\n";
-        auto gen_result = generate_text(model, engine, prompt_tokens,
-                                       cfg.max_tokens, cfg.temperature, eos_id);
+        auto gen_result = generate_text(model, engine, prompt_tokens, cfg.max_tokens,
+                                        sampling_config(cfg), eos_id);
         if (!gen_result) { std::cerr << "Error: " << gen_result.error().message << '\n'; continue; }
         auto generated = std::move(*gen_result);
 
@@ -339,12 +414,17 @@ int main(int argc, char *argv[])
     std::cout << "提示: \"" << cfg.prompt << "\"\n";
     std::cout << "Prompt tokens: " << prompt_tokens.size() << " 个\n";
     std::cout << "生成 " << cfg.max_tokens << " 个 token"
-              << " (temperature=" << cfg.temperature << ")\n";
+              << " (temperature=" << cfg.temperature << ", top-k=" << cfg.top_k
+              << ", top-p=" << cfg.top_p << ", repeat-penalty=" << cfg.repeat_penalty;
+    if (cfg.repeat_penalty != 1.0 && cfg.repeat_window > 0)
+        std::cout << " (window=" << cfg.repeat_window << ")";
+    if (cfg.has_seed) std::cout << ", seed=" << cfg.seed;
+    std::cout << ")\n";
     std::cout << "----------------------------------------" << std::endl;
 
     auto t_start = std::chrono::steady_clock::now();
-    auto gen_result = generate_text(model, *engine, prompt_tokens,
-                                   cfg.max_tokens, cfg.temperature, eos_id);
+    auto gen_result =
+        generate_text(model, *engine, prompt_tokens, cfg.max_tokens, sampling_config(cfg), eos_id);
     auto t_end = std::chrono::steady_clock::now();
     Scalar gen_sec = std::chrono::duration<Scalar>(t_end - t_start).count();
 
