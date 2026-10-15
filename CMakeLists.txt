@@ -855,6 +855,11 @@ if(Vulkan_FOUND)
     # 尺寸——消灭适配层 scan 的全尺寸 f32 副本；scratch St 仍 f32）。
     nn_embed_shader(scan_prefix_outer_f16 ${CMAKE_CURRENT_SOURCE_DIR}/shaders/scan_prefix_outer.comp -DNN_SHADER_F16=1)
     nn_embed_shader(scan_suffix_outer_f16 ${CMAKE_CURRENT_SOURCE_DIR}/shaders/scan_suffix_outer.comp -DNN_SHADER_F16=1)
+    # P4-2b：前缀扫描的"窄共享"变体（dk ≤ 32）——同一份源码，只是把共享足迹宏
+    # 压到 32：A/B 从 33.3KB 降到 8.5KB ⇒ Maxwell 每 SM 驻留的 workgroup 从 1 个
+    # 提到 6 个。C++ 侧按 dk ≤ 32 选它，缺它时自动回落宽变体（同数值、只是慢）。
+    nn_embed_shader(scan_prefix_outer_d32 ${CMAKE_CURRENT_SOURCE_DIR}/shaders/scan_prefix_outer.comp -DNN_SCAN_DK_MAX=32)
+    nn_embed_shader(scan_prefix_outer_d32_f16 ${CMAKE_CURRENT_SOURCE_DIR}/shaders/scan_prefix_outer.comp -DNN_SCAN_DK_MAX=32 -DNN_SHADER_F16=1)
     nn_embed_shader(scan_prefix_outer_gen_f16 ${CMAKE_CURRENT_SOURCE_DIR}/shaders/scan_prefix_outer_gen.comp -DNN_SHADER_F16=1)
     nn_embed_shader(scan_suffix_outer_gen_f16 ${CMAKE_CURRENT_SOURCE_DIR}/shaders/scan_suffix_outer_gen.comp -DNN_SHADER_F16=1)
     nn_embed_shader(outer_col_f16 ${CMAKE_CURRENT_SOURCE_DIR}/shaders/outer_col.comp -DNN_SHADER_F16=1)
