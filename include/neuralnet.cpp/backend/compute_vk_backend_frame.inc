@@ -539,7 +539,7 @@
         auto cmd_r = acquire_cmd();
         if (!cmd_r)
         {
-            vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
+            release_desc_set_now(desc_set);
             NN_TRY_CHECK(cmd_r);
         }
         auto [cmd, owns_cmd] = *cmd_r;

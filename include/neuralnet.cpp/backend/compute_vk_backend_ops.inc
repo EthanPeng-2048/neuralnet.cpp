@@ -83,7 +83,7 @@
         auto cmd_r = acquire_cmd();
         if (!cmd_r)
         {
-            vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
+            release_desc_set_now(desc_set);
             NN_TRY_CHECK(cmd_r);
         }
         auto [cmd, owns_cmd] = *cmd_r;
@@ -445,7 +445,7 @@
             auto ds2_r = alloc_desc_set(kr_pipe.descriptor_layout());
             if (!ds2_r)
             {
-                vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &ds_ks);
+                release_desc_set_now(ds_ks);
                 NN_TRY_CHECK(ds2_r);
             }
             VkDescriptorSet ds_kr = *ds2_r;
@@ -495,8 +495,8 @@
             auto cmd_r = acquire_cmd();
             if (!cmd_r)
             {
-                vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &ds_kr);
-                vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &ds_ks);
+                release_desc_set_now(ds_kr);
+                release_desc_set_now(ds_ks);
                 NN_TRY_CHECK(cmd_r);
             }
             auto [cmd, owns_cmd] = *cmd_r;
@@ -540,7 +540,8 @@
             record_output_barrier(cmd, output.buffer().impl());
 
             // 5. 提交（独立模式等待后两个描述符集均可回收；批量模式由帧池
-            //    reset 统一回收，与既有路径一致）
+            //    reset 统一回收，与既有路径一致）——本块只在 `owns_cmd`
+            //    （⇒ solo）下可达，故这里的直接释放不违反 RV-15 的登记规则
             if (owns_cmd)
             {
                 auto r = submit_and_wait(cmd, ds_ks);
@@ -607,7 +608,7 @@
         auto cmd_r = acquire_cmd();
         if (!cmd_r)
         {
-            vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
+            release_desc_set_now(desc_set);
             NN_TRY_CHECK(cmd_r);
         }
         auto [cmd, owns_cmd] = *cmd_r;
@@ -941,7 +942,7 @@
         auto cmd_r = acquire_cmd();
         if (!cmd_r)
         {
-            vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
+            release_desc_set_now(desc_set);
             NN_TRY_CHECK(cmd_r);
         }
         auto [cmd, owns_cmd] = *cmd_r;
@@ -1158,8 +1159,8 @@
             auto cmd_r = acquire_cmd();
             if (!cmd_r)
             {
-                VkDescriptorSet free_sets[2] = {ds1, ds2};
-                vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 2, free_sets);
+                release_desc_set_now(ds1);
+                release_desc_set_now(ds2);
                 NN_TRY_CHECK(cmd_r);
             }
             auto [cmd, owns_cmd] = *cmd_r;
@@ -1225,7 +1226,7 @@
         auto cmd_r = acquire_cmd();
         if (!cmd_r)
         {
-            vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
+            release_desc_set_now(desc_set);
             NN_TRY_CHECK(cmd_r);
         }
         auto [cmd, owns_cmd] = *cmd_r;
@@ -1326,7 +1327,7 @@
         auto cmd_r = acquire_cmd();
         if (!cmd_r)
         {
-            vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
+            release_desc_set_now(desc_set);
             NN_TRY_CHECK(cmd_r);
         }
         auto [cmd, owns_cmd] = *cmd_r;
@@ -1684,7 +1685,7 @@
         auto cmd_r = acquire_cmd();
         if (!cmd_r)
         {
-            vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
+            release_desc_set_now(desc_set);
             NN_TRY_CHECK(cmd_r);
         }
         auto [cmd, owns_cmd] = *cmd_r;
@@ -1755,7 +1756,7 @@
         auto cmd_r = acquire_cmd();
         if (!cmd_r)
         {
-            vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
+            release_desc_set_now(desc_set);
             NN_TRY_CHECK(cmd_r);
         }
         auto [cmd, owns_cmd] = *cmd_r;
@@ -1862,7 +1863,7 @@
         auto cmd_r = acquire_cmd();
         if (!cmd_r)
         {
-            vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
+            release_desc_set_now(desc_set);
             NN_TRY_CHECK(cmd_r);
         }
         auto [cmd, owns_cmd] = *cmd_r;
@@ -2141,7 +2142,7 @@
         auto cmd_r = acquire_cmd();
         if (!cmd_r)
         {
-            vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
+            release_desc_set_now(desc_set);
             NN_TRY_CHECK(cmd_r);
         }
         auto [cmd, owns_cmd] = *cmd_r;
@@ -2246,7 +2247,7 @@
         auto cmd_r = acquire_cmd();
         if (!cmd_r)
         {
-            vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
+            release_desc_set_now(desc_set);
             NN_TRY_CHECK(cmd_r);
         }
         auto [cmd, owns_cmd] = *cmd_r;
@@ -2340,7 +2341,7 @@
         auto cmd_r = acquire_cmd();
         if (!cmd_r)
         {
-            vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
+            release_desc_set_now(desc_set);
             NN_TRY_CHECK(cmd_r);
         }
         auto [cmd, owns_cmd] = *cmd_r;
@@ -2429,7 +2430,7 @@
         auto cmd_r = acquire_cmd();
         if (!cmd_r)
         {
-            vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
+            release_desc_set_now(desc_set);
             NN_TRY_CHECK(cmd_r);
         }
         auto [cmd, owns_cmd] = *cmd_r;
@@ -2528,7 +2529,7 @@
         auto cmd_r = acquire_cmd();
         if (!cmd_r)
         {
-            vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
+            release_desc_set_now(desc_set);
             NN_TRY_CHECK(cmd_r);
         }
         auto [cmd, owns_cmd] = *cmd_r;
@@ -2618,7 +2619,7 @@
         auto cmd_r = acquire_cmd();
         if (!cmd_r)
         {
-            vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &desc_set);
+            release_desc_set_now(desc_set);
             NN_TRY_CHECK(cmd_r);
         }
         auto [cmd, owns_cmd] = *cmd_r;
