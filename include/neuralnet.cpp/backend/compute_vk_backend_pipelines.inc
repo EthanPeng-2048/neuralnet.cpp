@@ -240,6 +240,19 @@
         return desc_set;
     }
 
+    // ── 辅助：提交前释放描述符集（**错误分支专用**，RV-15）──────────────
+    // 语义与 alloc_desc_set 的登记规则严格对齐：
+    //   batch 模式：集合已在 frames_[batch_frame_].desc_sets 名下 → **此处不得
+    //     释放**（同一句柄被 vkFreeDescriptorSets 两次 = 校验层 VUID 违规 /
+    //     驱动 UB），交给 reap_frame 统一回收（该帧命令并未绑定它，留着无害）。
+    //   solo 模式：集合未登记 → 必须立即释放（否则池配额泄漏）。
+    // 所有"拿到 cmd 之前的错误分支"（`!cmd_r` / `!ds2_r` …）一律走本函数。
+    void release_desc_set_now(VkDescriptorSet set) noexcept
+    {
+        if (set == VK_NULL_HANDLE || batch_mode_) return;
+        vkFreeDescriptorSets(device_.device(), gpu_tensor_pool_, 1, &set);
+    }
+
     // ── 辅助：跨 submit 数据依赖（多帧流水线核心）────────────────────────
     // 背景：单队列 FIFO 只是执行顺序保证。实测本驱动（NVIDIA + Windows）
     // 下，消费方 submit（download/matmul/batch 帧）紧跟上传 submit
