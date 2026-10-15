@@ -74,6 +74,7 @@ X(col2im_f16) X(group_reduce) X(group_reduce_f16) X(gather)\
 X(transpose_f16) X(rearrange_3d_f16) X(gather_f16) X(elementwise_v2_f16)\
 X(scatter_add) X(scatter_add_f16) X(scan_prefix_outer)\
 X(scan_prefix_outer_f16) X(scan_suffix_outer) X(scan_suffix_outer_f16)\
+X(scan_prefix_outer_d32) X(scan_prefix_outer_d32_f16)\
 X(scan_prefix_outer_gen) X(scan_prefix_outer_gen_f16)\
 X(scan_suffix_outer_gen) X(scan_suffix_outer_gen_f16) X(outer_col)\
 X(outer_col_f16) X(cast) X(trit_pack) X(matmul_q) X(matmul_q_f16)\
@@ -285,6 +286,21 @@ X(matmul_q_gemv) X(matmul_q_gemv_f16)
 #define NN_SPV_FN_scan_prefix_outer_f16 nn_scan_prefix_outer_f16_spirv_bytecode
 #else
 #define NN_SPV_FN_scan_prefix_outer_f16 NN_SPV_FN_MISSING
+#endif
+
+// P4-2b 窄共享变体（dk ≤ 32；同一份 .comp 以 -DNN_SCAN_DK_MAX=32 编出）
+#if __has_include("scan_prefix_outer_d32_spv.hpp")
+#include "scan_prefix_outer_d32_spv.hpp"
+#define NN_SPV_FN_scan_prefix_outer_d32 nn_scan_prefix_outer_d32_spirv_bytecode
+#else
+#define NN_SPV_FN_scan_prefix_outer_d32 NN_SPV_FN_MISSING
+#endif
+
+#if __has_include("scan_prefix_outer_d32_f16_spv.hpp")
+#include "scan_prefix_outer_d32_f16_spv.hpp"
+#define NN_SPV_FN_scan_prefix_outer_d32_f16 nn_scan_prefix_outer_d32_f16_spirv_bytecode
+#else
+#define NN_SPV_FN_scan_prefix_outer_d32_f16 NN_SPV_FN_MISSING
 #endif
 
 #if __has_include("scan_suffix_outer_spv.hpp")
@@ -717,12 +733,14 @@ private:
     VulkanPipeline group_reduce_f16_pipeline_;   // Phase C2c f16 输入变体
     // RLA 扫描原语（手写原语，不进 AOT 融合注册表；铁律 3：shader 不含算法）
     VulkanPipeline scan_prefix_outer_pipeline_;
+    VulkanPipeline scan_prefix_outer_d32_pipeline_;   // P4-2b 窄共享（dk ≤ 32）
     VulkanPipeline scan_suffix_outer_pipeline_;
     VulkanPipeline scan_prefix_outer_gen_pipeline_;  // 通用 d_k（>64）前缀扫描
     VulkanPipeline scan_suffix_outer_gen_pipeline_;  // 通用 d_k（>64）后缀扫描
     VulkanPipeline outer_col_pipeline_;
     // Phase C2f f16 扫描变体（输入输出均 half；St scratch 仍 f32）
     VulkanPipeline scan_prefix_outer_f16_pipeline_;
+    VulkanPipeline scan_prefix_outer_d32_f16_pipeline_;   // P4-2b 窄共享 f16
     VulkanPipeline scan_suffix_outer_f16_pipeline_;
     VulkanPipeline scan_prefix_outer_gen_f16_pipeline_;
     VulkanPipeline scan_suffix_outer_gen_f16_pipeline_;

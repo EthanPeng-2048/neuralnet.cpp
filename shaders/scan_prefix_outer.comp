@@ -2,7 +2,23 @@
 // RLA 前缀扫描原语：A_t = A0 + Σ_{i≤t, 同文档} k_i·k_i^T, B_t = B0 + Σ v_i·k_i^T
 // causal=0: 全集常数（无重置）；causal=1: 含自身前缀，文档边界处运行态清零
 // 输出 (B*H*5*dk, seq) 行块：[0) B·P  [1) A·P  [2) B^T·R  [3) s  [4) r
-// 1 workgroup/头，256 线程；A/B 驻 shared 64×65×2≈33.3KB ≤ 850M 48KB
+// 1 workgroup/头，256 线程；A/B 驻 shared（dk ≤ NN_SCAN_DK_MAX）
+//
+// **共享足迹宏 NN_SCAN_DK_MAX（P4-2b 占用率变体）**：默认 64 ⇒ A/B 占
+//   64×65×2×4 ≈ 33.3KB，Maxwell 上每 SM 只能驻留 **1 个** workgroup（32 个 WG 在
+//   5 个 SM 上要排 6.4 个波次）。以 `-DNN_SCAN_DK_MAX=32` 再编一份 ⇒ A/B 降到
+//   32×33×2×4 ≈ 8.5KB（+行块 0.8KB）⇒ 每 SM 可驻留 **6 个** ⇒ RAPT 的
+//   d128/h4（dk=32、BH=32）几乎压到 1 个波次。C++ 侧按 `dk ≤ 32` 选窄变体，
+//   缺窄变体时自动回落宽变体（等价、只是慢）。
+//
+// P4-2b（2026-10-15）**行归属（row ownership）结构**：线程 a 独占 A/B 的第 a 行，
+//   ⇒ 每 t 的「累加 → matvec 读出」不再需要跨线程可见性（同一线程既写自己的行、
+//   又只读自己的行），per-t barrier 从 4 次降到 2 次；同时把 R 行块也 stage 进
+//   shared（旧写法 [2)/[4) 每 t 各自读全局 R：前者 32×32 次、后者单线程 64 次），
+//   全局往返从 3 次/t 降到 1 次/t；[4) 的标量改由 dk 个线程各算一遍（同值）后各写
+//   自己那行，消掉"单线程串行 2·dk 次"的关键路径。
+//   **逐位不变**：每个元素的累加次序与 CPU 实现（scan_prefix_outer_f32_）、以及旧
+//   kernel 完全一致（A/B 逐元素每 t 只加一次、各行 j/c/i 均按升序），因此哈希相同。
 // ──────────────────────────────────────────────────────────────────────
 #version 450
 // -DNN_SHADER_F16=1 → f16 存储变体（Phase C2f：RLA 扫描原语，输入输出均
@@ -36,10 +52,15 @@ layout(push_constant) uniform Push {
     uint dk, heads, seq, causal, has_state, has_bnd, rows;
 };
 
-const uint PAD = 65u;
-shared float sA[64][PAD];
-shared float sB[64][PAD];
-shared float s_kv[64], s_vv[64], s_qv[64], s_num[64], s_Aq[64];
+#ifndef NN_SCAN_DK_MAX
+#define NN_SCAN_DK_MAX 64u
+#endif
+const uint PAD = NN_SCAN_DK_MAX + 1u;   // +1 消除行访问的 bank 冲突
+shared float sA[NN_SCAN_DK_MAX][PAD];
+shared float sB[NN_SCAN_DK_MAX][PAD];
+shared float s_qv[NN_SCAN_DK_MAX], s_kv[NN_SCAN_DK_MAX], s_vv[NN_SCAN_DK_MAX],
+             s_rv[NN_SCAN_DK_MAX], s_num[NN_SCAN_DK_MAX], s_Aq[NN_SCAN_DK_MAX];
+shared uint  s_reset;
 
 void main() {
     const uint bh  = gl_WorkGroupID.y;
@@ -48,21 +69,22 @@ void main() {
     const uint r0  = bh * dk;
     const uint tid = gl_LocalInvocationID.x;
 
-    // 1) 初始化 A/B（零 或 A0/B0 行块 h）
-    for (uint idx = tid; idx < dk * dk; idx += 256u) {
-        const uint a = idx / dk, c = idx % dk;
-        float va = 0.0, vb = 0.0;
-        if (has_state == 1u) {
-            const uint sr = h * dk + a;
-            va = NN_RD(A0[sr * dk + c]);
-            vb = NN_RD(B0[sr * dk + c]);
+    // 1) 初始化 A/B 行（零 或 A0/B0 行块 h）——行归属：线程 a 只碰自己的第 a 行
+    if (tid < dk) {
+        for (uint c = 0u; c < dk; ++c) {
+            float va = 0.0, vb = 0.0;
+            if (has_state == 1u) {
+                const uint sr = h * dk + tid;
+                va = NN_RD(A0[sr * dk + c]);
+                vb = NN_RD(B0[sr * dk + c]);
+            }
+            sA[tid][c] = va;
+            sB[tid][c] = vb;
         }
-        sA[a][c] = va;
-        sB[a][c] = vb;
     }
     barrier();
 
-    // 2) 双向：预累加全集
+    // 2) 双向：预累加全集（行归属；每 t 仅需 k/v，故仍是 1 载入 + 1 屏障/步）
     if (causal == 0u) {
         for (uint t = 0u; t < seq; ++t) {
             if (tid < dk) {
@@ -70,72 +92,125 @@ void main() {
                 s_vv[tid] = NN_RD(V[(r0 + tid) * seq + t]);
             }
             barrier();
-            for (uint idx = tid; idx < dk * dk; idx += 256u) {
-                const uint a = idx / dk, c = idx % dk;
-                sA[a][c] += s_kv[a] * s_kv[c];
-                sB[a][c] += s_vv[a] * s_kv[c];
+            if (tid < dk) {
+                for (uint c = 0u; c < dk; ++c) {
+                    sA[tid][c] += s_kv[tid] * s_kv[c];
+                    sB[tid][c] += s_vv[tid] * s_kv[c];
+                }
             }
             barrier();
         }
     }
 
-    // 3) 逐 t 顺序扫描 + 读出
+    // 3) 逐 t 顺序扫描 + 读出（行归属 ⇒ 每 t 2 次 barrier、1 次全局往返）
     for (uint t = 0u; t < seq; ++t) {
+        // 载入：q/k/v/r 四行块各铺满 dk 个线程并行读（4·dk ≤ 256 线程；
+        // dk > 64 走 generic 变体，故这里恒 ≤ 4·64 = 256）。
         if (tid < dk) {
             s_qv[tid] = NN_RD(P[(r0 + tid) * seq + t]);
-            s_kv[tid] = NN_RD(K[(r0 + tid) * seq + t]);
-            s_vv[tid] = NN_RD(V[(r0 + tid) * seq + t]);
+        } else if (tid < 2u * dk) {
+            s_vv[tid - dk] = NN_RD(V[(r0 + tid - dk) * seq + t]);
+        } else if (tid < 3u * dk) {
+            s_rv[tid - 2u * dk] = NN_RD(R[(r0 + tid - 2u * dk) * seq + t]);
+        } else if (tid < 4u * dk) {
+            s_kv[tid - 3u * dk] = NN_RD(K[(r0 + tid - 3u * dk) * seq + t]);
         }
-        barrier();
-
-        if (causal == 1u) {
+        if (tid == 0u && causal == 1u) {
             uint reset = 0u;
             if (has_bnd == 1u)
                 reset = (NN_RD(Bnd[b * seq + t]) != 0.0) ? 1u : 0u;
-            for (uint idx = tid; idx < dk * dk; idx += 256u) {
-                const uint a = idx / dk, c = idx % dk;
-                if (reset == 1u) { sA[a][c] = 0.0; sB[a][c] = 0.0; }
-                sA[a][c] += s_kv[a] * s_kv[c];
-                sB[a][c] += s_vv[a] * s_kv[c];
-            }
-            barrier();
+            s_reset = reset;
         }
-
-        // num = B·qv; Aq = A·qv（dk 线程各处理一行，j 串行）
-        if (tid < dk) {
-            float acc = 0.0, acc2 = 0.0;
-            for (uint j = 0u; j < dk; ++j) {
-                acc  += sB[tid][j] * s_qv[j];
-                acc2 += sA[tid][j] * s_qv[j];
-            }
-            s_num[tid] = acc;
-            s_Aq[tid]  = acc2;
-        }
-        barrier();
+        barrier();      // B1：载入可见（含 s_reset）
 
         if (tid < dk) {
-            float s = 0.0;
-            for (uint j = 0u; j < dk; ++j)
+            // 4 路展开（**只改 ILP，不改累加次序**：先并行取回 4 个操作数，
+            // 再按 c 升序逐个累加 —— 每个元素每 t 仍然恰好加一次、序不变）。
+            if (causal == 1u) {
+                if (s_reset == 1u)
+                    for (uint c = 0u; c < dk; ++c) { sA[tid][c] = 0.0; sB[tid][c] = 0.0; }
+                const float kt = s_kv[tid];
+                const float vt = s_vv[tid];
+                uint c = 0u;
+                for (; c + 4u <= dk; c += 4u) {
+                    const float k0 = s_kv[c + 0u], k1 = s_kv[c + 1u],
+                                k2 = s_kv[c + 2u], k3 = s_kv[c + 3u];
+                    sA[tid][c + 0u] += kt * k0;
+                    sA[tid][c + 1u] += kt * k1;
+                    sA[tid][c + 2u] += kt * k2;
+                    sA[tid][c + 3u] += kt * k3;
+                    sB[tid][c + 0u] += vt * k0;
+                    sB[tid][c + 1u] += vt * k1;
+                    sB[tid][c + 2u] += vt * k2;
+                    sB[tid][c + 3u] += vt * k3;
+                }
+                for (; c < dk; ++c) {
+                    sA[tid][c] += kt * s_kv[c];
+                    sB[tid][c] += vt * s_kv[c];
+                }
+            }
+            // num = B·qv；Aq = A·qv（线程独占行 ⇒ 无需屏障）：同样 4 路
+            // 展开取操作数、按 j 升序累加（与串行写法逐位一致）。
+            float num = 0.0, Aq = 0.0;
+            uint j = 0u;
+            for (; j + 4u <= dk; j += 4u) {
+                const float q0 = s_qv[j + 0u], q1 = s_qv[j + 1u],
+                            q2 = s_qv[j + 2u], q3 = s_qv[j + 3u];
+                num += sB[tid][j + 0u] * q0;
+                num += sB[tid][j + 1u] * q1;
+                num += sB[tid][j + 2u] * q2;
+                num += sB[tid][j + 3u] * q3;
+                Aq  += sA[tid][j + 0u] * q0;
+                Aq  += sA[tid][j + 1u] * q1;
+                Aq  += sA[tid][j + 2u] * q2;
+                Aq  += sA[tid][j + 3u] * q3;
+            }
+            for (; j < dk; ++j) {
+                num += sB[tid][j] * s_qv[j];
+                Aq  += sA[tid][j] * s_qv[j];
+            }
+            s_num[tid] = num;
+            s_Aq[tid]  = Aq;
+            Out[(r0 + tid) * seq + t]        = NN_WR(num);  // [0) B·P
+            Out[(rows + r0 + tid) * seq + t] = NN_WR(Aq);   // [1) A·P
+        }
+        barrier();      // B2：s_num / s_Aq 可见（[2)/[3)/[4) 需要全行）
+
+        if (tid < dk) {
+            // [3)/[2)/[4) 三条点积：同样"先取 4 个操作数、再按原序累加"。
+            float s = 0.0, acc = 0.0, r = 0.0;
+            uint j = 0u;
+            for (; j + 4u <= dk; j += 4u) {
+                const float q0 = s_qv[j + 0u], q1 = s_qv[j + 1u],
+                            q2 = s_qv[j + 2u], q3 = s_qv[j + 3u];
+                s += q0 * s_Aq[j + 0u];
+                s += q1 * s_Aq[j + 1u];
+                s += q2 * s_Aq[j + 2u];
+                s += q3 * s_Aq[j + 3u];
+                const float r0 = s_rv[j + 0u], r1 = s_rv[j + 1u],
+                            r2 = s_rv[j + 2u], r3 = s_rv[j + 3u];
+                r += r0 * s_num[j + 0u];
+                r += r1 * s_num[j + 1u];
+                r += r2 * s_num[j + 2u];
+                r += r3 * s_num[j + 3u];
+                const float b0 = sB[j + 0u][tid], b1 = sB[j + 1u][tid],
+                            b2 = sB[j + 2u][tid], b3 = sB[j + 3u][tid];
+                acc += b0 * r0;
+                acc += b1 * r1;
+                acc += b2 * r2;
+                acc += b3 * r3;
+            }
+            for (; j < dk; ++j) {
                 s += s_qv[j] * s_Aq[j];
-            Out[(r0 + tid) * seq + t]              = NN_WR(s_num[tid]); // [0) B·P
-            Out[(rows + r0 + tid) * seq + t]        = NN_WR(s_Aq[tid]); // [1) A·P
-            Out[(3u * rows + r0 + tid) * seq + t]   = NN_WR(s);         // [3) s
+                r += s_rv[j] * s_num[j];
+                acc += sB[j][tid] * s_rv[j];
+            }
+            Out[(2u * rows + r0 + tid) * seq + t] = NN_WR(acc);  // [2) B^T·R
+            Out[(3u * rows + r0 + tid) * seq + t] = NN_WR(s);    // [3) s
+            Out[(4u * rows + r0 + tid) * seq + t] = NN_WR(r);    // [4) r
         }
-        // [2) B^T·R
-        if (tid < dk) {
-            float acc = 0.0;
-            for (uint i = 0u; i < dk; ++i)
-                acc += sB[i][tid] * NN_RD(R[(r0 + i) * seq + t]);
-            Out[(2u * rows + r0 + tid) * seq + t] = NN_WR(acc);
-        }
-        // [4) r = R·(B·P)，标量，线程 0 写全部行
-        if (tid == 0u) {
-            float r = 0.0;
-            for (uint j = 0u; j < dk; ++j)
-                r += NN_RD(R[(r0 + j) * seq + t]) * s_num[j];
-            for (uint i = 0u; i < dk; ++i)
-                Out[(4u * rows + r0 + i) * seq + t] = NN_WR(r);
-        }
+        // B3：本 t 的读出读完 A/B 的列（[2)）与 s_qv/s_rv 之后，下一个 t 的
+        // 载入（覆写 s_qv/s_vv/s_rv/s_kv）与前缀累加（改写 A/B 行）才能开始。
         barrier();
     }
 }

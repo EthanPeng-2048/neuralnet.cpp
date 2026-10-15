@@ -576,6 +576,14 @@
             if (sfs_r)
                 scan_suffix_outer_pipeline_ = std::move(*sfs_r);
         }
+        // 16a. P4-2b 窄共享变体（dk ≤ 32；共享足迹 8.5KB ⇒ 每 SM 可驻留 6 个 WG）
+        const auto& spf32 = get_scan_prefix_outer_d32_spirv();
+        if (!spf32.empty())
+        {
+            auto r = VulkanPipeline::create_generic(
+                device_.device(), spf32, 8, 7 * sizeof(uint32_t));
+            if (r) scan_prefix_outer_d32_pipeline_ = std::move(*r);
+        }
         // 16b. 通用 d_k（>64）前缀/后缀扫描 pipelines（状态驻全局 scratch）
         const auto& spfg_spirv = get_scan_prefix_outer_gen_spirv();
         if (!spfg_spirv.empty())
@@ -617,6 +625,13 @@
                 auto r = VulkanPipeline::create_generic(
                     device_.device(), sfs16, 5, 6 * sizeof(uint32_t));
                 if (r) scan_suffix_outer_f16_pipeline_ = std::move(*r);
+            }
+            const auto& spf32_16 = get_scan_prefix_outer_d32_f16_spirv();
+            if (!spf32_16.empty())
+            {
+                auto r = VulkanPipeline::create_generic(
+                    device_.device(), spf32_16, 8, 7 * sizeof(uint32_t));
+                if (r) scan_prefix_outer_d32_f16_pipeline_ = std::move(*r);
             }
             const auto& spfg16 = get_scan_prefix_outer_gen_f16_spirv();
             if (!spfg16.empty())
@@ -870,6 +885,9 @@
     [[nodiscard]] bool has_scatter_add_pipeline() const noexcept { return scatter_add_pipeline_.handle() != VK_NULL_HANDLE; }
     [[nodiscard]] bool has_scatter_add_f16_pipeline() const noexcept { return scatter_add_f16_pipeline_.handle() != VK_NULL_HANDLE; }
     [[nodiscard]] bool has_scan_prefix_outer_pipeline() const noexcept { return scan_prefix_outer_pipeline_.handle() != VK_NULL_HANDLE; }
+    // P4-2b 窄共享变体（dk ≤ 32）：可选——缺它时调用方回落宽变体（同数值）
+    [[nodiscard]] bool has_scan_prefix_outer_d32_pipeline() const noexcept { return scan_prefix_outer_d32_pipeline_.handle() != VK_NULL_HANDLE; }
+    [[nodiscard]] bool has_scan_prefix_outer_d32_f16_pipeline() const noexcept { return scan_prefix_outer_d32_f16_pipeline_.handle() != VK_NULL_HANDLE; }
     [[nodiscard]] bool has_scan_suffix_outer_pipeline() const noexcept { return scan_suffix_outer_pipeline_.handle() != VK_NULL_HANDLE; }
     [[nodiscard]] bool has_scan_f16_pipelines() const noexcept
     {

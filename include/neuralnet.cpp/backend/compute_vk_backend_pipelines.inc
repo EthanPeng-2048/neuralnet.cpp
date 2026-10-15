@@ -26,9 +26,18 @@
         const bool generic = dk > 64u;  // 通用路径（状态驻全局 scratch，无 dk 上限）
         if (f16_io && !has_scan_f16_pipelines())
             NN_FAIL("scan_prefix_outer_gpu: f16 pipelines not available");
+        // P4-2b：dk ≤ 32 时优先走窄共享变体（占用率高 6× ⇒ 32 个 WG 只排 ~1 个
+        // 波次）；变体不可用（老 SPIR-V / 裁剪构建）→ 回落宽变体，数值逐位相同。
+        const bool narrow = !generic && dk <= 32u;
         VulkanPipeline& pipe = generic
             ? (f16_io ? scan_prefix_outer_gen_f16_pipeline_ : scan_prefix_outer_gen_pipeline_)
-            : (f16_io ? scan_prefix_outer_f16_pipeline_ : scan_prefix_outer_pipeline_);
+            : (f16_io
+                   ? (narrow && has_scan_prefix_outer_d32_f16_pipeline()
+                          ? scan_prefix_outer_d32_f16_pipeline_
+                          : scan_prefix_outer_f16_pipeline_)
+                   : (narrow && has_scan_prefix_outer_d32_pipeline()
+                          ? scan_prefix_outer_d32_pipeline_
+                          : scan_prefix_outer_pipeline_));
         if (!generic && !has_scan_prefix_outer_pipeline())
             NN_FAIL("scan_prefix_outer_gpu: pipeline not available");
         if (generic && !has_scan_prefix_outer_gen_pipeline())
@@ -104,6 +113,9 @@
         const bool generic = dk > 64u;  // 通用路径（状态驻全局 scratch，无 dk 上限）
         if (f16_io && !has_scan_f16_pipelines())
             NN_FAIL("scan_suffix_outer_gpu: f16 pipelines not available");
+        // 注意：**后缀扫描刻意不走窄共享变体**——实测它对 suffix 有害（D 的
+        // dk²×seq 列式散布读使其为流量/争用受限：窄变体把每 SM 的驻留 WG 从 3
+        // 提到 15，dk=32/BH=32 下 7.9 → 16.2 ms），故只给 scan_prefix 加变体。
         VulkanPipeline& pipe = generic
             ? (f16_io ? scan_suffix_outer_gen_f16_pipeline_ : scan_suffix_outer_gen_pipeline_)
             : (f16_io ? scan_suffix_outer_f16_pipeline_ : scan_suffix_outer_pipeline_);
