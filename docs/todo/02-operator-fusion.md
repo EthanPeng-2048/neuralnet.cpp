@@ -182,7 +182,7 @@ struct MatmulSpec {
 
 现行 forward 是**单 fold kernel 分块流式求值**：QKᵀ / 掩码 / online softmax / ΣwV 在同一 kernel 内逐 `EXPR_FOLD_BLOCK=128` 块完成，`S` 矩阵绝不物化；`tri_skip` 把被屏蔽区整块钳成空转（NR=2，每 WG 两行）。
 
-- **构造位置**：`make_fold_attn_o` 与掩码种类 `AttnMaskKind`（Plain/Causal/CausalDoc）定义在 `compute_layer_attention.hpp`（漏登记任一组合即 GPU 闭合世界硬报错）；位置偏置（ALiBi）是**正交的第二入参** `bool score_bias`，实际登记 5 个组合（3 掩码 × 2 偏置 − 1）。通用 fold 样例在 `expr_fold.hpp`（rowmax/rowsum/softmax_denom/logsumexp），fold 值构造经 **`FoldAnchor` 自登记**（与 `FusedAnchor` 同机制；`make_fold_logsumexp` 即此形态，新 fold 构造无需改 `scan_exprs`）。注意力 forward 直调 `engine.eval_expr(make_fold_attn_o(...))`，不经 DSL 钩子——其 5 组合由 scan 显式登记块覆盖（存量形态）。
+- **构造位置**：`make_fold_attn_o` 与掩码种类 `AttnMaskKind`（Plain/Causal/CausalDoc）定义在 `compute_layer_attention.hpp`；位置偏置（ALiBi）是**正交的第二入参** `bool score_bias`，实际组合 5 个（3 掩码 × 2 偏置 − 1）× {MHA, GQA}。通用 fold 样例在 `expr_fold.hpp`（rowmax/rowsum/softmax_denom/logsumexp），fold 值构造经 **`FoldAnchor` 自登记**（与 `FusedAnchor` 同机制；新 fold 构造无需改 `scan_exprs`）。注意力 forward 直调 `engine.eval_expr(make_fold_attn_o(...))`，不经 DSL 钩子——**其全部组合同样由定义方自登记**（`compute_layer_attention.hpp` 的 `attn_fold_anchor`；掩码清单 X 宏同时驱动枚举与登记表，P4-4 ①，2026-10-15）。
 - **掩码处理**：因果掩码对 row-max 的修正是常数（`-inf` 屏蔽列）；文档块对角掩码按 doc_id 分组；ALiBi 线性偏置折进链内加项。**掩码与位置偏置是两件正交的事、各有策略对象**：`AttnScoreMask` 族（`PlainScoreMask`/`CausalScoreMask`/`CausalDocScoreMask`，**只做掩码**）各自实现 `mask_kind()`（类级常量）+ `prepare()`（构建 doc_col/doc_ids 输入张量）+ `masked_scores()`（反向重算 S 的 DSL 文本），由 `AttentionBase::make_score_mask_()` 在配置期工厂化定型；位置偏置由 `PositionEncoder::apply_score_bias()` 在 **backward** 的"掩码之后、softmax 之前"独立叠加（非 ALiBi = no-op）。引擎只认"matmul+reduce/fold"结构、绝不认算法名。
 - **显存**：`scores`/`masked`/`attn_cache_` 全部不物化，每层注意力激活从 ~3×`BH·seq²` 降到 `O(BH·seq·d_k)`（fold 单遍每块只算一次 QKᵀ，S 从不存在）。
 - **backward**：`recompute_W_` 两步重算 W——① `S = masked(Q·Kᵀ)`（掩码树与 forward 的 fold 变体同构，matmul 分块快路径，S 瞬时物化一遍）② `W = softmax(S)`（单归约表达式，m/l 在 kernel 内部归一化、不作为输入/缓存）；随后 R/X 表达式 + 3×`batched_matmul` 得 grad_Q/K/V，绝不物化概率矩阵。
@@ -245,7 +245,7 @@ forward = 单 fold kernel（`FoldSpec` 分块流式，见 §关键算法）；ba
 构建期**一步**（CMake 自动编排，改 Layer 内联表达式后重跑构建即可）：
 
 1. **`tools/scan_exprs.cpp`**（收集 + 生成同一进程）：
-   · **收集**：只收集**结构**。`FusedAnchor<Expr>` 在静态初始化期按表达式**类型**登记结构（编译期可达），再由 dry-run per-layer + 模型 pass（**只跑 f32**）补齐"运行期配置相关"的结构；fold spec 与 matmul trans 族由显式登记块给出。
+   · **收集**：只收集**结构**。`FusedAnchor<Expr>` 在静态初始化期按表达式**类型**登记结构（编译期可达），再由 dry-run per-layer + 模型 pass（**只跑 f32**）补齐"运行期配置相关"的结构；fold spec 由定义方经 `FoldAnchor` 自登记（通用样例在 `expr_fold.hpp`、注意力组合在 `compute_layer_attention.hpp`），仅 matmul trans 族与测试覆盖仍在 `scan_exprs` 里显式登记。
    · **生成**：`tools/fused_generate.hpp`（原独立工具 `gen_fused`，现已并入本工具）对**每个结构发三份**：V0 全 f32（键 = `key`）/ **V1 运行期精度分派**（键 = `key#x`）/ V2 native16（键 = `key#a`，按 `expr_prec_sig_native16` 的**结构谓词**判定）→ GLSL → glslc → 内联 SPIR-V → `build/generated/fused_registry.hpp`。
    · **不经 `.bin` 中间序列化**（`expr_registry.hpp` 的 `write_registry/read_registry/kExprBinVersion` 已删除）。
 
@@ -263,7 +263,7 @@ forward = 单 fold kernel（`FoldSpec` 分块流式，见 §关键算法）；ba
 **端到端实测**（"写 `dsl::compute` 即自动融合"）：在 Layer 头里新写一个结构不在任何 dry-run/模型 pass 覆盖内的表达式 →
 
 ```
-[scan] 结构来源：dry-run 侧 71（per-layer+显式 38、模型 pass +25、fold 显式 +8） + 锚点 60（新增 14）= 合计 85（锚点独有 14、dry-run 独有 25）
+[scan] 结构来源：dry-run 侧 71（per-layer+显式 38、模型 pass +25、fold 显式 +8） + 锚点 60（新增 14）= 合计 85（锚点独有 14、dry-run 独有 25）   ← 当时实测（P4-4 ① 后 fold 分段已并入锚点，台账行见下节）
 [scan] 收集到 85 条融合表达式
 新增键：7d5efd96f337a4a9 / 7d5efd96f337a4a9#x / 7d5efd96f337a4a9#a
 ```
@@ -272,19 +272,19 @@ forward = 单 fold kernel（`FoldSpec` 分块流式，见 §关键算法）；ba
 
 **f16 路径实测**（`NN_PREC_TRACE=1 text_train … --gpu --f16`）：`[prec][miss]=0`、边界 cast 归因表**为空**、`[prec][alu-hit]` 6670 → 全程命中预生成 shader，零 cast 回退。
 
-`scan_exprs` 需覆盖所有 Layer 的 DSL 路径（Softmax/LN/RMSNorm fwd+bwd、CrossEntropy softmax 结构、**Attention fold 结构**——层 forward 直调 `engine.eval_expr(make_fold_attn_o(...))` 不经 DSL 钩子，scan 的显式登记块（3 掩码 × 2 偏置的 5 个组合）覆盖注意力 fold（漏组合即 GPU 闭合世界硬报错；fold 值构造另有 `FoldAnchor` 自登记通道，见"自登记锚点"节）、Linear 的 matmul 段、optimizer 的 `compute_into` 原地表达式），使融合签名被收集。**结构**已由自登记锚点保证（见下节），未命中 → `eval_expr` 硬报错（保持项目"GPU 硬报错、不降级"哲学）。
+`scan_exprs` 需覆盖所有 Layer 的 DSL 路径（Softmax/LN/RMSNorm fwd+bwd、CrossEntropy softmax 结构、**Attention fold 结构**——层 forward 直调 `engine.eval_expr(make_fold_attn_o(...))` 不经 DSL 钩子，其全部掩码/偏置/GQA 组合由定义方 `FoldAnchor` 自登记覆盖，见"自登记锚点"节）、Linear 的 matmul 段、optimizer 的 `compute_into` 原地表达式），使融合结构被收集。**结构**已由自登记锚点保证（见下节），未命中 → `eval_expr` 硬报错（保持项目"GPU 硬报错、不降级"哲学）。
 
 ### 自登记锚点：结构覆盖不再依赖手写清单
 
 手写 dry-run 清单只覆盖**跑到的**路径；配置分支没被跑到就漏（如 `MaxPool2D(pool≠2)`）。为此 `expr_dsl.hpp` 增加 `FusedAnchor<Expr>`：每个 `dsl::compute/_into/_reduce` 实例化 odr-use 一个锚点，其**静态初始化期**把"从表达式类型默认构造的符号实例"折叠出的结构登记进注册表。
 
 - **前提 = "结构 = 表达式类型"**：为此步骤①②③把 `consts` 值、`matmul.transA/transB`、`GroupedReduce.R` 逐出 key（分别改走 push constant），并把 `GroupedReduceRef` 的 `is_max`（决定视图 kind）提为模板参数。
-- **覆盖语义**：调用点在函数体里，**函数被编译即实例化**——与运行期是否走到该分支无关，因此是"编译期可达"而非"运行期可达"。A/B 实测（`-DNN_SCAN_NO_ANCHOR`）：结构数 **78（仅 dry-run/模型 pass）→ 91（+锚点）**，多出的 13 条都是编译进来的真实调用点（含 matmul、归约、16 个 vp 槽的宽表达式等）。
-- **两者互补，不冗余**（`NN_SCAN_DUMP_SOURCES=1` 逐条打印来源，实测 91 条）：per-layer+显式登记 38 + 模型 pass 32 + fold 显式 8 = **dry-run 侧 78**、锚点 66，**重叠 53 → 锚点独有 13、dry-run 独有 25**（口径：三段互不重叠；打印行见下）。所以**单独删任何一方都会丢结构**：
-  - **dry-run 独有 25 条**按形态分：**fold 8 条**（= 显式登记的掩码×偏置组合与通用 fold 样例，见下）、**含 matmul 段 7 条**（注意力反向 / CE / 优化器步）、**RowAccess(12) 4 条**（共享内存 SwiGLU 的半偏移行切分）、**RowGather(9)/ColBroadcast(8) 若干**（稀疏 CE 的 5 视图形态 `[0,8,8,8,8]` 等）——共同点是**结构由运行期配置决定**（视图种类/项数/掩码组合），类型层面推不出来，符号实例 `Expr{}` 与真实实例会折叠出**不同 key**（实测存在"视图种类与指令数完全相同、只有 key 不同"的镜像对，如 dry-only `784781c7b82fa76c` ↔ anchor-only `28cdf7c6d5df0e1d`）。
-  - **锚点独有 13 条**是镜像面：dry-run/模型 pass 没跑到的编译期可见调用点（最著名的是 `9ca81b4967cdfa20`——关掉锚点后 `text_infer` KV-cache 增量解码在 GPU 上闭合世界硬报错）。
+- **覆盖语义**：调用点在函数体里，**函数被编译即实例化**——与运行期是否走到该分支无关，因此是"编译期可达"而非"运行期可达"。A/B 实测（`-DNN_SCAN_NO_ANCHOR`，当时实测）：结构数 **78（仅 dry-run/模型 pass）→ 91（+锚点）**，多出的 13 条都是编译进来的真实调用点（含 matmul、归约、16 个 vp 槽的宽表达式等）。
+- **两者互补，不冗余**（`NN_SCAN_DUMP_SOURCES=1` 逐条打印来源；P4-4 ① 后实测 126 条）：per-layer+显式登记 58 + 模型 pass 32 = **dry-run 侧 90**、锚点 92，**重叠 56 → 锚点独有 36、dry-run 独有 34**（口径：两段互不重叠；打印行见下）。所以**单独删任何一方都会丢结构**：
+  - **dry-run 独有 34 条**按形态分：**含 matmul 段 10 条**（注意力反向 / CE / 优化器步）、**RowAccess(12) 4 条**（共享内存 SwiGLU 的半偏移行切分）、**RowGather/ColBroadcast/BatchMod 等稀疏与批视图若干**（稀疏 CE 的 5 视图形态 `[0,8,8,8,8]` 等）——共同点是**结构由运行期配置决定**（视图种类/项数），类型层面推不出来，符号实例 `Expr{}` 与真实实例会折叠出**不同 key**（实测存在"视图种类与指令数完全相同、只有 key 不同"的镜像对，如 dry-only `784781c7b82fa76c` ↔ anchor-only `28cdf7c6d5df0e1d`）。
+  - **锚点独有 36 条**是镜像面：dry-run/模型 pass 没跑到的编译期可见调用点。其中 **fold 14 条**（通用 v1 样例 3 + 注意力组合 10 + CE logsumexp 1）全部来自自登记——**dry-run 一条 fold 都产不出**（结构由构造实参决定，符号实例推不出来）；其余最著名的是 `9ca81b4967cdfa20`——关掉锚点后 `text_infer` KV-cache 增量解码在 GPU 上闭合世界硬报错。
   - **结论**：dry-run + 模型 pass 是结构的主要来源，**删不掉**；锚点补它跑不到的部分。这也是"扫描步骤本身无法删除"的精确根因。
-- **尚未自动化：注意力 fold 的 5 组合**（2026-10-14 登记为 [`18-roadmap.md`](18-roadmap.md) **P4-4**）。`make_fold_attn_o` 直调 `engine.eval_expr`、不经 DSL 钩子，其 Plain/Causal/CausalDoc × 偏置的 5 个组合**仍由 `scan_exprs.cpp` 的显式登记块覆盖**——是"手写登记块漏项 = GPU 闭合世界硬报错"的最后一个已知这类风险点。方向 = 对齐 `FoldAnchor`/`FusedAnchor` 改为自登记，使新增 fold 构造 / 掩码组合无需改 `scan_exprs`。
+- **已自动化：fold 全部结构**（[`18-roadmap.md`](18-roadmap.md) **P4-4 ①**，2026-10-15）。注意力 fold 的组合表由**定义方**自登记：`compute_layer_attention.hpp` 的 `attn_fold_anchor::register_all()` 在静态初始化期经 `FoldAnchor` 登记「掩码清单 × {无偏置, 位置偏置} × {MHA, GQA}」——掩码清单是 **X 宏单一真源**（`NN_ATTN_MASK_KIND_LIST` 同时展开枚举与登记表，新增掩码只改一处，`scan_exprs` 不动）；`expr_fold.hpp` 末尾同款自登记它的 3 个 v1 样例（该头在扫描段内才包含 `expr_dsl.hpp`，普通构建保持轻量）。`scan_exprs.cpp` 的 fold 显式登记块**已整体删除**，现在只剩 matmul-trans / 测试覆盖两类显式块。验收（同树 A/B 实测）：结构集合逐条（key + 指令摘要）与改动前**零差异**（126 条）；关掉锚点（`-DNN_SCAN_NO_ANCHOR`）后这 13 条 fold 结构**全部消失**（126 → 91 条 fold 只剩 CE logsumexp 的 1 条）——即它们现在的唯一来源就是自登记。回归与端到端：`src/expr_fold_test.cpp` §8 锁「锚点代表值契约」（同组合跨形状 key 不变、10 组合互不相同）；本机 GPU（850M）全量 `ctest` **48/48**（含 5 组合 × 5 形状的 `fused_gpu_test` 注意力用例，服务形状 ≠ 登记代表值 ⇒ 顺带证明覆盖任意形状）。
 - **常驻台账**：锚点登记进独立注册表 `anchor_registry()`，`scan_exprs` 末尾合并并打印来源分项（见下）。**锚点独有数突然变大 = 有新的层路径没纳入任何驱动**（回归信号）。
 - **只登记结构**：⚠ 自登记只能给**结构**（`sig=0`）。**精度签名由生成期的运行期分派变体覆盖**（见上节"精度签名已不是构建期集合"）——自登记 + V1 合起来才构成完整的"零注解"链路：结构靠编译期可达，签名靠运行期参数。
 - **模型级 pass（结构侧）**：per-layer dry-run 块只覆盖"层被单独造出来"的路径；有些调用点只在**完整模型**里才执行（GPT/RAPT 的 LM head、PatchEmbedding、模型级位置编码等）。`scan_exprs` 因此跑一遍**配置矩阵**（只跑 f32）：`mnist_mlp`×{LayerNorm,RMSNorm,BatchNorm}、`mnist_transformer`(ViT)、`cnn`×{pool2,pool3}、`gpt`×{Learned,ALiBi,Sinusoidal,RoPE}×{GeLU,SwiGLU}×{LayerNorm,RMSNorm}、`rapt`×{causal,bidir}（小配置 vocab=64/d_model=16/seq=8/H=2/d_ff=32/L=2；id 输入须填合法 token 值）。**每个模型先训练态 forward+backward、再推理态 forward+backward**（训练/推理双态层如 `BatchNorm` 的两条路径是不同表达式结构，只跑训练态则 GPU 推理闭合世界硬报错；对无双态语义的层 `set_training` 是 no-op，多跑一轮只重复登记已知结构）。该 pass 失败**中止构建**（注册表不完整 = 闭合世界缺口）。
@@ -294,7 +294,7 @@ forward = 单 fold kernel（`FoldSpec` 分块流式，见 §关键算法）；ba
   保留的是**整模型跑不到**的来源：优化器（5 变体）、损失（MSE / CE 稠密 / CE 稀疏）、RoPE `apply_step`（增量推理）、CSA×4（掩码/偏置组合，含模型未覆盖的 doc 变体）、MHA、以及 `scan_exprs` 内的**显式测试覆盖登记**（matmul+bias+relu / bmm_reduce / reduce_consts）。
 - **常驻分项台账**（每次构建打印，结构侧）：
   ```
-  [scan] 结构来源：dry-run 侧 78（per-layer+显式 38、模型 pass +32、fold 显式 +8） + 锚点 66（新增 13）= 合计 91（锚点独有 13、dry-run 独有 25）
+  [scan] 结构来源：dry-run 侧 90（per-layer+显式 58、模型 pass +32） + 锚点 92（新增 36）= 合计 126（锚点独有 36、dry-run 独有 34）
   ```
   A/B 开关：`-DNN_SCAN_NO_ANCHOR`（关锚点）/ `-DNN_SCAN_NO_DRYRUN`（关 dry-run/模型 pass），均只影响登记集合、不改语义。逐条来源用 `NN_SCAN_DUMP_SOURCES=1` 打印（`[scan][dry-only]` / `[scan][anchor-only]` + 结构摘要）。
 - **run-only 签名回填不存在**（A1e）：该工作流（`--f16` 下用 `NN_PREC_TRACE=1` 的 `[prec][miss]` 收集只有真实训练才暴露的签名、写进 `tools/prec_backfill.txt`）**已整体删除**——V1 分派 shader 覆盖任意签名，f16 训练实测 `miss=0` 且边界 cast 归因表为空。历史清单条目与复现命令归档在 `docs/history/history.md`。
@@ -302,7 +302,7 @@ forward = 单 fold kernel（`FoldSpec` 分块流式，见 §关键算法）；ba
   `src/expr_fused_key_test.cpp` 锁定（并入 `expr_cpu_test` 聚合目标，ctest 目标数不变）。
   任一条被违反（有人重新引入"运行期值决定结构"）→ 运行时 key 与登记 key 不一致
   → 闭合世界 miss；测试会立刻红。
-- **运行时证据**：关掉锚点（`-DNN_SCAN_NO_ANCHOR`，结构 91 → 78）后，`text_train` / `mnist_train --f16` / `gpu_stability_probe` 全部照常通过，但 **`text_infer`（KV-cache 增量解码）在 GPU 上闭合世界硬报错**：
+- **运行时证据**：关掉锚点（`-DNN_SCAN_NO_ANCHOR`，当次实测结构 91 → 78）后，`text_train` / `mnist_train --f16` / `gpu_stability_probe` 全部照常通过，但 **`text_infer`（KV-cache 增量解码）在 GPU 上闭合世界硬报错**：
 
   ```
   GpuEngine::eval_expr: 未找到该内联表达式的 AOT 融合 shader（闭合世界）；…

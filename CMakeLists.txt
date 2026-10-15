@@ -574,6 +574,12 @@ if(NN_BUILD_APPS OR NN_ENABLE_TESTS)
     nn_add_executable(expr_gpu_test src/expr_gpu_test.cpp)
     list(APPEND NN_TEST_TARGETS expr_gpu_test)
 
+    # ── DSL 无形状重载（dsl::compute / compute_reduce 的推导口径，P4-4）──
+    # 纯 CPU（推理规则与后端无关）：推导形状 == 显式形状、逐位值一致、
+    # 显式 P 透传、负例（冲突 / 无网格贡献者 → 明确报错、不猜形状）
+    nn_add_executable(dsl_shape_infer_test src/dsl_shape_infer_test.cpp)
+    list(APPEND NN_TEST_TARGETS dsl_shape_infer_test)
+
     # ── 融合 shader **逐形态** GPU 对拍（rope/swiglu/gelu/softmax/matmul/
     #    matmul+reduce/norm/reduce_consts/fold v1/fold attn/回退）──────────
     # ⚠ 此前该文件**未被任何 CMake 目标引用**（未编译、未注册）——它是融合
@@ -884,7 +890,8 @@ if(Vulkan_FOUND)
     nn_embed_shader(matmul_q_gemv_f16 ${CMAKE_CURRENT_SOURCE_DIR}/shaders/matmul_q_gemv.comp --target-env=vulkan1.2 -DNN_SHADER_F16=1)
 
     # 2. AOT 融合 shader：scan_exprs（**单步** = 收集 + 生成）
-    #    收集：FusedAnchor 自登记（按表达式类型）+ dry-run + 模型 pass
+    #    收集：FusedAnchor/FoldAnchor 自登记（按表达式类型 / 由 fold 定义方挂锚）
+    #          + dry-run + 模型 pass（fold 结构全部来自自登记，P4-4 ①）
     #    生成：expr_emitter（默认 GLSL）→ glslc → 内联 SPIR-V → fused_registry.hpp
     #    原 gen_fused 已并入 scan_exprs 的生成阶段（tools/fused_generate.hpp），
     #    不再经 expr_specs.bin 中间文件。

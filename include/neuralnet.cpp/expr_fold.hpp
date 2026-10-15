@@ -7,7 +7,8 @@
 //  dry-run）与 fused_gpu_test / expr_fold_test 对拍的**共享唯一来源**——
 //  各方必须构造出结构完全一致的 spec（key 一致），否则闭合世界查表未命中。
 //  rowmax/rowsum/softmax_denom 三个 fold v1 样例不被 Layer 使用，保留为状态
-//  语义回归锚点。
+//  语义回归锚点；它们的**结构自登记**在文件末尾（`FoldAnchor`，扫描期，
+//  与 fold 值构造的既有约定一致——新增/改动样例无需改 scan_exprs）。
 //
 //  注意力的 fold 构造（make_fold_attn_o / AttnMaskKind）属于 Layer 侧的
 //  表达式文本（与 AOT 收集原则"表达式文本只出现在 Layer"一致），定义在
@@ -182,3 +183,27 @@ namespace nn::expr
 }
 
 } // namespace nn::expr
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  扫描期自登记（AOT 收集）：本头三个 v1 样例的结构必须进扫描集合（GPU 对拍
+//  与 CPU 用同一构造），而它们不被 Layer 使用、没有别的消费方可以挂锚点 ——
+//  故由**定义方**在静态初始化期经 `FoldAnchor` 自登记：新增样例、改样例形状
+//  参数都无需改 scan_exprs（`logsumexp` 无自注册项：它只在 compute_loss.hpp
+//  的 CE 路径被构造，锚点由该消费方持有）。
+//  ⚠ `expr_dsl.hpp`（`FoldAnchor` 所在）只在本扫描段内包含：普通构建里本头
+//    仍只依赖 `expr_spec.hpp`（保持轻量）。
+// ═══════════════════════════════════════════════════════════════════════════
+#if defined(NN_EXPR_SCAN) && !defined(NN_SCAN_NO_ANCHOR)
+#include "expr_dsl.hpp"
+namespace nn::expr
+{
+// k（= 本头的唯一形状参数）不进 key → 一个代表值覆盖所有收缩长度。
+inline const bool g_fold_sample_anchors = []
+{
+    (void)dsl::FoldAnchor{ make_fold_rowmax(64) };
+    (void)dsl::FoldAnchor{ make_fold_rowsum(64) };
+    (void)dsl::FoldAnchor{ make_fold_softmax_denom(64) };
+    return true;
+}();
+} // namespace nn::expr
+#endif

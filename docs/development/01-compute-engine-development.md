@@ -240,13 +240,20 @@ Result<void> set_index(Tensor& t, std::size_t row, std::size_t col, Scalar v);
 引擎**没有**逐元素/广播/条件选择类原语（`UnaryOp`/`BinaryOp`/`CompareOp` 枚举也不存在）——这类运算统一用表达式 DSL 表达（单 kernel、无中间张量）：
 
 ```cpp
-auto y  = dsl::compute(engine, dsl::exp(dsl::leaf(*a)), a->rows(), a->cols());          // 一元
-auto z  = dsl::compute(engine, dsl::leaf(*a) + dsl::leaf(*b), a->rows(), a->cols());   // 二元
-auto w  = dsl::compute_into(engine, dsl::leaf(*a) * dsl::rparam(0.1f), *a);            // 原地+标量
-auto rg = dsl::compute(engine,                                                          // 条件选择
-    dsl::select(dsl::leaf(*x) > Scalar{0}, dsl::leaf(*g), dsl::rparam(0)),
-    x->rows(), x->cols());
+auto y  = dsl::compute(engine, dsl::exp(dsl::leaf(*a)));                    // 一元
+auto z  = dsl::compute(engine, dsl::leaf(*a) + dsl::leaf(*b));             // 二元
+auto w  = dsl::compute_into(engine, dsl::leaf(*a) * dsl::rparam(0.1f), *a); // 原地+标量
+auto rg = dsl::compute(engine,                                             // 条件选择
+    dsl::select(dsl::leaf(*x) > Scalar{0}, dsl::leaf(*g), dsl::rparam(0)));
+// 需要显式形状时（推导不出的网格，如裸广播向量）：dsl::compute(engine, expr, rows, cols[, P])
 ```
+
+> **输出形状可省**：`dsl::compute(engine, expr[, P])` 从表达式推导输出网格——
+> 各"网格贡献者"按广播规则（逐维相等或其一为 1）合并（张量叶/形状保持视图给张量形状、
+> 归约视图给输入整网格、`grouped_reduce(t,R)` 给 `(rows/R, cols)`、matmul 段给
+> `(batch·M, N)`、标量/索引叶/稀疏与批视图中性）；**冲突、不可推导或全无贡献者一律
+> 报错**并提示改用显式形式（不猜形状）。`dsl::compute_reduce(engine, expr[, P])` 同理
+> （它要的是**输入网格**）。细则见 [`cpp-api-manual.md`](cpp-api-manual.md) §6。
 
 > 理由：DSL 与逐元素算子能力完全重叠，且天然融合为单 kernel。
 > 引擎原语盘点见 `../todo/12-compute-engine-inventory.md`；

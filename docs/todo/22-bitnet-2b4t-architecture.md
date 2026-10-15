@@ -440,9 +440,12 @@ graph TB
 4. **tied head 不转置**：`token_emb_ (V,D)` **就是** head 的权重矩阵，`logits = W_emb·x`；
    只有 backward 的 `dX = W_embᵀ·g` 需要 `transA=true`。
 5. **attention fold 不在 `dsl::compute` 路径上**：层 forward 直调 `engine.eval_expr`，
-   因此 **fold 结构只能由 `scan_exprs` 的显式登记块产出**（dry-run/模型 pass 都收集不到）。
-   P2 的 GQA fold 变体（K/V_t 走 `HeadGroup` 视图）最初只加在模型 pass 的用例里 →
-   GPU 闭合世界硬报错；补进显式块后结构数 102 → **107**。
+   dry-run/模型 pass 一条 fold 结构都产不出（结构由构造实参决定）——因此 fold 结构
+   一度**只能由 `scan_exprs` 的显式登记块产出**。P2 的 GQA fold 变体（K/V_t 走
+   `HeadGroup` 视图）最初只加在模型 pass 的用例里 → GPU 闭合世界硬报错；补进显式块后
+   结构数 102 → **107**。**P4-4 ①（2026-10-15）起该显式块已删除**：注意力组合由
+   `compute_layer_attention.hpp` 的 `attn_fold_anchor` 经 `FoldAnchor` 在静态初始化期
+   自登记（掩码清单 X 宏 × {无偏置,位置偏置} × {MHA,GQA}）→ 新增组合无需改 `scan_exprs`。
 6. **头分组比必须做成"视图参数"而不是"算子字段"**：视图 `param` 是运行期形状数据
    （不进 key、经 push constant `vp` 槽），所以任意 `n_rep` 共用一份 shader。
    实测：测试用 heads=4/n_kv=2、登记用 heads=2/n_kv=1，两侧仍命中同一 fold key。

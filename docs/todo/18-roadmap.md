@@ -212,7 +212,7 @@ ZiPT 恢复、LRLA、CUDA、分布式。
 | **P4-1 性能利用率继续提升** | GPU 忙率 ~95.5%（40HX f16）/ ~95.9%（850M）；`墙钟 − 设备 kernel ≈ 4.2%`（P2-9，f32/f16 同幅、与精度无关） | ① 把剩余 4.2% 归因到 host 录制 / driver 提交 / fence 等待三处；② 提高设备端并行（帧环深度、descriptor 复用、队列提交粒度）；③ CPU 线程池利用率（小算子并行度与分块） | `NN_PROFILE=1` 同窗配对 A/B：墙钟下降 ≥3% 且 busy% 上升；字节锚逐位不变 | 中 | P2-9（**已否决**的搬 I/O 不重复）；`core_profile.hpp` |
 | **P4-2 算子性能继续提升** | `layer_bench` 已提供 op 级配对 A/B；重型 kernel = fold / matmul / reduce / `matmul_q`（三值打包 GEMM） | 按 op 逐项调参（tile / occupancy / 网格粒度）与算法（三值 GEMV、扫描原语）；**不含**扩 native16 覆盖（P2-10 已裁定不做） | `layer_bench --op <name>` 配对 A/B 提效、无系统性回退（噪声 ±6%）；端到端不回归 | 中 | P2-11/P2-13（已完成的特化/粒度变体）；`docs/todo/02` |
 | **P4-3 显存开销继续压低** | 04 号 L1（激活重计算）/L2（池归还）已实施；三值权重已压 param 侧（4 B → <2 B）；峰值显存（850M f16）606 MiB | 立项 04 号 **L3**：① Adafactor 类无 m/v 优化器（= P2-2）；② 注意力/softmax 子图进一步融合、消除 Q/K/V 激活集物化；③ 优化器状态低精度（`AdamWQuant` 已存在，4 B → 与三值同量级） | 同任务峰值显存下降，loss 曲线与基线一致（gradcheck 全绿） | 中–大 | `docs/todo/04`（L3 待立项）；P2-2 |
-| **P4-4 API 易用性 + Fold 表达式自动化扫描** | fold **值构造**已经 `FoldAnchor` 自登记（`make_fold_logsumexp` 即此形态，新构造无需改 scan）；但**注意力 fold 的 5 组合仍由 `scan_exprs.cpp` 显式登记块覆盖**（`make_fold_attn_o` 直调 `engine.eval_expr`、不经 DSL 钩子），**漏登记任一组合 = GPU 闭合世界硬报错** | ① 把注意力 fold 组合改为自登记（对齐 `FoldAnchor` / `FusedAnchor` 机制），消除"手写登记块漏项"这一类风险；② API 摩擦点收敛（`dsl::compute` 无 2 参重载、GUI 声明式字段表 = P2-6、CLI/GUI/文档一致性） | 新增 fold 构造 / 掩码组合**无需改 `scan_exprs`** 即被扫描（`NN_SCAN_DUMP_SOURCES=1` 逐条来源可观测）；结构数不丢（来源逐条对比）；`bench/gui_cli_audit.py` 退出码 0 | 小–中 | `docs/todo/02`（fold 登记机制）；P2-6 |
+| **P4-4 API 易用性 + Fold 表达式自动化扫描** | ✅ **① fold 自登记已完成 2026-10-15**：注意力 fold 组合改由**定义方**自登记（`compute_layer_attention.hpp` 的 `attn_fold_anchor::register_all()` 在静态初始化期经 `FoldAnchor` 登记「掩码清单 × {无偏置, 位置偏置} × {MHA, GQA}」，掩码清单 `NN_ATTN_MASK_KIND_LIST` 是 X 宏单一真源 → 枚举与登记表同源）；`expr_fold.hpp` 末尾同款登记它的 3 个 v1 样例；`scan_exprs.cpp` 的 fold 显式登记块**整体删除**（消除"手写登记块漏项 = GPU 闭合世界硬报错"这类风险）。**实测**：结构集合逐条（key + 指令摘要）与改动前零差异（126 条）；`-DNN_SCAN_NO_ANCHOR` 下这 13 条 fold 结构全部消失（126 → 91）⇒ 自登记是唯一来源；新回归 `expr_fold_test` §8 锁代表值契约。② 之一 `dsl::compute` 无形状重载 **✅ 已完成 2026-10-15** | 剩余 ②：GUI 声明式字段表（= P2-6）、CLI/GUI/文档一致性 | ① 验收已达成：新增掩码/组合**无需改 `scan_exprs`**（`NN_SCAN_DUMP_SOURCES=1` 逐条来源可观测）；结构数不丢（逐条对比零差异）；`bench/gui_cli_audit.py` 退出码 0（本机实测 0） | 小–中 | `docs/todo/02`（fold 登记机制）；P2-6 |
 
 ## 5. 13 号清单逐条裁定表
 
@@ -315,7 +315,7 @@ ZiPT 恢复、LRLA、CUDA、分布式。
 ## 9. 仍然生效的工程教训（原 13 §9 承接）
 
 13 号清单的"仍然生效的工程教训"中，以下 2 条在 13 删除后无处落地，按原义承接。
-（其余 3 条已由别处覆盖：`dsl::compute` 无 2 参重载见 `AGENTS.md` §7；`max_abs_diff` 计数已入本文 §5 裁定表；
+（其余 3 条已由别处覆盖：`dsl::compute` 无形状重载（已完成）见 `AGENTS.md` §7；`max_abs_diff` 计数已入本文 §5 裁定表；
 `gpt_test` 偶发失败已列为本文 P1-4。）
 
 ### 9.1 eager → DSL 迁移前必须确认目标表达式结构已被 `scan_exprs` 覆盖（原 13 §9-2）

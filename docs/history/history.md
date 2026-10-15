@@ -16,7 +16,7 @@
 
 ## 目录
 
-- [表达式 DSL / 融合 IR（expr_*.hpp）](#表达式 DSL / 融合 IR（expr_*.hpp）)（16 条）
+- [表达式 DSL / 融合 IR（expr_*.hpp）](#表达式 DSL / 融合 IR（expr_*.hpp）)（18 条）
 - [GPU 后端与 GPU 引擎（backend/*, compute_gpu_engine.hpp）](#GPU 后端与 GPU 引擎（backend/*, compute_gpu_engine.hpp）)（17 条）
 - [注意力 / ZiPT / Transformer / FeedForward 层](#注意力 / ZiPT / Transformer / FeedForward 层)（16 条）
 - [RAPT / CNN / MLP / Softmax / GPT 层](#RAPT / CNN / MLP / Softmax / GPT 层)（13 条）
@@ -57,6 +57,83 @@
 expr_opt / expr_registry / expr_spec）「历史状态类注释」摘录。整改原则：注释只记录当前实现的
 原理、契约与理由；本文件保存被移出的历史叙事（bug 根因、被否决方案、性能 A/B 过程、
 删除清单），供追溯用。
+
+## fold 结构全部自登记：注意力组合与 v1 样例改由定义方挂锚（P4-4 ①，2026-10-15）
+
+- 类型：演进记录 / 覆盖缺口收口（"手写登记块漏项 = GPU 闭合世界硬报错"的最后一个已知点）
+- **原状**：注意力 fold 的 5 个组合（3 掩码 × 2 位置偏置 − 1）× {MHA, GQA} 由
+  `tools/scan_exprs.cpp` 的显式登记块覆盖（连同 `expr_fold.hpp` 的 3 个 v1 样例，共 13 条结构）。
+  层 forward 直调 `engine.eval_expr(make_fold_attn_o(...))`、不经 DSL 钩子，构造点没有登记
+  通道 ⇒ 新增掩码/组合若忘了改那个块，只会在 GPU 运行期以闭合世界硬报错暴露
+  （历史先例：P-C2 漏 Doc/AlibiDoc → GPU doc 训练硬报错）。
+- **改动**：把登记搬到**定义方**（与 `FoldAnchor` 既有约定一致，`compute_loss.hpp` 的
+  CE logsumexp 即此形态）：
+  ① `compute_layer_attention.hpp`：掩码枚举改 **X 宏单一真源** `NN_ATTN_MASK_KIND_LIST`
+     （枚举成员与登记表由同一清单展开）；新增 `namespace attn_fold_anchor` 的
+     `register_all()`，在**静态初始化期**经 `FoldAnchor` 登记「清单里的每个掩码 ×
+     {无偏置, 位置偏置} × {kv_ratio=1, 2}」——"Plain + 偏置"（本仓不构造）跳过，共 10 条。
+     形状取代表值 `seq=64/dk=2/bh=2`（k/dk/bh 与 kv_ratio 的具体值都不进 key，见 `expr_spec_key`）；
+  ② `expr_fold.hpp` 末尾同款自登记它的 3 个 v1 样例（rowmax/rowsum/softmax_denom）——
+     它们不被 Layer 使用、没有别的消费方可挂锚；`expr_dsl.hpp`（`FoldAnchor` 所在）只在
+     `NN_EXPR_SCAN` 段内包含，普通构建仍只依赖 `expr_spec.hpp`；
+  ③ `scan_exprs.cpp`：fold 显式登记块**整体删除**（现在只剩 matmul-trans 与测试覆盖两类显式块），
+     台账行的 "fold 显式 +N" 分段随之删除。新增的两个自登记点都受 `-DNN_SCAN_NO_ANCHOR` 门控
+     （`compute_loss.hpp` 的 CE logsumexp 锚点早于该开关，不受其门控——证据③里残留的正是它）。
+- **证据**（同树 A/B，本机 Debug+GPU 构建）：
+  ① **结构集合逐条零差异**：改动前后各跑一遍 `NN_SCAN_DUMP_SOURCES=1`，126 条结构的
+     key + 指令摘要逐条相同；来源标签的迁移**恰好**是 13 条（`[dry-only]` → `[anchor-only]`，
+     全部 `fold=1`），其余 113 条标签不变。台账从
+     `dry-run 侧 103（…fold 显式 +13）+ 锚点 79（新增 23）` 变为
+     `dry-run 侧 90（per-layer+显式 58、模型 pass +32）+ 锚点 92（新增 36）`，合计仍 **126**。
+  ② **生成物只差发射顺序**：两份 `fused_registry.hpp` 行多重集**逐行相同**（19001511 B；
+     发射顺序随插入顺序变化）；同一二进制连跑两次**逐字节一致** ⇒ 扫描本身是确定性的。
+  ③ **锚点是唯一来源**（反证）：单独把 `scan_exprs.cpp` 以 `-DNN_SCAN_NO_ANCHOR` 编译并链接，
+     结构 126 → **91**，上述 13 条 fold 结构**全部消失**（fold 只剩 CE logsumexp 的 1 条，
+     它的锚点在 `compute_loss.hpp`、不随该开关关闭）。
+  ④ 新增回归 `src/expr_fold_test.cpp` §8「锚点代表值契约」：同一组合跨形状
+     （`{64,2,2}` vs `{512,64,8}`、GQA 比 2 vs 4）key 必须相同、10 个组合两两不同
+     ——锁住"登记一组代表值即覆盖所有形状"这一前提（11 条 PASS）。
+  ⑤ 本机 clang + libstdc++（Release，`build-ab`，GPU 关）：全量 `ctest` **46/46 通过**
+     （含 §8 新回归；GPU 标签用例在该构建下 skip）。
+  ⑥ 本机 GCC 15.2 + Vulkan（Release，`build-gpu`，设备 = **NVIDIA GTX 850M**，自动选卡）：
+     全量 `ctest` **48/48 通过**（含 `-Werror` 下的全新构建）；其中 `fused_gpu_test` 的
+     **5 组合 × 5 形状**注意力 fold 用例、通用 fold v1 用例与"未扫描表达式 → GPU 硬报错"
+     用例全过 —— 注意**服务形状 (bh,seq,dk) 与登记代表值 (64,2,2) 不同**，这同时证明
+     "一组代表值覆盖任意形状"在真实注册表上成立。
+- **边界**：登记表仍由"掩码清单"驱动（C++ 无反射）——新增掩码种类要在 X 宏加一项，但枚举与
+  登记表**同源展开**，因此"加了枚举忘了登记"这一漏项形态已不可能出现；GQA 比本身是运行期
+  vp 参数（不进 key），登记 kv_ratio=2 一条即覆盖任意 `n_rep`（docs/todo/22 §3.2 P2）。
+
+## `dsl::compute` / `compute_reduce` 无形状重载（P4-4 ②，2026-10-15）
+
+- 类型：演进记录 / API 摩擦点收敛
+- **原状**：`dsl::compute(engine, expr, rows, cols[, P])` 必带输出形状，调用方反复手写
+  `x.rows(), x.cols()`；`AGENTS.md` §7 曾把它列为"仍然生效的工程教训"（本文件另有
+  「教训：`dsl::compute` 无 2 参重载」条——早期一次 eager→DSL 迁移正是在这里写错形态）。
+- **改动**：新增 `dsl::compute(engine, expr[, P])` 与 `dsl::compute_reduce(engine, expr[, P])`；
+  输出网格由表达式推导（`expr_dsl.hpp` 的 `GridInfer`）：各"网格贡献者"按**广播规则**
+  （逐维相等或其一为 1）合并 —— 张量叶/形状保持视图给张量形状；归约视图与归约指令给
+  **输入整网格**（`compute` 下它们是广播读；`compute_reduce` 要的也正是输入网格）；
+  `grouped_reduce(t, R)` 给 `(rows/R, cols)`；matmul 段给 `(batch·M, N)`（GQA 的
+  `batch/ratio` 行块与 `to_spec` 的 `k` 同口径；A/B 本身不参与合并）；标量、网格索引叶
+  （`row()`/`col()`/`batch()`）与稀疏/批视图（RowGather/BatchMod/BatchCol）中性。
+  **形状冲突、无法推导、全无贡献者 = 返回错误**并提示改用显式形式（不猜形状）。
+- **库内接线**：6 处调用点改为无形状形式（`Linear` fwd/bwd、`ReLU` fwd/bwd、`Softmax` fwd/bwd、
+  `PlainScoreMask::masked_scores` 的 Q·Kᵀ——后者形参 `seq` 随之写成 `/*seq*/`），其余调用点
+  保持显式形式。表达式文本与形状取值逐字不变 ⇒ **AOT 键不变**（锚点 `FusedAnchor<Expr>`
+  经 4 参重载照常 odr-use）。
+- **证据**：
+  ① 新增回归 `src/dsl_shape_infer_test.cpp`（推导 == 显式形状、逐位值一致、3 参 P 透传、
+     负例：形状冲突 / 无网格贡献者报错）。
+  ② **结构集合逐行比对不变**：未改动的 v1.8.2 树 vs 本改动树，`NN_SCAN_DUMP_SOURCES=1`
+     的两份 dump 归一化树目录名后**除输出路径外零差异**（各 126 条结构；来源分项
+     dry-run 103 + 锚点 79 亦相同）。
+  ③ 本机 clang + libstdc++：CPU ctest 全绿。
+  ④ 40HX（clang + MSVC STL，Windows）：全量 ctest 47/48 —— 唯一失败的
+     `cli_precision_warning_test` 在**未改动的基线上同样失败**（`std::system` 启动 app 子进程
+     处即打 "cannot find the path specified"，Windows 构建布局下的既有问题，与本次改动无关）。
+- **未做（当时仍属 P4-4 ①）**：注意力 fold 的 5 组合自登记 —— 随后由本文件上一条
+  「fold 结构全部自登记」收口。
 
 ## step 内固定 I/O 开销归因：实测推翻"固定开销掩盖"（2026-10-14，P2-9 / 26 号 S0 归档）
 
