@@ -4,8 +4,10 @@
 //  收集：CPU 引擎 + 假张量跑一遍相关 Layer 的 forward/backward，使每个
 //  dsl::compute / compute_reduce / compute_into 在 NN_EXPR_SCAN 记录模式下把
 //  折叠出的 ExprSpec **结构**登记进全局注册表（按 expr_spec_key 去重）。
-//  脚本里还有两条互补来源：`FusedAnchor<Expr>` 静态初始化期按表达式**类型**
-//  自登记（编译期可达），以及 fold / matmul-trans 等显式登记块。
+//  脚本里还有两条互补来源：`FusedAnchor<Expr>` / `FoldAnchor` 在静态初始化期
+//  自登记（编译期可达、新增表达式无需改本文件；fold 的通用样例与注意力组合
+//  分别由 `expr_fold.hpp` / `compute_layer_attention.hpp` 挂锚），以及本文件
+//  里的 matmul-trans 显式登记块（运行期配置决定的结构）。
 //  合成：同进程内直接调 `nn::tool::generate_fused_registry`
 //  （tools/fused_generate.hpp，原独立工具 gen_fused）→
 //  <out_dir>/fused_registry.hpp。**不经任何中间序列化**。
@@ -767,66 +769,12 @@ int main(int argc, char* argv[])
     }
 #endif
     const std::size_t n_after_model = nn::fused::global_registry().specs.size();
-    // ── fold v1（标量域）分块状态归约（表达式集合登记）──────────────────────────
-    // 三个共享样例（expr_fold.hpp——与 fused_gpu_test 对拍**同源构造** →
-    // key 一致、闭合世界命中）：rowmax / rowsum / softmax_denom(online 双
-    // 状态)。k 不进 key → 任意收缩长度共享同一 shader；此处取代表值。
-    // 构造即 validate：结构违规在构建期直接失败，不带病进 registry。
-    {
-        const nn::ExprSpec fold_specs[] = {
-            nn::expr::make_fold_rowmax(64),
-            nn::expr::make_fold_rowsum(64),
-            nn::expr::make_fold_softmax_denom(64),
-        };
-        auto& reg_all = nn::fused::global_registry();
-        for (const auto& fs : fold_specs)
-        {
-            if (auto v = nn::validate_expr_spec(fs, fs.views.size()); !v)
-            {
-                std::fprintf(stderr, "[FAIL] fold 样例 validate 失败: %s\n",
-                             v.error().message.c_str());
-                return 1;
-            }
-            reg_all.add(fs);
-        }
-        // attention fold（双域）：vec_state_len/k/batch/view param 均不
-        // 进 key → dk 族登记是同 key 去重。**掩码 × 位置偏置的全部组合必须
-        // 登记**（3 种掩码 × 2 种偏置，其中 "Plain + 偏置" 不存在 → 共 5 个）——
-        // 层 forward 直调 engine.eval_expr(make_fold_attn_o)，不经 dsl::compute
-        // 的 NN_EXPR_SCAN 钩子，本块是 fold spec 唯一注册来源；漏 CausalDoc/
-        // 带偏置的组合 → GPU doc / ALiBi 训练闭合世界硬报错（fused 对拍以
-        // doc / alibi 用例作 CPU/GPU 对照覆盖）。
-        for (const auto mask : {nn::expr::AttnMaskKind::Plain,
-                                nn::expr::AttnMaskKind::Causal,
-                                nn::expr::AttnMaskKind::CausalDoc})
-        {
-            for (const bool score_bias : {false, true})
-            {
-                if (mask == nn::expr::AttnMaskKind::Plain && score_bias)
-                    continue;   // 无掩码 + ALiBi 不是本仓会构造的组合
-                for (const std::uint32_t dk : {2u, 4u, 8u})
-                {
-                    // kv_ratio=1（MHA）与 >1（GQA，K/V_t 走 HeadGroup 视图）是
-                    // **两个结构**（视图种类进 key）；但头分组比本身是运行期 vp
-                    // 参数、**不进 key** → 这里登记一次 kv_ratio=2 即覆盖任意
-                    // n_rep（docs/todo/22 §3.2 P2）。
-                    for (const std::uint32_t kv_ratio : {1u, 2u})
-                    {
-                        const nn::ExprSpec as =
-                            nn::expr::make_fold_attn_o(64, dk, 2, mask, score_bias, kv_ratio);
-                        if (auto v = nn::validate_expr_spec(as, as.views.size()); !v)
-                        {
-                            std::fprintf(stderr,
-                                         "[FAIL] attn fold 样例 validate 失败: %s\n",
-                                         v.error().message.c_str());
-                            return 1;
-                        }
-                        reg_all.add(as);
-                    }
-                }
-            }
-        }
-    }
+    // ── 注：fold 结构（通用 v1 样例 + 注意力 5 组合 × {MHA,GQA}）不在本文件
+    //    登记 ── 它们由**定义方**在静态初始化期经 `FoldAnchor` 自登记
+    //    （`expr_fold.hpp` 末尾；`compute_layer_attention.hpp` 的
+    //    `attn_fold_anchor`），随下方锚点注册表一并合并。此前这里有一份
+    //    手写登记块，漏项即 GPU 闭合世界硬报错（P4-4 ①，见
+    //    docs/history/history.md）。新增掩码/偏置组合只改定义方，不改这里。
 
     const std::size_t n_before_anchor = nn::fused::global_registry().specs.size();
     auto& reg = nn::fused::global_registry();
@@ -903,15 +851,14 @@ int main(int argc, char* argv[])
         for (const auto& s : anchor.specs)
             reg.add(s);
         // 分段口径（**互不重叠**）：dry-run 侧 = ①per-layer dry-run + matmul/bmm
-        // 显式登记（n_after_dry）+ ②模型 pass（+）+ ③fold/attn-fold 显式登记（+）；
-        // 锚点为独立来源，与上面各段取并集去重后的新增量 = 锚点独有。
-        std::printf("[scan] 结构来源：dry-run 侧 %zu（per-layer+显式 %zu、模型 pass +%zu、"
-                    "fold 显式 +%zu） + 锚点 %zu（新增 %zu）= 合计 %zu"
+        // 显式登记（n_after_dry）+ ②模型 pass（+）。fold 结构（通用 v1 样例与
+        // 注意力组合）与其余表达式同走自登记锚点（由定义方挂锚，见上方注释）。
+        std::printf("[scan] 结构来源：dry-run 侧 %zu（per-layer+显式 %zu、模型 pass +%zu）"
+                    " + 锚点 %zu（新增 %zu）= 合计 %zu"
                     "（锚点独有 %zu、dry-run 独有 %zu）\n",
                     n_before_anchor,
                     n_after_dry,
                     n_after_model - n_after_dry,
-                    n_before_anchor - n_after_model,
                     anchor.specs.size(),
                     reg.specs.size() - n_before_anchor,
                     reg.specs.size(),

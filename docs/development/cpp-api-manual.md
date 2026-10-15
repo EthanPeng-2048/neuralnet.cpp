@@ -311,15 +311,30 @@ nn::Model gpt = NN_UNWRAP(nn::build_gpt_model(engine, cfg));
 DSL 是库内**所有**逐元素与归约运算的写法（层不写手工循环）。三个入口：
 
 ```cpp
-// 输出一个**新张量**（默认 P = F32）
+// 输出一个**新张量**（默认 P = F32）。输出形状可省——由表达式推导：
+nn::Tensor y = NN_UNWRAP(nn::dsl::compute(engine, expr, nn::Precision::F32));
+
+// 显式给形状：推导不出的网格（如裸广播向量）用这一形
 nn::Tensor y = NN_UNWRAP(nn::dsl::compute(engine, expr, rows, cols, nn::Precision::F32));
 
 // 就地写进已有张量（只支持逐元素表达式，无归约）
 NN_UNWRAP(nn::dsl::compute_into(engine, expr, dst));
 
-// 归约：输出归约向量（(rows,1) 或 (1,cols) 原生形状）
-nn::Tensor r = NN_UNWRAP(nn::dsl::compute_reduce(engine, expr, rows, cols, P));
+// 归约：输出归约向量（(rows,1) 或 (1,cols) 原生形状）；rows/cols 是**输入网格**，可省
+nn::Tensor r = NN_UNWRAP(nn::dsl::compute_reduce(engine, expr, P));
 ```
+
+> **形状推导口径**（`expr_dsl.hpp` 的 `GridInfer`）：输出网格 =
+> 各"网格贡献者"按**广播规则**（逐维相等，或其一为 1）的合并。
+> 张量叶 / 形状保持视图（`RotateHalf`/`RowMod`/`RowAccess`/`Row|ColBroadcast`）贡献
+> 张量形状；归约视图与归约指令（`row_reduce_max(x)` 等）贡献**输入整网格**
+> （在 `compute` 下它们是"按行/列读"的广播读，输出仍是整网格）；`grouped_reduce(t, R)`
+> 贡献 `(rows/R, cols)`；`dsl::matmul` 段贡献 `(batch·M, N)`（GQA 的 `batch/ratio`
+> 行块与 `to_spec` 的 `k` 同口径；A/B 本身不参与合并）；标量、网格索引叶
+> （`row()`/`col()`/`batch()`）与稀疏/批视图（`RowGather`/`BatchMod`/`BatchCol`）中性。
+> **形状冲突、无法推导（如 GQA 行块不整除）、或全无贡献者（如裸 `row_broadcast(v)`）
+> 一律返回错误**并提示改用显式形式——不猜形状（静默错值远比报错昂贵）。
+> 回归用例：`src/dsl_shape_infer_test.cpp`。
 
 叶子与算子（全部在 `namespace nn::dsl`）：
 

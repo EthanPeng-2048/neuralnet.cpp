@@ -158,8 +158,10 @@ nn::Result<void> demo()
 
 要点：
 - **每一步都可能失败**，`Result<T>` 必须检查（`-fno-exceptions`，全库禁止 throw/try/catch）。
-- 表达式**必带输出形状**：`nn::dsl::compute(engine, expr, rows, cols)`。
-- `dsl::matmul` 是表达式叶子，输出形状由你给（这里是 `(2,4)`）。
+- 表达式输出形状**可省**：`nn::dsl::compute(engine, expr[, P])` 从操作数推导
+  （逐元素/广播/归约视图/matmul 段按广播规则合并；推导不出会**报错**并提示改用显式形式）。
+  推导不出的网格（如裸广播向量）用显式形式 `nn::dsl::compute(engine, expr, rows, cols[, P])`。
+- `dsl::matmul` 是表达式叶子；含 matmul 的表达式由 matmul 段推出 `(batch·M, N)`（这里是 `(2,4)`）。
 
 ### 2.4 错误处理范式
 
@@ -1276,7 +1278,7 @@ auto attn = engine.eval_expr(
     inputs, rows, cols, p_.stable);
 ```
 
-> `nn::expr::make_fold_attn_o` 等 fold 构造定义在 `compute_layer_attention.hpp`（AOT 原则："表达式文本只出现在 Layer"）。入参是**掩码 `AttnMaskKind{Plain, Causal, CausalDoc}` × 位置偏置 `bool score_bias`（ALiBi）**两个正交维度，`scan_exprs` 里必须把 5 个实际组合（3 掩码 × 2 偏置 − 1，"Plain + 偏置"不存在）**全部登记**，漏登记 → GPU 闭合世界硬报错。ALiBi 的偏置在 **backward** 里是掩码之后的独立一步（`PositionEncoder::apply_score_bias`），forward 则融在同一个 fold kernel 内。通用 fold 值构造（如 `nn::expr::make_fold_logsumexp`）走 **`FoldAnchor` 自登记**，无需改 `scan_exprs`。
+> `nn::expr::make_fold_attn_o` 等 fold 构造定义在 `compute_layer_attention.hpp`（AOT 原则："表达式文本只出现在 Layer"）。入参是**掩码 `AttnMaskKind{Plain, Causal, CausalDoc}` × 位置偏置 `bool score_bias`（ALiBi）**两个正交维度，实际组合 5 个（3 掩码 × 2 偏置 − 1，"Plain + 偏置"不存在）× {MHA, GQA}。**登记是自登记**：定义方（`compute_layer_attention.hpp` 的 `attn_fold_anchor`、`expr_fold.hpp` 的通用样例）在静态初始化期经 **`FoldAnchor`** 把全部组合登记进扫描集合，掩码清单 X 宏同时驱动枚举与登记表 —— 新增掩码/组合无需改 `scan_exprs`（P4-4 ①）。ALiBi 的偏置在 **backward** 里是掩码之后的独立一步（`PositionEncoder::apply_score_bias`），forward 则融在同一个 fold kernel 内。
 
 **普通业务代码不应该直接调这三个入口**——用 `dsl::compute*`。它们是给"Layer 显式登记 fold 构造"和"引擎自测"用的。
 

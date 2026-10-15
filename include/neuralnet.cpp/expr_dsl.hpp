@@ -1095,6 +1095,142 @@ template <typename E>
 }
 
 // ══════════════════════════════════════════════════════════════════════════
+// 输出网格形状推导（供 dsl::compute / compute_reduce 的**无形状重载**）
+//
+// 背景：`dsl::compute(engine, expr, rows, cols[, P])` 必带输出形状——调用方
+// 反复手写 `x.rows(), x.cols()`（docs/todo/18-roadmap.md P4-4 记为 API 摩擦点）。
+// `dsl::compute(engine, expr[, P])` 用**唯一口径**从表达式推导该形状：
+//
+//   输出网格 = 各"网格贡献者"的**广播合并**（逐维：相等，或其一为 1）。
+//   · 张量叶 / 形状保持视图（TensorRef / RotateHalf / RowMod / RowAccess /
+//     Broadcast）：贡献其张量形状（行广播 (F,1) / 列广播 (1,C) 由此天然合并）。
+//   · 归约视图（ReduceViewRef / ReduceRef）：在 compute 的输出网格里是
+//     "按行/列读"的**广播读**，故贡献**输入张量**的整网格（compute 的输出
+//     仍是整网格，不是归约向量——归约向量用 compute_reduce）。
+//   · GroupedReduce(g, R)：贡献 (rows/R, cols)（沿行分组、列不变）。
+//   · matmul 段：贡献 (batch·M, N)（与后端 batched_matmul 同一口径；GQA 的
+//     batch/ratio 行块亦按 to_spec 的 k 同一推导）。A/B **不**参与合并——
+//     它们是 GEMM 操作数，不是同网格项。
+//   · 标量（Const/RParam）、网格索引叶（row/col/batch）、稀疏与批视图
+//     （RowGather/BatchMod/BatchCol）：中性（不贡献）。
+//   · Unary/Binary/Select：递进子节点合并。
+//
+// 合并冲突（某维既非相等、又都不为 1）、形状不可推导、或**完全没有贡献者**
+// → 报错并提示显式给出 rows/cols。**绝不猜形状**（静默错值远比报错昂贵）。
+// ══════════════════════════════════════════════════════════════════════════
+struct GridInfer
+{
+    std::size_t rows = 0;
+    std::size_t cols = 0;
+    bool any = false;        // 是否合并过至少一个贡献者
+    bool conflict = false;   // 广播规则不成立（某维既不等、又都不为 1）
+    bool unknown = false;    // 有贡献者存在但形状推不出来（如行块不整除）
+
+    [[nodiscard]] static std::size_t merge_dim(std::size_t a, std::size_t b,
+                                               bool& conflict)
+    {
+        if (a == b) return a;
+        if (a == 1) return b;
+        if (b == 1) return a;
+        conflict = true;
+        return a;
+    }
+    void merge(std::size_t r, std::size_t c)
+    {
+        if (conflict || unknown) return;
+        if (!any) { rows = r; cols = c; any = true; return; }
+        rows = merge_dim(rows, r, conflict);
+        cols = merge_dim(cols, c, conflict);
+    }
+};
+
+// 缺省：不贡献（标量叶 / 网格索引叶 / 稀疏与批视图）
+template <typename E>
+inline void grid_contrib(const E&, GridInfer&) {}
+
+// 形状保持的叶子/视图
+inline void grid_contrib(const TensorRef& e, GridInfer& g)
+{ if (e.t.valid()) g.merge(e.t.rows(), e.t.cols()); else g.unknown = true; }
+inline void grid_contrib(const RotateHalfRef& e, GridInfer& g)
+{ if (e.t.valid()) g.merge(e.t.rows(), e.t.cols()); else g.unknown = true; }
+inline void grid_contrib(const RowModRef& e, GridInfer& g)
+{ if (e.t.valid()) g.merge(e.t.rows(), e.t.cols()); else g.unknown = true; }
+inline void grid_contrib(const RowAccessRef& e, GridInfer& g)
+{ if (e.t.valid()) g.merge(e.t.rows(), e.t.cols()); else g.unknown = true; }
+template <ExprViewKind Kind>
+inline void grid_contrib(const BroadcastRef<Kind>& e, GridInfer& g)
+{ if (e.t.valid()) g.merge(e.t.rows(), e.t.cols()); else g.unknown = true; }
+// 归约视图：compute 下是广播读 → 贡献输入整网格（compute_reduce 要的也是
+// 输入网格，两者同口径）
+template <ExprViewKind Kind>
+inline void grid_contrib(const ReduceViewRef<Kind>& e, GridInfer& g)
+{ if (e.t.valid()) g.merge(e.t.rows(), e.t.cols()); else g.unknown = true; }
+
+// 分组归约：输出 (rows/R, cols)
+template <bool IsMax>
+inline void grid_contrib(const GroupedReduceRef<IsMax>& e, GridInfer& g)
+{
+    if (!e.t.valid() || e.r_len == 0 || e.t.rows() % e.r_len != 0)
+    { g.unknown = true; return; }
+    g.merge(e.t.rows() / e.r_len, e.t.cols());
+}
+
+// matmul 段：输出 (batch·M, N)（与 compute_engine.hpp 的 batched_matmul 口径一致）
+inline void grid_contrib(const MatmulRef& e, GridInfer& g)
+{
+    const std::size_t batch = e.batch;
+    const std::size_t ra = e.a_kv_ratio ? e.a_kv_ratio : 1;
+    const std::size_t rb = e.b_kv_ratio ? e.b_kv_ratio : 1;
+    if (batch == 0 || !e.a.valid() || !e.b.valid()
+        || batch % ra != 0 || batch % rb != 0)
+    { g.unknown = true; return; }
+    const std::size_t a_blocks = batch / ra;   // GQA：该操作数只存 batch/ratio 份行块
+    const std::size_t b_blocks = batch / rb;
+    if (e.a.rows() % a_blocks != 0 || e.b.rows() % b_blocks != 0)
+    { g.unknown = true; return; }
+    const std::size_t a_rows_per = e.a.rows() / a_blocks;
+    const std::size_t b_rows_per = e.b.rows() / b_blocks;
+    const std::size_t M = e.transA ? e.a.cols() : a_rows_per;
+    const std::size_t N = e.transB ? b_rows_per : e.b.cols();
+    if (M == 0 || N == 0) { g.unknown = true; return; }
+    g.merge(batch * M, N);
+}
+
+// 复合节点：递进子节点合并
+template <typename E, ExprOp Rop>
+inline void grid_contrib(const ReduceRef<E, Rop>& e, GridInfer& g)
+{ grid_contrib(e.child, g); }
+template <typename Op, nn::Expression C>
+inline void grid_contrib(const Unary<Op, C>& e, GridInfer& g)
+{ grid_contrib(e.child, g); }
+template <typename Op, nn::Expression L, nn::Expression R>
+inline void grid_contrib(const Binary<Op, L, R>& e, GridInfer& g)
+{ grid_contrib(e.l, g); grid_contrib(e.r, g); }
+template <nn::BoolExpression C, nn::Expression T, nn::Expression Ex>
+inline void grid_contrib(const Select<C, T, Ex>& e, GridInfer& g)
+{ grid_contrib(e.cond, g); grid_contrib(e.then_e, g); grid_contrib(e.else_e, g); }
+
+// 推导出口：失败一律给出"可操作"的错误（点名入口 + 提示显式 rows/cols）
+template <typename E>
+[[nodiscard]] inline Result<std::pair<std::size_t, std::size_t>>
+infer_grid_shape(const E& e, const char* entry)
+{
+    GridInfer g;
+    grid_contrib(e, g);
+    const std::string where = std::string(entry) + "(engine, expr[, P])";
+    if (g.conflict)
+        NN_FAIL(where + " 无法推导输出形状：操作数形状不满足广播规则"
+                        "（逐维相等或其一为 1）→ 请用显式形式给出 rows/cols");
+    if (g.unknown)
+        NN_FAIL(where + " 无法推导输出形状：表达式含形状不可推导的项"
+                        "（如 GQA matmul 行块不整除）→ 请用显式形式给出 rows/cols");
+    if (!g.any)
+        NN_FAIL(where + " 无法推导输出形状：表达式不含可确定网格的张量操作数"
+                        "（如裸广播向量）→ 请用显式形式给出 rows/cols");
+    return std::pair<std::size_t, std::size_t>{g.rows, g.cols};
+}
+
+// ══════════════════════════════════════════════════════════════════════════
 // CPU 预绑定（cpu_prepare）—— 让"含 matmul/归约"的表达式也走编译期内联
 //
 // 背景：has_reduction_v 仅用于 CPU 分支分流（GPU/scan 一律 to_expr_spec）。
@@ -1569,6 +1705,20 @@ template <typename E>
 #endif
 }
 
+// ── 无形状重载：dsl::compute(engine, expr[, P]) ────────────────────────────
+// 输出网格由表达式推导（口径见上方"输出网格形状推导"）；推导失败 = 明确报错，
+// 绝不猜形状。需要非常规网格（如裸行广播向量）时继续用 4/5 参显式形式。
+template <typename E>
+[[nodiscard]] Result<Tensor> compute(ComputeEngine& eng, const E& e, Precision P)
+{
+    NN_TRY(rc, infer_grid_shape(e, "dsl::compute"));
+    return compute(eng, e, rc->first, rc->second, P);
+}
+
+template <typename E>
+[[nodiscard]] Result<Tensor> compute(ComputeEngine& eng, const E& e)
+{ return compute(eng, e, Precision::F32); }
+
 // ── CPU 侧"写进目标张量"（f16 目标 → f32 参考求值 + 舍入写回，§7.2）────────
 // f32 目标 = 直通 span 写入（零额外拷贝）。
 // 写版本：本函数是 DSL 在 CPU 上**绕过 ComputeEngine 写入口**的唯一落点，
@@ -1777,6 +1927,20 @@ template <typename E>
     return eng.eval_expr_reduce(spec, inputs, rows, cols, P);
 #endif
 }
+
+// ── 无形状重载：dsl::compute_reduce(engine, expr[, P]) ─────────────────────
+// 归约向量形状 (rows,1)/(1,cols) 由引擎按归约轴决定，调用方给出的只是**输入
+// 网格**；故这里的推导与 compute 同一口径（见"输出网格形状推导"）。
+template <typename E>
+[[nodiscard]] Result<Tensor> compute_reduce(ComputeEngine& eng, const E& e, Precision P)
+{
+    NN_TRY(rc, infer_grid_shape(e, "dsl::compute_reduce"));
+    return compute_reduce(eng, e, rc->first, rc->second, P);
+}
+
+template <typename E>
+[[nodiscard]] Result<Tensor> compute_reduce(ComputeEngine& eng, const E& e)
+{ return compute_reduce(eng, e, Precision::F32); }
 
 // ══════════════════════════════════════════════════════════════════════════
 // start_expr / end_expr — 跨行书写同一表达式的语法糖（IR-C 恢复自旧实现）

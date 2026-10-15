@@ -8,13 +8,13 @@
 >
 > **当前数字**：引擎 virtual **52 个方法**（`bench/doc_inventory.ps1` 口径。注意 `grep -c "\bvirtual\b"` 原始计 **54** 处 = 52 方法 + 析构 1 + 注释里的词 1，勿混用口径）；Layer/Loss/Optimizer 直调 **27 个**（含 `begin_expr`——由 `Adam::step`/`AdamW::step` 打开 IR-C 录制段；其余 25 个
 > 只服务 DSL lowering / 序列化 / CLI / 适配层 / 测试，见 §2）；CPU 求值机制 **2 套**
-> （DSL 模板路径 + IR 解释器，见 §3）；ctest **47** 个测试（**34** 个测试目标 + `cnn_test_gpu`
+> （DSL 模板路径 + IR 解释器，见 §3）；ctest **48** 个测试（**35** 个测试目标 + `cnn_test_gpu`
 > = `cnn_test --gpu` + `batchnorm_test_gpu` = `batchnorm_test --gpu` + `fusion_custom_layer_example`
 > = 库外使用者形态的 AOT 融合端到端门禁 + `expr_fuse_test` = IR-C 图融合 GPU 端到端，
 > 见 `AGENTS.md` §7。其中 `fused_gpu_test` = 融合 shader **逐形态** GPU 对拍；`expr_graph_test` = IR-C 图融合分析（CPU 12 用例）；`error_macro_test`
 > = 错误处理宏族（`NN_UNWRAP`/`NN_EXIT`/`NN_TRY_MSG`/`NN_FAIL`）；`kvrec_test`/`nnvocab_test`/`dataset_test`
 > = 统一数据集（KVRecord v2 / `.nnvocab` / `.nndataset`，见 `docs/todo/19`）；
-> `zipt_test` 随 ZiPT 移除，见 `docs/history/history.md`）。
+> `zipt_test` 随 ZiPT 移除，见 `docs/history/history.md`；`dsl_shape_infer_test` = `dsl::compute`/`compute_reduce` 的**无形状重载**（推导口径 + 负例）。
 >
 > 历史演进与收敛记录（计算类原语全量迁 DSL、算子收敛与遗留物
 > 清理、接口数字 58→49 / 直调 35→23 的过程）已移入 `docs/history/history.md`；**M4
@@ -35,7 +35,7 @@
 |------|------|
 | 纯 Matrix（无 Tensor） | `algebra_*` 在用，是 `Tensor` 的底层存储 + CPU 手写 kernel |
 | `forward_gpu` / `backward_gpu` 双实现 | 不存在（仅注释残留） |
-| eager（直接调引擎算子） | Layer 仍直调 **27 个**算子，且全部是基础设施 / 数据搬运 / 状态扫描 / fold 显式登记 / 三值打包 / 张量形变（见 §2.1）；计算类原语一律走 DSL |
+| eager（直接调引擎算子） | Layer 仍直调 **27 个**算子，且全部是基础设施 / 数据搬运 / 状态扫描 / fold 执行（结构自登记） / 三值打包 / 张量形变（见 §2.1）；计算类原语一律走 DSL |
 | `begin_expr` / `end_expr`（IR-C 录制图） | ✅ 现行（P1 机制 + P2 写穿多输出；`expr_graph.hpp`，见 §4.2/§4.3） |
 | `dsl::compute` | ✅ 当前主推，被 Layer 大量使用 |
 
@@ -82,9 +82,9 @@ transpose, trit_pack, try_create_tensor, zero
 clone、reshape、try_create_tensor、zero）、**数据搬运**（transpose/slice_rows/insert_rows/
 rearrange_3d/gather_rows/scatter_add_rows/im2col/col2im——DSL 表达式是"每输出元素
 独立计算"模型，搬运类的不规则索引/原子累加不属于它）、**状态扫描**（scan_prefix_outer/
-scan_suffix_outer/outer_col——顺序状态机，DSL 无此语义）、`eval_expr`（fold 登记：
-值构造经 `FoldAnchor` 自登记、注意力 5 组合由 scan 显式登记块覆盖，均属 AOT 设计
-而非旁路）、`begin_expr`（IR-C
+scan_suffix_outer/outer_col——顺序状态机，DSL 无此语义）、`eval_expr`（fold 执行
+路径：构造与登记同在**定义方**经 `FoldAnchor` 自登记——通用样例在 `expr_fold.hpp`、
+注意力组合在 `compute_layer_attention.hpp`，属 AOT 设计而非旁路）、`begin_expr`（IR-C
 录制段入口：`Adam::step`/`AdamW::step` 打开图录制，`ExprSegment` 守卫收口）。
 **三值打包**（`matmul_q`/`matmul_q_t`/`trit_pack`——`BitLinear` 的打包 GEMM 与打包，
 op-level 引擎原语，不进 DSL 闭合世界、无需 scan 登记，见 `docs/todo/21` §4.12）。
@@ -213,7 +213,7 @@ DSL 表达式，见 §2.1/§7.2），eager 只剩基础设施、不可约原语�
 
 | 差距 | 现状 | 说明 |
 |------|------|------|
-| A. Layer 直调算子 | **27 个**（全部为基础设施/张量形变/数据搬运/状态扫描/fold 显式登记/IR-C 录制段开合/三值打包） | ✅ **计算类原语已全部退出 Layer 直调**：Layer 只写 DSL；保留的 27 个按 §7.2 分类属"必须保留为层可见原语"（见 §2.1）；M4 起 `from_matrix`/`to_matrix` 也已退出 L2 |
+| A. Layer 直调算子 | **27 个**（全部为基础设施/张量形变/数据搬运/状态扫描/fold 执行（自登记）/IR-C 录制段开合/三值打包） | ✅ **计算类原语已全部退出 Layer 直调**：Layer 只写 DSL；保留的 27 个按 §7.2 分类属"必须保留为层可见原语"（见 §2.1）；M4 起 `from_matrix`/`to_matrix` 也已退出 L2 |
 | B. 求值机制 | **CPU 2 套 + GPU AOT** | ⚠️ 目标只剩 DSL + 引擎 lowering；余量 = 含归约/matmul 表达式仍走串行解释器（机制 2），即 §7.5 的 CPU lowering 缺口 |
 | C. 融合世代 | eager / dsl 并存 | eager 中待收敛的重复逐元素路径已清空，只剩 §7.2 ③ 不可约原语按设计公开；IR-C（图录制融合）现行（见 §4.2 与 `03-ir-optimization.md` §5.3） |
 | D. 死代码 | 无 | 无调用点接口已清空（历史清单见 `docs/history/history.md`） |

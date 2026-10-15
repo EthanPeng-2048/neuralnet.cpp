@@ -63,7 +63,7 @@ public:
             dsl::exp(dsl::leaf(input) - dsl::row_reduce_max(input))
             / dsl::row_reduce_sum(
                 dsl::exp(dsl::leaf(input) - dsl::row_reduce_max(input))),
-            input.rows(), input.cols(), p_.stable);
+            p_.stable);   // 输出仍是整网格（归约视图按行广播）→ 由表达式推导
         NN_TRY_CHECK(out);
         if (checkpoint_mode_)
             return out;
@@ -83,7 +83,7 @@ public:
             * (dsl::leaf(grad_output)
                - dsl::row_reduce_sum(dsl::leaf(output_cache_)
                                      * dsl::leaf(grad_output))),
-            output_cache_.rows(), output_cache_.cols(), p_.stable);
+            p_.stable);   // 输出仍是整网格（归约指令按行广播）→ 由表达式推导
         return out;
     }
 };

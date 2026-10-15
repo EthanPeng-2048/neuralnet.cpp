@@ -150,6 +150,12 @@ public:
 } // namespace demo
 ```
 
+> **输出形状可省**：上例的 `dsl::compute(engine, expr, rows, cols, P)` 可写成
+> `dsl::compute(engine, expr, P)` —— 输出网格由表达式推导（逐元素/广播/归约视图/
+> matmul 段各按广播规则合并，口径见 [`cpp-api-manual.md`](cpp-api-manual.md) §6）。
+> 推导不出的网格（如裸广播向量）会返回错误并提示改用显式形式，不会猜形状；
+> 两种写法在同一表达式上**结果逐位一致**（库内 6 处调用点已改为省略形式）。
+
 ### 接入与训练（与内置层逐字一致）
 
 ```cpp

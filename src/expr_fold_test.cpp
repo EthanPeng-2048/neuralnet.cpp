@@ -15,9 +15,12 @@
 //       finalize 读输入 —— 四类违规必须被拒绝（静态拒而非静默错算）
 //    7. 注册表去重 + key 契约（原 bin 序列化 roundtrip 的接替者：bin 已删除）：
 //       同结构重复 add 只留一条；tri_skip（只翻该字段）与掩码 body 差异均进 key
+//    8. 锚点代表值契约：注意力 fold 自登记（P4-4 ①）只登记一组代表形状，故
+//       同一组合跨形状 key 必须相同；10 个组合（掩码 × 偏置 × {MHA,GQA}）互不相同
 //  纯 CPU；输出 (rows,1)（eval_expr 的 cols 参数 = 1 调用约定）。
 // ───────────────────────────────────────────────────────────────────────────
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdio>
@@ -492,6 +495,58 @@ int test_expr_fold()
         for (const auto& s : reg.specs)
             if (s.fold && s.fold->tri_skip) saw_skip = true;
         check(saw_skip, "fold Causal → tri_skip=true 登记保留");
+    }
+
+    // ── 8) 锚点代表值契约（P4-4 ①）───────────────────────────────────────
+    // 注意力 fold 的结构自登记（`compute_layer_attention.hpp` 的
+    // `attn_fold_anchor`）只登记**一组代表形状**（seq=64/dk=2/bh=2，kv_ratio
+    // 取 1 与 2）——它能覆盖所有真实调用点的前提 = "这些量都不进 key"。本段把
+    // 该前提锁成契约（违反 → 闭合世界对真实形状 miss）：
+    //   ① 同一组合在任意形状下 key 相同（含 GQA 比：2 ≡ 4，任意 n_rep 共用）；
+    //   ② 10 个组合（掩码清单 × {无偏置, 位置偏置} −"Plain+偏置"，× {MHA,GQA}）
+    //      两两不同（登记少一条 = GPU 硬报错）。
+    {
+        const auto key_of = [](nn::expr::AttnMaskKind m, bool sb,
+                               std::uint32_t kv_ratio, std::uint32_t seq,
+                               std::uint32_t dk, std::uint32_t bh)
+        {
+            return nn::expr_spec_key(nn::canonicalize_expr_spec(
+                nn::expr::make_fold_attn_o(seq, dk, bh, m, sb, kv_ratio)));
+        };
+        const auto combo_name = [](nn::expr::AttnMaskKind m, bool sb,
+                                   std::uint32_t kv_ratio)
+        {
+            std::string n = m == nn::expr::AttnMaskKind::Plain      ? "plain"
+                          : m == nn::expr::AttnMaskKind::Causal     ? "causal"
+                                                                    : "doc";
+            if (sb) n += "+alibi";
+            n += kv_ratio > 1 ? " gqa" : " mha";
+            return n;
+        };
+        std::vector<std::string> keys;
+        for (const nn::expr::AttnMaskKind m : {nn::expr::AttnMaskKind::Plain,
+                                              nn::expr::AttnMaskKind::Causal,
+                                              nn::expr::AttnMaskKind::CausalDoc})
+            for (const bool sb : {false, true})
+            {
+                if (m == nn::expr::AttnMaskKind::Plain && sb)
+                    continue;   // 本仓不构造该组合（与自登记表同规则）
+                for (const std::uint32_t kv_ratio : {1u, 2u})
+                {
+                    const std::string k = key_of(m, sb, kv_ratio, 64, 2, 2);
+                    keys.push_back(k);
+                    // 形状无关：另一组完全不同（含 > EXPR_FOLD_BLOCK 的 seq）
+                    // 的形状 + 另一个 GQA 比必须折叠出同一 key。
+                    check(k == key_of(m, sb, kv_ratio == 1 ? 1u : 4u, 512, 64, 8),
+                          "attn fold " + combo_name(m, sb, kv_ratio) +
+                              " 形状无关（key 跨形状不变）");
+                }
+            }
+        std::sort(keys.begin(), keys.end());
+        keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+        check(keys.size() == 10,
+              "attn fold 10 个组合（掩码 × 偏置 × {MHA,GQA}）互不相同 n=" +
+                  std::to_string(keys.size()));
     }
 
     return fail;

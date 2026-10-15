@@ -51,11 +51,20 @@ namespace expr
 //   CausalDoc 因果 + 文档块对角（doc_col 经 RowBroadcast、doc_ids 经 BatchCol）
 // 位置偏置（ALiBi）不属于掩码：它由位置编码策略给出，作为独立的第二个维度
 // 传入（score_bias）。两者正交 —— 掩码策略不必知道位置编码的存在。
+//
+// 掩码清单是**单一真源**（X 宏）：枚举定义与下方 AOT 自登记表
+// （`#if defined(NN_EXPR_SCAN)` 段，见 make_fold_attn_o 之后）都由它展开 ——
+// 新增一种掩码只需在本清单加一项，scan_exprs 与登记表都无需改动。
+#define NN_ATTN_MASK_KIND_LIST(X) \
+    X(Plain)                      \
+    X(Causal)                     \
+    X(CausalDoc)
+
 enum class AttnMaskKind
 {
-    Plain,
-    Causal,
-    CausalDoc,
+#define NN_ATTN_MASK_KIND_ENUM(name) name,
+    NN_ATTN_MASK_KIND_LIST(NN_ATTN_MASK_KIND_ENUM)
+#undef NN_ATTN_MASK_KIND_ENUM
 };
 
 // fold 构造：掩码 × 位置偏置两个正交维度；生成的 IR 指令顺序固定为
@@ -207,6 +216,53 @@ enum class AttnMaskKind
     return s;
 }
 
+#if defined(NN_EXPR_SCAN)
+// ── AOT 自登记锚点（表达式自登记约定：新增掩码/偏置组合不改 scan_exprs）──
+// 注意力 fold 由**值构造器**产出（结构取决于 mask / score_bias / kv_ratio 三个
+// 实参），类型层面不编码结构 → `FusedAnchor<Expr>` 按类型登记覆盖不到；层
+// forward 又是直调 `engine.eval_expr(make_fold_attn_o(...))`、不经 DSL 钩子。
+// 故由本文件（构造与掩码清单的唯一定义来源）在静态初始化期经 `FoldAnchor`
+// 自登记**全部**组合（与 compute_loss.hpp 的 CE logsumexp 折叠同一形态）：
+//   掩码（`NN_ATTN_MASK_KIND_LIST`）× {无偏置, 位置偏置} × {MHA, GQA}
+// 其中"无掩码 + 位置偏置"不是本仓会构造的组合（无层路径），故实际为 5×2 = 10
+// 条结构。形状/运行期参数（seq/dk/bh 与 kv_ratio 的具体值）**不进 key** → 一
+// 组代表值即覆盖所有形状（docs/todo/22 §3.2 P2；GQA 的 HeadGroup 视图种类进
+// key，比本身不进 → MHA/GQA 各一条）。
+// 可用 `-DNN_SCAN_NO_ANCHOR` 关掉（与 FusedAnchor 同一 A/B 开关：只影响登记
+// 集合、不改语义）。
+#if !defined(NN_SCAN_NO_ANCHOR)
+namespace attn_fold_anchor
+{
+inline constexpr AttnMaskKind kMaskKinds[] = {
+#define NN_ATTN_MASK_KIND_ITEM(name) AttnMaskKind::name,
+    NN_ATTN_MASK_KIND_LIST(NN_ATTN_MASK_KIND_ITEM)
+#undef NN_ATTN_MASK_KIND_ITEM
+};
+
+// 登记表 = 本层实际会构造的全部组合。形状取代表值（k/dk/bh/kv_ratio 均不进
+// key；这里的取值与既有登记块一致，便于逐字节比对生成物）。
+[[nodiscard]] inline bool register_all()
+{
+    constexpr std::uint32_t seq = 64, dk = 2, bh = 2;
+    for (const AttnMaskKind mask : kMaskKinds)
+    {
+        for (const bool score_bias : { false, true })
+        {
+            if (mask == AttnMaskKind::Plain && score_bias)
+                continue;   // 无掩码 + 位置偏置：本仓不构造该组合
+            for (const std::uint32_t kv_ratio : { 1u, 2u })
+                (void)dsl::FoldAnchor{
+                    make_fold_attn_o(seq, dk, bh, mask, score_bias, kv_ratio) };
+        }
+    }
+    return true;
+}
+} // namespace attn_fold_anchor
+
+inline const bool g_attn_fold_anchors = attn_fold_anchor::register_all();
+#endif   // !NN_SCAN_NO_ANCHOR
+#endif   // NN_EXPR_SCAN
+
 } // namespace expr
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -277,11 +333,11 @@ public:
 
     [[nodiscard]] Result<Tensor> masked_scores(
         ComputeEngine& engine, const Tensor& Q, const Tensor& K,
-        std::size_t BH, std::size_t seq, const PrecisionProfile& p,
+        std::size_t BH, std::size_t /*seq*/, const PrecisionProfile& p,
         std::uint32_t kv_ratio) const override
     {
         return dsl::compute(engine, dsl::matmul_kv(Q, K, true, false, BH, 1, kv_ratio),
-                            BH * seq, seq, p.compute);
+                            p.compute);   // 输出 (BH·seq, seq) 由 matmul 段推导
     }
 };
 

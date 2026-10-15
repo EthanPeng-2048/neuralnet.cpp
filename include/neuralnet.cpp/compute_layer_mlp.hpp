@@ -118,7 +118,7 @@ public:
         // （边界 cast 或 in-kernel f16 变体，内部按 f32 计算、输出按目标精度舍入）。
         return dsl::compute(engine,
             dsl::matmul(w_, input, false, false) + dsl::row_broadcast(b_),
-            w_.rows(), input.cols(), p_.compute);
+            p_.compute);   // 输出形状 (M,N) 由表达式推导（matmul 段 + 行广播）
     }
 
     // ── backward: 同样简洁，精度由引擎处理 ────────────────────────────
@@ -135,7 +135,7 @@ public:
         // 直写（scan 的 Linear backward dry-run 自动登记该结构）。
         auto grad_input = dsl::compute(engine,
             dsl::matmul(w_, grad_output, true, false),
-            w_.cols(), grad_output.cols(), p_.compute);
+            p_.compute);   // (K, N) 由表达式推导
         NN_TRY_CHECK(grad_input);
         nn_dbg_scan("lin.grad_out", engine, grad_output);
         nn_dbg_scan("lin.cache", engine, input_cache_);
@@ -204,7 +204,7 @@ public:
             input_cache_ = input;
         return dsl::compute(engine,
             dsl::max(dsl::leaf(input), Scalar{0}),
-            input.rows(), input.cols(), p_.compute);
+            p_.compute);   // 输出网格 = 输入网格（由表达式推导）
     }
 
     // ── backward: grad_x = (x > 0) ? grad_out : 0 ────────────────────────
@@ -220,7 +220,7 @@ public:
         return dsl::compute(engine,
             dsl::select(dsl::leaf(input_cache_) > Scalar{0},
                         dsl::leaf(grad_output), Scalar{0}),
-            grad_output.rows(), grad_output.cols(), p_.compute);
+            p_.compute);   // 两操作数同形状（上方已校验），网格由表达式推导
     }
 };
 
