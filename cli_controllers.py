@@ -1036,6 +1036,24 @@ class GptInferController(CLIController):
         # 温度
         if "temperature" in kwargs:
             args.extend(["--temperature", self._format_arg_value(kwargs["temperature"])])
+
+        # 采样截断（P0-5）：top-k / top-p / 重复惩罚 / 种子
+        if "top_k" in kwargs:
+            args.extend(["--top-k", self._format_arg_value(kwargs["top_k"])])
+
+        if "top_p" in kwargs:
+            args.extend(["--top-p", self._format_arg_value(kwargs["top_p"])])
+
+        if "repeat_penalty" in kwargs:
+            args.extend(["--repeat-penalty",
+                         self._format_arg_value(kwargs["repeat_penalty"])])
+
+        if "repeat_window" in kwargs:
+            args.extend(["--repeat-window",
+                         self._format_arg_value(kwargs["repeat_window"])])
+
+        if "seed" in kwargs:
+            args.extend(["--seed", self._format_arg_value(kwargs["seed"])])
         
         # 设备选择
         if kwargs.get("gpu", False):

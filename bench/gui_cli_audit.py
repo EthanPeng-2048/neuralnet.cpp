@@ -131,7 +131,8 @@ CASES.append(("text_train", GptTrainController(), dict(
     model="gpt", text_file="t.txt", f16=True, max_steps=5)))
 CASES.append(("text_infer", GptInferController(), dict(
     model="g.bin", vocab="v.json", prompt="hello", max_tokens=200,
-    temperature=1.0, gpu=True, show_tokens=True)))
+    temperature=1.0, top_k=40, top_p=0.9, repeat_penalty=1.2,
+    repeat_window=64, seed=7, gpu=True, show_tokens=True)))
 
 
 def audit_gui_to_cli() -> int:

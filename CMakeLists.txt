@@ -542,6 +542,10 @@ if(NN_BUILD_APPS OR NN_ENABLE_TESTS)
     nn_add_executable(gpt_test src/gpt_test.cpp)
     list(APPEND NN_TEST_TARGETS gpt_test)
 
+    # ── 采样器（P0-5：top-k / top-p / 重复惩罚 / 种子；默认配置 ≡ 旧路径）──
+    nn_add_executable(sampling_test src/sampling_test.cpp)
+    list(APPEND NN_TEST_TARGETS sampling_test)
+
     # ── Activation Offload（原语往返 + GPT/RAPT 模型级一致性）──────────
     # 模型级 offload 一致性（GPU-only：无 Vulkan 构建时自身返回 77 = SKIP）
     nn_add_executable(gpt_offload_test src/gpt_offload_test.cpp)

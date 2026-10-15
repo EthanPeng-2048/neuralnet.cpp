@@ -1763,6 +1763,11 @@ class GptInferTab(TabBase):
                                           filetypes=[("词表文件", "*.nnvocab")]); r += 1
         self.max_tokens = _make_entry_row(p, "最大生成token数", r, "200"); r += 1
         self.temperature = _make_entry_row(p, "温度 (0=贪心)", r, "1.0"); r += 1
+        self.top_k = _make_entry_row(p, "top-k (0=关闭)", r, "0"); r += 1
+        self.top_p = _make_entry_row(p, "top-p (1.0=关闭)", r, "1.0"); r += 1
+        self.repeat_penalty = _make_entry_row(p, "重复惩罚 (1.0=关闭)", r, "1.0"); r += 1
+        self.repeat_window = _make_entry_row(p, "重复惩罚窗口 (0=全部)", r, "0"); r += 1
+        self.seed = _make_entry_row(p, "随机种子 (留空=随机)", r, ""); r += 1
         self.engine = _make_option_row(p, "计算引擎", r, ENGINE_OPTIONS, "CPU"); r += 1
         self.show_tokens_var = _make_checkbox_row(p, "显示token", r); r += 1
 
@@ -1783,6 +1788,11 @@ class GptInferTab(TabBase):
             args["prompt"] = prompt
         if self.max_tokens.get(): args["max_tokens"] = int(self.max_tokens.get())
         if self.temperature.get(): args["temperature"] = float(self.temperature.get())
+        if self.top_k.get(): args["top_k"] = int(self.top_k.get())
+        if self.top_p.get(): args["top_p"] = float(self.top_p.get())
+        if self.repeat_penalty.get(): args["repeat_penalty"] = float(self.repeat_penalty.get())
+        if self.repeat_window.get(): args["repeat_window"] = int(self.repeat_window.get())
+        if self.seed.get(): args["seed"] = int(self.seed.get())
         engine = self.engine.get()
         if engine == "GPU (Vulkan)":
             args["gpu"] = True

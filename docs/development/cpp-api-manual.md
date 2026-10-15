@@ -823,8 +823,28 @@ if (gpt != nullptr)
 }
 ```
 
-签名：`generate(engine, prompt, max_new_tokens, temperature = 1.0,
-eos_token_id = npos, min_new_tokens = 0)`。`temperature = 0` 为贪心。
+签名（旧，纯 temperature）：`generate(engine, prompt, max_new_tokens,
+temperature = 1.0, eos_token_id = npos, min_new_tokens = 0)`。`temperature = 0`
+为贪心。
+
+**采样配置重载（P0-5）**：`generate(engine, prompt, max_new_tokens,
+const SamplingConfig& cfg, eos_token_id = npos, min_new_tokens = 0)`：
+
+```cpp
+nn::SamplingConfig cfg;          // 默认 = 旧行为（仅 temperature）
+cfg.temperature    = 0.8;
+cfg.top_k          = 40;         // 0 = 关闭
+cfg.top_p          = 0.9;        // 1.0 = 关闭（核采样）
+cfg.repeat_penalty = 1.2;        // 1.0 = 关闭
+cfg.repeat_window  = 64;         // 0 = 全部上下文
+cfg.seed           = 7;          // has_seed = true ⇒ 同 prompt 输出可复现
+cfg.has_seed       = true;
+auto out = NN_UNWRAP(gpt->generate(engine, prompt, 200, cfg));
+```
+
+顺序固定：重复惩罚 → 温度 → top-k → top-p（保留集内重新归一化）→ softmax →
+采样/贪心。**`SamplingConfig{}`（全默认）与旧的 `temperature` 重载逐位一致**
+（`sampling_test` 锁该等价性：返回下标、概率向量、RNG 消耗序三者相同）。
 完整流程（加载模型含内嵌词表 → 编码 → 生成 → 解码）见 `src/text_infer.cpp`。
 
 ---

@@ -1341,11 +1341,10 @@ public:
     // ── 采样生成（RLA-2 增量运行态，KV cache） ─────────────────────
     // 利用 RLA-2 的运行态（B_t、z_t）作为 KV cache：逐 token 增量更新，
     // 每步 O(d²)（不重算前文），使生成真正线性于上下文长度。
+    // 采样配置版（P0-5）：见 GPTModel::generate 的同款说明
     [[nodiscard]] Result<std::vector<std::size_t>>
-    generate(ComputeEngine& engine,
-             const std::vector<std::size_t>& prompt,
-             std::size_t max_new_tokens,
-             Scalar temperature = 1.0,
+    generate(ComputeEngine& engine, const std::vector<std::size_t>& prompt,
+             std::size_t max_new_tokens, const SamplingConfig& cfg,
              std::size_t eos_token_id = static_cast<std::size_t>(-1),
              std::size_t min_new_tokens = 0)
     {
@@ -1403,21 +1402,43 @@ public:
 
         // 采样生成
         std::vector<std::size_t> generated;
-        std::mt19937_64 rng{std::random_device{}()};
+        std::vector<std::size_t> context(prompt);
+        std::uint64_t seed = cfg.seed;
+        if (!cfg.has_seed)
+        {
+            std::random_device rd;
+            seed = (static_cast<std::uint64_t>(rd()) << 32) | static_cast<std::uint64_t>(rd());
+        }
+        std::mt19937_64 rng{seed};
         std::uniform_real_distribution<Scalar> dist(0.0, 1.0);
         for (std::size_t step = 0; step < max_new_tokens; ++step)
         {
-            // temperature → softmax → 采样/贪心（三模型共用的采样器）
+            // 重复惩罚 → temperature → top-k/top-p → softmax → 采样/贪心
+            // （三模型共用的采样器；history = prompt + 已生成 token）
             std::vector<Scalar> lastv = last;
-            const std::size_t next = sample_next_token_(lastv, temperature, rng, dist);
+            const std::size_t next =
+                sample_next_token_(lastv, cfg, rng, dist, std::span<const std::size_t>(context));
 
             if (step >= min_new_tokens && next == eos_token_id) break;
             generated.push_back(next);
+            context.push_back(next);
 
             NN_TRY(r, step_one(next, pos++));
             last = std::move(*r);
         }
         return generated;
+    }
+
+    // 旧签名（纯 temperature 采样）：语义 = SamplingConfig 全默认
+    [[nodiscard]] Result<std::vector<std::size_t>>
+    generate(ComputeEngine& engine, const std::vector<std::size_t>& prompt,
+             std::size_t max_new_tokens, Scalar temperature = 1.0,
+             std::size_t eos_token_id = static_cast<std::size_t>(-1),
+             std::size_t min_new_tokens = 0)
+    {
+        SamplingConfig cfg;
+        cfg.temperature = temperature;
+        return generate(engine, prompt, max_new_tokens, cfg, eos_token_id, min_new_tokens);
     }
 };
 
