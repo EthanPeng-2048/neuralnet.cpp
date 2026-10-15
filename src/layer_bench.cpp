@@ -16,8 +16,10 @@
 // ───────────────────────────────────────────────────────────────────────────
 
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <iostream>
 #include <random>
@@ -62,6 +64,13 @@ struct BenchConfig
 
     // 算子级尺寸（matmul: (m,k)·(k,n)；逐元素/归约: (m,n)）
     std::size_t m = 1024, n = 1024, k = 1024;
+
+    // 扫描原语尺寸（scan_prefix / scan_suffix）：行块 = batch*heads*dk、列 = seq
+    std::size_t dk = 32;
+
+    // --hash：算子模式额外打印输出张量的**位级哈希**（kernel 改写前后的一比一
+    //   oracle：逐位不变的优化必须哈希相同；哈希覆盖 f32 原始位型，不做容差比较）
+    bool hash = false;
 
     // 算子级模式：非空时跑算子（--op <name|all>）
     std::vector<std::string> ops;
@@ -247,6 +256,7 @@ struct OpCtx
 {
     Tensor a, b, c;    // 主操作数/输出
     Tensor aux;        // 辅助（行/列向量等）
+    std::vector<Tensor> extra;   // 第三及以后的输入（扫描原语的 K/V/P/R…）
 };
 
 struct OpSpec
@@ -362,6 +372,76 @@ void run_scale(ComputeEngine& e, const BenchConfig&, OpCtx& ctx)
     (void)e.scale_inplace(ctx.a, Scalar{0.5f});
 }
 
+// ── RLA / RAPT 扫描原语（P4-2b）：状态扫描的顺序依赖是靠 barrier 串起来的，
+//    kernel 天生是**延迟敏感**而非吞吐敏感型 —— 所以口径记 ms（附 GFLOPS 仅作
+//    横向参照，数值必然很低），配对 A/B 看的是同一形状下的 ms 变化。
+//    形状（与 RAPT 训练同口径）：K/V/P/R (B*H*dk, seq)、A0/B0 (H*dk, dk)、
+//    boundary (1, B*seq)；输出 (B*H*5*dk, seq) 或 (B*H*3*dk, seq)。
+//    boundary 全 0 = 无文档边界（稳态扫描；全非零会让每 t 复位，属另一个工况）。
+
+Tensor make_zeros(ComputeEngine& e, std::size_t rows, std::size_t cols)
+{
+    Matrix m(rows, cols);
+    auto t = e.from_matrix(std::move(m));
+    if (!t) std::abort();
+    return std::move(*t);
+}
+
+Tensor make_scan_input(ComputeEngine& e, const BenchConfig& c,
+                       std::size_t rows, std::size_t cols)
+{
+    return c.f16 ? make_input_f16(e, rows, cols) : make_input(e, rows, cols);
+}
+
+void setup_scan_prefix(ComputeEngine& e, const BenchConfig& c, OpCtx& ctx)
+{
+    if (c.heads == 0 || c.dk == 0) { std::printf("scan_prefix: heads/dk 不能为 0\n"); std::abort(); }
+    const std::size_t rows = c.batch * c.heads * c.dk;
+    ctx.a = make_scan_input(e, c, rows, c.seq);            // K
+    ctx.b = make_scan_input(e, c, rows, c.seq);            // V
+    ctx.extra.push_back(make_scan_input(e, c, rows, c.seq));            // P
+    ctx.extra.push_back(make_scan_input(e, c, rows, c.seq));            // R
+    ctx.extra.push_back(make_scan_input(e, c, c.heads * c.dk, c.dk));   // A0
+    ctx.extra.push_back(make_scan_input(e, c, c.heads * c.dk, c.dk));   // B0
+    ctx.aux = make_zeros(e, 1, c.batch * c.seq);                        // boundary
+}
+void run_scan_prefix(ComputeEngine& e, const BenchConfig& c, OpCtx& ctx)
+{
+    auto r = e.scan_prefix_outer(ctx.a, ctx.b, ctx.extra[0], ctx.extra[1],
+                                 ctx.extra[2], ctx.extra[3], /*has_state=*/true,
+                                 c.dk, c.heads, /*causal=*/true, ctx.aux, /*has_bnd=*/true,
+                                 c.f16 ? nn::Precision::F16 : nn::Precision::F32);
+    if (!r) { std::printf("scan_prefix error: %s\n", r.error().message.c_str()); std::abort(); }
+    ctx.c = std::move(*r);
+}
+// 每 (t, 头) 的浮点工作量：[0)/[1)/[2) 三个 dk×dk 的 matvec = 3·2dk²，[3)/[4)
+// 是 O(dk) 的标量在内，量级上忽略（口径与 kernel 的真实算力占比一致）。
+double flops_scan_prefix(const BenchConfig& c)
+{
+    return 6.0 * static_cast<double>(c.dk) * static_cast<double>(c.dk) *
+           static_cast<double>(c.heads) * static_cast<double>(c.batch) *
+           static_cast<double>(c.seq);
+}
+
+void setup_scan_suffix(ComputeEngine& e, const BenchConfig& c, OpCtx& ctx)
+{
+    if (c.heads == 0 || c.dk == 0) { std::printf("scan_suffix: heads/dk 不能为 0\n"); std::abort(); }
+    const std::size_t rows = c.batch * c.heads * c.dk;
+    ctx.extra.push_back(make_scan_input(e, c, rows * c.dk, c.seq));   // D (B*H*dk², seq)
+    ctx.a = make_scan_input(e, c, rows, c.seq);            // X
+    ctx.b = make_scan_input(e, c, rows, c.seq);            // Y
+    ctx.aux = make_zeros(e, 1, c.batch * c.seq);           // boundary
+}
+void run_scan_suffix(ComputeEngine& e, const BenchConfig& c, OpCtx& ctx)
+{
+    auto r = e.scan_suffix_outer(ctx.extra[0], ctx.a, ctx.b,
+                                 c.dk, c.heads, /*causal=*/true, ctx.aux, /*has_bnd=*/true,
+                                 c.f16 ? nn::Precision::F16 : nn::Precision::F32);
+    if (!r) { std::printf("scan_suffix error: %s\n", r.error().message.c_str()); std::abort(); }
+    ctx.c = std::move(*r);
+}
+double flops_scan_suffix(const BenchConfig& c) { return flops_scan_prefix(c); }
+
 // ── 三值打包权重 GEMM（P2 / F3）与稠密 GEMM 的配对 A/B ───────────────────
 // 口径（docs 21 §5 的 P2 准入门槛）：同一 (m,k)·(k,n) 形状、同一份随机数造的
 // latent 权重；稠密侧走 matmul（f16 缓冲），打包侧走 matmul_q（0.25 B/权重）。
@@ -465,6 +545,8 @@ const std::vector<OpSpec>& op_registry()
         {"col_reduce_sum", setup_exp, run_col_reduce, bytes_col_reduce, false},
         {"transpose", setup_exp, run_transpose, bytes_transpose, false},
         {"scale_inplace", setup_exp, run_scale, bytes_binary, false},
+        {"scan_prefix", setup_scan_prefix, run_scan_prefix, flops_scan_prefix, true},
+        {"scan_suffix", setup_scan_suffix, run_scan_suffix, flops_scan_suffix, true},
     };
     return reg;
 }
@@ -492,6 +574,28 @@ void bench_op(ComputeEngine& engine, const BenchConfig& cfg, const OpSpec& spec)
     }
     const double g = (work / (best / 1000.0)) / scale;
     std::printf("  %-14s : %8.3f ms  %10.1f %s\n", spec.name, best, g, unit.data());
+
+    // 位级哈希（--hash）：对输出张量的原始位型做 FNV-1a 64。**逐位不变**的 kernel
+    // 改写必须哈希相同——比"看误差有几位相同"强：任何一位差异都会换哈希。
+    // 刻意放在计时之后：`to_matrix` 会改变池/流水线状态，放计时前会污染 ms。
+    if (cfg.hash)
+    {
+        auto out_m = engine.to_matrix(ctx.c);
+        if (!out_m) { std::printf("  哈希：to_matrix 失败\n"); std::abort(); }
+        std::uint64_t h = 1469598103934665603ull;
+        for (const auto& v : out_m->span())
+        {
+            std::uint32_t bits;
+            std::memcpy(&bits, &v, sizeof(bits));
+            for (int k = 0; k < 4; ++k)
+            {
+                h ^= (bits >> (8 * k)) & 0xffu;
+                h *= 1099511628211ull;
+            }
+        }
+        std::printf("  %-14s : hash=%016llx  (rows=%zu cols=%zu)\n", spec.name,
+                    static_cast<unsigned long long>(h), out_m->rows(), out_m->cols());
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -586,6 +690,8 @@ void print_help(const char* prog)
     help.opt("--cin/--cout/--kernel/--hw <n>", "卷积尺寸");
     help.opt("--rows/--cols <n>", "Softmax 形状");
     help.opt("--m/--n/--k <n>", "算子尺寸 (matmul: (m,k)·(k,n)；逐元素/归约: (m,n))");
+    help.opt("--dk <n>", "扫描原语 head 维 (scan_prefix/scan_suffix；默认 32)");
+    help.opt("--hash", "额外打印输出张量的位级哈希 (FNV-1a 64；kernel 改写逐位不变的 oracle)");
     help.opt("--help, -h", "显示此帮助信息");
 
     help.section("层名");
@@ -596,6 +702,7 @@ void print_help(const char* prog)
     help.text("matmul matmul_bt matmul_at batched_matmul add_inplace");
     help.text("row_reduce_sum col_reduce_sum transpose scale_inplace");
     help.text("matmul_q matmul_q_t (三值打包 GEMM) matmul_q_bw matmul_q_t_bw (权重带宽口径)");
+    help.text("scan_prefix scan_suffix (RLA/RAPT 状态扫描；尺寸: --batch/--heads/--dk/--seq)");
 }
 
 
@@ -658,6 +765,8 @@ int main(int argc, char* argv[])
         else if (a == "--m") { cfg.m = parse_size(argv[++i]); }
         else if (a == "--n") { cfg.n = parse_size(argv[++i]); }
         else if (a == "--k") { cfg.k = parse_size(argv[++i]); }
+        else if (a == "--dk") { cfg.dk = parse_size(argv[++i]); }
+        else if (a == "--hash") { cfg.hash = true; }
         else if (a == "--help" || a == "-h") { print_help(argv[0]); return 0; }
         else { std::printf("未知参数: %s（--help 查看用法）\n", a.c_str()); return 2; }
     }
