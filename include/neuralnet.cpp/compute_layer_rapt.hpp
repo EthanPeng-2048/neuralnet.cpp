@@ -156,10 +156,29 @@ private:
         NN_TRY(output_r, engine.try_create_tensor(BH * dk, seq, p_.compute));
         Tensor output = std::move(*output_r);
         // rms_inv_out == nullptr（checkpoint 模式）：不收集逐头 1/rms 缓存，
-        // backward 由 forward_recompute 重建；同时省掉 BH 次 GPU→CPU 下载。
-        // 宿主桥（17 §3 D11）：标量缓冲收逐头 1/rms，不经 Matrix。
-        std::vector<Scalar> rms_v;
-        if (rms_inv_out) rms_v.assign(BH * seq, Scalar{0});
+        // backward 由 forward_recompute 重建。
+        //
+        // P4-2（2026-10-15）：收集路径改为**设备侧拼装**。旧写法每头一次
+        // `download_vector`（= to_matrix ⇒ wait_in_flight 抽干整条流水线）+ 末尾
+        // 一次 upload ⇒ 每个 norm 调用 BH 次 GPU→CPU→GPU 往返。实测（RAPT 训练，
+        // 850M / d128·h4·L4 / seq128 / b8）该往返占墙钟 **75%**（256 次 to_matrix
+        // 与 258 次 begin/end_batch per step；GPT 同配置只有 2 次 begin_batch）。
+        // 新写法：一次 (BH,seq) F32 张量 + 逐头 `cast_into → insert_rows`，全部在
+        // 设备内完成（无 fence 等待、无 staging 传输）。
+        // 精度与旧路**逐位一致**：旧路以 P=F32 精确升位下载、再以 F32 回传；这里
+        // 对 f16 的 1/rms 先 `cast_into` 到 F32（f16→f32 精确）再插入 ⇒ 数值不变。
+        Tensor rms_out;      // 目标 (BH, seq) F32（缓存张量恒 F32，与旧路同）
+        Tensor ri_f32;       // f16 路径的 (1, seq) F32 落点（cast_into 不替换对象）
+        if (rms_inv_out)
+        {
+            NN_TRY(ro, engine.try_create_tensor(BH, seq, Precision::F32));
+            rms_out = std::move(*ro);
+            if (p_.compute != Precision::F32)
+            {
+                NN_TRY(rs, engine.try_create_tensor(1, seq, Precision::F32));
+                ri_f32 = std::move(*rs);
+            }
+        }
         for (std::size_t bh = 0; bh < BH; ++bh)
         {
             NN_TRY(x, engine.slice_rows(input, bh * dk, dk));
@@ -177,22 +196,22 @@ private:
             NN_TRY_CHECK(ri);
             if (rms_inv_out)
             {
-                NN_TRY(ri_v, detail::download_vector(engine, *ri));
-                for (std::size_t t = 0; t < seq; ++t)
-                    rms_v[bh * seq + t] = (*ri_v)[t];
+                if (ri_f32.valid())
+                {
+                    NN_TRY(c32, engine.cast_into(*ri, ri_f32));
+                    NN_TRY(ins_ri, engine.insert_rows(rms_out, bh, ri_f32));
+                }
+                else
+                {
+                    NN_TRY(ins_ri, engine.insert_rows(rms_out, bh, *ri));
+                }
             }
             auto n = dsl::compute(engine,
                 dsl::leaf(*x) * dsl::col_broadcast(*ri), dk, seq, p_.compute);
             NN_TRY_CHECK(n);
             NN_TRY(ins, engine.insert_rows(output, bh * dk, *n));
         }
-        if (rms_inv_out)
-        {
-            auto ri_t = detail::upload_span(engine, BH, seq, Precision::F32,
-                                            std::span(rms_v));
-            NN_TRY_CHECK(ri_t);
-            *rms_inv_out = std::move(*ri_t);
-        }
+        if (rms_inv_out) *rms_inv_out = std::move(rms_out);
         return output;
     }
 
