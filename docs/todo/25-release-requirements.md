@@ -34,5 +34,5 @@ ctest 是 CI **每次 push 都跑**的默认门禁，要求**分钟级**跑完�
 ## 3. 与常规门禁的关系
 
 - 常规 PR 门禁（构建 + `ctest` + `NN_BIND_DEBUG=1 ctest` + 文档审计）见
-  [`../CONTRIBUTING.md`](../CONTRIBUTING.md) §6 与 [`18-roadmap.md`](18-roadmap.md) §8。
+  [`../../CONTRIBUTING.md`](../../CONTRIBUTING.md) §6 与 [`18-roadmap.md`](18-roadmap.md) §8。
 - 本清单是**超集**：大版本在常规门禁之上，再要求第 1 项（端到端训练）与第 4 项（多编译器矩阵）。

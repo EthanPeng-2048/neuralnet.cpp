@@ -25,7 +25,7 @@
 - [领域模型工厂与 CLI 公共头](#领域模型工厂与 CLI 公共头)（3 条）
 - [src 应用入口（text/mnist/tokenizer/bench）](#src 应用入口（text/mnist/tokenizer/bench）)（5 条）
 - [GPU 手写原语 shader（shaders/*.comp）](#GPU 手写原语 shader（shaders/*.comp）)（12 条）
-- [构建期工具 / 基准脚本 / 对拍脚本](#构建期工具 / 基准脚本 / 对拍脚本)（13 条）
+- [构建期工具 / 基准脚本 / 对拍脚本](#构建期工具 / 基准脚本 / 对拍脚本)（14 条）
 - [表达式与融合测试](#表达式与融合测试)（18 条）
 - [层 / 模型测试](#层 / 模型测试)（14 条）
 - [精度 / RAPT / ZiPT / 分词器测试与探针](#精度 / RAPT / ZiPT / 分词器测试与探针)（11 条）
@@ -1033,6 +1033,30 @@ GPU 后端 / GPU 引擎头文件「历史状态类注释」摘录。整改原则
 # 构建期工具 / 基准脚本 / 对拍脚本
 
 > 本文件摘录 `tools/`、`bench/`、`compare_with_torch/` 注释整改中移出的历史状态记录（原位置为整改前行号）。
+
+## 文档一致性收口 + `doc_align_audit` [A] 扩展到 markdown 链接目标（P0-2/E8，2026-10-15）
+
+- 类型：演进记录 / 审计缺口收口（P0-2 的 ③⑤ 两项 + 台账漂移回正）
+- **原状**：① `docs/release-notes/` 缺 `v1.5.1.md`（E3，自 v1.5.1 起就缺）；
+  ② `bench/doc_align_audit.ps1` 的 [A] 只扫**反引号里的文件名**，markdown 链接目标不查 —— 实测
+  `todo/25-release-requirements.md` 里 `../CONTRIBUTING.md` 指向 `docs/CONTRIBUTING.md`（不存在）
+  这类死链因此长期漏检（E8）；③ ctest 计数在 12 号/AGENTS/18 号三处口径不一（47 vs 48），
+  §6 触发清单仍把**已落地**的 IR-C 列为待触发项，26 号进度总览停在"S4 未做 / ≤ f32 未达成"。
+- **改动**：① 补写 `docs/release-notes/v1.5.1.md`（依据 `git log/show v1.5.0..v1.5.1` 三个提交与
+  history 的两条归档，未引入新测量；含迁移指南表）；② `bench/doc_align_audit.ps1` 的 [A] 增加
+  "markdown 链接目标可达性"一节（相对路径按文档所在目录解析，外部 URL / 锚点 / `codex:` 豁免，
+  **行内代码段先剥离** —— 否则文档里作为示例写的链接形态会误报，实测就撞到过一次）；
+  ③ 台账回正：ctest 计数统一为 **48（GPU 树）/ 46（无 Vulkan 树）**（18 号 §2/§8.1/§8.2、AGENTS §11
+  索引行），§6 的 IR-C 行改为"已落地、不再是触发项"，§4.4 P3 由 8 项改 7 项，26 号进度总览改写为
+  "已全部收口"（S4 已完成 / S2 与 S5 已评估-不做 / 验收锚已达成），C9 标注已兑现，
+  新增 **C10**（GitHub issue #15：RAPT GPU 训练比同配置 GPT 慢 ≈16×，此前只在 issue 里跟踪、
+  未进任何台账）。
+- **证据**：`pwsh -File bench/doc_align_audit.ps1` → [A] 可行动 0（反引号文件名 0 + 链接目标 0，
+  检查 294 个链接目标）、[D]/[E]/[F] 各 0；`pwsh -File bench/doc_inventory.ps1` → `L2-VIOLATIONS: 0`、
+  `HANDWRITTEN-RESIDUE: 0`、virtual 52 / 宿主桥 41（与文档一致）；`ctest -N` 实测 48（GPU 树）/
+  46（CPU-only 树）。
+- **边界**：链接目标检查只覆盖**仓库内**相对路径（外部 URL 按设计不联网校验）；P0-2 的遗留项
+  `install()`/`find_package` 仍按用户裁定"本轮不做"（属 P0-4 剩余部分，不属本文档项）。
 
 ## P2-12 残差：优化器 dry-run 未透传 precision profile（2026-10-14；原位置 tools/scan_exprs.cpp:184）
 - 类型：bug 根因（构建期 scan 与运行期不同源）

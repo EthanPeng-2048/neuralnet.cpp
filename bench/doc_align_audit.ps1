@@ -1,6 +1,8 @@
 # doc_align_audit.ps1 — 文档↔代码对齐审计（只读）
 # 检查三类不一致：
-#   [A] 文档中反引号引用的 *.hpp/*.cpp/*.comp 文件是否真实存在
+#   [A] 文档引用的文件是否存在：① 反引号里的 *.hpp/*.cpp/*.comp/*.py 文件名；
+#       ② markdown 链接目标 `](路径)`（相对路径按文档所在目录解析；外部 URL / 锚点
+#       `#…` / `codex:` 跳过）——② 是本轮（2026-10-15，E8）补强项
 #   [B] 文档中是否仍引用已删除的符号
 #   [C] 数字型断言（virtual 数 / ctest 目标数 / N/N 绿）是否与实测一致
 param(
@@ -67,7 +69,38 @@ foreach ($d in $docs) {
         $hits | Select-Object -First $MaxPerFile | ForEach-Object { Write-Host $_ }
     }
 }
-Write-Host ("  [A] 可行动 {0} 处；历史白名单跳过 {1} 处（已删文件的历史提及）" -f $missCount, $histCount)
+# [A]② markdown 链接目标：相对路径按**文档所在目录**解析（跨目录引用写 `../…`）。
+# 豁免：外部 URL / `mailto:` / 纯锚点 `#…` / `codex:` 深链。检查数写入台账（链接目标数
+# 会随文档增长，只作披露；**可行动 = 找不到**）。
+$linkMiss = 0
+$linkChecked = 0
+foreach ($d in $docs) {
+    $dir = Split-Path -Parent $d
+    if (-not $dir) { $dir = '.' }
+    $lines = Get-Content $d
+    $hits = @()
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        # 先剥掉行内代码段（`…`）：文档里常把 `](路径)` 作为**示例**写在反引号内，
+        # 不是真链接 —— 不剥会误报（实测 18-roadmap 的 E8 行即此类）。
+        $text = $lines[$i] -replace '`[^`]*`', ''
+        foreach ($m in [regex]::Matches($text, '\]\(([^)\s]+)\)')) {
+            $t = $m.Groups[1].Value
+            if ($t -match '^(https?:|mailto:|codex:|#)') { continue }
+            $p = ($t -split '#')[0]
+            if (-not $p) { continue }
+            $linkChecked++
+            if (-not (Test-Path -LiteralPath (Join-Path $dir $p))) {
+                $hits += ("    {0}:{1}  {2}" -f $d, ($i + 1), $t)
+            }
+        }
+    }
+    if ($hits.Count -gt 0) {
+        $linkMiss += $hits.Count
+        Write-Host ("  -- {0}（{1} 处，示前 {2}）" -f $d, $hits.Count, [Math]::Min($MaxPerFile, $hits.Count))
+        $hits | Select-Object -First $MaxPerFile | ForEach-Object { Write-Host $_ }
+    }
+}
+Write-Host ("  [A] 可行动 {0} 处 = 反引号文件名 {1} 处 + markdown 链接目标 {2} 处（检查了 {3} 个链接目标）；历史白名单跳过 {4} 处（已删文件的历史提及）" -f ($missCount + $linkMiss), $missCount, $linkMiss, $linkChecked, $histCount)
 Write-Host ''
 
 # ── [B] 已删除符号的文档残留 ────────────────────────────────────────────
