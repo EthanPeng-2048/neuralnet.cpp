@@ -22,7 +22,8 @@ import sys
 import re
 import math
 from pathlib import Path
-from typing import Optional, Dict, Any, List, Tuple
+from dataclasses import dataclass
+from typing import Callable, Optional, Dict, Any, List, Tuple
 from tkinter import filedialog, messagebox
 from PIL import Image, ImageDraw, ImageFont, ImageTk
 
@@ -111,6 +112,8 @@ PRECISION_OPTIONS = ["f32", "f16"]
 #   精度预设下拉里的 "t1_58 (BitLinear + f16 存储)" = --t1_58 = profile_t1_58()
 #   = {param:T1_58, compute:F16, stable:F32, optimizer:F32}。
 PRECISION_PARAM_OPTIONS = ["f32", "f16", "t1_58"]
+# 精度预设下拉项（= CLI 的 --f16 / --t1_58 两个别名；选中即丢掉四槽位字段）
+PRECISION_PRESETS = ["f32 (默认)", "f16 (存储)", "t1_58 (BitLinear + f16 存储)"]
 # 模型架构：zipt(AttnZip) 已于 2026-10-01 移除（恢复前提见 docs/history/history.md / AGENTS §12）
 GPT_MODEL_OPTIONS = ["gpt", "rapt"]
 
@@ -225,6 +228,197 @@ def _make_label(parent, text, row, font_size=12, bold=True):
     lbl = ctk.CTkLabel(parent, text=text, font=("", font_size, weight))
     lbl.grid(row=row, column=0, columnspan=2, sticky="w", pady=(12, 4))
     return lbl
+
+
+# ================================================================
+#  声明式参数表（P2-6）：**UI 行与 collect_args 的唯一真源**
+# ================================================================
+# 背景：以前加一个 CLI 选项要手改两处（`__init__` 里建行 + `collect_args` 里
+# 取值/转换/条件发送），漏一处的后果是"界面有、命令没带"或"收集了不存在的键"。
+# 现在每个参数在 `fields()` 里声明一次：行怎么建（kind）、什么默认、发到
+# `collect_args` 的哪个键（arg）、空值发不发（emit）、复选框的 CLI 字面量
+# （literal）、属于哪个显隐分组（group）全在这里。
+#
+# 门禁（`bench/gui_cli_audit.py` 第 [5] 节）：**无 GUI** 导入本表的 fields()，
+# 用默认值/满值两趟驱动 `collect_fields` → 把 kwargs 交给对应 Controller →
+# 断言生成的 `--flag` 都真实存在；表里声明了而 Controller 不认的键、或
+# Controller 认而没人声明的键都会被点名。
+
+@dataclass(frozen=True)
+class Field:
+    """一个参数行。kind：
+
+    entry/int/float —— 文本框（int/float 会转换后发送）
+    option          —— 下拉框（**总是**发送；emit="always"）
+    check           —— 复选框（给了 literal 就按字面量总是发送，否则仅在与默认不同时发送）
+    file/dir/save   —— 文本框 + 文件/目录/另存为按钮（空则不发送）
+    text            —— 多行文本框（当前只用于 prompt）
+    label           —— 分组标题（不产生参数）
+    virtual         —— **无 UI**：仅声明"本 Tab 会从代码里发出这个 kwargs 键"，
+                       供门禁把该 Tab 的参数面收全（如 gpu / t1_58 / precision_*）
+    """
+    name: str
+    label: str = ""
+    kind: str = "entry"
+    default: Any = ""
+    options: Tuple[str, ...] = ()
+    arg: Optional[str] = None          # collect_args 的 kwargs 键（默认 = name）
+    emit: str = "changed"              # changed | always
+    literal: Optional[Tuple[Any, Any]] = None   # 复选框的 (真, 假) CLI 字面量
+    filetypes: Any = None
+    width: int = 200
+    group: str = ""                    # 显隐分组（子类给激活规则）
+    cast: Optional[Callable[[str], Any]] = None
+    skip_zero: bool = False            # int 字段：值 == 0 时不发送（旧手写口径）
+    ui_only: bool = False              # UI 状态：由 collect_args 后处理映射成别的键，自身不进命令
+
+    @property
+    def key(self) -> str:
+        """collect_args 里的 kwargs 键"""
+        return self.arg or self.name
+
+
+# ── 紧凑构造器（表本身要能一眼扫完，故不写 Field(...) 全参）──────────────
+def _e(name, label, default="", **kw):   return Field(name, label, "entry", default, **kw)
+def _i(name, label, default="", **kw):   return Field(name, label, "int", default, cast=int, **kw)
+def _fl(name, label, default="", **kw):  return Field(name, label, "float", default, cast=float, **kw)
+def _o(name, label, options, default=None, **kw):
+    return Field(name, label, "option", options[0] if default is None else default,
+                 tuple(options), emit="always", **kw)
+def _b(name, label, default=False, **kw):  return Field(name, label, "check", default, **kw)
+def _file(name, label, filetypes=None, **kw):
+    return Field(name, label, "file", "", filetypes=filetypes, **kw)
+def _dir(name, label, default="", **kw):  return Field(name, label, "dir", default, **kw)
+def _save(name, label, default="", filetypes=None, **kw):
+    return Field(name, label, "save", default, filetypes=filetypes, **kw)
+def _sep(label, group=""):                return Field("", label, "label", group=group)
+def _v(key, note=""):                     return Field(key, note, "virtual")
+
+
+def collect_fields(fields, value_of, active=None) -> Dict[str, Any]:
+    """按声明式表收集 kwargs —— **参数语义的唯一实现**（纯函数：门禁可直接测）。
+
+    · option 总是发送；entry/int/float/file/dir/save 空值不发（与旧手写口径一致）；
+    · int/float 按 cast 转换（值非法时抛 ValueError，与旧 `int(...)` 行为同）；
+    · check 给了 literal 就总是按字面量发送（`--shuffle-steps true|false`），
+      否则仅在与默认不同时发送（旧口径：`if var.get(): args[x] = True`）；
+    · label / virtual 不产生参数；`active` 为假（如按架构隐藏）的字段不发。
+    """
+    out: Dict[str, Any] = {}
+    for f in fields:
+        if f.kind in ("label", "virtual"):
+            continue
+        if active is not None and not active(f):
+            continue
+        key = f.key
+        value = value_of(f)
+        if f.kind == "check":
+            if f.literal is not None:
+                out[key] = f.literal[0] if bool(value) else f.literal[1]
+            elif f.emit == "always" or bool(value) != bool(f.default):
+                out[key] = bool(value)
+            continue
+        text = "" if value is None else str(value)
+        if text == "" and f.emit != "always":
+            continue
+        if f.skip_zero and f.cast is not None and f.cast(text) == 0:
+            continue
+        if f.emit == "always":
+            out[key] = f.cast(text) if f.cast else text
+        else:
+            out[key] = f.cast(text) if f.cast else text
+    return out
+
+
+class ParamsMixin:
+    """把 `fields()` 声明翻译成"建控件 + 取值 + 显隐"的通用实现。"""
+
+    # 控件表 / 行表：由 `_build_fields` 填充。这里只做**类级声明**（注解不产生
+    # 共享的可变默认值），同时让 `bench/gui_cli_audit.py` 的 [3] 节静态检查
+    # 认得这两个属性（子类里读 self._w 不会被误报"从未赋值"）。
+    _w: Dict[str, Any]
+    _rows: List[Tuple["Field", Any]]
+
+    @classmethod
+    def fields(cls) -> Tuple[Field, ...]:
+        return ()
+
+    # ── 建行 ─────────────────────────────────────────────────────
+    def _build_fields(self, p, start_row: int = 0) -> int:
+        self._w: Dict[str, Any] = {}
+        r = start_row
+        self._rows: List[Tuple[Field, Any]] = []
+        for f in self.fields():
+            if f.kind == "virtual":
+                continue
+            if f.kind == "label":
+                self._rows.append((f, _make_label(p, f.label, r))); r += 1
+                continue
+            widget, used = self._make_field_widget(p, f, r)
+            self._w[f.name] = widget
+            self._rows.append((f, self._w[f.name]))
+            r += used
+        return r
+
+    def _apply_groups(self):
+        """按 `_field_active`（默认看 group）统一显隐 —— 取代逐 Tab 手写控件清单"""
+        for f, w in self._rows:
+            if not f.group:
+                continue
+            w = getattr(w, "widget", w)
+            w.grid() if self._field_active(f) else w.grid_remove()
+
+    @staticmethod
+    def _make_field_widget(p, f: Field, r: int) -> Tuple[Any, int]:
+        """建一个字段的控件；返回 (控件, 占用的网格行数)"""
+        if f.kind == "option":
+            return _make_option_row(p, f.label, r, list(f.options), f.default,
+                                    width=f.width), 1
+        if f.kind == "check":
+            return _make_checkbox_row(p, f.label, r, f.default), 1
+        if f.kind == "file":
+            w = _make_file_row(p, f.label, r, filetypes=f.filetypes, width=f.width)
+            if f.default:
+                w.delete(0, "end"); w.insert(0, str(f.default))
+            return w, 1
+        if f.kind == "dir":
+            w = _make_dir_row(p, f.label, r, width=f.width)
+            if f.default:
+                w.delete(0, "end"); w.insert(0, str(f.default))
+            return w, 1
+        if f.kind == "save":
+            return _make_save_row(p, f.label, r, default_name=str(f.default),
+                                  filetypes=f.filetypes, width=f.width), 1
+        if f.kind == "text":
+            lbl = ctk.CTkLabel(p, text=f.label, anchor="w")
+            lbl.grid(row=r, column=0, columnspan=2, sticky="w", pady=(6, 2))
+            box = ctk.CTkTextbox(p, width=f.width, height=70)
+            box.grid(row=r + 1, column=0, columnspan=2, sticky="w", pady=(0, 4))
+            if f.default:
+                box.insert("1.0", str(f.default))
+            return box, 2
+        return _make_entry_row(p, f.label, r, f.default, width=f.width), 1
+
+    # ── 取值 / 收集 ──────────────────────────────────────────────
+    def _value_of(self, f: Field):
+        w = self._w[f.name]
+        if f.kind == "text":
+            return w.get("1.0", "end").strip()
+        return w.get()
+
+    def _field_active(self, f: Field) -> bool:
+        return True
+
+    def collect_args(self) -> Dict[str, Any]:
+        return collect_fields(self.fields(), self._value_of, self._field_active)
+
+    def _set_field(self, name: str, value):
+        """按表名设置控件值（option 的 var 需经 .widget.set）"""
+        w = self._w[name]
+        if hasattr(w, "widget") and hasattr(w.widget, "set"):
+            w.widget.set(value)
+        else:
+            w.delete(0, "end"); w.insert(0, str(value))
 
 
 # ================================================================
@@ -629,8 +823,12 @@ class OutputPanel(ctk.CTkFrame):
 # ================================================================
 #  TabBase - 所有标签页的基类
 # ================================================================
-class TabBase(ctk.CTkFrame):
-    """标签页基类：左右分栏（参数 | 输出）"""
+class TabBase(ParamsMixin, ctk.CTkFrame):
+    """标签页基类：左右分栏（参数 | 输出）。
+
+    `ParamsMixin` 提供声明式字段表（P2-6）：子类声明 `fields()` 即可自动建行 +
+    收集 kwargs；本类只保留布局/运行/输出这些通用逻辑。
+    """
 
     def __init__(self, master, controller, chart_configs=None, **kw):
         super().__init__(master, fg_color="transparent", **kw)
@@ -667,10 +865,6 @@ class TabBase(ctk.CTkFrame):
 
         self._running = False
         self.pack(fill="both", expand=True)
-
-    # subclass hook ------------------------------------------------
-    def collect_args(self) -> Dict[str, Any]:
-        return {}
 
     def _on_run(self):
         if self._running:
@@ -799,91 +993,15 @@ class MnistTrainTab(TabBase):
                              {"title": "Accuracy", "metrics": ["train_accuracy", "test_accuracy"]},
                          ])
 
+        # 参数行全部来自声明式字段表（P2-6）：加一个 CLI 选项 = 在 fields() 里加一行
         p = self.params_frame
-        r = 0
+        self._build_fields(p, 0)
 
-        # --- 基本参数 ---
-        self.arch = _make_option_row(p, "架构", r, ARCH_OPTIONS, "mlp"); r += 1
-        self.dataset = _make_dir_row(p, "数据集目录", r)
-        self.dataset.delete(0, "end")
-        self.dataset.insert(0, str(DATASETS_DIR / "mnist_data"))
-        r += 1
-        self.save_path = _make_save_row(p, "保存路径", r,
-                                         default_name="pretrained/mnist_model.nnmodel"); r += 1
-        self.resume_path = _make_file_row(p, "恢复路径 (训练断点 .nnckpt)", r,
-                                           filetypes=[("训练断点", "*.nnckpt *.bin")]); r += 1
-        self.epochs = _make_entry_row(p, "轮数 (epochs)", r, "10"); r += 1
-        self.batch_size = _make_entry_row(p, "批大小", r, "64"); r += 1
-        self.optimizer = _make_option_row(p, "优化器", r, optimizer_options("mnist_train"), "adam"); r += 1
-        self.weight_decay = _make_entry_row(p, "权重衰减", r, "0.01"); r += 1
-        self.engine = _make_option_row(p, "计算引擎", r, ENGINE_OPTIONS, "CPU"); r += 1
-        self.max_samples = _make_entry_row(p, "最大样本数 (0=全部)", r, "0"); r += 1
-
-        # --- 学习率调度 ---
-        self.lr_sep_label = _make_label(p, "── 学习率调度 ──", r); r += 1
-        self.lr = _make_entry_row(p, "最大学习率 (lr)", r, "0.001"); r += 1
-        self.lr_schedule = _make_option_row(p, "调度类型", r, LR_SCHEDULE_OPTIONS, "fixed"); r += 1
-        self.min_lr = _make_entry_row(p, "最小学习率 (min_lr)", r, "1e-6"); r += 1
-        self.warmup_epochs = _make_entry_row(p, "预热轮数", r, "0"); r += 1
-        self.lr_per_epoch = _make_entry_row(p, "每轮 lr (逗号分隔, 可选)", r, ""); r += 1
-
-        # --- 训练控制 ---
-        _make_label(p, "── 训练控制 ──", r); r += 1
-        self.shuffle_steps = _make_checkbox_row(p, "每 epoch 打乱 batch", r, True); r += 1
-
-        # --- 混合精度 ---
-        self.mp_sep_label = _make_label(p, "── 混合精度 ──", r); r += 1
-        self.precision_preset = _make_option_row(p, "精度预设", r,
-            ["f32 (默认)", "f16 (存储)", "t1_58 (BitLinear + f16 存储)"], "f32 (默认)"); r += 1
-        self.precision_param = _make_option_row(p, "参数精度 (param)", r, PRECISION_PARAM_OPTIONS, "f32"); r += 1
-        self.precision_compute = _make_option_row(p, "计算精度 (compute)", r, PRECISION_OPTIONS, "f32"); r += 1
-        self.precision_stable = _make_option_row(p, "稳定精度 (stable)", r, PRECISION_OPTIONS, "f32"); r += 1
-        self.precision_optimizer = _make_option_row(p, "优化器精度 (optimizer)", r, PRECISION_OPTIONS, "f32"); r += 1
-        self._mp_widgets = [self.mp_sep_label, self.precision_preset,
-                            self.precision_param, self.precision_compute,
-                            self.precision_stable, self.precision_optimizer]
-
-        # --- 归一化（全架构通用，auto = 按架构默认：
-        #     MLP/ViT = layernorm, CNN = batchnorm；位置见下一行）---
-        self.norm = _make_option_row(p, "归一化层", r, NORM_OPTIONS, "auto"); r += 1
-        # 归一化位置（CNN/ViT 专用）：MLP 挂载位置固定 → 随架构隐藏
-        self.norm_place = _make_option_row(p, "归一化位置", r, NORM_PLACE_OPTIONS, "auto"); r += 1
-        self._norm_place_widgets = [self.norm_place]
-
-        # --- MLP 专用参数 ---
-        self.mlp_sep_label = _make_label(p, "── MLP 参数 ──", r); r += 1
-        self.layer_dims = _make_entry_row(p, "layer_dims", r, "784,512,256,128,64,10"); r += 1
-        self._mlp_widgets = [self.mlp_sep_label, self.layer_dims]
-
-        # --- Transformer 专用参数 ---
-        self.tf_sep_label = _make_label(p, "── Transformer 参数 ──", r); r += 1
-        self.d_model = _make_entry_row(p, "d_model", r, "64"); r += 1
-        self.num_heads = _make_entry_row(p, "num_heads", r, "4"); r += 1
-        self.num_layers = _make_entry_row(p, "num_layers", r, "2"); r += 1
-        self.d_ff = _make_entry_row(p, "d_ff", r, "128"); r += 1
-        self.patch_size = _make_entry_row(p, "patch_size", r, "7"); r += 1
-        self.eval_samples = _make_entry_row(p, "eval_samples", r, "200"); r += 1
-        self._tf_widgets = [self.tf_sep_label, self.d_model, self.num_heads,
-                            self.num_layers, self.d_ff, self.patch_size, self.eval_samples]
-
-        # --- CNN 专用参数 (LeNet-5 风格) ---
-        self.cnn_sep_label = _make_label(p, "── CNN 参数 ──", r); r += 1
-        self.cnn_channels = _make_entry_row(p, "cnn_channels", r, "6,16"); r += 1
-        self.cnn_kernels = _make_entry_row(p, "cnn_kernels", r, "5,5"); r += 1
-        self.cnn_pool = _make_entry_row(p, "cnn_pool", r, "2"); r += 1
-        self.cnn_fc = _make_entry_row(p, "cnn_fc", r, "120,10"); r += 1
-        self._cnn_widgets = [self.cnn_sep_label, self.cnn_channels, self.cnn_kernels,
-                             self.cnn_pool, self.cnn_fc]
-
-        # --- LR 调度相关控件（fixed 时隐藏） ---
-        self._lr_schedule_widgets = [self.min_lr, self.warmup_epochs]
-
-        # 架构/调度切换回调
-        self.arch.trace_add("write", self._on_arch_change)
-        self.lr_schedule.trace_add("write", self._on_lr_schedule_change)
-        self.precision_preset.trace_add("write", self._on_precision_preset_change)
-        self._on_arch_change()
-        self._on_lr_schedule_change()
+        # 架构 / 调度 / 预设切换回调（显隐统一由 _apply_groups 按 group 驱动）
+        self._w["arch"].trace_add("write", lambda *a: self._apply_groups())
+        self._w["lr_schedule"].trace_add("write", lambda *a: self._apply_groups())
+        self._w["precision_preset"].trace_add("write", self._on_precision_preset_change)
+        self._apply_groups()
         self._on_precision_preset_change()
 
         self._add_export_button()
@@ -901,112 +1019,125 @@ class MnistTrainTab(TabBase):
         return {"format_version": 1, "name": name, "task": "mnist",
                 "device": dev, "data": data, "hyperparameters": args}
 
-    def _on_arch_change(self, *args):
-        """根据架构选择显示 MLP / Transformer / CNN 参数"""
-        arch = self.arch.get()
-        for w in self._mlp_widgets:
-            w = getattr(w, "widget", w)
-            w.grid() if arch == "mlp" else w.grid_remove()
-        for w in self._tf_widgets:
-            w = getattr(w, "widget", w)
-            w.grid() if arch == "transformer" else w.grid_remove()
-        for w in self._cnn_widgets:
-            w = getattr(w, "widget", w)
-            w.grid() if arch == "cnn" else w.grid_remove()
-        for w in self._norm_place_widgets:
-            w = getattr(w, "widget", w)
-            w.grid() if arch in ("transformer", "cnn") else w.grid_remove()
+    @classmethod
+    def fields(cls) -> Tuple[Field, ...]:
+        """MNIST 训练页字段表（P2-6：UI 行与 collect_args 的唯一真源）。
 
-    def _on_lr_schedule_change(self, *args):
-        """fixed 调度下隐藏 min_lr / warmup"""
-        is_fixed = self.lr_schedule.get() == "fixed"
-        for w in self._lr_schedule_widgets:
-            w = getattr(w, "widget", w)
-            if is_fixed:
-                w.grid_remove()
-            else:
-                w.grid()
+        group 语义（见 `_field_active`）：mlp/tf/cnn = 按架构显示；
+        place = 仅 Transformer/CNN（MLP 的归一化挂载位置由结构固定）；
+        sched = 仅非 fixed 调度（fixed 下 min_lr / warmup 无意义）。
+        """
+        return (
+            _o("arch", "架构", ARCH_OPTIONS, "mlp"),
+            _dir("dataset", "数据集目录", str(DATASETS_DIR / "mnist_data")),
+            _save("save_path", "保存路径", "pretrained/mnist_model.nnmodel", arg="save",
+                  filetypes=[("模型文件", "*.nnmodel *.bin")]),
+            _file("resume_path", "恢复路径 (训练断点 .nnckpt)", arg="resume",
+                  filetypes=[("训练断点", "*.nnckpt *.bin")]),
+            _i("epochs", "轮数 (epochs)", "10"),
+            _i("batch_size", "批大小", "64"),
+            _o("optimizer", "优化器", optimizer_options("mnist_train"), "adam"),
+            _fl("weight_decay", "权重衰减", "0.01"),
+            _o("engine", "计算引擎", ENGINE_OPTIONS, "CPU", ui_only=True),
+            _i("max_samples", "最大样本数 (0=全部)", "0"),
+            _sep("── 学习率调度 ──"),
+            _fl("lr", "最大学习率 (lr)", "0.001"),
+            _o("lr_schedule", "调度类型", LR_SCHEDULE_OPTIONS, "fixed"),
+            _fl("min_lr", "最小学习率 (min_lr)", "1e-6", group="sched"),
+            _i("warmup_epochs", "预热轮数", "0", group="sched"),
+            _e("lr_per_epoch", "每轮 lr (逗号分隔, 可选)"),
+            _sep("── 训练控制 ──"),
+            # --shuffle-steps 收 true/false 字面量（不是开关标志）⇒ literal
+            _b("shuffle_steps", "每 epoch 打乱 batch", True, literal=("true", "false")),
+            _sep("── 混合精度 ──"),
+            _o("precision_preset", "精度预设", PRECISION_PRESETS, PRECISION_PRESETS[0],
+               ui_only=True),
+            _o("precision_param", "参数精度 (param)", PRECISION_PARAM_OPTIONS, "f32"),
+            _o("precision_compute", "计算精度 (compute)", PRECISION_OPTIONS, "f32"),
+            _o("precision_stable", "稳定精度 (stable)", PRECISION_OPTIONS, "f32"),
+            _o("precision_optimizer", "优化器精度 (optimizer)", PRECISION_OPTIONS, "f32"),
+            _o("norm", "归一化层", NORM_OPTIONS, "auto"),
+            _o("norm_place", "归一化位置", NORM_PLACE_OPTIONS, "auto", group="place"),
+            _sep("── MLP 参数 ──", group="mlp"),
+            _e("layer_dims", "layer_dims", "784,512,256,128,64,10", group="mlp"),
+            _sep("── Transformer 参数 ──", group="tf"),
+            _i("d_model", "d_model", "64", group="tf"),
+            _i("num_heads", "num_heads", "4", group="tf"),
+            _i("num_layers", "num_layers", "2", group="tf"),
+            _i("d_ff", "d_ff", "128", group="tf"),
+            _i("patch_size", "patch_size", "7", group="tf"),
+            _i("eval_samples", "eval_samples", "200", group="tf"),
+            _sep("── CNN 参数 ──", group="cnn"),
+            _e("cnn_channels", "cnn_channels", "6,16", group="cnn"),
+            _e("cnn_kernels", "cnn_kernels", "5,5", group="cnn"),
+            _i("cnn_pool", "cnn_pool", "2", group="cnn"),
+            _e("cnn_fc", "cnn_fc", "120,10", group="cnn"),
+            # 无 UI：由 collect_args 的后处理发出（门禁用它们把参数面收全）
+            _v("gpu", "engine == GPU (Vulkan) 时才发"),
+            _v("f16", "精度预设 = f16"),
+            _v("t1_58", "精度预设 = t1_58"),
+        )
+
+    def _field_active(self, f: Field) -> bool:
+        if f.group == "mlp":
+            return self._w["arch"].get() == "mlp"
+        if f.group == "tf":
+            return self._w["arch"].get() == "transformer"
+        if f.group == "cnn":
+            return self._w["arch"].get() == "cnn"
+        if f.group == "place":
+            return self._w["arch"].get() in ("transformer", "cnn")
+        if f.group == "sched":
+            return self._w["lr_schedule"].get() != "fixed"
+        return True
+
+    def build_pack_config(self):
+        """把当前 MNIST 训练 UI 参数打包为训练包配置"""
+        args = self.collect_args()
+        data = {}
+        if args.get("dataset"):
+            data["train"] = args.pop("dataset")
+        dev = "cpu"
+        if args.pop("gpu", False):
+            dev = "gpu"
+        name = Path(args.get("save", "mnist_model.nnmodel")).stem or "mnist_run"
+        return {"format_version": 1, "name": name, "task": "mnist",
+                "device": dev, "data": data, "hyperparameters": args}
 
     def _on_precision_preset_change(self, *args):
-        """精度预设切换时自动填充各精度字段。
-
-        与 CLI 语义严格对齐（mnist_train --help / precision.hpp）：
-          · "f16 (存储)"  = --f16     = profile_f16()     = {param:F16,    compute:F16, stable:F32, optimizer:F32}
-          · "t1_58"       = --t1_58   = profile_t1_58()  = {param:T1_58,  compute:F16, stable:F32, optimizer:F32}
-        t1_58 预设下 param 之外的三个字段与 f16 预设逐字段相同（"其他默认 f16"），
-        stable/optimizer 留 F32 有实测依据（见 precision.hpp profile_f16() 注释）。
+        """精度预设切换时自动填充各精度字段（与 CLI 的 --f16 / --t1_58 逐字段对齐）：
+        f16 → {param:F16, compute:F16, stable:F32, optimizer:F32}；
+        t1_58 → 同 f16 但 param=T1_58（"其他默认 f16"）。语义见 precision.hpp。
         """
-        preset = self.precision_preset.get()
+        preset = self._w["precision_preset"].get()
         if "t1_58" in preset:
-            # 三值权重 + f16 存储（三值只作用于 BitLinear 的权重）
-            self.precision_param.widget.set("t1_58")
-            self.precision_compute.widget.set("f16")
-            self.precision_stable.widget.set("f32")
-            self.precision_optimizer.widget.set("f32")
+            param, compute = "t1_58", "f16"
         elif "f16" in preset:
-            # f16 存储：param 与 compute 都是 f16（= CLI --f16 = profile_f16()）
-            self.precision_param.widget.set("f16")
-            self.precision_compute.widget.set("f16")
-            self.precision_stable.widget.set("f32")
-            self.precision_optimizer.widget.set("f32")
+            param, compute = "f16", "f16"
         else:
-            # 全 f32
-            self.precision_param.widget.set("f32")
-            self.precision_compute.widget.set("f32")
-            self.precision_stable.widget.set("f32")
-            self.precision_optimizer.widget.set("f32")
+            param, compute = "f32", "f32"
+        self._set_field("precision_param", param)
+        self._set_field("precision_compute", compute)
+        self._set_field("precision_stable", "f32")
+        self._set_field("precision_optimizer", "f32")
 
     def collect_args(self):
-        args = {"arch": self.arch.get()}
-        if self.dataset.get(): args["dataset"] = self.dataset.get()
-        if self.save_path.get(): args["save"] = self.save_path.get()
-        if self.resume_path.get(): args["resume"] = self.resume_path.get()
-        if self.epochs.get(): args["epochs"] = int(self.epochs.get())
-        if self.lr.get(): args["lr"] = float(self.lr.get())
-        if self.batch_size.get(): args["batch_size"] = int(self.batch_size.get())
-        args["optimizer"] = self.optimizer.get()
-        if self.weight_decay.get(): args["weight_decay"] = float(self.weight_decay.get())
-        engine = self.engine.get()
-        if engine == "GPU (Vulkan)":
+        """表驱动收集 + **两处显式后处理**（表表达不了的条件语义）。
+
+        后处理只做"开关 / 别名的选择"，不做值搬运：
+          · `engine` → `--gpu`（UI 是下拉，CLI 是布尔标志）；
+          · `precision_preset` → `--f16` / `--t1_58` 别名（选中时**丢掉**四个槽位
+            字段，与 CLI 的"预设 = 整份 profile 快捷方式"语义一致）。
+        """
+        args = collect_fields(self.fields(), self._value_of, self._field_active)
+        if args.pop("engine", "CPU") == "GPU (Vulkan)":
             args["gpu"] = True
-        if self.max_samples.get(): args["max_samples"] = int(self.max_samples.get())
-        if self.lr_schedule.get(): args["lr_schedule"] = self.lr_schedule.get()
-        if self.min_lr.get(): args["min_lr"] = float(self.min_lr.get())
-        if self.warmup_epochs.get(): args["warmup_epochs"] = int(self.warmup_epochs.get())
-        # 手动每轮 lr（逗号分隔字符串，CLI --lr-per-epoch，优先级最高）
-        if self.lr_per_epoch.get(): args["lr_per_epoch"] = self.lr_per_epoch.get()
-        # 训练控制：--shuffle-steps 需要 true/false 字面量（不是开关标志）
-        args["shuffle_steps"] = "true" if self.shuffle_steps.get() else "false"
-        # 混合精度
-        if "t1_58" in self.precision_preset.get():
-            args["t1_58"] = True
-        elif "f16" in self.precision_preset.get():
-            args["f16"] = True
-        else:
-            args["precision_param"] = self.precision_param.get()
-            args["precision_compute"] = self.precision_compute.get()
-            args["precision_stable"] = self.precision_stable.get()
-            args["precision_optimizer"] = self.precision_optimizer.get()
-        # 架构特定参数
-        arch = self.arch.get()
-        # 归一化类型：全架构通用（auto = 与 CLI 默认一致，按架构取最合适）
-        args["norm"] = self.norm.get()
-        if arch == "mlp":
-            if self.layer_dims.get(): args["layer_dims"] = self.layer_dims.get()
-        elif arch == "transformer":
-            args["norm_place"] = self.norm_place.get()
-            if self.d_model.get(): args["d_model"] = int(self.d_model.get())
-            if self.num_heads.get(): args["num_heads"] = int(self.num_heads.get())
-            if self.num_layers.get(): args["num_layers"] = int(self.num_layers.get())
-            if self.d_ff.get(): args["d_ff"] = int(self.d_ff.get())
-            if self.patch_size.get(): args["patch_size"] = int(self.patch_size.get())
-            if self.eval_samples.get(): args["eval_samples"] = int(self.eval_samples.get())
-        elif arch == "cnn":
-            args["norm_place"] = self.norm_place.get()
-            if self.cnn_channels.get(): args["cnn_channels"] = self.cnn_channels.get()
-            if self.cnn_kernels.get(): args["cnn_kernels"] = self.cnn_kernels.get()
-            if self.cnn_pool.get(): args["cnn_pool"] = int(self.cnn_pool.get())
-            if self.cnn_fc.get(): args["cnn_fc"] = self.cnn_fc.get()
+        preset = args.pop("precision_preset", PRECISION_PRESETS[0])
+        if "t1_58" in preset or "f16" in preset:
+            args["t1_58" if "t1_58" in preset else "f16"] = True
+            for slot in ("precision_param", "precision_compute", "precision_stable",
+                         "precision_optimizer"):
+                args.pop(slot, None)
         return args
 
 
@@ -1094,12 +1225,8 @@ class MnistInferTab(TabBase):
         self._tk = _tk
 
         p = self.params_frame
-        r = 0
-        self.model_path = _make_file_row(p, "模型路径", r,
-                                          filetypes=[("模型文件", "*.nnmodel *.bin *.onnx")]); r += 1
-        self.input_method = _make_option_row(p, "输入方式", r,
-                                              ["单个文件", "目录", "画板绘制"],
-                                              "单个文件"); r += 1
+        # 普通字段走声明式表（P2-6）；输入方式/画板是自定义控件，见本类注释
+        r = self._build_fields(p, 0)
 
         # 单个文件输入行
         self._single_file_label = ctk.CTkLabel(p, text="图片文件 (CSV)", anchor="w", width=140)
@@ -1134,9 +1261,6 @@ class MnistInferTab(TabBase):
                        command=_browse_dir).pack(side="left")
         self._dir_row = _dir_frame
         r += 1
-        self.topk = _make_entry_row(p, "显示TopK", r, "3"); r += 1
-        self.show_pixels = _make_checkbox_row(p, "显示像素 (调试)", r); r += 1
-        self.engine = _make_option_row(p, "计算引擎", r, ENGINE_OPTIONS, "CPU"); r += 1
 
         # --- 画板区域（28×28 正方形，每格 10px） ---
         CANVAS_SIZE = 280
@@ -1209,7 +1333,7 @@ class MnistInferTab(TabBase):
         self.canvas.bind("<ButtonRelease-1>", self._on_draw_end)
 
         # 输入方式切换回调
-        self.input_method.trace_add("write", self._on_input_method_change)
+        self._w["input_method"].trace_add("write", self._on_input_method_change)
         self._on_input_method_change()
 
     def _on_canvas_configure(self, event):
@@ -1220,7 +1344,7 @@ class MnistInferTab(TabBase):
 
     def _on_input_method_change(self, *args):
         """切换输入方式时显示/隐藏对应控件：单个文件 / 目录 / 画板"""
-        method = self.input_method.get()
+        method = self._w["input_method"].get()
         is_canvas = method == "画板绘制"
         is_single = method == "单个文件"
         is_dir = method == "目录"
@@ -1415,14 +1539,35 @@ class MnistInferTab(TabBase):
         tmp.close()
         return tmp.name
 
+    @classmethod
+    def fields(cls) -> Tuple[Field, ...]:
+        """MNIST 推理页字段表（P2-6）。
+
+        **只收普通参数行**：`input_method` 的三态（单个文件 / 目录 / 画板绘制）
+        各自带自定义控件（文件行、目录行、画板 + 预览），其取值与 `input` 的映射
+        在 `collect_args` 里显式写（这类"按选项切换整块 UI"的语义表表达不了）。
+        `topk` / `show_pixels` / `engine` 在自定义块**之后**建行，故 `fields()` 里
+        声明、由 `_build_fields` 一次性建成（顺序 = 表顺序）。
+        """
+        return (
+            _file("model_path", "模型路径", arg="model",
+                  filetypes=[("模型文件", "*.nnmodel *.bin *.onnx")]),
+            _o("input_method", "输入方式", ["单个文件", "目录", "画板绘制"], "单个文件",
+               ui_only=True),
+            _i("topk", "显示TopK", "3"),
+            _b("show_pixels", "显示像素 (调试)", emit="always"),
+            _o("engine", "计算引擎", ENGINE_OPTIONS, "CPU", ui_only=True),
+            _v("gpu", "engine == GPU (Vulkan) 时才发"),
+            _v("input", "由输入方式（文件/目录/画板 CSV）决定"),
+        )
+
     def collect_args(self):
-        args = {}
-        if self.model_path.get(): args["model"] = self.model_path.get()
-        # 根据输入方式决定 input
-        method = self.input_method.get()
+        args = collect_fields(self.fields(), self._value_of, self._field_active)
+        args.pop("input_method", None)   # UI 状态，不进命令
+        # 输入方式的三态各自带自定义控件（画板会现场导出 CSV）——表表达不了，显式写
+        method = self._w["input_method"].get()
         if method == "画板绘制":
-            tmp_path = self._save_canvas_as_csv()
-            args["input"] = tmp_path
+            args["input"] = self._save_canvas_as_csv()
             self._update_preview_from_buffer()
         elif method == "单个文件":
             if self.single_file_path.get():
@@ -1431,10 +1576,7 @@ class MnistInferTab(TabBase):
         elif method == "目录":
             if self.dir_path.get():
                 args["input"] = self.dir_path.get()
-        if self.topk.get(): args["topk"] = int(self.topk.get())
-        args["show_pixels"] = self.show_pixels.get()
-        engine = self.engine.get()
-        if engine == "GPU (Vulkan)":
+        if args.pop("engine", "CPU") == "GPU (Vulkan)":
             args["gpu"] = True
         return args
 
@@ -1443,167 +1585,138 @@ class MnistInferTab(TabBase):
 #  Tab 3: 分词器训练
 # ================================================================
 class TokenizerTrainTab(TabBase):
+    @classmethod
+    def fields(cls) -> Tuple[Field, ...]:
+        return (
+            _file("text_file", "训练文本文件", filetypes=[("文本文件", "*.txt")]),
+            _o("tokenizer_type", "分词器类型", TOKENIZER_OPTIONS, "bpe", arg="tokenizer"),
+            _save("output_path", "输出路径", "bpe_vocab.nnvocab", arg="output",
+                  filetypes=[("词表文件", "*.nnvocab")]),
+            _i("vocab_size", "词表大小", "5000"),
+            _i("min_freq", "最小频率", "2"),
+            _i("threads", "预分词线程数 (0=自动)", "0"),
+        )
+
     def __init__(self, master):
         super().__init__(master, TokenizerTrainController())
-
-        p = self.params_frame
-        r = 0
-        self.text_file = _make_file_row(p, "训练文本文件", r,
-                                         filetypes=[("文本文件", "*.txt")]); r += 1
-        self.tokenizer_type = _make_option_row(p, "分词器类型", r,
-                                                TOKENIZER_OPTIONS, "bpe"); r += 1
-        self.output_path = _make_save_row(p, "输出路径", r,
-                                           default_name="bpe_vocab.nnvocab",
-                                           filetypes=[("词表文件", "*.nnvocab")]); r += 1
-        self.vocab_size = _make_entry_row(p, "词表大小", r, "5000"); r += 1
-        self.min_freq = _make_entry_row(p, "最小频率", r, "2"); r += 1
-        self.threads = _make_entry_row(p, "预分词线程数 (0=自动)", r, "0"); r += 1
-
-    def collect_args(self):
-        args = {}
-        if self.text_file.get(): args["text_file"] = self.text_file.get()
-        args["tokenizer"] = self.tokenizer_type.get()
-        if self.output_path.get(): args["output"] = self.output_path.get()
-        if self.vocab_size.get(): args["vocab_size"] = int(self.vocab_size.get())
-        if self.min_freq.get(): args["min_freq"] = int(self.min_freq.get())
-        if self.threads.get(): args["threads"] = int(self.threads.get())
-        return args
+        self._build_fields(self.params_frame, 0)
 
 
 # ================================================================
 #  Tab 4: 分词器推理
 # ================================================================
 class TokenizerInferTab(TabBase):
+    @classmethod
+    def fields(cls) -> Tuple[Field, ...]:
+        return (
+            _file("vocab_path", "词表路径", arg="vocab",
+                  filetypes=[("词表文件", "*.nnvocab")]),
+            _e("encode_text", "编码文本", "", arg="encode"),
+            _e("decode_ids", "解码ID列表", "", arg="decode"),
+            _file("encode_file", "编码文件", filetypes=[("文本文件", "*.txt")]),
+            # 位置参数：直接给文本文件即统计每行 token 数（--top 控制排行榜行数）
+            _file("stats_file", "统计文件 (最长行 token 数)", arg="text_file",
+                  filetypes=[("文本文件", "*.txt")]),
+            _i("top", "最长行排行榜 (top)", "10"),
+            _i("threads", "encode 线程数 (0=自动)", "0"),
+            _b("show_bytes_var", "显示字节", arg="show_bytes"),
+        )
+
     def __init__(self, master):
         super().__init__(master, TokenizerInferController())
-
-        p = self.params_frame
-        r = 0
-        self.vocab_path = _make_file_row(p, "词表路径", r,
-                                          filetypes=[("词表文件", "*.nnvocab")]); r += 1
-        self.encode_text = _make_entry_row(p, "编码文本", r, "", width=200); r += 1
-        self.decode_ids = _make_entry_row(p, "解码ID列表", r, "", width=200); r += 1
-        self.encode_file = _make_file_row(p, "编码文件", r,
-                                           filetypes=[("文本文件", "*.txt")]); r += 1
-        self.stats_file = _make_file_row(p, "统计文件 (最长行 token 数)", r,
-                                          filetypes=[("文本文件", "*.txt")]); r += 1
-        self.top = _make_entry_row(p, "最长行排行榜 (top)", r, "10"); r += 1
-        self.threads = _make_entry_row(p, "encode 线程数 (0=自动)", r, "0"); r += 1
-        self.show_bytes_var = _make_checkbox_row(p, "显示字节", r); r += 1
-
-    def collect_args(self):
-        args = {}
-        if self.vocab_path.get(): args["vocab"] = self.vocab_path.get()
-        if self.encode_text.get(): args["encode"] = self.encode_text.get()
-        if self.decode_ids.get(): args["decode"] = self.decode_ids.get()
-        if self.encode_file.get(): args["encode_file"] = self.encode_file.get()
-        # 位置参数：直接给文本文件即统计每行 token 数（--top 控制排行榜行数）
-        if self.stats_file.get(): args["text_file"] = self.stats_file.get()
-        if self.top.get(): args["top"] = int(self.top.get())
-        if self.threads.get(): args["threads"] = int(self.threads.get())
-        args["show_bytes"] = self.show_bytes_var.get()
-        return args
+        self._build_fields(self.params_frame, 0)
 
 
 # ================================================================
 #  Tab 5: GPT 训练
 # ================================================================
 class GptTrainTab(TabBase):
+    @classmethod
+    def fields(cls) -> Tuple[Field, ...]:
+        """GPT/RAPT 训练页字段表（P2-6）。
+
+        group 语义（见 `_field_active`，与旧手写回调逐条对齐）：
+          sched       = 非 fixed 调度（min_lr / max_norm）
+          cosine      = 仅 cosine（warmup_epochs）
+          step_cosine = 仅 step_cosine（warmup_steps）
+        注意两个"总是发送"的口径与旧代码一致：GPU 保护/日志的整数（flush_interval /
+        checkpoint_every / log_interval / save_interval）用 emit="always"，两个复选框
+        （activation_offload / grad_log）也用 emit="always"（False 也要发）。
+        其余整数走 skip_zero（旧 `_int(..., skip_vals=("0",))`：0 = 未设置）。
+        """
+        return (
+            _file("text_file", "数据集文件 (.nndataset)",
+                  filetypes=[("数据集文件", "*.nndataset")]),
+            _save("save_path", "保存路径", "gpt_model.nnmodel", arg="save"),
+            _file("resume_path", "恢复路径 (训练断点 .nnckpt)", arg="resume",
+                  filetypes=[("训练断点", "*.nnckpt *.bin *.nnpkg")]),
+            _i("resume_epoch", "续训起始 epoch (0-based)", "0", skip_zero=True),
+            _i("resume_step", "续训起始 step (0-based)", "0", skip_zero=True),
+            _sep("── 训练参数 ──"),
+            _i("epochs", "轮数", "10", skip_zero=True),
+            _i("batch_size", "批大小", "32", skip_zero=True),
+            _i("accum_steps", "梯度累积步数", "1", skip_zero=True),
+            _i("seq_len", "序列长度", "256", skip_zero=True),
+            _i("stride", "滑动窗口步长 (0=seq_len)", "0", skip_zero=True),
+            _o("optimizer", "优化器", optimizer_options("text_train"), "adam"),
+            _fl("weight_decay", "权重衰减", "0.01"),
+            _fl("beta1", "Adam β1 (空=默认 0.9)"),
+            _fl("beta2", "Adam β2 (空=默认 0.999)"),
+            _o("engine", "计算引擎", ENGINE_OPTIONS, "CPU", ui_only=True),
+            _sep("── 学习率调度 ──"),
+            _fl("lr", "最大学习率 (lr)", "0.001"),
+            _o("lr_schedule", "调度类型", GPT_LR_SCHEDULE_OPTIONS, "fixed"),
+            _fl("min_lr", "最小学习率 (min_lr)", "1e-6", group="sched"),
+            _i("warmup_epochs", "预热轮数 (cosine)", "0", group="cosine", skip_zero=True),
+            _i("warmup_steps", "预热步数 (step_cosine)", "0", group="step_cosine",
+               skip_zero=True),
+            _fl("max_norm", "梯度裁剪 (0=不裁剪)", "0", group="sched"),
+            _e("lr_per_epoch", "每轮 lr (逗号分隔, 可选)"),
+            _sep("── 限步 ──"),
+            _i("max_steps", "最大训练步数 (0=不限)", "0", skip_zero=True),
+            _sep("── 混合精度 ──"),
+            _o("precision_preset", "精度预设", PRECISION_PRESETS, PRECISION_PRESETS[0],
+               ui_only=True),
+            _o("precision_param", "参数精度 (param)", PRECISION_PARAM_OPTIONS, "f32"),
+            _o("precision_compute", "计算精度 (compute)", PRECISION_OPTIONS, "f32"),
+            _o("precision_stable", "稳定精度 (stable)", PRECISION_OPTIONS, "f32"),
+            _o("precision_optimizer", "优化器精度 (optimizer)", PRECISION_OPTIONS, "f32"),
+            _sep("── 模型参数 ──"),
+            _i("d_model", "d_model", "128", skip_zero=True),
+            _i("num_heads", "num_heads", "4", skip_zero=True),
+            _i("num_layers", "num_layers", "4", skip_zero=True),
+            _i("d_ff", "d_ff", "512", skip_zero=True),
+            _sep("── 架构细节 ──"),
+            _o("positional_encoding", "位置编码", POSITIONAL_ENCODING_OPTIONS, "learned"),
+            _o("activation", "FFN 激活", ACTIVATION_OPTIONS, "gelu"),
+            _o("norm_type", "归一化层", GPT_NORM_OPTIONS, "layernorm", arg="norm"),
+            _o("model_type", "模型架构", GPT_MODEL_OPTIONS, "gpt", arg="model"),
+            _sep("── GPU 保护 ──"),
+            _i("flush_interval", "flush 间隔", "1", emit="always"),
+            _i("checkpoint_every", "梯度检查点间隔", "0", emit="always"),
+            _b("activation_offload_var", "activation offload", arg="activation_offload",
+               emit="always"),
+            _sep("── 日志与保存 ──"),
+            _i("log_interval", "日志间隔 (steps)", "50", emit="always"),
+            _i("save_interval", "保存间隔 (steps)", "100", emit="always"),
+            _b("grad_log_var", "梯度日志", arg="grad_log", emit="always"),
+            _v("gpu", "engine == GPU (Vulkan) 时才发"),
+            _v("f16", "精度预设 = f16"),
+            _v("t1_58", "精度预设 = t1_58"),
+        )
+
     def __init__(self, master):
         super().__init__(master, GptTrainController(),
                          chart_configs=[
                              {"title": "Loss", "metrics": ["batch_loss", "train_loss", "test_loss"]},
                              {"title": "Perplexity", "metrics": ["perplexity"]},
                          ])
-
-        p = self.params_frame
-        r = 0
-
-        # --- 基本参数 ---
-        self.text_file = _make_file_row(p, "数据集文件 (.nndataset)", r,
-                                         filetypes=[("数据集文件", "*.nndataset")]); r += 1
-        self.save_path = _make_save_row(p, "保存路径", r,
-                                         default_name="gpt_model.nnmodel"); r += 1
-        self.resume_path = _make_file_row(p, "恢复路径 (训练断点 .nnckpt)", r,
-                                           filetypes=[("训练断点", "*.nnckpt *.bin *.nnpkg")]); r += 1
-        self.resume_epoch = _make_entry_row(p, "续训起始 epoch (0-based)", r, "0"); r += 1
-        self.resume_step = _make_entry_row(p, "续训起始 step (0-based)", r, "0"); r += 1
-
-        # --- 训练参数 ---
-        _make_label(p, "── 训练参数 ──", r); r += 1
-        self.epochs = _make_entry_row(p, "轮数", r, "10"); r += 1
-        self.batch_size = _make_entry_row(p, "批大小", r, "32"); r += 1
-        self.accum_steps = _make_entry_row(p, "梯度累积步数", r, "1"); r += 1
-        self.seq_len = _make_entry_row(p, "序列长度", r, "256"); r += 1
-        self.stride = _make_entry_row(p, "滑动窗口步长 (0=seq_len)", r, "0"); r += 1
-        self.optimizer = _make_option_row(p, "优化器", r, optimizer_options("text_train"), "adam"); r += 1
-        self.weight_decay = _make_entry_row(p, "权重衰减", r, "0.01"); r += 1
-        self.beta1 = _make_entry_row(p, "Adam β1 (空=默认 0.9)", r, ""); r += 1
-        self.beta2 = _make_entry_row(p, "Adam β2 (空=默认 0.999)", r, ""); r += 1
-        self.engine = _make_option_row(p, "计算引擎", r, ENGINE_OPTIONS, "CPU"); r += 1
-
-        # --- 学习率调度 ---
-        _make_label(p, "── 学习率调度 ──", r); r += 1
-        self.lr = _make_entry_row(p, "最大学习率 (lr)", r, "0.001"); r += 1
-        self.lr_schedule = _make_option_row(p, "调度类型", r,
-                                             GPT_LR_SCHEDULE_OPTIONS, "fixed"); r += 1
-        self.min_lr = _make_entry_row(p, "最小学习率 (min_lr)", r, "1e-6"); r += 1
-        self.warmup_epochs = _make_entry_row(p, "预热轮数 (cosine)", r, "0"); r += 1
-        self.warmup_steps = _make_entry_row(p, "预热步数 (step_cosine)", r, "0"); r += 1
-        self.max_norm = _make_entry_row(p, "梯度裁剪 (0=不裁剪)", r, "0"); r += 1
-        self.lr_per_epoch = _make_entry_row(p, "每轮 lr (逗号分隔, 可选)", r, ""); r += 1
-
-        # --- 限步（loss 范围/测试集/词表随数据集，生成期定好）---
-        _make_label(p, "── 限步 ──", r); r += 1
-        self.max_steps = _make_entry_row(p, "最大训练步数 (0=不限)", r, "0"); r += 1
-
-        # LR 调度相关控件（fixed 时隐藏）
-        self._lr_schedule_widgets = [self.min_lr, self.warmup_epochs,
-                                      self.warmup_steps, self.max_norm]
-        self.lr_schedule.trace_add("write", self._on_lr_schedule_change)
-        self._on_lr_schedule_change()
-
-        # --- 混合精度 ---
-        _make_label(p, "── 混合精度 ──", r); r += 1
-        self.precision_preset = _make_option_row(p, "精度预设", r,
-            ["f32 (默认)", "f16 (存储)", "t1_58 (BitLinear + f16 存储)"], "f32 (默认)"); r += 1
-        self.precision_param = _make_option_row(p, "参数精度 (param)", r, PRECISION_PARAM_OPTIONS, "f32"); r += 1
-        self.precision_compute = _make_option_row(p, "计算精度 (compute)", r, PRECISION_OPTIONS, "f32"); r += 1
-        self.precision_stable = _make_option_row(p, "稳定精度 (stable)", r, PRECISION_OPTIONS, "f32"); r += 1
-        self.precision_optimizer = _make_option_row(p, "优化器精度 (optimizer)", r, PRECISION_OPTIONS, "f32"); r += 1
-        self.precision_preset.trace_add("write", self._on_precision_preset_change)
+        # 参数行全部来自声明式字段表（P2-6）
+        self._build_fields(self.params_frame, 0)
+        self._w["lr_schedule"].trace_add("write", lambda *a: self._apply_groups())
+        self._w["precision_preset"].trace_add("write", self._on_precision_preset_change)
+        self._apply_groups()
         self._on_precision_preset_change()
-
-        # --- 模型参数 ---
-        _make_label(p, "── 模型参数 ──", r); r += 1
-        self.d_model = _make_entry_row(p, "d_model", r, "128"); r += 1
-        self.num_heads = _make_entry_row(p, "num_heads", r, "4"); r += 1
-        self.num_layers = _make_entry_row(p, "num_layers", r, "4"); r += 1
-        self.d_ff = _make_entry_row(p, "d_ff", r, "512"); r += 1
-
-        # --- 架构细节 ---
-        _make_label(p, "── 架构细节 ──", r); r += 1
-        self.positional_encoding = _make_option_row(p, "位置编码", r,
-                                                      POSITIONAL_ENCODING_OPTIONS, "learned"); r += 1
-        self.activation = _make_option_row(p, "FFN 激活", r,
-                                            ACTIVATION_OPTIONS, "gelu"); r += 1
-        self.norm_type = _make_option_row(p, "归一化层", r,
-                                           GPT_NORM_OPTIONS, "layernorm"); r += 1
-        self.model_type = _make_option_row(p, "模型架构", r,
-                                            GPT_MODEL_OPTIONS, "gpt"); r += 1
-
-        # --- GPU 保护 ---
-        _make_label(p, "── GPU 保护 ──", r); r += 1
-        self.flush_interval = _make_entry_row(p, "flush 间隔", r, "1"); r += 1
-        self.checkpoint_every = _make_entry_row(p, "梯度检查点间隔", r, "0"); r += 1
-        self.activation_offload_var = _make_checkbox_row(p, "activation offload", r); r += 1
-
-        # --- 日志与保存 ---
-        _make_label(p, "── 日志与保存 ──", r); r += 1
-        self.log_interval = _make_entry_row(p, "日志间隔 (steps)", r, "50"); r += 1
-        self.save_interval = _make_entry_row(p, "保存间隔 (steps)", r, "100"); r += 1
-        self.grad_log_var = _make_checkbox_row(p, "梯度日志", r); r += 1
-
         self._add_export_button()
 
     def build_pack_config(self):
@@ -1620,131 +1733,46 @@ class GptTrainTab(TabBase):
         return {"format_version": 1, "name": name, "task": "gpt",
                 "device": dev, "data": data, "hyperparameters": args}
 
-    def _on_lr_schedule_change(self, *args):
-        """fixed 调度下隐藏 min_lr / warmup / grad_clip"""
-        sched = self.lr_schedule.get()
-        is_fixed = sched == "fixed"
-        is_cosine = sched in ("cosine", "step_cosine")
-        for w in self._lr_schedule_widgets:
-            w = getattr(w, "widget", w)
-            if is_fixed:
-                w.grid_remove()
-            else:
-                w.grid()
-        # step_cosine 特有: warmup_steps 可见, warmup_epochs 隐藏
-        if not is_fixed:
-            if sched == "cosine":
-                self.warmup_epochs.grid()
-                self.warmup_steps.grid_remove()
-            elif sched == "step_cosine":
-                self.warmup_epochs.grid_remove()
-                self.warmup_steps.grid()
+    def _field_active(self, f: Field) -> bool:
+        sched = self._w["lr_schedule"].get()
+        if f.group == "sched":
+            return sched != "fixed"
+        if f.group == "cosine":
+            return sched == "cosine"
+        if f.group == "step_cosine":
+            return sched == "step_cosine"
+        return True
 
     def _on_precision_preset_change(self, *args):
-        """精度预设切换时自动填充各精度字段。
+        """精度预设切换时自动填充各精度字段（与 CLI 的 --f16 / --t1_58 逐字段对齐）。
 
-        与 CLI 语义严格对齐（text_train --help / precision.hpp）：
-        `--f16` = profile_f16() = {param:F16, compute:F16, stable:F32, optimizer:F32}，
-        即"f16 存储"，**不是** mnist_train 的 master-weights 配方（{f32,f16,f32,f32}）。
-        `--t1_58` = profile_t1_58() = {param:T1_58, compute:F16, stable:F32,
-        optimizer:F32} —— 就是 --f16 再把 param 换成三值（"其他默认 f16"），
-        只有 BitLinear 的权重是三值（GPT：4 投影 + fc1/fc2 + 未 tie 的 LM head）。
+        text_train 的 `--f16` = profile_f16() = {param:F16, compute:F16, stable:F32,
+        optimizer:F32}（**不是** mnist_train 的 master-weights 配方）；`--t1_58` 就是
+        --f16 再把 param 换成三值。语义见 precision.hpp。
         """
-        preset = self.precision_preset.get()
+        preset = self._w["precision_preset"].get()
         if "t1_58" in preset:
-            self.precision_param.widget.set("t1_58")
-            self.precision_compute.widget.set("f16")
-            self.precision_stable.widget.set("f32")
-            self.precision_optimizer.widget.set("f32")
+            param, compute = "t1_58", "f16"
         elif "f16" in preset:
-            self.precision_param.widget.set("f16")
-            self.precision_compute.widget.set("f16")
-            self.precision_stable.widget.set("f32")
-            self.precision_optimizer.widget.set("f32")
+            param, compute = "f16", "f16"
         else:
-            self.precision_param.widget.set("f32")
-            self.precision_compute.widget.set("f32")
-            self.precision_stable.widget.set("f32")
-            self.precision_optimizer.widget.set("f32")
+            param, compute = "f32", "f32"
+        self._set_field("precision_param", param)
+        self._set_field("precision_compute", compute)
+        self._set_field("precision_stable", "f32")
+        self._set_field("precision_optimizer", "f32")
 
     def collect_args(self):
-        def _int(entry, key, skip_vals=("0",)):
-            v = entry.get()
-            if v and v not in skip_vals:
-                return {key: int(v)}
-            return {}
-
-        def _float(entry, key):
-            v = entry.get()
-            if v:
-                return {key: float(v)}
-            return {}
-
-        def _str(entry, key):
-            v = entry.get()
-            if v:
-                return {key: v}
-            return {}
-
-        args = {}
-        args.update(_str(self.text_file, "text_file"))
-        args.update(_str(self.save_path, "save"))
-        args.update(_str(self.resume_path, "resume"))
-        args.update(_int(self.resume_epoch, "resume_epoch"))
-        args.update(_int(self.resume_step, "resume_step"))
-        args.update(_int(self.epochs, "epochs"))
-        args.update(_int(self.batch_size, "batch_size"))
-        args.update(_int(self.accum_steps, "accum_steps"))
-        args.update(_int(self.seq_len, "seq_len"))
-        args.update(_int(self.stride, "stride"))
-        args["optimizer"] = self.optimizer.get()
-        args.update(_float(self.weight_decay, "weight_decay"))
-        args.update(_float(self.beta1, "beta1"))
-        args.update(_float(self.beta2, "beta2"))
-        args.update(_int(self.max_steps, "max_steps"))
-        engine = self.engine.get()
-        if engine == "GPU (Vulkan)":
+        """表驱动收集 + 两处后处理（engine → --gpu；preset → --f16/--t1_58 别名）"""
+        args = collect_fields(self.fields(), self._value_of, self._field_active)
+        if args.pop("engine", "CPU") == "GPU (Vulkan)":
             args["gpu"] = True
-        # 学习率
-        args.update(_float(self.lr, "lr"))
-        sched = self.lr_schedule.get()
-        args["lr_schedule"] = sched
-        if sched != "fixed":
-            args.update(_float(self.min_lr, "min_lr"))
-            if sched == "cosine":
-                args.update(_int(self.warmup_epochs, "warmup_epochs"))
-            elif sched == "step_cosine":
-                args.update(_int(self.warmup_steps, "warmup_steps"))
-            args.update(_float(self.max_norm, "max_norm"))
-        args.update(_str(self.lr_per_epoch, "lr_per_epoch"))
-        # 模型
-        args.update(_int(self.d_model, "d_model"))
-        args.update(_int(self.num_heads, "num_heads"))
-        args.update(_int(self.num_layers, "num_layers"))
-        args.update(_int(self.d_ff, "d_ff"))
-        # 混合精度
-        if "t1_58" in self.precision_preset.get():
-            args["t1_58"] = True
-        elif "f16" in self.precision_preset.get():
-            args["f16"] = True
-        else:
-            args["precision_param"] = self.precision_param.get()
-            args["precision_compute"] = self.precision_compute.get()
-            args["precision_stable"] = self.precision_stable.get()
-            args["precision_optimizer"] = self.precision_optimizer.get()
-        # 架构细节
-        args["positional_encoding"] = self.positional_encoding.get()
-        args["activation"] = self.activation.get()
-        args["norm"] = self.norm_type.get()
-        args["model"] = self.model_type.get()
-        # GPU 保护
-        args.update(_int(self.flush_interval, "flush_interval", skip_vals=()))
-        args.update(_int(self.checkpoint_every, "checkpoint_every", skip_vals=()))
-        args["activation_offload"] = self.activation_offload_var.get()
-        # 日志
-        args.update(_int(self.log_interval, "log_interval", skip_vals=()))
-        args.update(_int(self.save_interval, "save_interval", skip_vals=()))
-        args["grad_log"] = self.grad_log_var.get()
+        preset = args.pop("precision_preset", PRECISION_PRESETS[0])
+        if "t1_58" in preset or "f16" in preset:
+            args["t1_58" if "t1_58" in preset else "f16"] = True
+            for slot in ("precision_param", "precision_compute", "precision_stable",
+                         "precision_optimizer"):
+                args.pop(slot, None)
         return args
 
 
@@ -1752,51 +1780,39 @@ class GptTrainTab(TabBase):
 #  Tab 6: GPT 推理
 # ================================================================
 class GptInferTab(TabBase):
+    @classmethod
+    def fields(cls) -> Tuple[Field, ...]:
+        """GPT 推理页字段表（P2-6）。prompt 用多行文本框（kind="text"；
+        `_value_of` 会 strip，空则不发 —— 与旧 `get("1.0","end").strip()` 同）。
+        采样开关留空/为 0 时不发（`--top-k 0` 与不传等价，CLI 侧默认即关）。"""
+        return (
+            _file("model_path", "模型路径", arg="model",
+                  filetypes=[("模型文件", "*.nnmodel *.bin *.pt *.nnpkg")]),
+            _file("vocab_path", "词表路径 (模型未嵌入时)", arg="vocab",
+                  filetypes=[("词表文件", "*.nnvocab")]),
+            _i("max_tokens", "最大生成token数", "200"),
+            _fl("temperature", "温度 (0=贪心)", "1.0"),
+            _i("top_k", "top-k (0=关闭)", "0"),
+            _fl("top_p", "top-p (1.0=关闭)", "1.0"),
+            _fl("repeat_penalty", "重复惩罚 (1.0=关闭)", "1.0"),
+            _i("repeat_window", "重复惩罚窗口 (0=全部)", "0"),
+            _i("seed", "随机种子 (留空=随机)"),
+            _o("engine", "计算引擎", ENGINE_OPTIONS, "CPU", ui_only=True),
+            _b("show_tokens_var", "显示token", arg="show_tokens", emit="always"),
+            _sep("── 提示文本 (prompt) ──"),
+            Field("prompt_box", "", "text", "Once upon a time", arg="prompt", width=340),
+            _v("gpu", "engine == GPU (Vulkan) 时才发"),
+        )
+
     def __init__(self, master):
         super().__init__(master, GptInferController())
-
-        p = self.params_frame
-        r = 0
-        self.model_path = _make_file_row(p, "模型路径", r,
-                                          filetypes=[("模型文件", "*.nnmodel *.bin *.pt *.nnpkg")]); r += 1
-        self.vocab_path = _make_file_row(p, "词表路径 (模型未嵌入时)", r,
-                                          filetypes=[("词表文件", "*.nnvocab")]); r += 1
-        self.max_tokens = _make_entry_row(p, "最大生成token数", r, "200"); r += 1
-        self.temperature = _make_entry_row(p, "温度 (0=贪心)", r, "1.0"); r += 1
-        self.top_k = _make_entry_row(p, "top-k (0=关闭)", r, "0"); r += 1
-        self.top_p = _make_entry_row(p, "top-p (1.0=关闭)", r, "1.0"); r += 1
-        self.repeat_penalty = _make_entry_row(p, "重复惩罚 (1.0=关闭)", r, "1.0"); r += 1
-        self.repeat_window = _make_entry_row(p, "重复惩罚窗口 (0=全部)", r, "0"); r += 1
-        self.seed = _make_entry_row(p, "随机种子 (留空=随机)", r, ""); r += 1
-        self.engine = _make_option_row(p, "计算引擎", r, ENGINE_OPTIONS, "CPU"); r += 1
-        self.show_tokens_var = _make_checkbox_row(p, "显示token", r); r += 1
-
-        # --- 提示文本（仅多行输入） ---
-        _make_label(p, "── 提示文本 (prompt) ──", r); r += 1
-        self.prompt_box = ctk.CTkTextbox(p, height=150, width=340)
-        self.prompt_box.grid(row=r, column=0, columnspan=2, sticky="w",
-                              padx=4, pady=4)
-        self.prompt_box.insert("1.0", "Once upon a time")
-        r += 1
+        self._build_fields(self.params_frame, 0)
 
     def collect_args(self):
-        args = {}
-        if self.model_path.get(): args["model"] = self.model_path.get()
-        if self.vocab_path.get(): args["vocab"] = self.vocab_path.get()
-        prompt = self.prompt_box.get("1.0", "end").strip()
-        if prompt:
-            args["prompt"] = prompt
-        if self.max_tokens.get(): args["max_tokens"] = int(self.max_tokens.get())
-        if self.temperature.get(): args["temperature"] = float(self.temperature.get())
-        if self.top_k.get(): args["top_k"] = int(self.top_k.get())
-        if self.top_p.get(): args["top_p"] = float(self.top_p.get())
-        if self.repeat_penalty.get(): args["repeat_penalty"] = float(self.repeat_penalty.get())
-        if self.repeat_window.get(): args["repeat_window"] = int(self.repeat_window.get())
-        if self.seed.get(): args["seed"] = int(self.seed.get())
-        engine = self.engine.get()
-        if engine == "GPU (Vulkan)":
+        """表驱动收集 + 一处后处理（engine → --gpu）"""
+        args = collect_fields(self.fields(), self._value_of, self._field_active)
+        if args.pop("engine", "CPU") == "GPU (Vulkan)":
             args["gpu"] = True
-        args["show_tokens"] = self.show_tokens_var.get()
         return args
 
 

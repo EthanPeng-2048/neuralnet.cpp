@@ -14,6 +14,10 @@
   [4] 优化器名单一致性（RV-04）：CLI `--help` 声明的名单（唯一真源 =
       `compute_optimizer.hpp` 的 `kOptimizerTable`）与 gui.py 的兜底名单逐项比对。
       → 抓"改了表忘了改 GUI"（GUI 的选项运行时从 CLI 派生，兜底只在未构建时生效）。
+  [5] 声明式字段表（P2-6）：`gui.py` 各 Tab 的 `fields()` 里声明的**每个**
+      kwargs 键，喂给对应 Controller 后必须真的产生影响（生成 flag 或位置参数）。
+      → 抓"表里加了一行、控制器不认"（表单是死的）；与 [1]（手写场景 → flag 存在性）
+      互补：[1] 验"发出去的 flag 都存在"，[5] 验"表里的每一行都发得出去"。
 
 退出码非 0 = 存在可行动问题。历史/有意为之的差异在此显式登记为白名单。
 """
@@ -308,9 +312,101 @@ def audit_optimizer_names() -> int:
     return bad
 
 
+# ══════════════════════════════════════════════════════════════════════
+# [5] 声明式字段表 ↔ Controller（P2-6）
+# ══════════════════════════════════════════════════════════════════════
+# 逐 Tab 的 (可执行文件, gui.py 里的 Tab 类, Controller)：与 GUI 的装配一致。
+TABLE_TABS = [
+    ("mnist_train", "MnistTrainTab", MnistTrainController),
+    ("mnist_infer", "MnistInferTab", MnistInferController),
+    ("tokenizer_train", "TokenizerTrainTab", TokenizerTrainController),
+    ("tokenizer_infer", "TokenizerInferTab", TokenizerInferController),
+    ("text_train", "GptTrainTab", GptTrainController),
+    ("text_infer", "GptInferTab", GptInferController),
+]
+
+
+def _load_gui_tables():
+    """无 customtkinter 依赖地导入 gui.py（桩模块；与 gui_draw_logic_audit 同款）"""
+    import types
+
+    class _Any:
+        def __init__(self, *a, **k):
+            pass
+
+        def __getattr__(self, name):
+            return _Any()
+
+        def __call__(self, *a, **k):
+            return _Any()
+
+        def __mro_entries__(self, bases):
+            return (object,)
+
+    mod = types.ModuleType("customtkinter")
+    mod.__getattr__ = lambda name: _Any()
+    sys.modules.setdefault("customtkinter", mod)
+    import gui  # noqa: E402   （桩就位后再导入）
+    return gui
+
+
+def _probe_value(field):
+    """给字段造一个"控制器认得出"的探测值（类型按 cast 定）"""
+    if field.kind == "check":
+        return True
+    if field.kind == "option":
+        return field.default
+    if field.cast is int:
+        return "1"
+    if field.cast is float:
+        return "0.5"
+    return "probe"
+
+
+def audit_field_tables() -> int:
+    """表里声明的每个 kwargs 键都必须真的产生影响（否则这一行表单是死的）。
+
+    判据：`_build_command(**{key: probe})` 与 `_build_command()` 不同（生成 flag 或
+    位置参数）。虚拟项（`_v()`）也一并验 —— 它们声明的是"由代码后处理发出的键"。
+    """
+    print("\n=== [5] 声明式字段表 ↔ Controller（P2-6：表里每一行都发得出去）===")
+    try:
+        gui = _load_gui_tables()
+    except Exception as exc:   # pragma: no cover
+        print(f"  [BAD] 导入 gui.py 失败: {exc}")
+        return 1
+    bad = 0
+    for exe, tab_name, ctrl_cls in TABLE_TABS:
+        tab = getattr(gui, tab_name, None)
+        if tab is None or not hasattr(tab, "fields"):
+            print(f"  [BAD] gui.{tab_name} 没有声明式字段表")
+            bad += 1
+            continue
+        ctrl = ctrl_cls()
+        base = ctrl._build_command()
+        keys, dead = 0, []
+        for field in tab.fields():
+            if field.kind == "label" or field.ui_only:
+                continue      # label 无参数；ui_only = 由后处理映射成别的键
+            keys += 1
+            try:
+                cmd = ctrl._build_command(**{field.key: _probe_value(field)})
+            except Exception as exc:
+                dead.append(f"{field.key}(异常 {exc})")
+                continue
+            if cmd == base:
+                dead.append(field.key)
+        if dead:
+            print(f"  [BAD] {exe:17s} 表里声明但控制器不认/无效果: {dead}")
+            bad += len(dead)
+        else:
+            print(f"  [OK ] {exe:17s} {keys} 个键全部有效")
+    return bad
+
+
 def main() -> int:
     bad = (audit_gui_to_cli() + audit_phantom_options() + audit_gui_attrs()
-           + audit_optimizer_names())
+           + audit_optimizer_names() + audit_field_tables())
     print(f"\n{'PASS' if not bad else 'FAIL'}  可行动问题={bad}")
     return 1 if bad else 0
 
