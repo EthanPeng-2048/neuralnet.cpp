@@ -130,6 +130,15 @@ RAPT 是上述算法的工程实现：Layer 用 3 个 op-level 扫描原语 + DS
 
 **形状约定**：batch-major（`i = b*seq+t`）；头 `(b,h)` 行块起点 `r0 = (b*H+h)*dk`；K/V/P/R（X/Y）为 `(B·H·dk, seq)`，D 为 `(B·H·dk², seq)`；A0/B0 为 `(H·dk, dk)`（B>1 按头循环）；boundary 为 `(1, B·seq)`（1 = 文档起点）；空参数用 **(1,1) dummy + bool 标志**（规避 0 字节 GPU buffer）；**dk ≤ 64**（GPU MAX_DK）；标量块 s/r 在头块内 dk 行重复存放（实现写全部行，Layer 读任一行均可）。
 
+**GPU 实现骨架（P4-2b，2026-10-15）**：1 个 workgroup/头、256 线程（派发 `wg=(1, B·H, 1)`）。
+`scan_prefix_outer` 的专用路径（dk ≤ 64）是**行归属**结构——线程 a 独占 A/B 第 a 行，于是
+"前缀累加 → 行读出"（`B·q`/`A·q`）由同一线程完成、每 t 只需 **3 次 barrier + 1 次全局往返**；
+内层循环 4 路展开（先并行取数、再按原序累加）只提 ILP、**不改任何元素的累加次序** ⇒ GPU 与
+CPU 实现**逐位一致**（门禁 `scan_bitwise_test`）。**dk ≤ 32 走窄共享变体**（同一份 `.comp` 加
+`-DNN_SCAN_DK_MAX=32`；共享 33.3KB → 8.5KB，Maxwell 每 SM 驻留 6 个 WG 而不是 1 个）。
+⚠ `scan_suffix_outer` **刻意保持原结构**：它的成本由 D 的 `(dk², seq)` 列式散布读主导（流量/争用
+受限），提高占用率实测更慢——见 `docs/history/history.md`「P4-2 (b)」条。
+
 ### 4.2 Layer 组合（算法在 Layer；现行 RLA-2 路径）
 
 前置统一：`Q/K → RMSNorm → RoPE → ReLU` 得 `Qp/Kp`（`V` 不 ReLU、不 RoPE）。

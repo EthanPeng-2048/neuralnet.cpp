@@ -144,12 +144,16 @@ clang-format -i path/to/new_file.hpp
    裁定后再实施」的习惯（`docs/todo/` 就是项目开发者的工作区）。
 3. 提交前自查：
    ```bash
-   cmake --preset dev && cmake --build --preset dev && ctest --preset dev   # 测试必须绿（当前口径：无 Vulkan 47 项 / 开 GPU 49 项）
+   cmake --preset dev && cmake --build --preset dev && ctest --preset dev   # 测试必须绿（当前口径：无 Vulkan 48 项 / 开 GPU 50 项）
    python bench/gui_cli_audit.py         # 改了 gui.py / cli_controllers.py / 任一 CLI 选项后必跑（当前 exit 0）
    python bench/gui_draw_logic_audit.py    # 改了画板绘制路径后必跑（桩替换 customtkinter，无需 GUI）
    python bench/gui_draw_runtime_audit.py  # 同上（真机：功能闭环 + 拖动开销对照；无显示时 77 = SKIP）
    python scripts/audit_modern_style.py  # 现代 C++ 风格（裸指针 / new / delete / malloc）；⚠ 见下
    git clang-format --diff               # 风格：只格式化**你改动的行**
+   ./build/layer_bench --op scan_prefix --gpu --batch 8 --heads 4 --dk 32 --seq 128 --hash
+                                         # 改了状态扫描原语（或任何 GPU kernel）后必跑：配对 A/B 的 ms +
+                                         # 位级哈希（逐位不变的改写必须哈希相同）。改完只需 `ninja layer_bench`
+                                         # （PCH + 1 个 TU ≈2 min），全量重建留到最后一次
    ```
    ⚠ `audit_modern_style.py` 对本仓当前是 **FAIL（59 E / 147 W）**——E 几乎全部落在 Vulkan C API
    边界（`reinterpret_cast<VkBaseInStructure*>` 的 pNext 串链、`void* mapped`、`std::free`）与一处

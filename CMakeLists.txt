@@ -1167,7 +1167,7 @@ if(NN_ENABLE_PCH AND NN_PCH_CANDIDATES)
         target_include_directories(nn_pch PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
         target_link_libraries(nn_pch PRIVATE Vulkan::Vulkan)
         # ⚠ 必须等 `compile_gpu_shaders`（手写原语 SPIR-V 嵌入头 + fused_registry）
-        #   生成完再编 PCH：nn.hpp 里那 36 个 `#if __has_include("..._spv.hpp")`
+        #   生成完再编 PCH：nn.hpp 里那 44 个 `#if __has_include("..._spv.hpp")`
         #   与 `#if __has_include("fused_registry.hpp")` 是在**编 PCH 那一刻**求值
         #   的——早于生成完成就会整块落空，且从此不再重新求值（没 include 就没
         #   depfile 记录），表现为运行期 "matmul SPIR-V bytecode not embedded" /

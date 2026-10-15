@@ -45,7 +45,7 @@
 | **P1-1 → P1-2（+ P2-1 合并）** | 18 §4.2 P1-1/P1-2、§4.3 P2-1；C4/C5 | P1-2 是**真实功能缺陷**：TDR 重启 / `--resume` 后 Adam 动量归零，续训轨迹不连续 | **P1-1 先拆**（`text_train` 模块化，否则恢复路径继续膨胀）；P1-2 与 P2-1 同属版本段改动，**合批做省一次 `MODEL_VERSION` 升版**；中–大 |
 | **P1-5 CI 冒烟扩 MSVC Debug + 权重变化断言** | 18 §4.2 P1-5 / §5 裁定表"13 §8" | 防"loss 不动"类静默失败；且是 **P2-7 的前置** | 无（P0-1 已就绪）；可复用 `f16_writeback_probe` 的"8 步 Adam 参数必须移动"思路；中 |
 | **P4-1 性能利用率** | 18 §4.5 P4-1 / §3.1 C9 尾注 | 唯一还没归因的固定成本：`墙钟 − 设备 kernel ≈ 4.2%`（f32/f16 同幅） | 需 `NN_PROFILE` 设备侧证据链（host 录制 / driver 提交 / fence 等待三处归因）；中；**注意 P2-9 已否决"搬 I/O 位置"** |
-| **P4-2 算子性能** | 18 §4.5 P4-2 | 重型 kernel（fold / matmul / reduce / `matmul_q`）逐项 tile·occupancy 调参；**C10 的修复大概率落这里** | `layer_bench --op` 配对 A/B 已就绪；中 |
+| **P4-2 算子性能** ✅ **C10 派生的 (a)+(b) 已完成（2026-10-15）** | 18 §4.5 P4-2 | (a) RAPT `rms_norm_forward_` 设备侧拼装（−29.7%）；(b) `scan_prefix` 行归属 + 4 路展开 + 窄共享变体（单次 4.7×、同会话 e2e −42.6%，数值逐位不变）。**剩下的重型 kernel** = fold / matmul / reduce / `matmul_q` 逐项 tile·occupancy 调参；**e2e 的新瓶颈已转移到 host staging**（`copy_from` ≈66% 墙钟，归 P4-1 口径） | `layer_bench --op <name> --hash` 配对 A/B 就绪（扫描原语用 `--dk`）；suffix 已验证「加占用率更慢」⇒ 别动；中 |
 | **P4-3 显存 L3（04 号立项）** | 18 §4.5 P4-3 / [`04`](04-memory-optimization.md) L3 | 下一档显存杠杆 = 注意力/softmax 子图进一步融合（消 Q/K/V 物化）+ 优化器状态低精度 | 立项 04 号 L3；动 IR/融合；中–大 |
 | **P2-7 backend 超大 header 拆分** | 18 §4.3 P2-7 / §3.2 E6 | header-only 项目里增量编译是主要开发税 | **前置 = P1-5**（否则拆分没有回归网）；中–大 |
 
