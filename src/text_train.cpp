@@ -1235,6 +1235,11 @@ int main(int argc, char *argv[])
     // --max-steps：按本进程执行的步数计数（与 --resume 组合可分段跑）
     std::size_t steps_executed = 0;
     bool stop_training = false;
+    // 断点保存失败计数（P1-1 退出码语义，docs/todo/18 §4.2）：
+    // `--save-interval` 的 .nnckpt 写失败**不得**以成功码退出——否则"断点丢了"
+    // 会被上层（脚本/CI/训练包）当成"这一轮训练完好"。这里只记账不中断训练
+    // （磁盘抖动不该毁掉整轮），收尾时据此给非零退出码。
+    std::size_t ckpt_save_failures = 0;
 
     for (int epoch = cfg.start_epoch; epoch < cfg.epochs; ++epoch)
     {
@@ -1632,7 +1637,11 @@ int main(int argc, char *argv[])
                 auto save_r = nn::save_model(ckpt_path_of(cfg.save_path), model, spec,
                                              tokenizer_bytes, nn::ModelRole::Checkpoint);
                 if (!save_r)
-                    std::cerr << "\n  [ckpt] 保存失败: " << save_r.error().message << "\n";
+                {
+                    ++ckpt_save_failures;
+                    std::cerr << "\n  [ckpt] 保存失败（第 " << ckpt_save_failures
+                              << " 次）: " << save_r.error().message << "\n";
+                }
             }
 
             // ── --max-steps 到达：本步已完成更新与保存，退出步循环 ──
@@ -1798,11 +1807,24 @@ int main(int argc, char *argv[])
         // 推理模型（Model 角色）：三值层写打包形态 + τ（不含训练参数）
         auto save_result = nn::save_model(cfg.save_path, model, spec, tokenizer_bytes,
                                           nn::ModelRole::Model);
-        NN_EXIT(save_result, 1, "Error: ");
+        if (!save_result)
+        {
+            // 推理模型写不出去 = 这一轮训练对用户没有产出 ⇒ 必须是失败退出
+            std::cerr << "Error: " << save_result.error().message << "\n";
+            return 1;
+        }
     }
     std::cout << "\n训练完成! 总耗时: " << std::fixed << std::setprecision(1)
               << total_sec << "s"
               << "  词表已嵌入模型文件" << std::endl;
+    if (ckpt_save_failures > 0)
+    {
+        // 退出码语义（P1-1）：有断点没写出去 ⇒ 非零退出。模型文件已落盘，
+        // 但"可续训"这一性质不成立，上层不得把它当成功。
+        std::cerr << "[错误] 本次训练有 " << ckpt_save_failures
+                  << " 次 checkpoint(.nnckpt) 保存失败（推理模型已写出）⇒ 退出码 1\n";
+        return 1;
+    }
 
     return 0;
 }
