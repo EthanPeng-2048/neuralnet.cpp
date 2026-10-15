@@ -1013,7 +1013,78 @@ class MnistTrainTab(TabBase):
 # ================================================================
 #  Tab 2: MNIST 推理
 # ================================================================
+class StrokeTrack:
+    """画板笔迹状态（纯逻辑，无 Tk/PIL 依赖 ⇒ 可单测）。
+
+    P2-6「绘制节流」半边：拖动期的每帧开销封顶 + 空帧跳过。
+
+    · **每笔只建一个画布项**：当前笔迹的点集原地增长，调用方用
+      `canvas.coords(item, ...)` 刷新同一个项，不再为每个 motion 事件
+      `create_line`（旧实现：一笔拖动 = N 个画布项，重放/重绘都随项数增长）。
+    · **空帧跳过**：坐标未变的重复 motion 事件直接返回 False（dirty 标志），
+      调用方据此不刷新画布。
+    · **光栅化延迟**：笔迹段在拖动期只累积（`drain()` 之前不动 PIL），
+      边界（刷新预览 / 保存 CSV / 结束一笔）一次性按折线画进高分辨率缓冲
+      ⇒ 拖动期零 PIL 调用，折线段数从"每段一次调用"降为"每批一次调用"。
+    """
+
+    def __init__(self):
+        self._strokes = []      # 已提交笔迹（dict；_draw_grid 据此重放）
+        self._live = None       # 当前笔迹（dict，pts 为点列表）
+        self._pending = []      # 待光栅化的折线（点列表的列表）
+
+    # ── 一笔的生命周期 ────────────────────────────────────────────
+    def begin(self, x, y, brush, canvas_w, canvas_h):
+        """开始一笔：记录起点与当时的画布尺寸（重放时按尺寸缩放）"""
+        self._live = {"type": "poly", "pts": [(x, y)], "width": int(brush),
+                      "w": canvas_w, "h": canvas_h}
+        self._strokes.append(self._live)
+
+    def extend(self, x, y):
+        """追加一个点；返回 True = 有新笔迹（需刷新画布），False = 空帧"""
+        if self._live is None:
+            return False
+        pts = self._live["pts"]
+        if pts and pts[-1] == (x, y):
+            return False        # 空帧：坐标与上一帧相同
+        pts.append((x, y))
+        return True
+
+    def end(self):
+        """结束一笔（进入待光栅化队列）；返回是否有待画内容"""
+        live = self._live
+        self._live = None
+        if live is None:
+            return False
+        pts = live["pts"]
+        # 单击（只有 1 个点）：用"同坐标两点 + 圆头"表示一个点
+        self._pending.append(pts if len(pts) >= 2 else [pts[0], pts[0]])
+        return True
+
+    def drain(self):
+        """取走待光栅化的折线（取走后队列清空；调用方负责真正画出来）"""
+        out = self._pending
+        self._pending = []
+        return out
+
+    def clear(self):
+        self._strokes.clear()
+        self._live = None
+        self._pending.clear()
+
+    # ── 只读视图 ──────────────────────────────────────────────────
+    def strokes(self):
+        """已提交笔迹（含当前未结束的一笔）"""
+        return self._strokes
+
+    def live_points(self):
+        """当前笔迹的点列表（未开始一笔时为空）"""
+        return self._live["pts"] if self._live is not None else []
+
+
 class MnistInferTab(TabBase):
+    _PAINT_MS = 16          # 画布刷新节流（P2-6：每个 motion 事件最多每帧刷一次）
+
     def __init__(self, master):
         super().__init__(master, MnistInferController())
 
@@ -1124,7 +1195,10 @@ class MnistInferTab(TabBase):
         self._pil = _PILImage
         self._pixel_buf_hires = _PILImage.new("L", (self._CANVAS_SIZE, self._CANVAS_SIZE), 0)
         self._pixel_buf = _PILImage.new("L", (28, 28), 0)  # 28x28 用于推理
-        self._strokes = []  # 持久化笔迹，供 _draw_grid 重放，避免重绘时丢失
+        # 笔迹状态（P2-6 绘制节流）：每笔一个画布项 + 空帧跳过 + 光栅化延迟
+        self._track = StrokeTrack()
+        self._live_item = None   # 当前笔迹的画布项（每帧 coords 刷新，不新建）
+        self._last_paint = 0.0   # 上次画布刷新时刻（按帧节流；数据不受节流）
         self._canvas_w = 1
         self._canvas_h = 1
 
@@ -1164,6 +1238,7 @@ class MnistInferTab(TabBase):
     def _draw_grid(self):
         """在画布上绘制 28x28 网格，并重放已保存的笔迹（按当前尺寸缩放）"""
         self.canvas.delete("all")
+        self._live_item = None   # delete("all") 后旧项引用失效；当前笔迹由下面的重放画回
         w = self._canvas_w
         h = self._canvas_h
         cell_w = w / 28
@@ -1175,20 +1250,20 @@ class MnistInferTab(TabBase):
             y = int(j * cell_h)
             self.canvas.create_line(0, y, w, y, fill="#333355", width=1)
         # 重放笔迹（按当前画布尺寸缩放，保持视觉比例）
-        for s in self._strokes:
+        for s in self._track.strokes():
             sw = s.get("w") or 1
             sh = s.get("h") or 1
             sx = self._canvas_w / sw
             sy = self._canvas_h / sh
-            x1, y1, x2, y2 = s["coords"]
-            if s["type"] == "oval":
-                self.canvas.create_oval(x1 * sx, y1 * sy, x2 * sx, y2 * sy,
-                                         fill="white", outline="white")
-            else:
-                width = max(1, int(s.get("width", self._brush_size) * sx))
-                self.canvas.create_line(x1 * sx, y1 * sy, x2 * sx, y2 * sy,
-                                         fill="white", width=width,
-                                         capstyle="round", smooth=True)
+            pts = s.get("pts") or []
+            flat = [c for p in pts for c in p]
+            if len(pts) < 2:   # 单击：同坐标两点 = 一个点
+                flat = flat + flat[:2]
+            width = max(1, int(s.get("width", self._brush_size) * sx))
+            self.canvas.create_line(*[v * (sx if i % 2 == 0 else sy)
+                                      for i, v in enumerate(flat)],
+                                     fill="white", width=width,
+                                     capstyle="round", smooth=True)
 
     def _canvas_to_pixel(self, cx, cy):
         """将画布坐标映射到 28x28 像素缓冲坐标"""
@@ -1197,43 +1272,57 @@ class MnistInferTab(TabBase):
         return max(0, min(27, px)), max(0, min(27, py))
 
     def _on_draw_start(self, event):
+        """开始一笔：**只记录起点**，画布项在 _paint_live 里首次创建"""
         self._last_x = event.x
         self._last_y = event.y
-        # 画圆点到画布，并记录笔迹
-        br = self._brush_size // 2
-        coords = (event.x - br, event.y - br, event.x + br, event.y + br)
-        self.canvas.create_oval(*coords, fill="white", outline="white")
-        self._strokes.append({"type": "oval", "coords": coords,
-                               "w": self._canvas_w, "h": self._canvas_h})
-        # 绘制到高分辨率缓冲（保持画布精度，后续降采样时产生灰度）
-        from PIL import ImageDraw as _Draw
-        draw = _Draw.Draw(self._pixel_buf_hires)
-        draw.ellipse(coords, fill=255)
+        self._track.begin(event.x, event.y, self._brush_size,
+                          self._canvas_w, self._canvas_h)
+        self._live_item = None
+        self._paint_live()     # 单击也要立刻可见（同坐标两点 + 圆头）
 
     def _on_draw_move(self, event):
-        if self._last_x is not None:
-            # 画布上线条，并记录笔迹
-            coords = (self._last_x, self._last_y, event.x, event.y)
-            self.canvas.create_line(*coords, fill="white",
-                                     width=self._brush_size,
-                                     capstyle="round", smooth=True)
-            self._strokes.append({"type": "line", "coords": coords,
-                                   "width": self._brush_size,
-                                   "w": self._canvas_w, "h": self._canvas_h})
-            # 绘制到高分辨率缓冲（保持画布精度，后续降采样时产生灰度）
-            from PIL import ImageDraw as _Draw
-            draw = _Draw.Draw(self._pixel_buf_hires)
-            draw.line(coords, fill=255, width=self._brush_size)
+        """追加一个点：空帧（坐标未变）直接跳过；画布刷新**按帧节流**
+
+        数据侧永不节流（`extend` 每个事件都记），只节流视觉刷新：快速拖动时
+        Tk 每帧可能吐出上百个 motion 事件，逐个 `create_line`/`coords` 是
+        拖动卡顿的主因。刷新上限 = 每 `_PAINT_MS` 一次（结束一笔时强制补一次）。
+        """
+        if not self._track.extend(event.x, event.y):
+            return              # 空帧：无新笔迹，不刷新
         self._last_x = event.x
         self._last_y = event.y
+        now = time.monotonic()
+        if now - self._last_paint >= self._PAINT_MS / 1000.0:
+            self._last_paint = now
+            self._paint_live()
+
+    def _paint_live(self):
+        """把当前笔迹刷到画布：复用 **同一个** 画布项（P2-6：不为每个
+        motion 事件新建 item，拖动期画布项数 = 笔数）"""
+        pts = self._track.live_points()
+        if not pts:
+            return
+        flat = [c for p in pts for c in p]
+        if len(pts) == 1:
+            flat = flat + flat[:2]
+        if self._live_item is None:
+            self._live_item = self.canvas.create_line(
+                *flat, fill="white", width=self._brush_size,
+                capstyle="round", smooth=True)
+        else:
+            self.canvas.coords(self._live_item, *flat)
 
     def _on_draw_end(self, event):
+        self._paint_live()     # 补一次视觉刷新（节流期间最后一段也要看得见）
+        self._track.end()      # 进入待光栅化队列（拖动期零 PIL 调用）
+        self._live_item = None
         self._last_x = None
         self._last_y = None
         self._update_preview_from_buffer()
 
     def _clear_canvas(self):
-        self._strokes.clear()
+        self._track.clear()
+        self._live_item = None
         self.canvas.delete("all")
         self._draw_grid()
         self._pixel_buf_hires = self._pil.new("L", (self._CANVAS_SIZE, self._CANVAS_SIZE), 0)
@@ -1293,7 +1382,21 @@ class MnistInferTab(TabBase):
 
     def _downsample_buffer(self):
         """从高分辨率缓冲降采样到 28×28，使用双线性插值产生灰度抗锯齿效果"""
+        # P2-6：先把待光栅化的笔迹一次性画进高分辨率缓冲（拖动期零 PIL
+        # 调用；本函数是"读缓冲"的唯一入口，因此也是唯一的刷新点）
+        self._rasterize_pending()
         self._pixel_buf = self._pixel_buf_hires.resize((28, 28), self._pil.BILINEAR)
+
+    def _rasterize_pending(self):
+        """把待光栅化笔迹按折线批量画进高分辨率缓冲（每批一次 draw.line）"""
+        pending = self._track.drain()
+        if not pending:
+            return
+        from PIL import ImageDraw as _Draw
+        draw = _Draw.Draw(self._pixel_buf_hires)
+        for pts in pending:
+            flat = [c for p in pts for c in p]
+            draw.line(flat, fill=255, width=self._brush_size, joint="curve")
 
     def _save_canvas_as_csv(self) -> str:
         """将画板内容保存为 CSV 文件（784 个 0~1 像素值），返回文件路径
