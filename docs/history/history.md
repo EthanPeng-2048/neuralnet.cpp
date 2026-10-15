@@ -4235,3 +4235,233 @@ INTERFACE 的 `/utf-8` 同处一条命令行 → `cl` 报
 `optimizer_test`（后者含 AdamW `wd≠0` 单步与手写参考**逐位一致**、顺序对调差值 ≠ 0、以及
 同目标写序的建边/不合组/反序 fail-fast 三断言）；本机 Linux（clang + libstdc++、CPU-only）
 另跑 40/40。
+
+# RV-14 专项审计：VK descriptor set 回收（2026-10-15，只审计）
+
+**背景**：外部审查把"VK Descriptor Set 回收需专项复审"列为待验证项（`descriptor*` 在旧
+`compute_vk_backend.hpp` 中出现 199 处；`pending_destroys_` 只管 buffer），立项为 RV-14。
+本轮按"只审计、不改代码"执行，审计对象 = `backend/compute_vk_backend.hpp` + 四个片段
+（`_destroy/_frame/_pipelines/_ops.inc`，6151 行）。
+
+**做法**：机械清点三类点位（分配 / 归还 / 池重置）后逐点判"是否可能 use-after-free"。
+计数实测：`vkFreeDescriptorSets` **27 处**（destroy 1 / frame 1 / pipelines 5 / ops 20），
+分配点**唯一**（`alloc_desc_set`），**池重置 0 处**（无 `vkResetDescriptorPool`；池只在
+`~GpuBackend` 由 `vkDestroyDescriptorPool` 销毁，且其前一行是 `vkDeviceWaitIdle`）。
+
+**结论 = 闭环**：① batch 模式：`alloc_desc_set` 成功即把集合登记进
+`frames_[batch_frame_].desc_sets`，唯一释放点是 `reap_frame`（顺序 = 等该帧 fence → 销毁该帧
+延迟 buffer → 释放该帧描述符集 → `in_flight = false`），而 `start_frame` 复用槽前必先
+`reap_frame(i, wait=true)` ⇒ 不存在"集合仍被在飞帧引用却被释放"或"命令缓冲已 reset、集合已
+释放"的窗口；② solo 模式：`submit_and_wait` 等到 fence 后才释放，其余释放点全在**提交前**的
+错误分支；③ 27 处释放点里 19 处是 `if (!cmd_r)`/`if (owns_cmd)` 分支——`acquire_cmd` 的 batch
+分支**不可失败**（直接返回预分配的帧命令缓冲），故这些分支只在 solo 模式可达、集合未登记，
+单次释放正确；④ buffer 侧：延迟销毁按"当前录制帧"（batch）/最近活跃帧（solo）打标签，标签恒
+≥ 任何可能引用该 buffer 的帧 ⇒ 无提前释放；标签在池区间归还时一并释放，不会出现"区间被复用
+而 buffer 仍被引用"。
+
+**审计派生一条真缺陷（另立 RV-15，Open，未在本轮修）**：`matmul_q_impl` 的 `#ks`/`#kr` 路径
+在 `alloc_desc_set(#kr)` 失败分支里**即时**释放 `ds_ks`——batch 模式下该集合已登记进帧表，帧
+被 `reap_frame` 时会**再释放一次**（双重释放）。触发需三条同时成立：batch 录制中 + 池分配在
+两次分配之间失败（`maxSets = 262144` 耗尽）+ 调用方从错误恢复继续跑（库内训练路径会终止，
+故当前实践不可达）。方案 = 收敛一个 `release_desc_set_now()`（batch 下不即时释放、留给 reap）。
+
+**口径说明**：结论是**代码级生命周期分析**，不是"校验层零告警"对拍——本机
+`/usr/share/vulkan/explicit_layer.d/` 只有 MESA/INTEL 层，**无 `VK_LAYER_KHRONOS_validation`**。
+复现命令见 `docs/todo/00-code-review-remediation.md` 的 RV-14 卡（审计表 + 分类依据 + 未做项）。
+
+# P2-6「绘制节流」半边：画板拖动开销（2026-10-15）
+
+**立项表述与实测不符（先纠偏）**：13 §5.3 / X5 记的是"`_on_draw_move` 每次 motion
+**全量降采样重绘**"。实测当时代码并不做降采样——拖动期的每事件开销是
+**逐事件新建画布项**（`canvas.create_line`，一笔长拖 = N 个 item）+ **逐事件 PIL 画线**
+（`ImageDraw.Draw(...).line(...)`）。所以"复用 `_RENDER_MS` 节流先例"这条处方对不上病灶：
+真正要封顶的是"每个 motion 事件的工作量"与"画布项数随事件数增长"。
+
+**改动（`gui.py`）**：
+1. 新增纯逻辑类 `StrokeTrack`（无 Tk/PIL 依赖 ⇒ 可单测）：一笔的点集原地增长，
+   `extend()` 对"坐标未变的重复事件"返回 False（**空帧跳过**），`end()` 把折线推入
+   待光栅化队列，`drain()` 一次性取走。
+2. `_paint_live()`：**复用同一个画布项**（`canvas.coords`）——拖动期画布项数 = 笔数。
+3. **视觉刷新按帧节流**（`_PAINT_MS = 16`）：数据侧永不节流（每个事件都进 `StrokeTrack`），
+   只限制刷新频率；结束一笔时强制补最后一次刷新。
+4. **PIL 光栅化延迟**：`_rasterize_pending()` 按批一次 `draw.line(折线)`，由
+   `_downsample_buffer()`（读缓冲的唯一入口）触发 ⇒ 拖动期零 PIL 调用。
+
+**实测（本机，合成事件；`python bench/gui_draw_runtime_audit.py`）**：2000 个 motion 事件
+（一半是空帧）**16.6 ms vs 旧写法 37.9 ms（2.3×）**；画布项 **2058 → 59**（网格 58 + 笔迹 1），
+即复杂度从 O(事件数) 降到 O(笔数)。功能闭环同测：一笔落下后 28×28 缓冲非零像素 100/784，
+`collect_args` 输出 784 值 CSV 且非全零（证明"延迟光栅化"没丢笔迹）。
+
+**门禁**：`bench/gui_draw_logic_audit.py`（`StrokeTrack` 语义 + AST 源码级不变量：拖动不建项 /
+按帧节流 / 读缓冲前必先光栅化 / 旧属性零引用；**用桩替换 customtkinter，无需 GUI**）、
+`bench/gui_draw_runtime_audit.py`（真机功能 + 开销对照；无显示时退出码 77 = SKIP）；
+`bench/gui_cli_audit.py` 退出码 0。
+**剩余**：P2-6 的字段表半边（dataclass 元数据自动生成 UI 行与 `collect_args`）未动。
+
+# `gpt_test` 偶发失败（C6 / P1-4）复现结论：未复现 + 同机完全确定（2026-10-15）
+
+**历史记录**：13 §9.5 记"62 次直跑 1 次失败（2026-10-01），日志被覆盖未定位"，列为 C6/P1-4。
+
+**本轮复现（本机 Release + clang 24.0.0 / libstdc++ / 8 线程）**：
+
+| 口径 | 次数 | 失败 | 日志指纹 |
+|---|---|---|---|
+| 串行直跑（`build-gpu/test/gpt_test`） | 200 | **0** | 200 份**同一 md5** `dc077445bf463a8f0018b91dc0581e3d` |
+| 8 路并发直跑 | 8 | 0 | 与串行**同一 md5** |
+| 串行直跑（加环境指纹行后） | 40 | 0 | 同一 md5 `8f4b82d6e8330980e3405cadbb754149` |
+| `taskset -c 0,1`（**2 核超订 8 线程**，最大争用） | 30 | 0 | 同上，**同一 md5** |
+
+⇒ **同机同码下该测试逐字节确定**（连打印出的 `max_err` / `max_abs` 都完全一致）：不存在
+"数值比较随机漂移"的成分。因此历史那一次失败**不能归因于测试自身的随机性**，只剩两类可能：
+① **环境差异**（编译器/标准库/构建类型/CPU 指令集——例如 FMA 收缩会改变浮点舍入，
+而 gradcheck 是容差判据）；② **当次进程级异常**（分配/线程创建失败等）。两者在本机都不可复现。
+统计口径：0/200 ⇒ 本机失败率 95% 置信上界 ≈ **1.5%**，与历史 1/62（≈1.6%）相容。
+
+**处置（不加 retry / skip，理由显式）**：输出逐字节确定 ⇒ 任何失败都必然对应"环境变了或
+代码变了"，重试/跳过只会掩盖真实回归。因此只做**可归因性**加固：
+`src/gpt_test.cpp` 新增 `print_env_fingerprint()`，输出一行
+`[env] <编译器> / <标准库> / <构建类型> / hw_threads=N / FMA=on|off`——历史失败的真正障碍是
+**日志被覆盖**（P0-1 已让 CI 用 `ctest --output-on-failure` 保留日志），本行让任何一份失败日志
+自带环境坐标，FMA 开/关尤其关键（它是唯一能让 gradcheck 数值在容差边界漂移的编译期因素）。
+
+**复现命令**：
+`for i in $(seq 1 200); do ./build-gpu/test/gpt_test > /tmp/r.log 2>&1 || echo FAIL $i; md5sum /tmp/r.log; done | sort -u | wc -l`
+→ 1（= 无失败且日志单一指纹）；并发版把命令换成 `&` + `wait`，超订版加 `taskset -c 0,1`。
+
+# C10 归因：RAPT GPU 训练为什么慢（2026-10-15，只定位不改代码）
+
+**立项背景**：issue #15 记"同一命令只换 `--model rapt`，40HX 上 62.9 s vs 3.9 s（≈16×）"，
+原怀疑方向（**未验证**）= 短序列下扫描原语的逐 step kernel 启动 + staging 常数。
+
+**复现（本机 850M / Vulkan / d128·h4·L4·ff512 / seq128 / b8 / `--max-steps 3` / `NN_PROFILE=1`）**：
+RAPT step **741.81 ms** vs GPT **134.84 ms**（3 步口径）= **5.5×**。（40HX 的 16× 是同一机制的
+更大比值：GPT 在那台机器上更快，而往返成本是"每调用一次 drain"的固定时长，与算力无关。）
+
+**结论一：原怀疑方向证伪**。host 侧扫描派发极小——`scan_prefix_outer` 0.80 ms、
+`outer_col` 1.38 ms、`scan_suffix_outer` 0.40 ms（合计 ≈0.3% 墙钟）；扫描的问题在
+**设备侧 kernel 时长**（见结论三），不在"启动 + staging 常数"。
+
+**结论二：主因是 `rms_norm_forward_` 的逐头 host 往返**。exclusive 表：
+`to_matrix` **573.82 ms / 768 次**（= 墙钟 **75%**，单次 747 µs），且全部落在
+`fwd.blk#N`（每 block 192 次 / 3 步 = 64/step，恰等于 `2 × batch × heads` = 2×8×4）；
+`begin_batch`/`end_batch` 各 **774 次**（258/step）——每次 `download_vector` 都会
+`wait_in_flight` 抽干整条流水线，随后相邻算子再开一帧。GPT 同配置只有 6 次 begin_batch。
+
+**A/B 验证（决定性）**：`--checkpoint-every 1` 时 forward **不收集**逐头 1/rms
+（`rms_norm_forward_` 的 `rms_inv_out == nullptr` 分支明确"省掉 BH 次 GPU→CPU 下载"）
+⇒ RAPT **forward 659.88 → 160.77 ms（4.1×，与 GPT forward 103.19 ms 同量级）**；
+总墙钟反而升到 1022.81 ms，因为 backward 的重算路径把同样的下载又做了一遍（768 次 to_matrix
+移到 `bwd.blk#N`）——即**下载成本随"哪条路径收集 rms_inv"迁移，不随数学变化**。
+
+**结论三：设备侧最大单项是 `scan_prefix` kernel 本体**。设备 kernel 合计 530.40 ms
+（busy 69.3%），其中 `scan_prefix@fwd|bwd.blk#N` = **340 ms（64%）**，单次 8–10 ms
+（dk=32 / seq=128 / BH=32）——不是启动开销，是 kernel 本身慢；这是 P4-2 的逐 op 靶子。
+
+**归口（未在本轮改代码）**：两项分别归 **P4-2**——(a) 逐头 1/rms 收集改设备侧拼装
+（`insert_rows` 进 (BH,seq) 缓冲，去掉 download+upload 往返；**f16 注意**：现有往返会把值
+落成 F32，设备侧改写要保持被消费处的精度一致）+ 逐头循环批量化（同循环还有 1060 次
+`slice_rows`/step）；(b) `scan_prefix` tile/并行度调参。复现命令 =
+`NN_VULKAN_DEVICE=850M NN_PROFILE=1 ./build-gpu/text_train datasets/tinystories_200mb.nndataset
+--model rapt|gpt --d-model 128 --num-heads 4 --num-layers 4 --d-ff 512 --seq-len 128
+--batch-size 8 --max-steps 3 --gpu`（对照加 `--checkpoint-every 1`）。
+
+# P0-5 推理采样：top-k / top-p / 重复惩罚 / 种子（2026-10-15）
+
+**改了什么**：
+1. `compute_layer_base.hpp` 新增 `nn::SamplingConfig`（`temperature` / `top_k` / `top_p` /
+   `repeat_penalty` / `repeat_window` / `seed` + `has_seed`）与扩展的共用采样器
+   `sample_next_token_(logits, cfg, rng, dist, history)`；顺序固定 =
+   **重复惩罚 → 温度 → top-k → top-p（核采样，保留集内重新归一化）→ 数值稳定 softmax →
+   采样/贪心**。确定性口径：top-k 按（值降序, 下标升序）；逆 CDF 按下标升序累加；
+   贪心并列取最小下标且**不消耗 RNG**。**全默认（top_k=0/top_p=1/repeat_penalty=1/无 history）
+   与旧 temperature 路径逐位一致**（返回下标 + 概率向量 + RNG 状态三者相同），旧 4 参重载保留为转发。
+2. `GPTModel` / `RAPTModel::generate` 新增 `SamplingConfig` 重载（旧 `Scalar temperature`
+   重载 = 全默认语义）；`has_seed` 时用 `cfg.seed` 播种（否则仍 `random_device`）；
+   `history` = prompt + 已生成 token。
+3. `src/text_infer.cpp`：`--top-k`（0=关）/ `--top-p`（1.0=关）/ `--repeat-penalty`（1.0=关）/
+   `--repeat-window`（0=全部上下文）/ `--seed`；CLI 校验 + 生成横幅回显；GUI「GPT 推理」页
+   同步暴露同样 5 个字段（`cli_controllers.GptInferController` + `gui.py` 的 `GptInferTab`）。
+4. 新测试目标 `sampling_test`（ctest 48 → **49**；无 Vulkan 树 46 → **47**）：默认配置 ≡ 旧路径
+   的逐位等价性、top-k/top-p/重复惩罚/`repeat_window` 语义、贪心不消耗 RNG、模型级
+   「同 seed 可复现 + 不同 seed 不同 + `top_k=1` ≡ 贪心」。
+
+**端到端实测（本机 850M，`gpt_model.nnmodel` + `bpe_vocab_stories.nnvocab`）**：
+`--max-tokens 16 --seed 7 --top-k 40 --top-p 0.9 --repeat-penalty 1.2` **连跑 3 次输出逐 token 相同**；
+换 `--seed 8` 输出不同；`--temperature 0` 与 `--top-k 1` 输出逐 token 相同（贪心等价）。
+
+**三组「编译器 × 标准库」验证（最终源状态）**：
+
+| 环境 | 编译器 / 标准库 | 构建 | ctest |
+|---|---|---|---|
+| 本机（Vulkan 850M） | clang 24 + libstdc++ | 零告警 | **49/49** |
+| `102` WSL（`~/nn-verify`，CPU-only） | clang 24 + **libc++** | 零告警 | **47/47**（GPU 用例 77=skip） |
+| `102` WSL（同目录 `build-gcc`） | g++ 15.2 + libstdc++ | 零告警 | **47/47** |
+
+**libc++ 抓到的真实移植性缺陷（已修）**：`sampling_test.cpp` 里用 `{1}` 直接当
+`std::span<const std::size_t>` 实参——libstdc++ 接受，**libc++ 报 "no matching function"**
+（span 无 `initializer_list` 构造）。改为显式数组 `const std::size_t hist_neg[1] = {1};`。
+这正是 AGENTS §2「clang + libc++ 口径更严」那条纪律的又一例。
+
+**未做（按 27 号计划的拆分）**：GUI 的多轮上下文闭环（连续 N 轮不丢上下文）留 P2-6 批次。
+
+# RV-15（descriptor set 双重释放）+ P4-2 (a)（RAPT 逐头 host 往返）合并提交（2026-10-15）
+
+## RV-15：batch 模式下 descriptor set 双重释放（RV-14 审计派生）
+
+**改法**（`backend/compute_vk_backend_pipelines.inc` + `_ops.inc` + `_frame.inc`）：
+新增 `release_desc_set_now(VkDescriptorSet)`——**语义与 `alloc_desc_set` 的登记规则严格对齐**：
+`VK_NULL_HANDLE` 或 batch 模式（集合已在 `frames_[batch_frame_].desc_sets` 名下）直接返回，
+交给 `reap_frame` 统一回收；solo 模式（未登记）立即 `vkFreeDescriptorSets`。
+所有「拿到 cmd 之前的错误分支」全部改走它：`_ops.inc` 17 处 + `_frame.inc::dispatch_compute` 1 处，
+含**原缺陷点** `matmul_q_impl` 的 `!ds2_r` 分支，以及两处一次释放两个集合的写法
+（`{ds1, ds2}` 数组 → 两次 helper 调用）。`owns_cmd` 块内两处直接释放保留（该块只在 solo 可达 ⇒
+集合未登记 ⇒ 直接释放正确），并加注释说明依据。
+
+**审计复现**：`rg -n "vkFreeDescriptorSets" include/neuralnet.cpp/backend/*.inc` ⇒ 9 处 =
+helper 自身 1 + `submit_and_wait` 5 + `reap_frame` 1 + `owns_cmd` 2，**错误分支 0 处**。
+**验证**：本机 850M 全量重建零告警（该 TU 仅在有 Vulkan 时编译）+ ctest 49/49；
+102 WSL clang24+libc++ 47/47、g++15.2+libstdc++ 47/47（无 Vulkan 旁证）。
+
+## P4-2 (a)：RAPT 逐头 1/rms 的 host 往返 → 设备侧拼装
+
+**背景**：C10 归因（同日）测得 RAPT 的 `to_matrix` 占墙钟 75%，来源是 `rms_norm_forward_`
+为收集逐头 1/rms 缓存而「每头一次 download + 末尾一次 upload」（= 每个 norm 调用 BH 次
+GPU→CPU→GPU 往返，每次 `to_matrix` 都会 `wait_in_flight` 抽干整条流水线）。
+
+**改法**（`compute_layer_rapt.hpp::rms_norm_forward_`）：一次 `(BH, seq)` F32 张量 +
+逐头 `cast_into(*ri, ri_f32)`（f16 时，f16→f32 精确）→ `insert_rows(rms_out, bh, ...)`，
+全部在设备内完成。p_.compute == F32 时直接 `insert_rows`（连 cast 都不做）。
+checkpoint 模式（`rms_inv_out == nullptr`）行为不变。
+
+**A/B（850M / Vulkan / `d128·h4·L4 / seq128 / b8 / --max-steps 3` / `NN_PROFILE=1`，配对同窗）**：
+
+| 指标 | before | after | Δ |
+|---|---|---|---|
+| step（3 步） | 741.81 ms | **521.68 ms** | **−29.7%** |
+| forward / backward | 659.88 / 38.05 ms | 372.25 / 118.18 ms | −43.6% / +2.1×（backward 的 GPU 工作此前被 forward 的 drain「隐藏」） |
+| `to_matrix` | 573.82 ms / **768 次**（75% 墙钟） | **0 次** | 消除 |
+| `begin_batch` / `end_batch` | 774 / 774（258/step） | **6 / 6** | −99% |
+| GPU 忙率 / 墙钟 | 69.3% / 765.50 ms | **84.0%** / 543.29 ms | 忙率 +14.7pt，墙钟 −29.0% |
+
+**数值不变性（逐位证明）**：102 WSL 上把 (a) 三段代码单独回退后重建，同一 `rapt_test`
+（CPU f32）与 `rapt_test --f16`（CPU f16）的**完整 stdout 逐字节一致**（含逐参数梯度
+`max_err` 的 7+ 位有效数字、causal 与 bidirectional 两个 gradcheck、block 级检查）
+⇒ `... | diff - && echo BIT_IDENTICAL`。GPU 侧为构造性等价（`cast_into` 的 f16→f32 是
+文档化的精确升位 + `insert_rows` 为设备内行拷贝）+ 全量 GPU 套件通过（含 `rapt_test --f16 --gpu`）。
+
+**测量方法论（本轮踩到的坑，写给下一次 A/B）**：
+· `text_train` 每个 epoch 用 `random_device` shuffle 样本 ⇒ **训练 loss 轨迹不可复现**
+  （实测同命令两次 `9.0271…` vs `9.0245…`，模型文件 md5 也不同）⇒ A/B 只能看墙钟/剖析；
+· 数值 oracle 用**确定性测试二进制**：`rapt_test --gpu` / `rapt_test --f16 --gpu`（两次运行逐字节一致），
+  或 `rapt_test`（CPU）。
+
+## P4-2 (b) 现状：`scan_prefix` 成为唯一大项（未修，已定位）
+
+(a) 之后 RAPT 的设备时间 456.60 ms（忙率 84%）里，`scan_prefix@fwd|bwd.blk#N` ≈ **282 ms（62%）**：
+单次 7.4–7.9 ms（dk=32 / seq=128 / BH=32），host 侧派发为 `dispatch_compute(..., wg=(1, BH, 1))`
+——每头一个 workgroup、256 线程，per-t 有 ~6 次 barrier 与三段「仅 32 线程的串行 matvec」，
+且 R 行块每 t 被跨步读 64 次。与「原始计算量 ~10^6 FLOP/次」相差 3–4 个数量级 ⇒ 延迟/占用受限，
+不是吞吐受限。**约束**：任何并行扫描/分块前缀都会改变累加结合序 ⇒ 字节锚移动（须按 §8.3 立新锚）；
+逐位不变的可做项 = R 行块 stage 进 shared、[4] 的 32 行写入改成 `tid < dk` 并行（写同一个标量）、
+去冗余 div/mod。**成本**：SPIR-V 嵌入头参与 PCH ⇒ 每次 shader 迭代都要全量重建（8 核 ≈20 min），
+故 (b) 需单独排期（已在 18 号 §4.5 P4-2 行登记配方与 oracle）。

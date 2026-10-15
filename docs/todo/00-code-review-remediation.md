@@ -461,7 +461,7 @@ GPU 侧用 `static_cast<int>(P)` 拼精度签名/报错文本的地方补一致�
 
 ### RV-14 — VK Descriptor Set 回收：专项复审（**只审计，不改代码**）
 
-- **优先级**：中（审计项） · **状态**：`Open` · **来源**：审查（"待验证"） · **依赖**：GPU 提权环境
+- **优先级**：中（审计项） · **状态**：`Fixed`（2026-10-15，只审计） · **来源**：审查（"待验证"） · **依赖**：无（代码级审计，不需要 GPU 运行）
 
 **现象与证据**：`compute_vk_backend.hpp` 中 `descriptor*` 出现 **199** 处；`pending_destroys_` 只管 **buffer**
 （延迟销毁），descriptor set / pool 的归还路径（如 `:3595` 附近"只归还描述符集；solo fence/cmd 留待下次复用"）
@@ -472,6 +472,93 @@ GPU 侧用 `static_cast<int>(P)` 拼精度签名/报错文本的地方补一致�
 
 **验收**：审计表格落进本文（或 `../history/history.md`）；结论明确（"闭环 / 有窗口 + 触发条件"）。
 
+**审计结论（RV-14，2026-10-15）= 闭环，唯一窗口见 RV-15**
+
+审计范围 = `backend/compute_vk_backend.hpp` + 四个片段（`_destroy/_frame/_pipelines/_ops.inc`，
+共 6151 行）。计数实测：`vkFreeDescriptorSets` **27 处**（destroy 1 / frame 1 / pipelines 5 / ops 20，
+`rg -n "vkFreeDescriptorSets" include/neuralnet.cpp/backend/*.inc`）；分配点**唯一**
+（`alloc_desc_set`，`_pipelines.inc` 内 `vkAllocateDescriptorSets`）；**池重置点 = 0**
+（全仓无 `vkResetDescriptorPool`），池只在 `~GpuBackend` 里 `vkDestroyDescriptorPool`，且其前一行是
+`vkDeviceWaitIdle` ⇒ 析构期不存在"池先销毁、在飞帧仍引用集合"的窗口。
+
+生命周期（两条模式，逐点核对）：
+
+| 模式 | 分配 | 归属 | 归还时机 | 可能 use-after-free？ |
+|---|---|---|---|---|
+| batch（`batch_mode_`，录制期） | `alloc_desc_set` 成功即 `frames_[batch_frame_].desc_sets.push_back` | **帧** | `reap_frame(i)`：① 等/确认该帧 fence → ② 销毁该帧延迟 buffer → ③ 整批 `vkFreeDescriptorSets` | **否**：唯一释放点在该帧 fence 之后 |
+| solo（`batch_mode_ == false`） | `alloc_desc_set`（不登记） | 调用点 | `submit_and_wait` 等完 fence 后释放；或"提交前"的错误分支释放 | **否**：前者在 fence 后，后者命令尚未提交 |
+
+27 处释放点的分类（上下文逐点核对，无遗漏）：
+
+- **帧回收 1 处**：`_destroy.inc::reap_frame` 内的批量释放（fence 之后）。
+- **solo 权威点 5 处**：`_pipelines.inc::submit_and_wait` 内 4 个错误分支 + 结尾正常释放；该函数只被
+  `owns_cmd == true`（⇒ solo）的调用点使用。
+- **solo 错误分支 19 处**：`if (!cmd_r) { free(...) }` ×17 与 `if (owns_cmd) {...}` 块内 ×2。
+  依据：`acquire_cmd()` 的 **batch 分支不可失败**（只置 `batch_has_ops_` / `ts_cur_` 后返回预分配的帧
+  命令缓冲），故这些分支只在 solo 模式可达，而 solo 模式不登记 ⇒ 单次释放，正确。
+- **1 处异常**：`_ops.inc` 的 `matmul_q_impl`（`#ks`/`#kr` 路径）在 `if (!ds2_r)` 分支即时释放
+  `ds_ks`——**batch 模式下该集合已登记**，且该分支在 batch 模式**可达** ⇒ 双重释放风险，
+  另立 **RV-15**。
+
+帧槽复用与等待的闭合性（"录制期引用"如何被保证）：
+`start_frame()` 在复用槽 `i` 前先 `reap_frame(i, wait=true)`；`reap_frame` 的顺序是
+**等 fence → 销毁该帧延迟 buffer（`pending_destroys_` 按 `pd.frame == i` 过滤）→ 释放该帧描述符集
+→ `in_flight = false`**，`vkResetCommandBuffer` 只在 `reap_frame` 之后发生。因此不存在
+"集合仍被在飞帧引用、其引用的 buffer 已被销毁"或"命令缓冲已被 reset、集合已被释放"的窗口。
+buffer 侧：`needs_deferred_destroy()` = batch 录制中恒真 / 非 batch 时看最近活跃帧是否在飞；
+`defer_buffer_destroy` 打**当前录制帧**（batch）或最近活跃帧（solo）标签——标签恒 ≥ 任何可能引用
+该 buffer 的帧（后录制的帧不可能引用已析构的 buffer）⇒ 不存在"释放早于在飞引用"的路径。
+
+未提交帧 / 空帧：ring 槽内 `desc_sets` 非空而 `in_flight == false`（如 `end_batch` 的
+`vkEndCommandBuffer` 失败路径）时不会被 `reap_completed_frames`/`wait_in_flight` 触及，但**该槽下次
+复用时 `reap_frame` 照样释放**（有界，非泄漏）；进程退出由池销毁兜底。（`desc_sets` 也不会跨帧共享：
+每个 dispatch 各分配一份。）
+
+池预算：`maxSets = 262144` × `STORAGE_BUFFER 4/set`（`FREE_DESCRIPTOR_SET_BIT`）。耗尽时
+`vkAllocateDescriptorSets` 经 `vk_check` 返回错误（**不静默**）；batch 模式下该错误的处理路径即 RV-15。
+
+证据与复现：
+`rg -n "vkFreeDescriptorSets" include/neuralnet.cpp/backend/*.inc`（27 处，逐点上下文已分类）；
+`rg -n "vkAllocateDescriptorSets|vkResetDescriptorPool|vkDestroyDescriptorPool" include/neuralnet.cpp/backend/`
+（分配 1 / 重置 0 / 销毁 1）；`rg -n "reap_frame|start_frame|defer_buffer_destroy" …`
+（闭合性三段顺序见 `_destroy.inc` 的 `reap_frame` 与 `_frame.inc` 的 `start_frame`）。
+**未做（口径说明）**：本机**无 Vulkan 校验层**（`/usr/share/vulkan/explicit_layer.d/` 只有
+MESA/INTEL 层，无 `VK_LAYER_KHRONOS_validation`），故结论是**代码级生命周期分析**，
+不是"校验层零告警"对拍；后者需要装有校验层的主机。
+
+### RV-15 — batch 模式下 descriptor set 双重释放（RV-14 审计发现）
+
+- **优先级**：低（条件可达） · **状态**：`Fixed`（2026-10-15） · **来源**：RV-14 审计 · **依赖**：无
+
+**现象与证据**：`backend/compute_vk_backend_ops.inc` 的 `matmul_q_impl` K 切分路径：
+`alloc_desc_set(#ks)` 成功后，`alloc_desc_set(#kr)` 失败时**即时**释放 `ds_ks`。
+但 `alloc_desc_set` 在 `batch_mode_` 下已把 `ds_ks` 登记进 `frames_[batch_frame_].desc_sets`
+（RV-14 表第 1 行）⇒ 该帧被提交并 `reap_frame` 时会**再次**释放同一句柄
+（`vkFreeDescriptorSets` 对已释放句柄 = 校验层 VUID 违规 / 驱动 UB）。
+
+**触发条件（三条同时）**：① 处于 batch 录制中；② 池分配在两次 `alloc_desc_set` 之间失败
+（`maxSets = 262144` 耗尽或分配错误）；③ 调用方**从该错误恢复并继续**运行（库内训练路径会终止，
+故当前实践不可达；受影响的是"记错误、继续跑"的嵌入方）。
+
+**方案**（收敛成 1 个 helper，语义与 `alloc_desc_set` 的登记规则同源）：
+新增 `release_desc_set_now(VkDescriptorSet)` = `if (!batch_mode_) vkFreeDescriptorSets(...)`，
+把"提交前错误分支"的即时释放全部走它——batch 下改为"留在帧表里由 `reap_frame` 统一回收"
+（该帧命令并未绑定这些集合，留着无害）；solo 下行为逐字节不变。
+
+**验收**：`rg` 审计显示"`!cmd_r`/`!ds2_r` 错误分支不再直接调用 `vkFreeDescriptorSets`"；
+GPU ctest（本机 850M）全绿；solo 路径行为不变（三值/融合用例覆盖 `matmul_q`）。
+
+**验收证据（RV-15，2026-10-15）**：`compute_vk_backend_pipelines.inc` 新增
+`release_desc_set_now(VkDescriptorSet)`（`VK_NULL_HANDLE` / batch 模式直接返回 ⇒ 交给
+`reap_frame`）；`_ops.inc` 17 处 + `_frame.inc` 1 处（`dispatch_compute`）的"提交前错误分支"
+全部改走该 helper，含 `matmul_q_impl` 的 `!ds2_r` 分支（原缺陷点）与两处一次释放两个集合的
+写法（`{ds1, ds2}` 数组 → 两次 helper 调用）。`owns_cmd` 块内的两处直接释放保留并加注释
+（该块只在 solo 可达，集合未登记 ⇒ 直接释放正确）。
+审计复现：`rg -n "vkFreeDescriptorSets" include/neuralnet.cpp/backend/*.inc` ⇒ 只剩
+helper 自身 1 处 + `submit_and_wait` 5 处 + `reap_frame` 1 处 + `owns_cmd` 2 处（共 9 处），
+**错误分支 0 处**。验证：本机 850M（Vulkan 路径真的被编译到）全量重建零告警 + `ctest` **49/49**；
+102 WSL clang24+libc++ 与 g++15.2+libstdc++ 各 **47/47**（无 Vulkan 树不含该 TU，属旁证）。
+
 ---
 
 ## 3. 建议批次与顺序
@@ -480,7 +567,7 @@ GPU 侧用 `static_cast<int>(P)` 拼精度签名/报错文本的地方补一致�
 |---|---|---|
 | **批 A（必修）** | RV-01、RV-02 | 同一错误处理主题：先定"无条件 fail-fast"宏，再统一工厂错误协议。这两项有 Release 下**UB / 静默**风险，优先级最高 |
 | **批 B（高）** | RV-03、RV-04 | RV-03 是**未来会静默错**的隐患（趁图优化还没重排）；RV-04 是低风险高收益的收敛 |
-| **批 C（中）** | RV-05、RV-06、RV-07、RV-08、RV-09、RV-14 | 相对独立、可并行；RV-05/14 需 GPU 提权环境；RV-08 建议"表驱动 → 物理拆分"分多次提交 |
+| **批 C（中）** | RV-05、RV-06、RV-07、RV-08、RV-09、RV-14（+ 审计派生的 RV-15） | 相对独立、可并行；RV-05 需 GPU 提权环境（RV-14 已完成——代码级审计不需跑 GPU）；RV-08 建议"表驱动 → 物理拆分"分多次提交 |
 | **批 D（低）** | RV-10、RV-11、RV-12、RV-13 | RV-10/11/13 是小改（注释 / 断言 / 移定义）；RV-12 只做设计评估 |
 
 **2026-10-11 进度**：批 A（RV-01、RV-02）与批 B（RV-03、RV-04）已 **Fixed**——每条的
@@ -499,6 +586,12 @@ GPU 侧用 `static_cast<int>(P)` 拼精度签名/报错文本的地方补一致�
 | WSL (Ubuntu 26.04) | g++ 15.2 + **libstdc++** | 构建 0 告警；ctest **40/40** |
 | Windows 102 | clang-cl 23.1.0 + **MSVC STL**（Vulkan GPU 启用） | 构建通过；ctest **42/42**（含全部 GPU 用例） |
 | Windows 102 | cl.exe **19.51** (VS18) + **MSVC STL** | 构建通过；ctest **42/42** |
+
+**2026-10-15 进度**：批 C 的 **RV-14**（VK descriptor set 回收专项复审）已 **Fixed** ——
+**只审计**：27 个释放点逐点分类 ⇒ **闭环，无 use-after-free、无泄漏**；唯一窗口是 batch 模式下
+"错后仍继续运行"的调用方，另立 **RV-15**（Open，收敛成 1 个 helper 即可）。RV-14 结论为
+代码级生命周期分析，不再需要 GPU 提权环境（本机无校验层的口径已在卡内注明）。
+**仍然 Open**：RV-05、RV-07、RV-08、RV-12、RV-15。
 
 门禁：`bench/doc_inventory.ps1` → `L2-VIOLATIONS: 0`、`HANDWRITTEN-RESIDUE: 0`、
 `virtual methods: 52 declarations / 52 unique`（与本文 §4.3 口径一致）；
