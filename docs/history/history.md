@@ -4534,3 +4534,48 @@ suffix 1 次，不是热点）。
 **成本口径（可复用的捷径）**：shader 迭代真的不需要全量重建——SPIR-V 嵌入头进 PCH 只意味着
 **PCH + 用它的 TU** 要重编；`ninja -C build-gpu layer_bench` 只重编 PCH + 1 个 TU（≈2 min），
 全量重建（8 核 ≈20 min）只在最后做一次。本轮 shader 迭代 8 轮全部按这个口径做。
+
+# P2-6「字段表」半边：GUI 参数改成声明式表（2026-10-15）
+
+**问题**：加一个 CLI 选项要手改两处——`__init__` 里建一行 + `collect_args` 里取值/转换/条件
+发送。6 个 Tab、7 处手写 `collect_args`、约 110 个参数行，漏一处就是"界面有、命令没带"
+（或反过来收集了不存在的键），而且**没人能静态审计**。
+
+**改法**：`Field`（frozen dataclass）+ 紧凑构造器 `_e/_i/_fl/_o/_b/_file/_dir/_save/_sep/_v`
++ **纯函数 `collect_fields`**（参数语义的唯一实现：option 总是发、entry 空则不发、`skip_zero`
+按旧口径跳过 0、check 按 `literal` 发 CLI 字面量或仅在改动时发、`group` + `_field_active`
+决定条件发送）+ `ParamsMixin`（建行 / 取值 / 显隐 `_apply_groups`）。`TabBase` 继承 mixin；
+**每个 Tab 只剩 `fields()` 一张表 + 少量显式后处理**（`engine → --gpu`、`precision_preset →
+--f16/--t1_58`、`input_method → input`、画板导 CSV）。
+
+**逐字段等价性验证（本次重构的核心证据）**：从 `git show HEAD:gui.py` 取出旧的 `collect_args`
+方法体，用**同一个 fake self**（控件桩按场景给值）分别驱动旧函数与新表实现，22 个场景比对
+kwargs：
+
+| 结果 | 数量 | 说明 |
+|---|---|---|
+| 逐字段完全一致 | **17** | 含每 Tab 的默认场景 + 架构/调度/预设/引擎切换场景 |
+| 有意收紧 | 4 | **fixed 调度下不再发被隐藏的 `min_lr`/`warmup_epochs`**（旧代码会把隐藏控件的默认值一起发出去：`--lr-schedule fixed --warmup-epochs 0 --min-lr 1e-06`；GptTrainTab 原本就是这个口径） |
+| 命令行层等价 | 1 | `show_bytes=False`：旧版显式发 False、新版不发 —— 控制器侧 `if kwargs.get(...)` 两者**生成的命令都是空**（实测） |
+
+**门禁**：`bench/gui_cli_audit.py` 新增第 **[5] 节（声明式字段表 ↔ Controller 闭包）**——
+表里声明的每个 kwargs 键喂给对应 Controller 后必须真的产生影响（否则这一行表单是死的），
+`_v()` 虚拟项（`gpu`/`f16`/`t1_58`/`input`…）一并纳入；`ui_only=True` 的字段（`engine`/
+`precision_preset`/`input_method`）显式声明"由后处理映射成别的键"。实测 6 个 Tab 的
+35/5/6/8/43/12 个键**全部有效**。
+
+**重构过程中审计抓到的两个真 bug（都在提交前修掉）**：
+
+1. `TabBase` 里遗留的 `collect_args` 桩（`return {}`）**覆盖了 mixin 的实现** ⇒
+   Tokenizer 两页 / GPT 推理页 / MNIST 推理页会**一个参数都不发**（GUI 静默失效，
+   逻辑上跑得通、只是命令永远是默认值）；
+2. 我把 tokenizer 页的属性名写成 `show_bytes`，与旧代码的 `show_bytes_var` 不一致 ⇒
+   等价性对照直接抛 `AttributeError`。
+
+**顺带清理**：删掉从未被读的 `_mp_widgets` 死码；`PRECISION_PRESETS` 常量收敛两页重复的
+预设字面量；旧的 5 组手写显隐清单（`_mlp_widgets`/`_tf_widgets`/`_cnn_widgets`/
+`_norm_place_widgets`/`_lr_schedule_widgets`）由 `group` 声明 + `_apply_groups` 取代。
+
+**复现**：`python bench/gui_cli_audit.py`（exit 0，五节）、`python bench/gui_draw_logic_audit.py`
+（exit 0）、`python bench/gui_cli_audit.py` 的 [3] 节同时验"控件删了引用还在"这类只在运行期
+才炸的错误。
