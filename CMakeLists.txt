@@ -546,6 +546,11 @@ if(NN_BUILD_APPS OR NN_ENABLE_TESTS)
     nn_add_executable(sampling_test src/sampling_test.cpp)
     list(APPEND NN_TEST_TARGETS sampling_test)
 
+    # ── RLA 扫描原语的**逐位**回归（CPU 参考 ↔ GPU；P4-2b 改写的前提）──────
+    # 无 GPU 时自身打印 77 = ctest SKIP（与 gpu_test 同约定）。
+    nn_add_executable(scan_bitwise_test src/scan_bitwise_test.cpp)
+    list(APPEND NN_TEST_TARGETS scan_bitwise_test)
+
     # ── Activation Offload（原语往返 + GPT/RAPT 模型级一致性）──────────
     # 模型级 offload 一致性（GPU-only：无 Vulkan 构建时自身返回 77 = SKIP）
     nn_add_executable(gpt_offload_test src/gpt_offload_test.cpp)
