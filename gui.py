@@ -295,6 +295,51 @@ def _sep(label, group=""):                return Field("", label, "label", group
 def _v(key, note=""):                     return Field(key, note, "virtual")
 
 
+# ── P1-2：断点续训（`.nnckpt`）的禁列（与 CLI 同一口径）──────────────────
+# 指向带训练状态段的断点时，形状 / 配方 / 计数器一律由断点决定；显式给出即报错
+# （docs/todo/18 §4.2 P1-2、docs/todo/23 §2.1.1）。**唯一真源** =
+# `include/neuralnet.cpp/cli/text_train_config.hpp` 的 `kForbiddenResumeFlags`
+# （本集合存的是 kwargs 键；→ CLI 旗标的映射由各字段的 arg/name 决定，
+#  门禁 `bench/gui_cli_audit.py` [6] 节按该映射核对两边一致）。
+CKPT_RESUME_FORBIDDEN_KEYS = frozenset({
+    "resume_epoch", "resume_step",
+    "epochs", "lr", "batch_size", "accum_steps", "seq_len", "stride",
+    "optimizer", "weight_decay", "beta1", "beta2",
+    "d_model", "num_heads", "num_layers", "d_ff", "model_type",
+    "f16", "t1_58",
+    "precision_param", "precision_compute", "precision_stable", "precision_optimizer",
+    "lr_schedule", "warmup_epochs", "warmup_steps", "min_lr", "lr_per_epoch",
+    "max_norm", "positional_encoding", "activation", "norm_type",
+})
+
+# 断点续训时仍允许的（C 类：完全不改变训练）
+CKPT_RESUME_ALLOWED_KEYS = frozenset({
+    "save", "save_interval", "log_interval", "max_steps", "gpu", "grad_log",
+    "checkpoint_every", "activation_offload",
+})
+
+
+def model_file_role(path: str) -> Optional[str]:
+    """读模型文件头的 role 字节（v7+）：'model' / 'checkpoint' / None。
+
+    布局 = `magic u32 | version u32 | precision u8 | role u8`
+    （见 `model_serialization.hpp` 的文件格式注释）。读不到 / 版本 < 7 /
+    魔数不符 ⇒ None（按"命令行全权"处理，交给 CLI 自己判）。
+    """
+    try:
+        with open(path, "rb") as f:
+            head = f.read(10)
+    except OSError:
+        return None
+    if len(head) < 10 or head[0:4] != b"NNNN":
+        return None
+    version = int.from_bytes(head[4:8], "little")
+    if version < 7:
+        return None
+    role = head[9]
+    return {0: "model", 1: "checkpoint"}.get(role)
+
+
 def collect_fields(fields, value_of, active=None) -> Dict[str, Any]:
     """按声明式表收集 kwargs —— **参数语义的唯一实现**（纯函数：门禁可直接测）。
 
@@ -1652,6 +1697,9 @@ class GptTrainTab(TabBase):
                   filetypes=[("训练断点", "*.nnckpt *.bin *.nnpkg")]),
             _i("resume_epoch", "续训起始 epoch (0-based)", "0", skip_zero=True),
             _i("resume_step", "续训起始 step (0-based)", "0", skip_zero=True),
+            _sep("⚠ 断点续训模式：形状 / 配方 / 计数器由断点状态段决定，"
+                 "本页对应输入不发送（要改配方请从 .nnmodel 开新一轮）",
+                 group="ckpt_resume"),
             _sep("── 训练参数 ──"),
             _i("epochs", "轮数", "10", skip_zero=True),
             _i("batch_size", "批大小", "32", skip_zero=True),
@@ -1734,6 +1782,8 @@ class GptTrainTab(TabBase):
                 "device": dev, "data": data, "hyperparameters": args}
 
     def _field_active(self, f: Field) -> bool:
+        if f.group == "ckpt_resume":
+            return self._ckpt_resume_active()
         sched = self._w["lr_schedule"].get()
         if f.group == "sched":
             return sched != "fixed"
@@ -1773,7 +1823,19 @@ class GptTrainTab(TabBase):
             for slot in ("precision_param", "precision_compute", "precision_stable",
                          "precision_optimizer"):
                 args.pop(slot, None)
+        # 断点续训（.nnckpt）：形状/配方/计数器由状态段决定 ⇒ 一律不发这些参数
+        # （CLI 侧对显式输入直接报错，见 CKPT_RESUME_FORBIDDEN_KEYS 的注释）。
+        if self._ckpt_resume_active():
+            for key in CKPT_RESUME_FORBIDDEN_KEYS:
+                args.pop(key, None)
         return args
+
+    def _ckpt_resume_active(self) -> bool:
+        """恢复路径指向 `.nnckpt`（Checkpoint 角色）⇒ 进入断点续训模式。"""
+        path = self._value_of(next(f for f in self.fields() if f.key == "resume"))
+        if not path:
+            return False
+        return model_file_role(str(path)) == "checkpoint"
 
 
 # ================================================================

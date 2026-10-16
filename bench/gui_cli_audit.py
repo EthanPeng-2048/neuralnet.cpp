@@ -404,9 +404,101 @@ def audit_field_tables() -> int:
     return bad
 
 
+def audit_ckpt_resume_filter() -> int:
+    """[6] 断点续训（.nnckpt）时 GUI 不得发出 A/B 类参数（P1-2）。
+
+    三点：
+      ① gui.py 的禁列集合 ↔ CLI 的 `kForbiddenResumeFlags`（**唯一真源**，直接读
+         `cli/text_train_config.hpp`；键 → 旗标的映射用字段的 arg/name，与表格一致）；
+      ② 恢复路径指向 **Checkpoint 角色**（v7+ role=1）时 `collect_args()` 不发任何
+         禁列键（否则 CLI 会按 P1-2 的禁列规则报错）；
+      ③ 指向 Model 角色（warm start，CLI 全权）时**照发** —— 防止把 SFT 的配方面
+         一起砍掉。
+    """
+    print("\n=== [6] 断点续训禁列：gui.py ↔ CLI 表 ↔ 收集行为（P1-2）===")
+    import re
+    import tempfile
+
+    header = (ROOT / "include/neuralnet.cpp/cli/text_train_config.hpp").read_text(
+        encoding="utf-8")
+    m = re.search(r"kForbiddenResumeFlags\[\]\s*=\s*\{(.*?)\};", header, re.S)
+    if not m:
+        print("  [BAD] 头文件里找不到 kForbiddenResumeFlags")
+        return 1
+    cli_flags = set(re.findall(r'"(--[a-z0-9_\-]+)"', m.group(1)))
+    try:
+        gui = _load_gui_tables()
+    except Exception as exc:   # pragma: no cover
+        print(f"  [BAD] 导入 gui.py 失败: {exc}")
+        return 1
+
+    # 例外（其余 = 键名去 `--` 再把 `_` 换成 `-`）：两个字段有 arg= 覆盖；
+    # `--t1_58` 的flag 本身带下划线（保留下划线是 CLI 的既有拼写）。
+    arg_overrides = {"model_type": "--model", "norm_type": "--norm", "t1_58": "--t1_58"}
+    gui_flags = {arg_overrides.get(k, "--" + k.replace("_", "-"))
+                 for k in gui.CKPT_RESUME_FORBIDDEN_KEYS}
+    bad = 0
+    only_gui, only_cli = gui_flags - cli_flags, cli_flags - gui_flags
+    if only_gui or only_cli:
+        print(f"  [BAD] 禁列集合与 CLI 不一致：仅 gui {sorted(only_gui)}；"
+              f"仅 CLI {sorted(only_cli)}")
+        bad += len(only_gui) + len(only_cli)
+    else:
+        print(f"  [OK ] 禁列集合与 CLI `kForbiddenResumeFlags` 逐项一致（{len(cli_flags)} 项）")
+
+    class _W:                       # 假控件：collect_args 只需要 .get()
+        def __init__(self, value):
+            self._v = value
+
+        def get(self):
+            return self._v
+
+    def make_file(role: int) -> str:
+        """造一个 v8 头（magic|version|precision|role），只需前 10 字节可读。"""
+        fd, path = tempfile.mkstemp(suffix=".nnckpt" if role == 1 else ".nnmodel")
+        with open(fd, "wb") as f:
+            f.write(b"NNNN" + (8).to_bytes(4, "little") + bytes([0, role]))
+        return path
+
+    for role, label, expect_forbidden in ((1, "Checkpoint（.nnckpt 续训）", False),
+                                         (0, "Model（.nnmodel warm start）", True)):
+        path = make_file(role)
+        tab = gui.GptTrainTab.__new__(gui.GptTrainTab)   # 不建控件：直接装假 _w
+        tab._w = {}
+        for field in gui.GptTrainTab.fields():
+            if field.kind == "label":
+                continue
+            value = path if field.key == "resume" else field.default
+            tab._w[field.name] = _W(value)
+        try:
+            args = tab.collect_args()
+        except Exception as exc:
+            print(f"  [BAD] {label} 下 collect_args 异常: {exc}")
+            bad += 1
+            continue
+        leaked = sorted(k for k in args if k in gui.CKPT_RESUME_FORBIDDEN_KEYS)
+        if expect_forbidden and not leaked:
+            print(f"  [BAD] {label} 应照发 A/B 类参数（warm start 的配方来源），实际一个都没发")
+            bad += 1
+        elif not expect_forbidden and leaked:
+            print(f"  [BAD] {label} 仍发出禁列参数: {leaked}（CLI 会报错）")
+            bad += len(leaked)
+        else:
+            tail = f"（禁列 {len(gui.CKPT_RESUME_FORBIDDEN_KEYS)} 项全部不发）" \
+                if not expect_forbidden else "（照发，CLI 全权）"
+            print(f"  [OK ] {label}: 参数面符合角色语义 {tail}")
+        for k in ("save", "log_interval"):
+            if k not in args:
+                print(f"  [BAD] {label} 把 C 类参数 {k} 也砍掉了（应保留）")
+                bad += 1
+        Path(path).unlink(missing_ok=True)
+    return bad
+
+
 def main() -> int:
     bad = (audit_gui_to_cli() + audit_phantom_options() + audit_gui_attrs()
-           + audit_optimizer_names() + audit_field_tables())
+           + audit_optimizer_names() + audit_field_tables()
+           + audit_ckpt_resume_filter())
     print(f"\n{'PASS' if not bad else 'FAIL'}  可行动问题={bad}")
     return 1 if bad else 0
 
