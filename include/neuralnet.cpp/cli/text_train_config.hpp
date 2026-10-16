@@ -72,7 +72,7 @@ void print_text_train_usage(const char *prog)
 
     help.section("选项");
     help.opt("--save <path>", "推理模型保存路径 (默认: gpt_model.nnmodel；\n只含推理所需参数——三值层写打包形态，不含训练参数)");
-    help.opt("--resume <path>", "从训练断点 (.nnckpt) 恢复训练；\n推理模型文件 (.nnmodel) 没有训练参数，会被明确拒绝");
+    help.opt("--resume <path>", "从模型文件恢复训练：\n断点 .nnckpt = 断点续训（形状/配方/计数器由断点决定，二者不得再由命令行给出）；\n推理模型 .nnmodel = warm start（SFT：CLI 全权、优化器冷启动；\n三值模型的打包权重按文件 τ 反量化成 f32 latent 后可继续训练）");
     help.opt("--resume-epoch <n>", "从第 n 个 epoch 继续 (0-based，需配合 --resume；默认 0)");
     help.opt("--resume-step <n>", "从本 epoch 内第 n 步继续 (0-based，需配合 --resume；默认 0)");
     help.opt("--epochs <n>", "训练轮数 (默认: 10)");

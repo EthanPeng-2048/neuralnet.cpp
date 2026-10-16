@@ -3,8 +3,11 @@
 // 验收（docs/todo/18-roadmap.md §4.2 P1-1）："新增恢复路径单测"。
 // 覆盖：
 //   [1] 断点路径派生：`--save` 的 .nnmodel → 同名 .nnckpt；非 .nnmodel 追加。
-//   [2] 恢复路径的角色门禁：Model 角色（.nnmodel）明确拒绝；Checkpoint 放行；
+//   [2] 恢复路径的角色语义：Checkpoint = 断点续训、Model = warm start（都放行）；
 //       文件不存在/不可读放行（交给 peek_model_spec 的"从头训练"语义）。
+//       **P1-7 起没有需要拒绝的角色组合**：三值（T1_58）`.nnmodel` 的打包载荷
+//       在载入时按文件 τ 反量化成 f32 latent ⇒ 首次 forward 与推理文件逐位一致、
+//       随后 8 步 Adam 参数确实移动（本节直接覆盖这条）。
 //   [3] 断点往返（恢复路径主用例）：保存 Checkpoint → `resume_text_train`
 //       按文件规格重建模型并载参 → 参数与保存前**逐位一致**、内嵌词表字节数一致。
 //   [4] 断点记账与退出码语义（P1-1 第一刀的回归锁）：写失败只记账不终止
@@ -23,6 +26,7 @@
 #include <sstream>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "neuralnet.cpp/nn.hpp"
 #include "neuralnet.cpp/cli/text_train_checkpoint.hpp"
@@ -56,6 +60,20 @@ std::filesystem::path scratch_dir()
 [[nodiscard]] nn::ModelSpec tiny_spec()
 {
     return nn::make_gpt_spec(VOCAB, D_MODEL, SEQ_LEN, HEADS, D_FF, LAYERS);
+}
+
+// 按参数顺序拍参数快照（宿主侧 f32；用于"参数确实移动"的断言）
+[[nodiscard]] std::vector<nn::Scalar> params_snapshot(nn::ComputeEngine& eng,
+                                                      nn::Model& m)
+{
+    std::vector<nn::Scalar> out;
+    for (auto& t : m.parameters())
+    {
+        auto mat = eng.to_matrix(t.get());
+        if (!mat) { out.push_back(-1e30f); continue; }
+        for (auto v : mat->span()) out.push_back(v);
+    }
+    return out;
 }
 
 // 按参数顺序逐元素比较两个模型（同引擎、逐位相等；顺序由 parameters() 决定）
@@ -116,24 +134,10 @@ void test_role_gate_and_roundtrip(const std::filesystem::path& dir)
     CHECK(log.failures() == 0, "断点写到可写路径不应记账失败");
 
     // 角色语义（v8，2026-10-16 裁定；docs/todo/23 §2.1.1）：
-    //   Model（.nnmodel）= warm start（SFT）⇒ **放行**；
-    //   Checkpoint / 老文件 / 不存在 ⇒ 放行；
-    //   唯一拒绝 = 三值（T1_58）的 .nnmodel（打包形态无 latent ⇒ 指向 P1-7）。
-    CHECK(nn::cli::check_resume_target(model_file, spec),
-          "dense 推理模型（.nnmodel）必须放行 —— SFT warm start 入口");
-    CHECK(nn::cli::check_resume_target(ckpt_file, spec), "Checkpoint 角色必须放行");
-    CHECK(nn::cli::check_resume_target((dir / "missing.nnckpt").string(), spec),
-          "不存在的断点应放行（由载入提示走'从头训练'语义）");
-    {
-        nn::ModelSpec ternary_spec = spec;
-        ternary_spec.weight_quant = nn::WeightQuant::T1_58;
-        auto gate_t158 = nn::cli::check_resume_target(model_file, ternary_spec);
-        CHECK(!gate_t158, "三值（T1_58）的 .nnmodel 必须被拒绝（打包形态无 latent）");
-        CHECK(!gate_t158 &&
-                  gate_t158.error().message.find("P1-7") != std::string::npos &&
-                  gate_t158.error().message.find(".nnckpt") != std::string::npos,
-              "拒绝文案应指向 P1-7 与 .nnckpt");
-    }
+    //   Model（.nnmodel）= warm start（SFT）⇒ **放行**（三值同样放行，见下面的
+    //     P1-7 反量化块）；Checkpoint / 老文件 / 不存在 ⇒ 放行。
+    //   **P1-7 已删除**"三值 .nnmodel 必须被拒"那条门禁（`check_resume_target`
+    //   随之删除）：打包载荷现在按文件 τ 反量化成可训练 latent。
 
     // ── P1-2 第三刀 B：禁列（按旗标名）+ 状态采纳 + 数据集身份门禁 ────────
     {
@@ -241,8 +245,7 @@ void test_role_gate_and_roundtrip(const std::filesystem::path& dir)
           "恢复后的参数应与保存前逐位一致");
 
     // 角色语义变更后（2026-10-16 裁定）的反例形态：dense `.nnmodel` ⇒ **warm start**
-    // 走通整条恢复流程（SFT 入口）；三值 `.nnmodel` 的拒绝由 `check_resume_target`
-    // 覆盖（上面），错误经 Result 回报而不在 stderr 上留痕。
+    // 走通整条恢复流程（SFT 入口）；三值 `.nnmodel` 见下面的 P1-7 反量化块。
     nn::cli::TrainConfig warm_cfg;
     warm_cfg.resume_path = model_file;
     warm_cfg.load_existing = true;
@@ -255,6 +258,133 @@ void test_role_gate_and_roundtrip(const std::filesystem::path& dir)
     if (warm)
         CHECK(params_identical(eng, original, m2),
               "warm start 载入的参数应与写出前逐位一致");
+
+    // ── P1-7：三值（T1_58）`.nnmodel` 的续训入口（打包 → latent 反量化）──────
+    // 三值推理文件的载荷是打包形态（没有 latent，部署态 `backward()` 会报错）。
+    // `resume_text_train` 以**可训练意图**载入：序列化层按文件 τ 反量化成 f32
+    // latent（量化器不动点，见 `ternary_pack.hpp` 的 `latent_row_scale`），层再按
+    // 文件 τ 播种量化缓存 ⇒ 首次 forward 与推理文件里的模型**逐位一致**。
+    {
+        nn::ModelSpec t_spec = tiny_spec();
+        t_spec.weight_quant = nn::WeightQuant::T1_58;
+        const nn::PrecisionProfile t1 = nn::profile_t1_58();
+        auto src_r = nn::build_gpt_model_from_spec(eng, t_spec, t1);
+        NN_ASSERT_ALWAYS(src_r, "text_train_modules_test: 构建三值小 GPT 失败");
+        nn::Model src = std::move(*src_r);
+
+        const std::string t_file = (dir / "ternary.nnmodel").string();
+        NN_ASSERT_ALWAYS(nn::cli::save_text_train_model(t_file, src, t_spec,
+                                                       kTokenizerBytes),
+                         "text_train_modules_test: 写三值推理模型失败");
+        {
+            auto role = nn::peek_model_role(t_file);
+            CHECK(role.has_value() && *role == nn::ModelRole::Model,
+                  "三值文件的角色仍是 Model（.nnmodel）");
+            auto peeked = nn::peek_model_spec(t_file);
+            CHECK(peeked.has_value() && peeked->weight_quant == nn::WeightQuant::T1_58,
+                  "文件规格记住 weight_quant=t1_58");
+        }
+
+        nn::cli::TrainConfig t_cfg;
+        t_cfg.resume_path = t_file;
+        t_cfg.load_existing = true;
+        // 精度 profile 由命令行给出（Model 角色 = CLI 全权，文件只记 weight_quant）：
+        // 用它跟文件里那个模型对齐，才能要求"首次 forward 逐位一致"。
+        t_cfg.precision = t1;
+        nn::ModelSpec t_spec_out;
+        nn::Model t_model;
+        std::ostringstream t_out, t_err;
+        auto t_res =
+            nn::cli::resume_text_train(eng, t_cfg, t_model, t_spec_out, t_out, t_err);
+        CHECK(t_res.has_value(), "三值 .nnmodel 应能按 warm start 载入（P1-7：不再被拒）");
+        if (t_res.has_value())
+        {
+            CHECK(t_res->weights_loaded, "三值 warm start 应载入参数");
+            CHECK(t_res->spec_restored, "三值 warm start 应按文件规格重建（BitLinear）");
+            CHECK(t_out.str().find("反量化") != std::string::npos,
+                  "提示应说明打包权重按文件 τ 反量化成 latent");
+            CHECK(t_err.str().empty(), "三值 warm start 顺利时不应在 stderr 留痕");
+        }
+
+        // 固定输入：token IDs (seq_len, batch)
+        constexpr std::size_t BATCH = 2;
+        nn::Matrix x_m(SEQ_LEN, BATCH);
+        for (std::size_t i = 0; i < x_m.size(); ++i)
+            x_m.span()[i] = static_cast<nn::Scalar>(i % VOCAB);
+        const nn::Tensor x_t = upload(eng, x_m);
+
+        // 首次 forward：与写出前的模型逐位一致（wq/τ 播种自文件，不经重算）
+        auto y_src = src.forward(x_t);
+        auto y_warm = t_model.forward(x_t);
+        CHECK(y_src.has_value() && y_warm.has_value(), "三值两侧 forward 成功");
+        if (y_src.has_value() && y_warm.has_value())
+        {
+            const nn::Matrix a = download(eng, *y_src);
+            const nn::Matrix b = download(eng, *y_warm);
+            bool same = (a.rows() == b.rows() && a.cols() == b.cols());
+            for (std::size_t i = 0; same && i < a.size(); ++i)
+                same = (a.span()[i] == b.span()[i]);
+            CHECK(same, "同精度口径下三值 warm start 首次 forward 与推理文件**逐位一致**");
+        }
+
+        // 不给精度旗标也能载入（BitLinear 由文件规格确定；其余槽走 CLI 默认）
+        {
+            nn::cli::TrainConfig d_cfg;
+            d_cfg.resume_path = t_file;
+            d_cfg.load_existing = true;
+            nn::ModelSpec d_spec_out;
+            nn::Model d_model;
+            std::ostringstream d_out, d_err;
+            auto d_res = nn::cli::resume_text_train(eng, d_cfg, d_model, d_spec_out, d_out,
+                                                    d_err);
+            CHECK(d_res.has_value(), "不给精度旗标也应能载入三值 warm start（规格定 BitLinear）");
+            if (d_res.has_value())
+            {
+                auto y_d = d_model.forward(x_t);
+                CHECK(y_d.has_value(), "默认精度口径下三值 warm start 也能前向");
+                auto g_d = d_model.zero_grad();
+                CHECK(g_d.has_value(), "默认精度口径下 zero_grad 成功");
+            }
+        }
+
+        // 8 步 Adam：backward 可跑（不是只读部署态）、参数确实移动（P1-7 验收）
+        auto opt = nn::create_optimizer("adam", eng, t_model.parameters(),
+                                       t_model.param_gradients(), 1e-2f, 0.0f, t1);
+        NN_ASSERT_ALWAYS(opt != nullptr, "text_train_modules_test: 建三值优化器失败");
+        const std::vector<nn::Scalar> before = params_snapshot(eng, t_model);
+
+        nn::CrossEntropyLoss ce;
+        ce.set_precision_profile(t1);
+        nn::Matrix tgt_m(VOCAB, SEQ_LEN * BATCH, nn::Scalar{0});
+        for (std::size_t i = 0; i < SEQ_LEN * BATCH; ++i)
+            tgt_m.set_value(i % VOCAB, i, 1.0f);
+        const nn::Tensor tgt_t = upload(eng, tgt_m);
+
+        bool steps_ok = true;
+        for (int step = 0; step < 8 && steps_ok; ++step)
+        {
+            steps_ok = t_model.zero_grad().has_value();
+            auto logits = t_model.forward(x_t);
+            if (!logits) { steps_ok = false; break; }
+            auto loss = ce.forward(eng, *logits, tgt_t);
+            if (!loss) { steps_ok = false; break; }
+            auto grad = ce.backward();
+            if (!grad) { steps_ok = false; break; }
+            if (!t_model.backward(*grad)) { steps_ok = false; break; }
+            if (!opt->step()) { steps_ok = false; break; }
+        }
+        CHECK(steps_ok,
+              "三值 warm start 后 8 步 Adam（forward/loss/backward/step）全部成功");
+        const std::vector<nn::Scalar> after = params_snapshot(eng, t_model);
+        std::size_t moved = 0, total = 0;
+        for (std::size_t i = 0; i < before.size() && i < after.size(); ++i)
+        {
+            ++total;
+            if (before[i] != after[i]) ++moved;
+        }
+        std::printf("    三值 warm start 8 步：移动参数 %zu/%zu\n", moved, total);
+        CHECK(moved > 0, "三值 warm start 后 8 步 Adam 参数确实移动");
+    }
 }
 
 // ── [4] 断点记账与退出码语义（P1-1 第一刀回归锁）────────────────────────

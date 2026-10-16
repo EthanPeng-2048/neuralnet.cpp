@@ -15,10 +15,13 @@
 //       与梯度都在容差内一致；三值逐位一致）
 //   [6] 跨形状对拍：分块内核的**形状契约**（轴向 / 尾块 / 单列 × transA × f32/f16）
 //   [7] BitLinear 跨形状端到端：打包 vs 稠密（多块 + 尾块 + 两种 profile）
+//   [8] 反量化（P1-7）：打包行 → latent 行；`L == trit·(τ·K/n)` 逐位、
+//       再量化复现同一组 trit、逐行 absmean(L) == τ（量化器不动点）
 //
 // 退出码：0 = 通过，1 = 失败，77 = 跳过（--gpu 且无设备，或引擎无打包能力）
 // ───────────────────────────────────────────────────────────────────────────
 
+#include <algorithm>
 #include <bit>
 #include <cmath>
 #include <cstdint>
@@ -619,6 +622,83 @@ void test_bitlinear_shapes(nn::ComputeEngine& eng, const char* tag)
 
 } // namespace
 
+// ── [8] 反量化（P1-7）：打包行 → 可训练 latent 行 ─────────────────────────
+// 契约（`ternary_pack.hpp` 的 `latent_row_scale` / `dequant_row`）：
+//   ① L = trit·(τ·K/n)（n = 该行非零 trit 数；n = 0 ⇒ 整行 0）；
+//   ② 用同一个 τ 再打包 ⇒ **同一组 trit**（逐位相同的容器字）：非零位置
+//      |L| = τ·K/n ≥ τ > 0.5τ 恒成立（n ≤ K）；
+//   ③ 逐行 absmean(L) == τ（量化器不动点 ⇒ 续训不会出现 τ·n/K 的尺度跳变）。
+// 覆盖：一般行 / 全零行 / 全非零行 / K 非 16 倍数（含尾部字）。
+void test_dequant()
+{
+    std::puts("[8] 反量化（P1-7）：L = trit·(τ·K/n)、trit 复现、absmean == τ");
+    using namespace nn::trit_pack;
+
+    const std::size_t Ks[3] = {17, 32, 37};
+    bool formula_ok = true, repack_ok = true, fixed_point_ok = true;
+    bool zero_row_ok = true, dense_row_ok = true;
+    double worst_rel = 0.0;
+    for (std::size_t ki = 0; ki < 3; ++ki)
+    {
+        const std::size_t K = Ks[ki];
+        const std::size_t wpr = words_per_row(K);
+        // 行集：一般行 / 全零行 / 全非零行（τ 由各自行算出，与训练期 absmean 同定义）
+        std::vector<std::vector<float>> rows;
+        std::vector<float> r0(K), r1(K, 0.0f), r2(K), r3(K);
+        for (std::size_t i = 0; i < K; ++i)
+        {
+            r0[i] = 0.13f * static_cast<float>((i * 7 + ki) % 11) - 0.7f;
+            r2[i] = (i % 2 == 0) ? 0.8f : -0.55f;
+            r3[i] = 1e-3f * static_cast<float>(i % 3);   // 整行近零（全归 0 或全 ±1）
+        }
+        rows.push_back(r0);
+        rows.push_back(r1);
+        rows.push_back(r2);
+        rows.push_back(r3);
+
+        for (const std::vector<float>& w : rows)
+        {
+            double acc = 0.0;
+            for (float v : w) acc += std::fabs(static_cast<double>(v));
+            const float tau = static_cast<float>(acc / static_cast<double>(K));
+            std::vector<std::uint32_t> words(wpr, 0u);
+            pack_row(w.data(), K, tau, words.data());
+            std::vector<float> lat(K, 0.0f);
+            dequant_row(words.data(), K, tau, lat.data());
+
+            // ① 公式逐位
+            const float s = latent_row_scale(words.data(), K, tau);
+            for (std::size_t i = 0; i < K; ++i)
+                if (lat[i] != at(words.data(), i) * s) formula_ok = false;
+            // ② 再打包 = 同一组 trit（逐位相同的容器）
+            std::vector<std::uint32_t> again(wpr, 0u);
+            pack_row(lat.data(), K, tau, again.data());
+            if (again != words) repack_ok = false;
+            // ③ 逐行 absmean(L) == τ（浮点链只有 ±1 ulp；这里给 2e-6 相对带）
+            double l1 = 0.0;
+            for (float v : lat) l1 += std::fabs(static_cast<double>(v));
+            const double mean = l1 / static_cast<double>(K);
+            const double rel = std::fabs(mean - static_cast<double>(tau)) /
+                               std::max(1e-30, std::fabs(static_cast<double>(tau)));
+            worst_rel = std::max(worst_rel, rel);
+            if (rel > 2e-6) fixed_point_ok = false;
+            // 边界：全零行 ⇒ 整行 0；全非零行 ⇒ absmean 精确等于 τ（K/n = 1）
+            if (&w == &rows[1])
+            {
+                for (float v : lat)
+                    if (v != 0.0f) zero_row_ok = false;
+            }
+            if (&w == &rows[2] && s != tau) dense_row_ok = false;
+        }
+    }
+    CHECK(formula_ok, "L == trit·(τ·K/n)（逐位）");
+    CHECK(repack_ok, "反量化后用同一个 τ 再打包 ⇒ 容器字逐位相同（trit 复现）");
+    CHECK(fixed_point_ok, "逐行 absmean(L) == τ（量化器不动点）");
+    CHECK(zero_row_ok, "全零行 ⇒ 整行 0（n = 0 不产生 inf/NaN）");
+    CHECK(dense_row_ok, "全非零行 ⇒ 幅值就是 τ（K/n = 1）");
+    std::printf("    逐行 absmean 相对偏差 worst = %.3e（K ∈ {17,32,37}）\n", worst_rel);
+}
+
 int main(int argc, char* argv[])
 {
     bool gpu = false;
@@ -626,6 +706,7 @@ int main(int argc, char* argv[])
         if (std::string(argv[i]) == "--gpu") gpu = true;
 
     test_layout();
+    test_dequant();
     if (gpu)
     {
         nn::cli::EngineConfig ec;

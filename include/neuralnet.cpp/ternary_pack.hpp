@@ -95,6 +95,46 @@ inline void pack_row(const float* w, std::size_t k, float tau,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+//  反量化（P1-7：打包 → 可训练 latent）
+//
+//  语义：文件里的模型前向用的是 `(wq∘τ)·X`。把打包权重反量化成 f32 latent 时，
+//  "把 trit 乘回 τ"（L = wq·τ）**不是**量化器的逆：τ 的定义是**逐行 absmean**，
+//  而 L = wq·τ 的行 absmean 是 τ·n/K（n = 该行非零 trit 数）⇒ 反代回去 τ 会变，
+//  有效权重 wq·τ 也跟着变（尺度跳变，warm start 的 loss 会跳一下）。
+//
+//  正确取值是**量化器的不动点**：
+//      L = wq · (τ·K/n)
+//  它同时满足两条不变量：
+//    ① 行 L1 质量 = K·τ ⇒ absmean(L) == τ（与训练时 latent 的定义同源）；
+//    ② 非零位置 |L| = τ·K/n ≥ τ > 0.5τ（n ≤ K 恒成立）⇒ 再量化复现**同一组
+//       trit**，即 quantize(L) == (wq, τ)。
+//  于是"反量化 → 首次 forward"与文件里的模型逐位一致，此后每次重算 τ 也只是
+//  ±1 ulp（不是 τ·n/K 的尺度跳变）。n = 0（整行三值 0，τ 必为 0）⇒ 整行 0。
+//
+//  调用方：`model_serialization` 的**载入路径**（宿主侧逐行解码 + 反量化，L3 是
+//  宿主字节/Matrix 的落点）——`WeightLoadIntent::Trainable`（P1-7）。
+// ═══════════════════════════════════════════════════════════════════════════
+
+// 一行反量化后的非零幅值 τ·K/n（n = 该行非零 trit 数；n = 0 ⇒ 0）
+[[nodiscard]] inline float latent_row_scale(const std::uint32_t* words, std::size_t k,
+                                            float tau) noexcept
+{
+    std::size_t n = 0;
+    for (std::size_t i = 0; i < k; ++i)
+        if (at(words, i) != 0.0f) ++n;
+    if (n == 0) return 0.0f;
+    return tau * static_cast<float>(k) / static_cast<float>(n);
+}
+
+// 打包行（2-bit 容器）→ latent 行（k 个 f32；`out` 为宿主连续缓冲）
+inline void dequant_row(const std::uint32_t* words, std::size_t k, float tau,
+                        float* out) noexcept
+{
+    const float s = latent_row_scale(words, k, tau);
+    for (std::size_t i = 0; i < k; ++i) out[i] = at(words, i) * s;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 //  base-3（部署编码，1.6 bpw）
 //
 //  2-bit 定长编码是**运行期**容器（解码只有移位/掩码，喂 `matmul_q`）；部署
