@@ -13,8 +13,12 @@
 本项目的部分代码由 AI 辅助生成。当前使用（且目前限于）以下 AI 工具：
 
 - **DeepSeek V4 系列**
+- **DeepSeek V4.1 系列**
 - **Mi Mimo v2.5 系列**
+- **Mi Mimo v2.6 系列**
+- **Qwen3.8 系列**
 - **VS Code Copilot**
+- **ChatGPT Codex**
 
 > AI 仅作为辅助工具，所有代码的所有权与最终版权归本项目作者（EthanPeng-2048）所有，不影响上述 MIT 许可证的效力。
 
