@@ -414,6 +414,51 @@ void test_integrity(const std::filesystem::path &dir)
     }
 }
 
+// ── [9] save → load → save 逐字节一致（P1-2 验收口径）───────────────────
+// 全部状态张量为 f32 时（默认 profile 的常态）重写必须**逐字节一致**：
+// kvrec 字段顺序固定、摘要覆盖确定、参数载荷同精度回写。
+// （f16 状态张量经 load 物化为 f32 ⇒ 再 save 会被提升为 f32：值逐位不变、
+//  编码变化；生产路径不存在这种再写——save 一律从活状态导出，见 23 §2.1.1。）
+void test_resave_byte_identity(const std::filesystem::path &dir)
+{
+    std::cout << "\n── [9] save → load → save 逐字节一致（f32 状态）──\n";
+    nn::CpuEngine engine;
+    auto model_r = make_model(engine);
+    CHECK(model_r.has_value(), "建模型");
+    if (!model_r) return;
+    nn::Model &model = *model_r;
+
+    nn::Matrix m(2, 3);
+    m.span()[0] = 0.125f; m.span()[1] = -1.5f; m.span()[2] = 3.0f;
+    m.span()[3] = -0.25f; m.span()[4] = 7.5f;  m.span()[5] = 0.5f;
+    std::vector<nn::Tensor> blobs{upload(engine, m, nn::Precision::F32)};
+
+    nn::TrainState st = sample_state();
+    st.optimizer_blob_count = blobs.size();
+    const std::string tok = "nnvocab-resave";
+    const auto path1 = dir / "resave1.nnckpt";
+    const auto path2 = dir / "resave2.nnckpt";
+    CHECK(nn::save_model(path1.string(), model, tiny_spec(), tok, nn::ModelRole::Checkpoint,
+                         nn::CheckpointState{&st, blobs}).has_value(),
+          "写第一份断点");
+
+    auto loaded = nn::load_train_state(engine, path1.string());
+    CHECK(loaded.has_value(), "读回状态 + 状态张量");
+    if (loaded)
+    {
+        nn::TrainState back = loaded->state;
+        CHECK(nn::save_model(path2.string(), model, tiny_spec(), tok,
+                             nn::ModelRole::Checkpoint,
+                             nn::CheckpointState{&back, loaded->optimizer_blobs}).has_value(),
+              "用读回的内容重写第二份断点");
+        const std::string b1 = read_file(path1);
+        const std::string b2 = read_file(path2);
+        CHECK(b1.size() == b2.size() && b1 == b2,
+              "两份文件逐字节一致（save → load → save）");
+        CHECK(b1.size() > nn::MODEL_TAIL_BYTES, "文件含尾部标记");
+    }
+}
+
 // ── [7] 数据集身份差异说明（诊断面）────────────────────────────────────
 void test_dataset_identity()
 {
@@ -442,6 +487,7 @@ int main()
     test_kvrec_roundtrip();
     test_checkpoint_roundtrip(dir);
     test_integrity(dir);
+    test_resave_byte_identity(dir);
     test_dataset_identity();
 
     std::filesystem::remove_all(dir);   // 只清自己造的临时目录

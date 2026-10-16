@@ -321,6 +321,11 @@ ZiPT 恢复、LRLA、CUDA、分布式（7 项）。
    `role = Model` 时 CLI 全权；② 状态段 save→load→save 逐字节一致，老版本（v5/v6/v7）缺段回落
    冷启动语义；③ 数据集身份（sha256 + 网格三元组）不匹配**硬报错且不得提供逃生阀**；④ P2-1 的校验和 /
    尾部完整性标记缺失或截断必须报错。
+   **状态（2026-10-16）：① ② ③ ④ 全部落地并有门禁**——①③ 见 `text_train_modules_test` [6] 与
+   端到端四例（`docs/history/history.md`「P1-2（第三刀）」）、② 见 `train_state_test` [9]、
+   ④ 见 `train_state_test` [5]；优化器侧见 `optimizer_state_test`（重启续跑 = 直跑逐位一致）。
+   **尚未收口**：GUI 训练页在 ckpt 续训时仍会发 A/B 旗标（会撞禁列报错，文案清晰但应主动不发）
+   ⇒ `gui.py` 侧按 role 禁用那些字段并与 `bench/gui_cli_audit.py` 同步（第四刀）。
 
 ### 8.3 验收纪律
 

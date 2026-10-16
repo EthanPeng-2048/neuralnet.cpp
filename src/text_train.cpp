@@ -55,6 +55,16 @@ namespace
 // 错误经 Result 交给 main 打印 + 退出码 1（P1-1 口径）。
 [[nodiscard]] nn::Result<int> run_text_train(nn::cli::TrainConfig cfg)
 {
+    // ── 断点状态采纳（P1-2 第三刀 B）────────────────────────────────────
+    // 必须**早于**建模型/建优化器/切窗口：状态段是断点的权威来源（精度 profile、
+    // 曲线形状、网格、起点都在里面），CLI 再给一遍即报错（禁列见 recovery 模块）。
+    nn::cli::ResumeStateAdoption adoption;
+    if (cfg.load_existing)
+    {
+        NN_TRY(adopt_r, nn::cli::adopt_resume_state(cfg, std::cout, std::cerr));
+        adoption = std::move(*adopt_r);
+    }
+
     // ── 打开数据集（.nndataset；token 流/掩码/词表都在生成期定好）──────
     std::cout << "加载数据集: " << cfg.text_path << " ..." << std::endl;
     NN_TRY_MSG(ds_r, "打开数据集失败", nn::Dataset::open(cfg.text_path));
@@ -120,6 +130,19 @@ namespace
     dataset_identity.num_docs = dataset.info().num_docs;
     dataset_identity.num_windows = window_offsets.size();
     dataset_identity.loss_scope = loss_scope;
+    // 网格三元组的最后一项（与 loop 内同一公式）：身份门禁靠它判断"续训语义是否成立"
+    dataset_identity.steps_per_epoch =
+        (window_offsets.size() + cfg.batch_size - 1) / cfg.batch_size;
+
+    // ── 数据集身份门禁（硬错、无逃生阀；docs/todo/23 §2.1.1）────────────
+    // 数据集变 ⇒ 窗口数变 ⇒ steps_per_epoch 变 ⇒ step 级调度的 total_steps、
+    // global_step 语义、epoch 边界同时改变 ⇒ "同一断点 + 不同数据集"没有正确
+    // 的续训语义。合法出口 = 从 .nnmodel 开新一轮（下面的 warm start 分支）。
+    if (adoption.adopted)
+    {
+        NN_TRY_CHECK(nn::cli::verify_dataset_identity(
+            adoption.state.dataset, dataset_identity, cfg.resume_path));
+    }
 
     // ── 打印配置 ─────────────────────────────────────────────
     std::cout << "========================================\n";
@@ -324,6 +347,15 @@ namespace
         NN_FAIL("错误：未知优化器名称: " + cfg.optimizer_name);
     nn::Optimizer& optimizer = *optimizer_holder;
     mem_probe.mark(*engine, "optimizer-created");
+
+    // ── 优化器状态恢复（P1-2；含 Adam 的 `t`）────────────────────────────
+    // 张量数量/形状由 `Optimizer::load_state` 校验（对不上明确报错，不静默冷启动）。
+    // 位置必须在优化器构造之后：状态张量按优化器自身的缓冲形状回写。
+    if (adoption.adopted)
+    {
+        NN_TRY_CHECK(nn::cli::load_optimizer_state(*engine, cfg.resume_path, optimizer,
+                                                  std::cout));
+    }
 
     nn::CrossEntropyLoss ce_loss;
     // loss 链精度 = profile.stable（§9.1 / D9：softmax/log/大词表归约的溢出防线；

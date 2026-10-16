@@ -180,8 +180,15 @@ ceil(M/(4·(256/subgroup_size)))` 是布局契约**）。CPU 侧 `matmul_q_impl`
 `[sha256 32B]["NNEND" 5B]`**（P2-1：`verify_model_integrity` 在 `load_model` / `load_train_state`
 里先行校验，截断/损坏明确报错）。载入 `.nnmodel` 后三值层是**只读**态（无 latent ⇒ `backward()`
 返回明确错误；`parameters()` 不再 abort）。CLI：`--save`（默认 `*.nnmodel`）写推理角色、
-`--save-interval` 写 `*.nnckpt`、`--resume` **只认** `.nnckpt`（Checkpoint 角色；`.nnmodel` 的
-放开随 P1-2 第二刀落地）；v5/v6/v7 老 `.bin`/`.nnmodel` 仍可读（v7 无状态段 ⇒ 冷启动语义）。
+`--save-interval` 写 `*.nnckpt`；**`--resume` 的 role 语义（P1-2 第三刀，2026-10-16）**：
+`.nnckpt` ⇒ 断点续训，**形状/配方/计数器一律由状态段决定**，显式给出 A/B 类旗标即报错
+（禁列表 `nn::cli::kForbiddenResumeFlags`；仍允许 `--save`/`--save-interval`/`--log-interval`/
+`--max-steps`/`--gpu`/`--grad-log`/`--checkpoint-every`/`--activation-offload`/`--flush-interval`），
+数据集身份（sha256 + 网格三元组）不一致硬报错（无逃生阀，出口 = 从 `.nnmodel` 开新一轮）；
+`.nnmodel` ⇒ **warm start**（SFT 入口，CLI 全权、优化器冷启动），**唯一拒绝三值 `.nnmodel`**
+（打包形态无 latent ⇒ 指向 P1-7）；v5/v6/v7 老 `.bin`/`.nnmodel` 仍可读（v7 无状态段 ⇒ 冷启动语义）。
+断点状态段 = `train_state.hpp` 的 `TrainState`（含精度四槽与 lr 曲线形状）+ `Optimizer::save_state/
+load_state`（含 Adam 的 `t`）；读写 API = `CheckpointState` / `peek_train_state` / `load_train_state`。
 `text_infer` / `mnist_infer` 用 `peek_any_model_spec` + `load_any_model` + `peek_model_role`。
 **`Layer::sub_layers()` 已删除**（层树枚举没有消费者）；参数下标转发走**受保护的**
 `param_children()`（仅供参数协议，不是对外结构契约）。
