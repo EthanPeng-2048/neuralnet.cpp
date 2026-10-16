@@ -111,7 +111,7 @@ matmul / matmul_with_bias / add_inplace / accumulate / row_reduce_sum / col_redu
 | 角色 | 文件 | 内容 | 谁写 | 谁读 |
 |---|---|---|---|---|
 | **模型**（推理） | `*.nnmodel`（`.bin` 的接替者） | 推理所需的**全部**参数：Dense 层参数 + 三值层的**打包形态** + τ。**不含**"训练才需要"的参数 | `text_train`/`mnist_train` 收尾的 `--save`（默认 `gpt_model.nnmodel`） | `text_infer` / `mnist_infer` / 任何人 |
-| **训练断点** | `*.nnckpt` | 模型 + **训练参数**：三值层 latent（f32）+ 训练状态段（v8；见 §2.1.1，**未实施**） | `--save-interval`（周期性）、需要续训时 | `--resume`（Checkpoint 角色；v8 起状态段为唯一权威） |
+| **训练断点** | `*.nnckpt` | 模型 + **训练参数**：三值层 latent（f32）+ 训练状态段（v8；见 §2.1.1；**格式与读写已落地，训练路径接线待续**） | `--save-interval`（周期性）、需要续训时 | `--resume`（Checkpoint 角色；v8 起状态段为唯一权威） |
 
 **v7 文件头**：`magic "NNNN" | version=7 | Scalar precision | role u8 | spec_len + spec kvrec`
 —— `role`（Model / Checkpoint）是**文件属性**，不是"模型状态"：它只回答"这份文件是什么"，
@@ -148,6 +148,13 @@ CLI/GUI 的默认保存名同步改为 `.nnmodel`（`.bin` 不再被写入）。
 
 **一句话**：断点是**训练的可续点**，不是"更大的模型文件"——状态段里的一切都是**断点权威**，
 CLI 不再有发言权。
+
+**落地进度（2026-10-16）**：**第一刀已落地** —— v8 段布局 + `TrainState` 编解码
+（`include/neuralnet.cpp/train_state.hpp`）+ 读写 API（`save_model` 的 `CheckpointState`、
+`peek_train_state` / `load_train_state` / `verify_model_integrity`）+ 回归用例
+`train_state_test`（含"剥成 v7 仍可加载"的零破坏用例）；**待续** —— `Optimizer::save_state/
+load_state`、训练路径接线（写状态段 + 按状态段还原精度/计数器/lr 曲线形状）、禁列校验、
+数据集身份门禁、GUI 同步。
 
 **段布局（v8，追加在 tokenizer 之后；老文件按版本回落）**
 

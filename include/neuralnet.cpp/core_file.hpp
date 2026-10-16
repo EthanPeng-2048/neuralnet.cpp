@@ -14,6 +14,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 #include <concepts>
+#include <array>
 #include <cstdint>
 #include <fstream>
 #include <iterator>
@@ -21,6 +22,7 @@
 #include <string>
 
 #include "core_errors.hpp"
+#include "core_sha256.hpp"
 
 namespace nn
 {
@@ -34,6 +36,45 @@ namespace nn
         NN_FAIL("Cannot open text file: " + path);
     return std::string{std::istreambuf_iterator<char>(ifs),
                        std::istreambuf_iterator<char>()};
+}
+
+// ── 流式文件摘要（P2-1：整文件校验和 / 数据集身份）─────────────────────
+// 分块累加 sha256（1 MiB 块），不把文件读进内存；`limit_bytes` 限定只摘要
+// 文件前缀（整文件校验和要排除尾部的摘要本身）。文件不足 `limit_bytes` 时报错。
+[[nodiscard]] inline Result<std::array<std::uint8_t, 32>> sha256_file_prefix(
+    const std::string &path, std::uint64_t limit_bytes = ~std::uint64_t{0})
+{
+    std::ifstream ifs(path, std::ios::binary);
+    if (!ifs)
+        NN_FAIL("Cannot open file for hashing: " + path);
+
+    detail::Sha256State st;
+    std::array<char, 1u << 20> buf{};
+    std::uint64_t remain = limit_bytes;
+    while (remain > 0)
+    {
+        const auto want = static_cast<std::streamsize>(
+            remain < buf.size() ? remain : buf.size());
+        ifs.read(buf.data(), want);
+        const auto got = ifs.gcount();
+        if (got <= 0)
+        {
+            if (limit_bytes == ~std::uint64_t{0}) break;   // 正常读到文件尾
+            NN_FAIL("文件短于摘要范围（" + path + "）：期望前 " +
+                    std::to_string(limit_bytes) + " 字节");
+        }
+        detail::sha256_update(st, std::string_view(buf.data(),
+                                                  static_cast<std::size_t>(got)));
+        remain -= static_cast<std::uint64_t>(got);
+    }
+    return detail::sha256_finalize(st);
+}
+
+// 整文件 sha256（hex）——数据集身份（`TrainState.dataset.sha256`）用
+[[nodiscard]] inline Result<std::string> sha256_file_hex(const std::string &path)
+{
+    NN_TRY(d, sha256_file_prefix(path));
+    return sha256_hex(*d);
 }
 
 // ── 二进制 POD 读写（全库 reinterpret_cast 字节边界的唯一收敛点）───────

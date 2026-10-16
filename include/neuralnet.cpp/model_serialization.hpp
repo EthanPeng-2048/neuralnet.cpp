@@ -15,15 +15,19 @@
 #include <cstring>
 #include <fstream>
 #include <span>
+#include <streambuf>
 #include <string>
 #include <tuple>
 #include <type_traits>
+#include <array>
 #include <vector>
 
 #include "core_config.hpp"
 #include "core_file.hpp"    // 二进制 POD 读写（cast 边界收敛点）
+#include "core_sha256.hpp"  // 整文件校验和（P2-1）
 #include "model_spec.hpp"
 #include "model_keyvalue_record.hpp"
+#include "train_state.hpp"  // 训练状态段（P1-2）
 #include "compute_layer.hpp"
 #include "model_container.hpp"
 
@@ -31,25 +35,36 @@ namespace nn
 {
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  二进制文件格式（v4，自描述规格头）
+//  二进制文件格式（v8，自描述规格头）
 //
 //    [magic 4B]                 "NNNN" —— 标识「nn.cpp 的模型文件」
 //    [version 4B]               模型格式版本号（v[x]；>=4 为自描述格式）
 //    [precision 1B]             f32/f64 精度标记
+//    [role 1B]                  文件角色（v7 起；Model=推理 / Checkpoint=训练）
 //    [spec_len 8B]              规格头长度前缀（解决内容大小不确定问题）
 //    [spec: KeyValueRecord]     字段记录模型信息（自描述，无偏移量假设）
-//    [param matrices...]        模型权重
-//    [extra state matrices...]  非可学习状态（如 BatchNorm running 统计）
+//    [state_len 8B]             训练状态段长度（**v8 起**；0 = 无该段）
+//    [state: kvrec]             训练状态（TrainState：计数器 / 配方 / 数据集身份）
+//    [optimizer blobs...]       优化器状态张量（参数条目形态；数量见 kvrec 的
+//                               optimizer_blob_count；仅 Checkpoint 角色非零）
+//    [param entries...]         模型权重（v7 起为参数级 kind 条目）
+//    [extra state entries...]   非可学习状态（如 BatchNorm running 统计）
 //    [tokenizer_len 8B]         0 = 未嵌入
 //    [tokenizer data...]        词表数据（**按模型版本分派**：
 //                               v5 及以下 = 内嵌 JSON 字符串（模型格式的一部分，
 //                               照常读取、零破坏）；v6 起 = .nnvocab 文件镜像
 //                               字节（[label "NNVC"][词表 kvrec v2]））
+//    [sha256 32B]               整文件校验和（**v8 起**；覆盖本字段之前的全部字节）
+//    ["NNEND" 5B]               尾部完整性标记（**v8 起**）
 //
 //  文件格式 v4+ 自描述（长度前缀 + KeyValueRecord）；v1/v2/v3 偏移量定长
 //  格式在 header 校验阶段（read_and_validate_header）即拒绝。
 //
 //  precision 字节: 0 = f32, 1 = f64（用于校验保存时与加载时的 Scalar 类型一致）
+//
+//  角色语义（v8 起冻结，docs/todo/23 §2.1.1）：checkpoint = model 的**超集** ——
+//  同一容器 + role 字节，训练状态段 role-gated（Model 写 0 长度）。`.nnckpt`
+//  仍需能被推理入口直接读（裁决第 3 条的"测试推理"用途），故不做独立格式。
 // ═══════════════════════════════════════════════════════════════════════════
 
 inline constexpr uint32_t MODEL_MAGIC    = 0x4E4E4E4E;  // "NNNN"
@@ -59,15 +74,19 @@ inline constexpr uint32_t MODEL_MAGIC    = 0x4E4E4E4E;  // "NNNN"
 //     `.nnckpt` 写模型 + 训练参数（三值层写 f32 latent）。
 //   · v5/v6 的扁平矩阵序列仍**可读**（role 缺失按 Model 处理）；**写一律 v7**。
 // v6: 内嵌词表改为 .nnvocab kvrec（v5 及以下仍读其内嵌 JSON，见上）。
-inline constexpr uint32_t MODEL_VERSION  = 7;
+// v8（docs/todo/18 §4.2 P1-2 + §4.3 P2-1 合批）：
+//   · **训练状态段**（role 门控；spec 之后）：`TrainState` 的 kvrec（计数器 /
+//     训练配方含精度 profile 与 lr 曲线形状 / 数据集身份）+ 优化器状态张量条目。
+//     Model 角色写 0 长度；老文件（v7 及以下）缺段 ⇒ 冷启动语义（零破坏）。
+//   · **整文件校验和 + 尾部完整性标记**：`[sha256 32B]["NNEND" 5B]`（摘要覆盖
+//     其前的全部字节，边写边算：见 `detail::HashingStreamBuf`）；截断/损坏的
+//     文件在读入前即明确报错（`verify_model_integrity`），不再静默载入错误权重。
+inline constexpr uint32_t MODEL_VERSION  = 8;
 
-// ── 已知缺口：.bin 全文件无校验和 ─────────────────────────────────────────
-// 内容损坏会被静默载入错误权重且无感知（.nnpkg 有 sha256，模型 .bin 没有）。
-// 若引入整文件校验和与尾部完整性标记，需升 MODEL_VERSION —— **已排期**：
-// 计划与 P1-2 的 role 门控「训练状态段」（计数器 / 优化器状态 / 训练配方 /
-// 数据集身份）合并为一次 **7 → 8** 升版（裁定见 docs/todo/18 §4.2 P1-2 行、
-// 设计见 docs/todo/23 §2.1.1）。
-// ═══════════════════════════════════════════════════════════════════════
+// ── 尾部完整性标记（v8；见上）────────────────────────────────────────────
+inline constexpr std::size_t MODEL_DIGEST_BYTES = 32;          // sha256
+inline constexpr std::string_view MODEL_TAIL_MAGIC = "NNEND";  // 5 字节
+inline constexpr std::size_t MODEL_TAIL_BYTES = MODEL_DIGEST_BYTES + MODEL_TAIL_MAGIC.size();
 
 // ── 精度标记（写入文件头，加载时校验） ──────────────────────────────────
 // 0 = float (f32), 1 = double (f64)
@@ -90,7 +109,7 @@ namespace detail
 
 template <typename T>
     requires std::is_trivially_copyable_v<T>
-[[nodiscard]] inline Result<void> write_bytes(std::ofstream &ofs, const T &v)
+[[nodiscard]] inline Result<void> write_bytes(std::ostream &ofs, const T &v)
 {
     if (!nn::write_pod(ofs, v))
         NN_FAIL("Write error");
@@ -119,7 +138,7 @@ template <typename T>
 
 // variadic 字段批量写入：依次写入每个字段，遇错即停
 template <typename... Ts>
-[[nodiscard]] inline Result<void> write_fields(std::ofstream &ofs, const Ts &...fields)
+[[nodiscard]] inline Result<void> write_fields(std::ostream &ofs, const Ts &...fields)
 {
     Result<void> result = {};
     bool stop = false;
@@ -167,10 +186,43 @@ template <typename... Ts>
     return values;
 }
 
+// ── 边写边算 sha256 的流缓冲（v8 整文件校验和；P2-1）────────────────────
+// 所有写路径都走 std::ostream 接口（write_pod / os.write），故把哈希塞进
+// streambuf 就能零侵入地覆盖"校验和该覆盖的每一个字节"——不需要把整文件
+// 在内存里拼一遍，也不需要写完再读回来算一遍。
+// 用法：`HashingStreamBuf hb(ofs.rdbuf(), st); std::ostream os(&hb);` 之后
+// 所有写入交给 `os`；摘要本体与尾部标记**不经** os（它们不算进摘要）。
+class HashingStreamBuf : public std::streambuf
+{
+public:
+    HashingStreamBuf(std::streambuf &sink, Sha256State &hasher) noexcept
+        : sink_(sink), hasher_(hasher) {}
+
+protected:
+    std::streamsize xsputn(const char *s, std::streamsize n) override
+    {
+        if (n > 0)
+            sha256_update(hasher_, std::string_view(s, static_cast<std::size_t>(n)));
+        return sink_.sputn(s, n);
+    }
+
+    int_type overflow(int_type c) override
+    {
+        if (traits_type::eq_int_type(c, traits_type::eof())) return traits_type::not_eof(c);
+        const char ch = traits_type::to_char_type(c);
+        if (xsputn(&ch, 1) != 1) return traits_type::eof();
+        return static_cast<int_type>(static_cast<unsigned char>(ch));
+    }
+
+private:
+    std::streambuf &sink_;
+    Sha256State &hasher_;
+};
+
 // ── 矩阵读写（v5：per-tensor precision tag）──────────────────────────────
 
 // v5：写入矩阵时附带 precision tag（1B），tag 值见 precision_tag()
-[[nodiscard]] inline Result<void> write_matrix_v5(std::ofstream &ofs, const Matrix &m, Precision p)
+[[nodiscard]] inline Result<void> write_matrix_v5(std::ostream &ofs, const Matrix &m, Precision p)
 {
     // 写入 precision tag（§11.3）
     NN_TRY(r, write_bytes<uint8_t>(ofs, precision_tag(p)));
@@ -184,7 +236,7 @@ template <typename... Ts>
 }
 
 // v5：写入 f16 矩阵
-[[nodiscard]] inline Result<void> write_matrix_fp16(std::ofstream &ofs, const MatrixT<Precision::F16> &m)
+[[nodiscard]] inline Result<void> write_matrix_fp16(std::ostream &ofs, const MatrixT<Precision::F16> &m)
 {
     NN_TRY(r, write_bytes<uint8_t>(ofs, precision_tag(Precision::F16)));
     NN_TRY(r2, write_bytes<uint64_t>(ofs, static_cast<uint64_t>(m.rows())));
@@ -257,7 +309,7 @@ template <typename... Ts>
 }
 
 // ── v4 兼容：无 precision tag 的矩阵读写 ─────────────────────────────────
-[[nodiscard]] inline Result<void> write_matrix(std::ofstream &ofs, const Matrix &m)
+[[nodiscard]] inline Result<void> write_matrix(std::ostream &ofs, const Matrix &m)
 {
     NN_TRY(r, write_bytes<uint64_t>(ofs, static_cast<uint64_t>(m.rows())));
     NN_TRY(r2, write_bytes<uint64_t>(ofs, static_cast<uint64_t>(m.cols())));
@@ -421,7 +473,7 @@ inline void apply_spec_version_defaults(KeyValueRecord &kv, uint32_t version)
 
 // ── 规格头读写：长度前缀 + KeyValueRecord（无偏移量假设） ────────────────
 
-[[nodiscard]] inline Result<void> write_spec_header(std::ofstream &ofs, const ModelSpec &spec)
+[[nodiscard]] inline Result<void> write_spec_header(std::ostream &ofs, const ModelSpec &spec)
 {
     auto bytes = spec_to_kv(spec).serialize();
     NN_TRY(r, write_bytes<uint64_t>(ofs, static_cast<uint64_t>(bytes.size())));
@@ -459,9 +511,26 @@ inline constexpr std::size_t kMaxSerializedStringBytes = 64u * 1024u * 1024u;
     return spec_from_kv(*kv_r);
 }
 
+// ── 训练状态段读取（v8）：长度前缀 + KeyValueRecord → TrainState ─────────
+// `state_len == 0` = 无该段（Model 角色，或断点由未接线路径写出）⇒ 默认值，
+// 续训路径按"冷启动语义"处理。
+[[nodiscard]] inline Result<TrainState> read_train_state_section(
+    std::ifstream &ifs, std::uint64_t state_len)
+{
+    if (state_len == 0) return TrainState{};
+    if (state_len > kMaxSerializedStringBytes)
+        NN_FAIL("训练状态段长度越界（超过 64 MiB），文件可能损坏或恶意");
+    std::string bytes(static_cast<std::size_t>(state_len), '\0');
+    ifs.read(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    if (!ifs)
+        NN_FAIL("Unexpected end while reading train state section");
+    NN_TRY(kv, KeyValueRecord::parse(bytes));
+    return train_state_from_kv(*kv);
+}
+
 // ── 文件头读写 ──────────────────────────────────────────────────────
 
-[[nodiscard]] inline Result<void> write_header(std::ofstream &ofs, ModelRole role)
+[[nodiscard]] inline Result<void> write_header(std::ostream &ofs, ModelRole role)
 {
     NN_TRY(r, write_bytes<uint32_t>(ofs, MODEL_MAGIC));
     NN_TRY(r2, write_bytes<uint32_t>(ofs, MODEL_VERSION));
@@ -515,7 +584,7 @@ inline constexpr std::size_t kMaxSerializedStringBytes = 64u * 1024u * 1024u;
 // v5 及以下 = JSON 字符串；v6 起 = .nnvocab 文件镜像字节。
 // 本层只搬字节，解释权在调用方（load_tokenizer_from_model_blob）。
 
-[[nodiscard]] inline Result<void> write_tokenizer(std::ofstream &ofs, const std::string &data)
+[[nodiscard]] inline Result<void> write_tokenizer(std::ostream &ofs, const std::string &data)
 {
     NN_TRY(r, write_bytes<uint64_t>(ofs, static_cast<uint64_t>(data.size())));
     if (!data.empty())
@@ -589,7 +658,24 @@ struct ParamBlob
     std::vector<std::uint8_t> payload;
 };
 
-[[nodiscard]] inline Result<void> write_param_blob(std::ofstream &ofs, const ParamBlob &b)
+// 未信任长度防御：条目字节数不得超过文件剩余长度
+// （与 read_matrix_v5 同一威胁模型：先校验再分配/跳过）
+[[nodiscard]] inline Result<void> ensure_blob_fits_(
+    std::ifstream &ifs, std::uint64_t aux_len, std::uint64_t payload_len)
+{
+    const std::streampos pos = ifs.tellg();
+    ifs.seekg(0, std::ios::end);
+    const std::streampos end = ifs.tellg();
+    if (pos < 0 || end < pos)
+        NN_FAIL("Cannot determine file size while reading param entry");
+    ifs.seekg(pos);
+    const auto remain = static_cast<std::uint64_t>(end - pos);
+    if (aux_len > remain || payload_len > remain - aux_len)
+        NN_FAIL("参数条目长度越界（文件可能损坏或恶意）");
+    return {};
+}
+
+[[nodiscard]] inline Result<void> write_param_blob(std::ostream &ofs, const ParamBlob &b)
 {
     NN_TRY(r0, write_bytes<uint8_t>(ofs, static_cast<uint8_t>(b.kind)));
     NN_TRY(r1, write_bytes<uint8_t>(ofs, precision_tag(b.precision)));
@@ -628,18 +714,7 @@ struct ParamBlob
     NN_TRY_CHECK(alen_r);
     auto plen_r = read_bytes<uint64_t>(ifs);
     NN_TRY_CHECK(plen_r);
-    // 未信任长度防御：载荷字节数不得超过文件剩余长度（与 read_matrix_v5 同一威胁模型）
-    {
-        const std::streampos pos = ifs.tellg();
-        ifs.seekg(0, std::ios::end);
-        const std::streampos end = ifs.tellg();
-        if (pos < 0 || end < pos)
-            NN_FAIL("Cannot determine file size while reading param entry");
-        ifs.seekg(pos);
-        const auto remain = static_cast<std::uint64_t>(end - pos);
-        if (*alen_r > remain || *plen_r > remain - *alen_r)
-            NN_FAIL("参数条目长度越界（文件可能损坏或恶意）");
-    }
+    NN_TRY_CHECK(ensure_blob_fits_(ifs, *alen_r, *plen_r));
     ParamBlob b;
     b.kind = static_cast<ParamKind>(*k_r);
     b.precision = precision_from_tag(*pt_r);
@@ -660,6 +735,30 @@ struct ParamBlob
         if (!ifs) NN_FAIL("Unexpected end while reading param payload");
     }
     return b;
+}
+
+// ── 跳过参数条目（只读条目头，载荷 seek 过去）────────────────────────────
+// 读训练状态段（在参数之前）与读参数（状态段在前）时各需跳过对方；把载荷
+// 读进内存再丢掉在大模型上是纯浪费（一条 embedding 就几百 MB）。
+[[nodiscard]] inline Result<void> skip_param_blob(std::ifstream &ifs)
+{
+    auto k_r = read_bytes<uint8_t>(ifs);
+    NN_TRY_CHECK(k_r);
+    if (*k_r > static_cast<uint8_t>(ParamKind::I8Packed4))
+        NN_FAIL("参数条目 kind 非法（" + std::to_string(*k_r) + "）");
+    NN_TRY_CHECK(read_bytes<uint8_t>(ifs));   // precision tag
+    NN_TRY_CHECK(read_bytes<uint64_t>(ifs));  // rows
+    NN_TRY_CHECK(read_bytes<uint64_t>(ifs));  // cols
+    auto alen_r = read_bytes<uint64_t>(ifs);
+    NN_TRY_CHECK(alen_r);
+    auto plen_r = read_bytes<uint64_t>(ifs);
+    NN_TRY_CHECK(plen_r);
+    NN_TRY_CHECK(ensure_blob_fits_(ifs, *alen_r, *plen_r));
+    const auto jump = static_cast<std::streamoff>(*alen_r + *plen_r);
+    ifs.seekg(jump, std::ios::cur);
+    if (!ifs)
+        NN_FAIL("参数条目跳过失败（文件可能损坏或截断）");
+    return {};
 }
 
 } // namespace detail
@@ -824,24 +923,129 @@ struct ParamBlob
 // ═══════════════════════════════════════════════════════════════════════════
 //  公开 API
 //
-//  save_model      — 保存 Model + ModelSpec（可选嵌入 tokenizer 数据）
-//  load_model      — 从文件加载参数，返回嵌入的 tokenizer 数据（如有）
-//  peek_model_spec — 只读文件头，返回 ModelSpec（不读参数）
+//  save_model          — 保存 Model + ModelSpec（可选嵌入 tokenizer / 训练状态）
+//  load_model          — 从文件加载参数，返回嵌入的 tokenizer 数据（如有）
+//  peek_model_spec     — 只读文件头，返回 ModelSpec（不读参数）
+//  verify_model_integrity — 整文件校验和 + 尾部标记校验（v8；P2-1）
+//  peek_train_state    — 只读训练状态段（计数器/配方/数据集身份；不读权重）
+//  load_train_state    — 读训练状态段 + 优化器状态张量（续训路径）
 // ═══════════════════════════════════════════════════════════════════════════
 
-// ── 保存模型（v7：文件角色 + 参数级 kind）────────────────────────────────
+// ── 整文件完整性校验（v8；P2-1）──────────────────────────────────────────
+// 校验尾部 `[sha256 32B]["NNEND" 5B]`：摘要覆盖其前的**全部字节**。
+// 截断/损坏的文件在解析参数之前就明确报错（旧缺陷 C5：静默载入错误权重）。
+// 成本 = 一次顺序读（分块哈希，不把文件读进内存）；调用方是
+// load_model / load_train_state，`peek_*` 只读头部故不校验。
+[[nodiscard]] inline Result<void> verify_model_integrity(const std::string &filename)
+{
+    std::ifstream ifs(filename, std::ios::binary);
+    if (!ifs)
+        NN_FAIL("Cannot open file for reading: " + filename);
+    ifs.seekg(0, std::ios::end);
+    const std::streampos end = ifs.tellg();
+    if (end < 0)
+        NN_FAIL("Cannot determine file size: " + filename);
+    const auto total = static_cast<std::uint64_t>(end);
+    if (total < MODEL_TAIL_BYTES)
+        NN_FAIL("模型文件过小（" + std::to_string(total) + " 字节 < 尾部标记 " +
+                std::to_string(MODEL_TAIL_BYTES) + " 字节）：文件被截断或不是模型文件: " + filename);
+    ifs.seekg(static_cast<std::streamoff>(total - MODEL_TAIL_BYTES), std::ios::beg);
+    if (!ifs)
+        NN_FAIL("Seek failed while verifying: " + filename);
+    std::array<std::uint8_t, MODEL_TAIL_BYTES> tail{};
+    ifs.read(reinterpret_cast<char *>(tail.data()),
+             static_cast<std::streamsize>(MODEL_TAIL_BYTES));
+    if (ifs.gcount() != static_cast<std::streamsize>(MODEL_TAIL_BYTES))
+        NN_FAIL("尾部完整性标记读取失败（文件被截断）: " + filename);
+    if (std::string_view(reinterpret_cast<const char *>(tail.data()) + MODEL_DIGEST_BYTES,
+                         MODEL_TAIL_MAGIC.size()) != MODEL_TAIL_MAGIC)
+        NN_FAIL("模型文件缺少尾部完整性标记（\"NNEND\"）：文件被截断、损坏，"
+                "或是旧版本（v7 及以下）文件: " + filename);
+
+    std::array<std::uint8_t, MODEL_DIGEST_BYTES> stored{};
+    std::memcpy(stored.data(), tail.data(), MODEL_DIGEST_BYTES);
+    NN_TRY(digest, nn::sha256_file_prefix(filename, total - MODEL_TAIL_BYTES));
+    if (*digest != stored)
+    {
+        NN_FAIL("模型文件校验和不匹配（内容损坏）: " + filename +
+                "\n  文件记录的摘要: " + nn::sha256_hex(stored).substr(0, 16) +
+                "\n  实测摘要      : " + nn::sha256_hex(*digest).substr(0, 16) +
+                "\n  该文件不可用，请用上游断点/模型重新产出。");
+    }
+    return {};
+}
+
+// ── 训练状态段（v8；role 门控）──────────────────────────────────────────
+// 仅 Checkpoint 角色可携带；Model 角色必须为空（推理文件不带训练状态，
+// docs/todo/23 §2.1.1）。`optimizer_blobs` 的顺序由优化器定义
+// （`Optimizer::save_state` 的产出顺序即载入时的期望顺序）。
+struct CheckpointState
+{
+    const TrainState *state = nullptr;          // 状态本体（空 = 写 0 长度段）
+    std::span<const Tensor> optimizer_blobs{};  // 优化器状态张量（Dense 形态落盘）
+};
+
+// ── 保存模型（v8：文件角色 + 参数级 kind + 训练状态段 + 尾部校验和）──────
 // role 决定"写哪些参数"：Model = 推理模型（三值层写打包形态，默认 base-3 载荷）；
-// Checkpoint = 训练断点（三值层写 f32 latent）。
+// Checkpoint = 训练断点（三值层写 f32 latent）+ 可选训练状态段。
 [[nodiscard]] inline Result<void> save_model(const std::string &filename,
     Model &model, const ModelSpec &spec, const std::string &tokenizer_data = {},
-    ModelRole role = ModelRole::Model)
+    ModelRole role = ModelRole::Model, const CheckpointState &ckpt = {})
 {
+    if (ckpt.state != nullptr && role != ModelRole::Checkpoint)
+        NN_FAIL("训练状态段只能写入 Checkpoint 角色（.nnckpt）：推理模型（.nnmodel）"
+                "不得携带训练状态（docs/todo/23 §2.1.1）");
+    if (ckpt.state == nullptr && !ckpt.optimizer_blobs.empty())
+        NN_FAIL("优化器状态张量必须与训练状态一同写入（CheckpointState::state 为空）");
+
     std::ofstream ofs(filename, std::ios::binary);
     if (!ofs)
         NN_FAIL("Cannot open file for writing: " + filename);
-    NN_TRY(r, detail::write_header(ofs, role));
-    NN_TRY(r2, detail::write_spec_header(ofs, spec));
+
+    // v8 整文件校验和：所有内容字节经哈希流写入；摘要与尾部标记最后**不经**该流
+    detail::Sha256State hasher;
+    detail::HashingStreamBuf hbuf(*ofs.rdbuf(), hasher);
+    std::ostream os(&hbuf);
+
+    NN_TRY(r, detail::write_header(os, role));
+    NN_TRY(r2, detail::write_spec_header(os, spec));
+
+    // ── 训练状态段（v8）：[state_len][kvrec][优化器状态张量条目 × N] ──────
+    // 无状态（.nnmodel / 未接线断点）时写 0 长度，布局保持统一。
+    {
+        TrainState snapshot;
+        if (ckpt.state != nullptr)
+        {
+            snapshot = *ckpt.state;
+            snapshot.optimizer_blob_count = ckpt.optimizer_blobs.size();
+        }
+        const std::string state_bytes = train_state_to_kv(snapshot).serialize();
+        const std::uint64_t state_len =
+            (ckpt.state != nullptr) ? static_cast<std::uint64_t>(state_bytes.size()) : 0u;
+        NN_TRY(r3, detail::write_bytes<uint64_t>(os, state_len));
+        if (state_len > 0)
+        {
+            os.write(state_bytes.data(), static_cast<std::streamsize>(state_bytes.size()));
+            if (!os)
+                NN_FAIL("Write error while writing train state to: " + filename);
+        }
+    }
     auto& engine = model.engine();
+
+    // 优化器状态张量（Dense 条目；形状/精度随张量自描述，载入方自行校验）
+    for (const Tensor &t : ckpt.optimizer_blobs)
+    {
+        if (!t.valid())
+            NN_FAIL("优化器状态张量非法（未绑定存储）");
+        ParamEntry e;
+        e.kind = ParamKind::Dense;
+        e.precision = t.precision();
+        e.rows = t.rows();
+        e.cols = t.cols();
+        e.payload = t;
+        NN_TRY(b, param_entry_to_blob(engine, e, role));
+        NN_TRY(w, detail::write_param_blob(os, *b));
+    }
 
     // 逐层逐参数（索引 = 本层参数扁平顺序；`Model::parameters()` 即各层的级联）
     for (std::size_t li = 0; li < model.num_layers(); ++li)
@@ -852,7 +1056,7 @@ struct ParamBlob
         {
             NN_TRY(e, L.export_param(i, role));
             NN_TRY(b, param_entry_to_blob(engine, *e, role));
-            NN_TRY(w, detail::write_param_blob(ofs, *b));
+            NN_TRY(w, detail::write_param_blob(os, *b));
         }
     }
 
@@ -867,13 +1071,23 @@ struct ParamBlob
         e.cols = e_tensor.get().cols();
         e.payload = e_tensor;
         NN_TRY(b, param_entry_to_blob(engine, e, role));
-        NN_TRY(w, detail::write_param_blob(ofs, *b));
+        NN_TRY(w, detail::write_param_blob(os, *b));
     }
 
     // tokenizer 数据（长度前缀，0 = 未嵌入；v5=JSON / v6=.nnvocab，按版本分派）
-    NN_TRY(r3, detail::write_tokenizer(ofs, tokenizer_data));
-    if (!ofs)
+    NN_TRY(r4, detail::write_tokenizer(os, tokenizer_data));
+    if (!os)
         NN_FAIL("Write error while saving model to: " + filename);
+
+    // ── 尾部（v8）：整文件校验和 + 完整性标记 ─────────────────────────────
+    // 注意：摘要与标记本身**不算进**校验和 ⇒ 直接写 ofs（绕过哈希流）。
+    const auto digest = detail::sha256_finalize(hasher);
+    ofs.write(reinterpret_cast<const char *>(digest.data()),
+              static_cast<std::streamsize>(digest.size()));
+    ofs.write(MODEL_TAIL_MAGIC.data(),
+              static_cast<std::streamsize>(MODEL_TAIL_MAGIC.size()));
+    if (!ofs)
+        NN_FAIL("Write error while writing file tail to: " + filename);
     return {};
 }
 
@@ -902,11 +1116,85 @@ struct ParamBlob
     return role;
 }
 
+// ── 只读训练状态段（v8）：计数器 / 训练配方 / 数据集身份（不读权重）──────
+// 供续训路径在建模型**之前**取精度 profile 与计数器、供 CLI/GUI 显示断点状态。
+// 没有该段（role=Model，或 v7 及以下 / 未接线的断点）→ 明确报错，调用方据此
+// 回落"冷启动语义"（docs/todo/18 §4.2 P1-2）。
+[[nodiscard]] inline Result<TrainState> peek_train_state(const std::string &filename)
+{
+    std::ifstream ifs(filename, std::ios::binary);
+    if (!ifs)
+        NN_FAIL("Cannot open file for reading: " + filename);
+    auto version_r = detail::read_and_validate_header(ifs);
+    NN_TRY_CHECK(version_r);
+    if (*version_r < 8)
+        NN_FAIL("训练状态段自 v8 起才有：" + filename + " 是 v" +
+                std::to_string(*version_r) + "（按冷启动语义处理）");
+    auto spec_r = detail::read_spec_header(ifs, *version_r);
+    NN_TRY_CHECK(spec_r);
+    auto len_r = detail::read_bytes<uint64_t>(ifs);
+    NN_TRY_CHECK(len_r);
+    if (*len_r == 0)
+        NN_FAIL("文件没有训练状态段（推理模型 .nnmodel，或该断点由旧版本写出）: " +
+                filename);
+    NN_TRY(state, detail::read_train_state_section(ifs, *len_r));
+    return *state;
+}
+
+// ── 读训练状态段 + 优化器状态张量（v8；续训路径）────────────────────────
+// 优化器状态张量按 `optimizer_blob_count` 顺序读出，**物化为 f32**（与参数
+// 条目同一口径），并记录每个张量在文件里的精度（载入方据此校验/转换）。
+struct LoadedTrainState
+{
+    TrainState state;
+    std::vector<Tensor> optimizer_blobs;
+    std::vector<Precision> optimizer_blob_precisions;
+};
+
+[[nodiscard]] inline Result<LoadedTrainState> load_train_state(
+    ComputeEngine &engine, const std::string &filename)
+{
+    std::ifstream ifs(filename, std::ios::binary);
+    if (!ifs)
+        NN_FAIL("Cannot open file for reading: " + filename);
+    auto version_r = detail::read_and_validate_header(ifs);
+    NN_TRY_CHECK(version_r);
+    if (*version_r < 8)
+        NN_FAIL("训练状态段自 v8 起才有：" + filename + " 是 v" +
+                std::to_string(*version_r) + "（按冷启动语义处理）");
+    NN_TRY_CHECK(verify_model_integrity(filename));
+    auto spec_r = detail::read_spec_header(ifs, *version_r);
+    NN_TRY_CHECK(spec_r);
+    auto len_r = detail::read_bytes<uint64_t>(ifs);
+    NN_TRY_CHECK(len_r);
+    if (*len_r == 0)
+        NN_FAIL("文件没有训练状态段（推理模型 .nnmodel，或该断点由旧版本写出）: " +
+                filename);
+
+    LoadedTrainState out;
+    NN_TRY(st, detail::read_train_state_section(ifs, *len_r));
+    out.state = std::move(*st);
+    out.optimizer_blobs.reserve(out.state.optimizer_blob_count);
+    out.optimizer_blob_precisions.reserve(out.state.optimizer_blob_count);
+    for (std::size_t i = 0; i < out.state.optimizer_blob_count; ++i)
+    {
+        NN_TRY(b, detail::read_param_blob(ifs));
+        if (b->kind != ParamKind::Dense)
+            NN_FAIL(std::string("优化器状态条目必须是 Dense 形态，实际 kind=") +
+                    param_kind_name(b->kind));
+        NN_TRY(e, param_blob_to_entry(engine, *b));
+        out.optimizer_blob_precisions.push_back(b->precision);
+        out.optimizer_blobs.push_back(std::move(e->payload));
+    }
+    return out;
+}
+
 // ── 加载参数 + tokenizer ───────────────────────────────────────────────
 //    返回嵌入的 tokenizer 数据（空串 = 未嵌入）；version_out 可取回文件
 //    版本，用于词表数据的 v5(JSON)/v6(.nnvocab kvrec) 分派。
 // v5：per-tensor precision tag（读取时自动识别 f32/f16）
 // v4：无 precision tag（所有矩阵为 f32）
+// v8：读参数前先做整文件校验和校验；并跳过训练状态段（读它用 load_train_state）
 [[nodiscard]] inline Result<std::string> load_model(const std::string &filename, Model &model,
                                                    uint32_t *version_out = nullptr,
                                                    ModelRole *role_out = nullptr)
@@ -921,6 +1209,10 @@ struct ParamBlob
     if (version_out) *version_out = version;
     if (role_out) *role_out = role;
 
+    // v8：整文件校验和（截断/损坏在读参数之前明确报错）
+    if (version >= 8)
+        NN_TRY_CHECK(verify_model_integrity(filename));
+
     // 读取并校验规格头
     auto spec_r = detail::read_spec_header(ifs, version);
     NN_TRY_CHECK(spec_r);
@@ -930,6 +1222,17 @@ struct ParamBlob
         {
             NN_FAIL("Model architecture mismatch while loading '" + filename + "': "                 "model expects " + spec_summary(*stored) +                 " but file contains " + spec_summary(*spec_r));
         }
+    }
+
+    // v8：跳过训练状态段（[state_len][kvrec][优化器状态张量条目 × N]）——
+    // 读权重不需要它；kvrec 仍要解析出 blob 数才知道跳过几条张量条目。
+    if (version >= 8)
+    {
+        auto state_len_r = detail::read_bytes<uint64_t>(ifs);
+        NN_TRY_CHECK(state_len_r);
+        NN_TRY(st, detail::read_train_state_section(ifs, *state_len_r));
+        for (std::size_t i = 0; i < st->optimizer_blob_count; ++i)
+            NN_TRY_CHECK(detail::skip_param_blob(ifs));
     }
 
     auto& engine = model.engine();
