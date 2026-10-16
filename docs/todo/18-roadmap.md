@@ -91,7 +91,7 @@
 | C1 | GPU `stable=f16` 训练 loss 回读冻结（权重照常更新） | `docs/todo/14-f16-stable-gpu-loss-frozen.md` | GPU f16 训练的 loss 曲线不可观测；无对应 ctest 用例 |
 | C2 | `optimizer=f16` 无 loss scaling 即更新爆炸、`stable=f16` 约 200 步 NaN | `docs/development/05-mixed-precision.md` §12.5；`src/text_train.cpp` 解析处只赋值不校验；核对与立项见 [`24-f16-training-defects.md`](24-f16-training-defects.md) | 用户可组合出必崩配置，且无任何启动期提示 |
 | C3 | `NormType::BatchNorm` **静默回落**到 LayerNorm | `compute_layer_mlp.hpp:782`（`make_norm_layer`）；`README.md:248` 声称支持；`gui.py:60` 把 `batchnorm` 列为可选项；`model_spec.hpp:43` 保留枚举 | 模型规格写 batchnorm、实际跑 layernorm，无告警、无日志。**✅ 已解决**：真正实现 `BatchNorm` 层（P0-3），`make_norm_layer` 真分支，见 `docs/history/history.md` |
-| C4 | checkpoint（`.bin`）不存 Adam m/v | `model_serialization.hpp`（`MODEL_VERSION = 5`，见该文件版本常量注释）；`compute_optimizer.hpp` 无 `save_state/load_state` | TDR 重启 / `--resume` 后动量归零，续训轨迹不连续 |
+| C4 | checkpoint（`.bin`）不存 Adam m/v | `model_serialization.hpp`（版本常量现为 **v7**，见该文件注释）；`compute_optimizer.hpp` 无 `save_state/load_state` | TDR 重启 / `--resume` 后动量归零，续训轨迹不连续。**2026-10-16 裁定：范围扩写为「训练状态段」（计数器 / 优化器状态 / 训练配方 / 数据集身份），见表下 P1-2 行** |
 | C5 | `.bin` 无整文件校验和与尾部完整性标记 | `model_serialization.hpp` 版本常量附近的注释（明示"若引入需升 MODEL_VERSION"） | 截断/损坏的模型文件无法与合法文件区分 |
 | C6 | ~~`gpt_test` 偶发失败未定位~~ **✅ 已定性（2026-10-15）：未复现 + 同机完全确定**。278 次直跑（200 串行 + 8 并发 + 40 串行 + 30 次 `taskset -c 0,1` 2 核超订）**零失败且日志逐字节一致**（单一 md5）⇒ 不存在数值随机性；历史 1/62 只能是环境差异（编译器/CPU/FMA）或当次进程级异常。已加环境指纹行（`[env] 编译器/标准库/构建/线程数/FMA`）使未来任何失败自带坐标；**不加 retry/skip**（输出确定 ⇒ 失败必属环境或代码变化，重试会掩盖回归） | 13 原条目 §9.5（62 次直跑 1 次失败、日志被覆盖）；本轮证据与复现命令见 `docs/history/history.md` | 剩余风险 = ≤1.5%（95% 上界，本机口径）的 CI 偶发红；已在失败日志自描述上闭环 |
 | C7 | RAPT / CNN 未接 f16：`Conv2D` 权重/偏置/梯度硬编码 `Precision::F32` | `compute_layer_conv.hpp:148`（权重）、`:151`（偏置）、`:154`/`:155`（权重/偏置梯度）；RAPT 头内 32 处 `dsl::compute*` 调用未接精度实参 | f16 只覆盖 MLP/GPT 路径，CNN/RAPT 用户得不到显存收益 |
@@ -133,6 +133,7 @@
 | M3 | ~~IR-C 跨表达式图融合不采用~~ **已恢复并接入训练路径（P1+P2）**：`begin_expr/end_expr` + 图融合（P1 链 / P2 写穿多输出）+ Adam/AdamW 接线；S6 自动窗口仍未接线 | `docs/todo/03-ir-optimization.md`；`docs/history/history.md`「IR-C 定位修正与恢复立项」「IR-C P2 收官」 | S6 之外的"能融的必须写进单个 `dsl::compute`"已放宽（跨表达式经录制段融合）；**P4 CE online-softmax fold 已落地（通用 FoldSpec 机制，5→3 kernel/step，见 `docs/history/history.md`「CE online-softmax 单趟 fold（P4）」）**；**P3 跨链批量派发已落地（`#b` 批量变体 + BDA 实例表 + 图内同签名分组 CAP 32）**：设备表读数口径 = 批量/非批量分列（用户裁定），`fused@optimizer` 归零、派发计入 `fused_b@optimizer` 行，**合计 1330 → 57 calls/20 步（2.85/step ≤ 6/step）**；批量 vs 逐个逐字节一致（含同组混形状）、字节锚逐位不变，见 `docs/history/history.md`「P3 跨链批量派发」 |
 | M4 | M7 存储多态未立项 | `docs/todo/17-unified-tensor-engine.md` §5 M7 行 | 新增第三后端仍需改 `compute_tensor.hpp` |
 | M5 | ZiPT / AttnZip 已整体移除，代码保留在 `legacy/zipt` 分支 | `docs/history/history.md`「ZiPT 移除」条 | 记忆压缩方向暂缺实现 |
+| M6 | **三值（T1_58）模型无法续训**：`.nnmodel` 载荷是打包形态，BitLinear 载入后进 `packed_only_` 部署态，`backward()` 直接报错（`compute_layer_bitlinear.hpp:394`「部署态只读」）⇒ 三值模型不能从推理模型做 SFT / QAT 续训（dense 模型不受影响） | `compute_layer_bitlinear.hpp`（`import_param` 的 `TernaryPacked*` 分支 + `packed_only_`）；`ternary_pack.hpp`（解码 + τ） | 三值模型的 SFT 入口缺失；**单独立项**（见 §4.2 P1-7 行） |
 
 ## 4. 路线图分期
 
@@ -181,17 +182,19 @@ P4 = 持续优化方向（底座已稳后继续加杠杆，2026-10-14 立项，�
 | 项目 | 目标 | 验收口径 | 成本 | 依赖 |
 |---|---|---|---|---|
 | **P1-1 `text_train` 模块化** ✅ **已完成（2026-10-16）**<br>（2026-10-15 第一刀 = 退出码语义） | 抽 `train_loop` / `recovery` / `checkpoint` 模块；退出码语义修正（保存失败不得成功退出） | 现有关键路径回归逐字节一致；新增恢复路径单测；`std::exit` 只在 CLI 参数解析层出现 | 中（1746 行文件拆解，34 处 `std::exit`） | 无，但它是 P1-2 的前置 —— **已完成，P1-2 已解锁**。**落地形态**：`src/text_train.cpp` 1830 → **396 行**（只留接线与唯一出口 `main`），四模块落 `include/neuralnet.cpp/cli/`：`text_train_config.hpp`（`TrainConfig` + `--help` + argv 解析 =**唯一允许 `std::exit` 的层**）、`text_train_loop.hpp`（epoch × step + 非阻塞 loss 回读 + 梯度累积/裁剪 + 测试评估 + `--max-steps` + 定期断点 + `NN_NAN_TRACE`/`NN_MEM_STATS` 探针）、`text_train_recovery.hpp`（`--resume`：角色门禁 / 按文件规格重建 / 载参）、`text_train_checkpoint.hpp`（`.nnckpt` 路径派生 + 保存记账 + 收尾退出码 + `.nnmodel` 产出）。**三模块不终止进程**：错误一律 `Result` 上抛，`main` 是唯一出口（错误 → 打印 + 退出码 1）；探针中止经 `abort_code = 9` 回报（旧 `return 9` 语义不变）。**验收证据（2026-10-16，clang 24 + Release + `NN_ENABLE_NATIVE=OFF` 的 `build-rv`）**：① **关键路径逐字节一致**——21 个场景（f32 / `--f16` / `--model rapt` / `--t1_58` / `--grad-log` / `--checkpoint-every 1` / `--activation-offload` / `--accum-steps 2` / `step_cosine` / `--max-norm` / 单窗口多 epoch）改动前后 stdout/stderr **逐行相同**（仅时间字段归一）、退出码相同、`.nnmodel`/`.nnckpt` **md5 逐位相同**；② 错误路径文案仅 2 处有意变更（`Error: X` → `推理模型保存失败: X`、数据集打开错误去掉 `[nn] … (expr) at file:line` 噪声），角色门禁与断点失败文案**逐字未变**；③ 新门禁 `text_train_modules_test`（断点路径派生 / 角色门禁 / 断点往返参数逐位一致 / 记账与退出码 / 推理模型角色）；④ `ctest` 49/49（无 Vulkan 树；GPU 用例 77 = skip）、`doc_inventory` 新增第 [6] 节门禁（三模块 + `src/text_train.cpp` 不得出现 `std::exit`/`NN_EXIT`/`NN_UNWRAP`）PASS。过程与盘点见 `docs/history/history.md`「P1-1（第二刀）」。 |
-| **P1-2 checkpoint 优化器状态** | `.bin` 增加可选优化器状态段（Adam m/v，`MODEL_VERSION` 5 → 6）；`Optimizer` 基类加 `save_state/load_state`；恢复路径接线 | 老文件缺段 = 冷启动语义；save→load→save SHA256 逐字节一致；TDR 模拟重启后动量非零且 loss 轨迹连续 | 中 | **P1-1**（否则恢复逻辑继续膨胀） |
+| **P1-2 `.nnckpt` 训练状态段 + role 语义**（**2026-10-16 裁定扩写**，原名「checkpoint 优化器状态」） | `.nnckpt`（role=Checkpoint）增加 **role 门控的训练状态段**，`MODEL_VERSION` **7 → 8**（与 P2-1 校验和/尾部标记**同批升版**）：① **计数器**（global_step / epoch / epoch 内步号 / 当前 lr）；② **优化器状态** 经 `Optimizer::save_state/load_state`（Adam m/v **+ `t`**、SGD momentum、Muon、AdamWQuant 的 f16 状态与逐行尺度）；③ **训练配方**（精度 profile 四槽 + weight_quant、lr 调度配方与**曲线形状** `total_epochs/total_steps`、batch_size/accum_steps/max_norm/stride）；④ **数据集身份**（`.nndataset` 文件 sha256 + tokens/docs/windows/`steps_per_epoch`/loss_scope）。**role 语义（冻结）**：`Checkpoint` ⇒ 除"完全不改变训练"的参数外**一律禁止输入**（显式给出即报错，按**旗标名**判定、不看值；`--resume-epoch/--resume-step` 同在禁列），`Model` ⇒ **CLI 全权**（`--resume` 放开 `.nnmodel`，供 SFT warm start：优化器冷启动、step 归零） | 老文件（v5/v6/v7）缺段 = 冷启动语义；save→load→save SHA256 逐字节一致；TDR 模拟重启后动量非零、`t` 连续、loss 轨迹连续；断点自带精度 profile ⇒ 不给 `--f16`/`--t1_58` 也能完整还原；数据集身份不匹配**硬报错、无逃生阀**；禁列旗标显式出现即报错（单测覆盖） | 中–大 | **P1-1** ✅（已解锁）；P2-1 合批。**落点** = `model_serialization.hpp`（v8 段布局 + 尾部 sha256/完整性标记）、`compute_optimizer.hpp`（`save_state/load_state`）、`cli/text_train_{loop,recovery,checkpoint}.hpp` 接线、`bench/doc_inventory.ps1` 新增门禁、GUI 的 `--resume-epoch/--resume-step` 随 role 禁用 |
 | **P1-3 危险精度组合启动期告警** ✅ **已完成 2026-10-13** | **不单独定义**——需求、口径、验收一律引用 [`24-f16-training-defects.md`](24-f16-training-defects.md) §2.3 / §5 F1（口径：仅警告，不退出、不加确认开关）。**落地**：`include/neuralnet.cpp/cli/cli_precision_warning.hpp`（`nn::cli::dangerous_precision_warning`）+ `text_train`/`mnist_train` 调用点 + 门禁 `src/cli_precision_warning_test.cpp`（单测组合矩阵 + 子进程捕获 stderr 断言退出码不变） | 见 24 号台账 F1 验收口径 | 小 | 无 |
 | **P1-4 `gpt_test` flaky 定位** ✅ **已完成 2026-10-15** | **未复现（278 次直跑零失败，含 2 核超订）且同机逐字节确定** ⇒ 定性为"环境差异或进程级异常"，非测试随机性。**未加 retry/skip**（输出确定 ⇒ 失败必对应环境或代码变化）；改为加环境指纹行 + 复用 P0-1 的 `--output-on-failure` 日志留存。证据/统计口径/复现命令见 `docs/history/history.md` 的同名条目与本文 §3.1 C6 行 | 连续大样本直跑零失败 ✅；结论入 history ✅ | 小–中 | P0-1 ✅ |
 | **P1-5 CI 冒烟扩到 MSVC Debug + 权重变化断言** | Debug 构建冒烟；训练 N 步后断言参数**确实变化**（防"loss 不动"类静默失败） | CI 中 MSVC Debug 目标编译通过；权重变化断言可检出冻结；大 TU 若触发 C1128 再出 `/bigobj` | 中 | P0-1。可复用 `f16_writeback_probe` 的"8 步 Adam 参数必须移动"思路 |
 | **P1-6 自定义层使用文档 + 精度自检**（文档部分 **✅ 已完成 2026-10-11**；精度自检 R2 **✅ 已完成 2026-10-14**） | ① 文档：已落 `docs/development/write-a-custom-layer.md`（层骨架模板 + 可复制 gradcheck 片段 + 七条契约 + GPU checklist；示例层经数值梯度检查实测通过 `max|num−an| = 4.7e-06`、50 步 Adam 收敛）。② 代码（**已完成**）：`Layer::init` NVI 在 `init_impl` 之后统一执行 `check_param_precision_()`——层声明的 `param` 槽是存储精度时，逐个校验 `parameters()` 的张量实际存储精度与之相同（`precision_bytes == 0` 的 T1_58 等非存储精度声明跳过）。**它当场抓到了 3 处真实静默降级**：Conv2D 的 w_/b_、RAPT 的 token_emb_、以及 `ReLULinearAttention` **从未把 profile 转发给它自持的 4 个 Linear**（RAPT 注意力投影权重在 `--f16` 下一直是 f32）——前两处在 P2-3 修掉，第三处由本自检在扫描期报错后发现并修复（现 47/47 全绿） | 文档：按模板能写出可训练的自定义层；自检：硬编码 F32 的层在 init 期被拒绝 | 小 | ✅ **已完成 2026-10-14** |
 
+| **P1-7 三值模型的续训入口（打包 → latent 反量化载入）** | 让 `--resume <x.nnmodel>`（role=Model，三值层为打包形态）能进入**可训练态**：载入时按文件内的 τ 把打包权重**反量化**成 f32 latent（`ternary_pack.hpp` 解码 + `BitLinear::import_param` 已有的「从打包只读态恢复可训练」分支），而不是落到 `packed_only_` 部署态 | 反量化载入后首次 forward 的 wq/τ 与文件内打包权重**逐位一致**（量化确定性）；随后 backward 可跑、8 步 Adam 参数确实移动；dense 模型路径逐位不变 | 小–中 | **单独立项（2026-10-16 裁定）**；前置 = P1-2 的 role 语义（`.nnmodel` resume 放开否则被门禁挡住） |
+
 ### 4.3 P2（3–6 月：结构优化）
 
 | 项目 | 目标 | 验收口径 | 成本 | 依赖 |
 |---|---|---|---|---|
-| **P2-1 `.bin` 整文件校验和 + 尾部完整性标记** | 版本段之后加校验和；按注释约定升 `MODEL_VERSION` | 截断文件明确报错；合法文件 round-trip SHA256 一致 | 小–中 | P1-2（同一版本段改动，合并做省一次升版） |
+| **P2-1 `.bin` 整文件校验和 + 尾部完整性标记** | 尾部加 `[sha256 32B][magic "NNEND"]`（边写边算，`core_sha256.hpp` 的增量 `sha256_update` 已就绪）；`MODEL_VERSION` **7 → 8**（与 P1-2 同一次升版） | 截断/损坏文件明确报错；合法文件 round-trip SHA256 一致 | 小–中 | P1-2（同一版本段改动，合并做省一次升版） |
 | **P2-2 Adafactor 类无 m/v 优化器** | 新增不物化二阶矩的优化器，训练更大模型 | 同任务对比 Adam 的显存下降与收敛曲线；`create_optimizer` 可创建 | 中 | 无 |
 | **P2-3 RAPT / CNN f16 接线** | ✅ **已完成 2026-10-14**。① RAPT：**27 处** `dsl::compute*` 补精度实参 `p_.compute`（此前全部落默认 F32）；两个残差分支从硬编码 `Precision::F32` 改为 `p_.compute`（与 GPTBlock/TransformerEncoderLayer 同口径）；`token_emb_`/`grad_token_emb_` 改 `p_.param`；`rms_norm_forward_/backward_` 的输出张量从默认 F32 改 `p_.compute`（**否则 dst/src 精度错配 → `insert_rows` 断言**）。② Conv2D：`w_`/`b_`/`grad_w_`/`grad_b_` 改 `p_.param`，4 处 `dsl::compute*` 补 `p_.compute`。③ `CnnConfig` 增 `precision` 字段，`build_cnn_model(_from_spec)` 在 add 之前注入（新增可选 profile 形参）。**门禁**：`cnn_smoke_test`/`rapt_smoke_test` 增 `--f16`；ctest 新增 4 条 `cnn_test_f16(_gpu)` / `rapt_test_f16(_gpu)`（断言 loss 有限且下降、梯度无 NaN） | f16 下 CNN/RAPT 训练健康收敛；默认 profile 的 f32 逐位不变（param/compute 默认 F32） | 中 | ✅ **已完成**（ctest 47/47） |
 | **P2-4 Dataset / DataLoader 抽象 + 流式文本**（**前半 Dataset 已落地** = 19 号设计阶段一~三；本条只剩**流式后半**：DataLoader/分块迭代 `for_each_chunk`，不再把语料整段读进内存） | 流式加载（Dataset 格式与统一只读类见 `docs/todo/19-unified-dataset.md`） | 大文件训练内存曲线平稳；`dataset_test` 逐位一致口径回归 | 中 | 无 |
@@ -246,7 +249,7 @@ ZiPT 恢复、LRLA、CUDA、分布式（7 项）。
 | 13 §5.1 F16C 快路径 | **条件触发（P2-8）** | 纯软件位操作在 f16 热点链上是真实开销，但收益未量化。**触发条件（三条同时）**：① CPUID 探测可行；② `NN_ENABLE_NATIVE` ON/OFF 两态都能构建；③ `f16_cpu_probe` 全量对拍逐位一致。历史次正规移位 UB 教训（`docs/development/05-mixed-precision.md` §12.12）要求对拍先行 |
 | 13 §5.2 CPU f32→f16→f32 双趟 | **不做** | 该双趟是**量化模拟语义**，删除会改变行为；收益是热路径一次全量转换，属低量级。若将来有真实调用方依赖"直接返回"语义，另立 API 区分而非删除 |
 | 13 §5.3 GUI 绘制节流 | **✅ 已完成（2026-10-15，P2-6 绘制半边）** | 原表述"每次 motion 全量降采样重绘"与实测不符（当时已在 render 端节流）；真正的拖动开销 = 逐事件建画布项 + 逐事件 PIL 画线，已改为一笔一项 + 空帧跳过 + 按帧节流 + 光栅化延迟，见 §3.3 X5 与 `docs/history/history.md` |
-| 13 §7 checkpoint 优化器状态 | **做（P1-2）** | TDR 重启动量归零是**真实功能缺陷**（C4）。设计已明确：可选段 + 老文件缺段 = 冷启动 + `MODEL_VERSION` 升版。**依赖 §3 先拆** |
+| 13 §7 checkpoint 优化器状态 | **做（P1-2）** | TDR 重启动量归零是**真实功能缺陷**（C4）。设计已明确：可选段 + 老文件缺段 = 冷启动 + `MODEL_VERSION` 升版。**依赖 §3 先拆**。**2026-10-16 裁定扩写**：段内容 = 计数器 + 优化器状态 + 训练配方 + 数据集身份，role 门控，**v7 → v8**（与 P2-1 同批）；role 语义 = `Checkpoint` 禁 A/B 输入 / `Model` 全权（含 `.nnmodel` warm start，SFT）——细则见 §4.2 P1-2 行与 [`23`](23-library-design-cleanup-and-model-file-roles.md) §2.1.1 |
 | 13 §8 CI 冒烟 | **做（P1-5）** | MSVC Debug + 权重变化断言可防"loss 不动"类静默失败，与 C1/C3 同族。`/bigobj` 未复现前不加 |
 | 13 §9.4 max_abs_diff 统一 | **不做（择机）** | **实测 7 份定义**（`attn_consistency_test.cpp`、`ce_fusion_test.cpp`、`conv2d_gradcheck.cpp`、`fused_gpu_test.cpp`、`gpu_test.cpp`、`maxpool_gradcheck.cpp`、`tensor_expr_test.cpp`），且语义有分叉（conv2d 版多形状守卫返回 `1e9`）。**计数三处不一致**：13 号原文写 9 份、`src/test_common.hpp:19` 注释仍写 9 份、中途交接口径写 8 份，实测为 7 份——P0-2 文档回正时需一并订正。纯测试卫生、无产品风险，机械改写有反例 |
 | 13 §9.5 `gpt_test` 偶发失败 | **做（P1-4）** | 偶发红在 CI 化（P0-1）后必然变成噪声；先复现再定性。62 次直跑 1 次失败、日志被覆盖，需先补日志留存 |
@@ -312,6 +315,12 @@ ZiPT 恢复、LRLA、CUDA、分布式（7 项）。
    `NN_EXIT` / `NN_UNWRAP`（这三种写法都会直接终止进程）——三模块的错误一律经 `Result` 上抛，进程唯一出口是
    `main`（CLI 参数解析层是另一个例外，见 `cli/text_train_config.hpp`）。P1-2 的 checkpoint 状态段与
    `--resume` 接线必须保持这条不变量：新增错误检查用 `NN_TRY` / `NN_TRY_MSG` / `NN_FAIL`。
+
+7. **`.nnckpt` 训练状态段与 role 语义（P1-2，v8，2026-10-16 起生效）**：① `role = Checkpoint` 恢复时，
+   A/B 类旗标（形状/配方/计数器，清单见 §4.2 P1-2 行）**显式出现即报错**——按旗标名判定、不看值；
+   `role = Model` 时 CLI 全权；② 状态段 save→load→save 逐字节一致，老版本（v5/v6/v7）缺段回落
+   冷启动语义；③ 数据集身份（sha256 + 网格三元组）不匹配**硬报错且不得提供逃生阀**；④ P2-1 的校验和 /
+   尾部完整性标记缺失或截断必须报错。
 
 ### 8.3 验收纪律
 
