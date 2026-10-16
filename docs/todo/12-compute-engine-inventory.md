@@ -6,12 +6,11 @@
 > 目的：把当前代码里实际并存的计算 API 与遗留物列清楚，作为事实底座；全部结论来自
 > 当前工作树的源码与构建配置，复现命令见 `bench/doc_inventory.ps1` 与 §9。
 >
-> **当前数字**：引擎 virtual **52 个方法**（`bench/doc_inventory.ps1` 口径。注意 `grep -c "\bvirtual\b"` 原始计 **54** 处 = 52 方法 + 析构 1 + 注释里的词 1，勿混用口径）；Layer/Loss/Optimizer 直调 **27 个**（含 `begin_expr`——由 `Adam::step`/`AdamW::step` 打开 IR-C 录制段；其余 25 个
+> **当前数字**（2026-10-16 实测）：引擎 virtual **52 个方法**（`bench/doc_inventory.ps1` 口径。注意 `rg -c "\bvirtual\b"` 在 `compute_engine.hpp` 里原始计 **54** 处 = 52 方法 + 析构 1 + 注释里的词 1，勿混用口径）；Layer/Loss/Optimizer 直调 **28 个**（含 `begin_expr`——由 `Adam::step`/`AdamW::step` 打开 IR-C 录制段；含 `cast_into`——层内结果按 profile 落精度；其余 26 个
 > 只服务 DSL lowering / 序列化 / CLI / 适配层 / 测试，见 §2）；CPU 求值机制 **2 套**
-> （DSL 模板路径 + IR 解释器，见 §3）；ctest **48** 个测试（**35** 个测试目标 + `cnn_test_gpu`
-> = `cnn_test --gpu` + `batchnorm_test_gpu` = `batchnorm_test --gpu` + `fusion_custom_layer_example`
-> = 库外使用者形态的 AOT 融合端到端门禁 + `expr_fuse_test` = IR-C 图融合 GPU 端到端，
-> 见 `AGENTS.md` §7。其中 `fused_gpu_test` = 融合 shader **逐形态** GPU 对拍；`expr_graph_test` = IR-C 图融合分析（CPU 12 用例）；`error_macro_test`
+> （DSL 模板路径 + IR 解释器，见 §3）；ctest **49** 个（**无 Vulkan 树**；GPU 树 **51**）＝
+> **38 个测试目标 + 13 个变体/附加**（**完整枚举只写在 `docs/todo/18` §2 / `AGENTS.md` §7**，
+> 此处不重复以免漂移）。其中 `fused_gpu_test` = 融合 shader **逐形态** GPU 对拍；`expr_graph_test` = IR-C 图融合分析（CPU 12 用例）；`error_macro_test`
 > = 错误处理宏族（`NN_UNWRAP`/`NN_EXIT`/`NN_TRY_MSG`/`NN_FAIL`）；`kvrec_test`/`nnvocab_test`/`dataset_test`
 > = 统一数据集（KVRecord v2 / `.nnvocab` / `.nndataset`，见 `docs/todo/19`）；
 > `zipt_test` 随 ZiPT 移除，见 `docs/history/history.md`；`dsl_shape_infer_test` = `dsl::compute`/`compute_reduce` 的**无形状重载**（推导口径 + 负例）。
@@ -60,7 +59,7 @@
 多精度 Phase 2 加入 `cast_into`/`copy_into`/`supports_native_data_move`/
 `supports_expr_precision_variant` 与 `Precision P` 参数的运算类原语。
 
-### 2.1 被 Layer / Loss / Optimizer **直接调用**的算子：27 个
+### 2.1 被 Layer / Loss / Optimizer **直接调用**的算子：28 个
 
 （统计口径：`compute_layer*.hpp` + `compute_loss.hpp` + `compute_optimizer.hpp` +
 `model_container.hpp` + `compute_position_encoding.hpp` 中出现的 `engine.<op>(`，排除
@@ -68,7 +67,7 @@
 复现：`bench/doc_inventory.ps1`）
 
 ```
-begin_batch, begin_expr, clone, col2im, create_offload_buffer, create_tensor,
+begin_batch, begin_expr, cast_into, clone, col2im, create_offload_buffer, create_tensor,
 end_batch, eval_expr, flush_batch, gather_rows, im2col, insert_rows,
 matmul_q, matmul_q_t, offload_restore, offload_save, outer_col, rearrange_3d,
 reshape, scan_prefix_outer, scan_suffix_outer, scatter_add_rows, slice_rows,
