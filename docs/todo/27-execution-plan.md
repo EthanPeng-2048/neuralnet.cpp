@@ -46,6 +46,9 @@
 |---|---|---|---|
 | **P1-2（+ P2-1 合并）** —— P1-1 ✅ 已完成（2026-10-16） | 18 §4.2 P1-2、§4.3 P2-1；C4/C5，门禁 §8.2 第 7 条 | P1-2 是**真实功能缺陷**：TDR 重启 / `--resume` 后 Adam 动量归零，续训轨迹不连续。**2026-10-16 裁定扩写**为「`.nnckpt` 训练状态段 + role 语义」：状态段 = 计数器 + 优化器状态 + 训练配方 + 数据集身份（role 门控，**v7 → v8**，与 P2-1 同批）；`Checkpoint` **禁止 A/B 类 CLI 输入**（显式即报错），`Model` **CLI 全权**（放开 `.nnmodel` 恢复以支持 SFT） | 前置 **P1-1 已解锁**（`text_train` 已拆为 `cli/text_train_{config,loop,recovery,checkpoint}.hpp` + 396 行入口，恢复路径不再膨胀）；P1-2 与 P2-1 同属版本段改动，**合批做省一次 `MODEL_VERSION` 升版**。细则见 [`23`](23-library-design-cleanup-and-model-file-roles.md) §2.1.1；中–大 |
 | **P1-7 三值模型续训入口（打包 → latent 反量化）** | 18 §4.2 P1-7 / §3.4 M6 | 三值模型的 `.nnmodel` 载入后是 `packed_only_` 部署态 ⇒ `backward()` 明确报错，**三值 SFT / QAT 续训没有入口**；单独立项（不塞进 P1-2） | 前置 = P1-2 的 role 语义（否则 `.nnmodel` resume 本身被门禁挡住）；载入路径改动，验收 = 反量化后 wq/τ 与文件内打包权重逐位一致；小–中 |
+
+> **P1-2 已完成（2026-10-16，四刀）** ⇒ 它的行不再排期：状态写回 18 §4.2（§4.3 前的状态条）与 §8.2 门禁 7，
+> 过程见 `docs/history/history.md` 四条同名条目；**下一项主线 = P1-7**（前置已解除），可并行 P1-5。
 | **P1-5 CI 冒烟扩 MSVC Debug + 权重变化断言** | 18 §4.2 P1-5 / §5 裁定表"13 §8" | 防"loss 不动"类静默失败；且是 **P2-7 的前置** | 无（P0-1 已就绪）；可复用 `f16_writeback_probe` 的"8 步 Adam 参数必须移动"思路；中 |
 | **P4-1 性能利用率** | 18 §4.5 P4-1 / §3.1 C9 尾注 | 唯一还没归因的固定成本：`墙钟 − 设备 kernel ≈ 4.2%`（f32/f16 同幅） | 需 `NN_PROFILE` 设备侧证据链（host 录制 / driver 提交 / fence 等待三处归因）；中；**注意 P2-9 已否决"搬 I/O 位置"** |
 | **P4-2 算子性能** ✅ **C10 派生的 (a)+(b) 已完成（2026-10-15）** | 18 §4.5 P4-2 | (a) RAPT `rms_norm_forward_` 设备侧拼装（−29.7%）；(b) `scan_prefix` 行归属 + 4 路展开 + 窄共享变体（单次 4.7×、同会话 e2e −42.6%，数值逐位不变）。**剩下的重型 kernel** = fold / matmul / reduce / `matmul_q` 逐项 tile·occupancy 调参；**e2e 的新瓶颈已转移到 host staging**（`copy_from` ≈66% 墙钟，归 P4-1 口径） | `layer_bench --op <name> --hash` 配对 A/B 就绪（扫描原语用 `--dk`）；suffix 已验证「加占用率更慢」⇒ 别动；中 |
