@@ -152,9 +152,10 @@ CLI 不再有发言权。
 **落地进度（2026-10-16）**：**第一刀已落地** —— v8 段布局 + `TrainState` 编解码
 （`include/neuralnet.cpp/train_state.hpp`）+ 读写 API（`save_model` 的 `CheckpointState`、
 `peek_train_state` / `load_train_state` / `verify_model_integrity`）+ 回归用例
-`train_state_test`（含"剥成 v7 仍可加载"的零破坏用例）；**待续** —— `Optimizer::save_state/
-load_state`、训练路径接线（写状态段 + 按状态段还原精度/计数器/lr 曲线形状）、禁列校验、
-数据集身份门禁、GUI 同步。
+`train_state_test`（含"剥成 v7 仍可加载"的零破坏用例）；**第二刀已落地** ——
+`Optimizer::save_state` / `load_state` / `state_step`（全表覆盖，含"重启续跑 = 直跑"的逐位门禁
+`optimizer_state_test`）；**待续** —— 训练路径接线（写状态段 + 按状态段还原精度/计数器/lr 曲线
+形状）、禁列校验、数据集身份门禁、`.nnmodel` 恢复放开、GUI 同步。
 
 **段布局（v8，追加在 tokenizer 之后；老文件按版本回落）**
 
