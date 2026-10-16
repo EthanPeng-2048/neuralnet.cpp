@@ -19,8 +19,10 @@
 #include <cstddef>
 #include <cstdlib>
 #include <iostream>
+#include <span>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "neuralnet.cpp/core_config.hpp"        // nn::Scalar
@@ -191,7 +193,56 @@ struct TrainConfig
 
     // 混合精度控制（docs/development/05-mixed-precision.md §9.1）
     nn::PrecisionProfile precision;     // 默认全 F32（零回归）
+
+    // ── 本进程**显式给出**的 A/B 类旗标（P1-2；按旗标名登记，不含值）──────
+    // 断点续训（role=Checkpoint 且带训练状态段）时，这些旗标一律禁止输入
+    // （docs/todo/23 §2.1.1），续训路径据此报错；`role=Model`（SFT warm start）
+    // 时它们才是合法的配方来源。
+    std::vector<std::string> explicit_train_flags;
 };
+
+// ── 断点续训禁列（P1-2，docs/todo/18 §4.2 / docs/todo/23 §2.1.1）──────────
+// A 类（计数器/状态）+ B 类（形状/配方）：断点是**训练的可续点**，这些值由
+// 断点自带的状态段提供，续训时再显式给 = 把轨迹掰弯（lr 曲线形状、step 网格、
+// 精度路径都会跟着变），故一律报错。
+// C 类（允许，见下）只留"完全不改变训练"的参数：`--save` / `--save-interval` /
+// `--log-interval` / `--max-steps` / `--gpu`（+ 设备）/ `--grad-log` /
+// `--checkpoint-every` / `--activation-offload` / `--flush-interval` / `--resume`
+// 本身（含数据集路径 = 位置）、以及探针环境变量。
+inline constexpr std::string_view kForbiddenResumeFlags[] = {
+    "--resume-epoch", "--resume-step",
+    "--epochs", "--lr", "--batch-size", "--accum-steps", "--seq-len", "--stride",
+    "--optimizer", "--weight-decay", "--beta1", "--beta2",
+    "--d-model", "--num-heads", "--num-layers", "--d-ff", "--model",
+    "--f16", "--t1_58",
+    "--precision-param", "--precision-compute", "--precision-stable", "--precision-optimizer",
+    "--lr-schedule", "--warmup-epochs", "--warmup-steps", "--min-lr", "--lr-per-epoch",
+    "--max-norm", "--positional-encoding", "--activation", "--norm",
+};
+
+[[nodiscard]] constexpr std::span<const std::string_view> forbidden_resume_flags() noexcept
+{
+    return kForbiddenResumeFlags;
+}
+
+[[nodiscard]] inline bool is_forbidden_resume_flag(std::string_view arg) noexcept
+{
+    for (std::string_view f : forbidden_resume_flags())
+        if (arg == f) return true;
+    return false;
+}
+
+// 禁列清单（一行式，报错文案/帮助/审计脚本共用同一口径）
+[[nodiscard]] inline std::string forbidden_resume_flags_text()
+{
+    std::string s;
+    for (std::string_view f : forbidden_resume_flags())
+    {
+        if (!s.empty()) s += " ";
+        s += f;
+    }
+    return s;
+}
 
 TrainConfig parse_text_train_args(int argc, char *argv[])
 {
@@ -199,6 +250,11 @@ TrainConfig parse_text_train_args(int argc, char *argv[])
     for (int i = 1; i < argc; ++i)
     {
         std::string arg = argv[i];
+        // ── A/B 类旗标登记（P1-2 断点续训禁列；按**旗标名**判定、不看值）──
+        // 解析层的默认值与用户输入无法区分，故必须在解析期记录"本进程真出现过"
+        // 的旗标；续训路径在断点带训练状态段时发现列表非空即报错。
+        if (nn::cli::is_forbidden_resume_flag(arg))
+            cfg.explicit_train_flags.push_back(arg);
         if (arg == "--help" || arg == "-h")
         {
             print_text_train_usage(argv[0]);
