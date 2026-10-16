@@ -4580,6 +4580,87 @@ kwargs：
 （exit 0）、`python bench/gui_cli_audit.py` 的 [3] 节同时验"控件删了引用还在"这类只在运行期
 才炸的错误。
 
+# P1-1（第二刀）：`text_train` 模块化 + `std::exit` 收敛（2026-10-16）
+
+**类型**：演进记录（结构重构）+ 回归验证（逐字节 A/B）。
+
+**背景**：18 §4.2 P1-1 的后半（前半"退出码语义"见上一节）。要点：`src/text_train.cpp`
+1808 行里 CLI 解析 / 训练循环 / TDR 恢复 / checkpoint 混杂，`std::exit` 约 40 处；
+E5 记的"任一改动牵动全文件"是真实成本，也是 **P1-2（checkpoint 优化器状态）的前置阻塞**。
+接缝盘点（含"TDR 重启续训段与循环状态耦合最紧、抽它要先定义状态结构"）写在上一节的
+"未做"里，本轮按那份盘点执行。
+
+**落地形态**（`src/text_train.cpp` 1830 → **396** 行，只留接线 + 唯一出口 `main`）：
+
+| 模块（`include/neuralnet.cpp/cli/`） | 职责 | 行数 |
+|---|---|---|
+| `text_train_config.hpp` | `TrainConfig` + `--help` 排版 + argv 解析（**CLI 参数解析层 = 全流程唯一允许 `std::exit` 的地方**） | 522 |
+| `text_train_loop.hpp` | epoch × step 循环：采样/前向/稀疏 CE/反向/累积/裁剪/优化器、非阻塞 loss 回读、测试评估、`--max-steps`、定期断点、`NN_NAN_TRACE`/`NN_MEM_STATS` 探针、梯度统计 | 988 |
+| `text_train_recovery.hpp` | `--resume`：角色门禁 → 读规格 → 按规格重建（GPT/ALiBi-GPT/RAPT）→ 载参 | 127 |
+| `text_train_checkpoint.hpp` | `.nnckpt` 路径派生 + 断点保存**记账**（失败只记账不中断）+ 收尾退出码 + `.nnmodel` 产出 | 83 |
+
+**关键决定（为什么这么切）**：
+
+1. **三个模块不终止进程**——错误一律 `Result` 上抛，`main` 是唯一出口（`error` → 打印 +
+   退出码 1）。这是 P1-2 能落地的前提：恢复路径必须**可被测试直接调用**，而不是"调用即
+   可能结束进程"。探针中止（`NN_NAN_TRACE` 命中）不是错误而是"诊断完成"，经
+   `TextTrainLoopOutcome::abort_code = 9` 回报，调用方据此跳过收尾保存与剖析报告
+   （与旧 `return 9` 行为逐字一致）。
+2. **循环体逐字搬移**，只动三类地方：错误分支（`NN_EXIT` → `Result` 上抛）、少数名字/
+   语义替换（`optimizer->` → 引用 `.`、`tokenizer->vocab_size()` → 传入的 `vocab_size`、
+   `mem_mark(...)` → 探针对象的 lambda）、断点保存调用。循环里的**输出文案与顺序**是回归锚，
+   搬迁期间不动它，让"改动前后 stdout/stderr 逐行相同"成为可机械验证的判据（见下）。
+3. **状态归属**：循环需要而 src 原本持有的东西（`lr_sched_cfg`、`optimizer_current_lr`、
+   `steps_per_epoch`、测试子集、`eff_seq`、`x/y/loss_mask/flat_targets` 缓冲）一律在 loop 内
+   派生或经 `TextTrainLoopInput` 传入——不留"一半状态在 src、一半在 header"的缝合线。
+4. **角色门禁的错误文案不加语境前缀**（用 `NN_TRY_CHECK` 而非 `NN_TRY_MSG`）：该文案是
+   用户可见契约（docs/todo/23 §2.1），逐字保留。
+5. **探针随循环进 loop 模块**：`NN_NAN_TRACE` 的四个 helper 与 `NN_MEM_STATS` 的
+   `TextTrainMemProbe` 都只在循环里用；探针门语义不变（默认构建整块不编译、`on` 恒 false、
+   不求值 `getenv`）。
+6. **共同坑**：`nn::create_optimizer` 返回 `unique_ptr`（未知名字 = nullptr），**不是**
+   `Result`——`NN_EXIT(optimizer, 1, …)` 能吃它是因为宏族对"上下文可判定类型"有重载；
+   改成 `Result` 上抛时必须显式判空（本轮在 src 里改为
+   `if (!optimizer_holder) NN_FAIL(...)`），否则 `NN_TRY_MSG` 会在编译期报
+   "no member named 'error'"。
+
+**验收（2026-10-16，`build-rv` = clang 24 + Release + `NN_ENABLE_NATIVE=OFF` + 无 Vulkan）**：
+
+1. **关键路径逐字节一致**：21 个场景在改动前后对照（f32 / `--f16` / `--model rapt` /
+   `--t1_58` / `--grad-log` / `--checkpoint-every 1` / `--activation-offload` /
+   `--accum-steps 2 --max-steps 4` / `step_cosine` / `--max-norm` / 单窗口多 epoch /
+   `--resume` 成功路径 / 错误路径 ×6 / `--help`）——**stdout 与 stderr 逐行相同**（仅
+   `time=X.Xs` / `总耗时: X.Xs` 两个时间字段归一）、**退出码相同**、写出的
+   `.nnmodel` / `.nnckpt` **md5 逐位相同**。用例数据 = 44 token 的 `.nndataset` +
+   `seq_len 256`（**单窗口** ⇒ 无 shuffle 随机性，可逐字节比对；多窗口场景结构一致、
+   数值随 `std::random_device` 变动，属既有语义）。
+2. **错误路径文案只有两处有意变更**：`Error: X` → `推理模型保存失败: X`（补语境）、
+   数据集打开错误去掉 `[nn] … (expr) at file:line`（改由 `NN_TRY_MSG` 语境透出）。
+   角色门禁（`--resume` 认 `.nnmodel` 为断点）与断点失败记账文案**逐字未变**。
+3. **新门禁 `src/text_train_modules_test.cpp`（注册进 ctest）**：断点路径派生（含
+   `.nnckpt.nnckpt` / 裸 `.nnmodel` 退化输入）/ 角色门禁三态（Model 拒绝、Checkpoint 放行、
+   不存在放行）/ **断点往返（按文件规格重建 + 载参后参数逐位一致 + 内嵌词表字节数一致）** /
+   记账与退出码（写失败计数 1 + 收尾码 1；成功不计账、不打印）/ 推理模型角色可被
+   `peek_model_role` 认出。全 CPU、秒级、临时目录自建自清。
+4. **门禁与审计**：`ctest --test-dir build-rv` **49/49**（无 Vulkan 树；GPU 用例 77 = skip）；
+   `pwsh bench/doc_inventory.ps1` → `L2-VIOLATIONS: 0`、`HANDWRITTEN-RESIDUE: 0`，
+   **新增第 [6] 节**（`text_train` 的 loop/recovery/checkpoint 与入口不得出现
+   `std::exit` / `NN_EXIT` / `NN_UNWRAP`）PASS；`bench/doc_align_audit.ps1` exit 0；
+   `python bench/gui_cli_audit.py` PASS 可行动问题 0（选项名单与帮助/解析分支未漂移）。
+5. **跨编译器**：`build-gpu`（g++ 15 + libstdc++ + Release + Vulkan 启用）编译
+   `text_train` 与 `text_train_modules_test` 零告警，新测试在该构建下同样通过。
+
+**顺手回正的文档漂移**（都不是本轮改动引入，属 27 号象限二的"索引/口径卫生"）：
+`host_bridge_uses` 实测 **41 → 39**（P4-2 拆掉 RAPT 逐头 host 往返的效果，文档一直写着 41）；
+Layer 直调算子 **27 → 28**（`cast_into` 早已进 L2 文件，12 号未同步）；`18 §8.2` 第 2 条
+仍写"统一写实测 49/47"（应为 51/49）；各计数行（`include/` 78 hpp/43424 行、`src/`
+79 cpp/26574 行、`docs/` 46 篇、`ctest` 51/49）按 2026-10-16 实测刷新。
+
+**未做 / 后续**：P1-2（`.bin` 优化器状态段）现在**直接可开工**（前置已解锁）；
+`--resume-epoch/--resume-step` 的续训语义本轮未动（只是搬进 loop 的同一段代码）；
+`mnist_train` / `text_infer` 等的参数解析层仍在各自 `src/*.cpp`（本轮范围外）；
+setup 路径上的错误不再带 `(expr) at file:line`（如需保留可另立）。
+
 # P1-1（第一刀）：`text_train` 的退出码语义——断点写失败不得成功退出（2026-10-15）
 
 **缺陷**（docs/todo/18 §4.2 P1-1 的"退出码语义修正"）：`--save-interval` 的 `.nnckpt`

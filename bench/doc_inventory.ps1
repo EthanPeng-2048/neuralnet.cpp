@@ -139,3 +139,46 @@ if ($residue.Count -gt $baseline) {
     exit 1
 }
 Write-Output "  [GATE] PASS — 残留未超基线（新增检查须用宏族）。"
+
+# 6) text_train 模块的"不得终止进程"审计（P1-1 模块化，2026-10-16）
+#    试点：`src/text_train.cpp` 曾经是"CLI 解析 + 训练循环 + TDR 恢复 + checkpoint"
+#    混杂的 1830 行文件，exit 散落其间（E5 → 18 §4.2 P1-1）。模块化后四块落在
+#      include/neuralnet.cpp/cli/text_train_config.hpp   （CLI 参数解析层：唯一允许 std::exit）
+#      include/neuralnet.cpp/cli/text_train_loop.hpp     （训练循环）
+#      include/neuralnet.cpp/cli/text_train_recovery.hpp （--resume 恢复）
+#      include/neuralnet.cpp/cli/text_train_checkpoint.hpp（断点/推理模型产出）
+#      src/text_train.cpp                                （入口：接线 + 唯一出口 main）
+#    判据（剥行注释与字符串字面量后）：**除参数解析层外**不得出现 std::exit /
+#    NN_EXIT / NN_UNWRAP —— 三者都会直接终止进程（NN_UNWRAP = abort 语义），
+#    与"错误经 Result 上抛、进程只有一个出口"冲突。基线 0；新增错误检查请用
+#    NN_TRY / NN_TRY_MSG / NN_FAIL（loop 内返回 Result）。
+$exitScan = @(
+    'include\neuralnet.cpp\cli\text_train_loop.hpp',
+    'include\neuralnet.cpp\cli\text_train_recovery.hpp',
+    'include\neuralnet.cpp\cli\text_train_checkpoint.hpp',
+    'src\text_train.cpp'
+)
+$exitHits = @()
+foreach ($rel in $exitScan) {
+    $p = Join-Path $root $rel
+    if (-not (Test-Path $p)) { continue }
+    $lineNo = 0
+    foreach ($raw in (Get-Content $p)) {
+        $lineNo++
+        $code = [regex]::Replace($raw, '"(?:[^"\\]|\\.)*"', '""')
+        $cmt = $code.IndexOf('//')
+        if ($cmt -ge 0) { $code = $code.Substring(0, $cmt) }
+        if ($code -match 'std::exit\s*\(|\bNN_EXIT\b|\bNN_UNWRAP\b') {
+            $exitHits += ("{0}:{1}" -f $rel, $lineNo)
+        }
+    }
+}
+Write-Output ''
+Write-Output '=== [6] text_train 模块的进程终止审计（P1-1：模块只经 Result 上抛）==='
+foreach ($h in $exitHits) { Write-Output ("  [exit] {0}" -f $h) }
+Write-Output ("  TERMINATING-CALLS: {0}   (baseline 0)" -f $exitHits.Count)
+if ($exitHits.Count -gt 0) {
+    Write-Output "  [GATE] FAIL — text_train 的循环/恢复/断点模块与入口不得直接终止进程（std::exit / NN_EXIT / NN_UNWRAP）；请改 Result 上抛（NN_TRY / NN_TRY_MSG / NN_FAIL）。"
+    exit 1
+}
+Write-Output "  [GATE] PASS — 无终止调用（CLI 参数解析层是唯一例外：cli/text_train_config.hpp）。"

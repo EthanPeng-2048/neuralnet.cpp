@@ -625,6 +625,13 @@ if(NN_BUILD_APPS OR NN_ENABLE_TESTS)
     nn_add_executable(cli_precision_warning_test src/cli_precision_warning_test.cpp)
     list(APPEND NN_TEST_TARGETS cli_precision_warning_test)
 
+    # ── P1-1：text_train 模块化（recovery / checkpoint 的恢复路径单测）──────
+    # [1] 断点路径派生；[2] --resume 角色门禁；[3] 断点往返（参数逐位一致）；
+    # [4] 断点记账 + 收尾退出码语义（P1-1 第一刀回归锁）；[5] 推理模型角色。
+    # 全 CPU、秒级、无外部依赖（临时目录自建自清）。
+    nn_add_executable(text_train_modules_test src/text_train_modules_test.cpp)
+    list(APPEND NN_TEST_TARGETS text_train_modules_test)
+
     # ── RV-04 优化器元数据表（唯一真源 ↔ 工厂）+ RV-03 同目标写序回归 ──────
     # [1] 表内每个 name 都能被 create_optimizer 构造、名单文本与表一致；
     # [2] AdamW（wd≠0）单步 vs 手写参考 + 顺序对调的负例；

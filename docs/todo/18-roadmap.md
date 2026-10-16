@@ -49,18 +49,18 @@
 
 | 维度 | 实测 | 复现 |
 |---|---|---|
-| `include/` | **74 个 `.hpp` / 41247 行** | `Get-ChildItem include -Recurse -Filter *.hpp` + 逐文件 `Get-Content` 计数 |
-| `src/` | **75 个 `.cpp` / 26614 行** | 同上换 `src -Filter *.cpp` |
+| `include/` | **78 个 `.hpp` / 43424 行** | `Get-ChildItem include -Recurse -Filter *.hpp` + 逐文件 `Get-Content` 计数 |
+| `src/` | **79 个 `.cpp` / 26574 行** | 同上换 `src -Filter *.cpp` |
 | `shaders/` | **22 个 `.comp`** | `Get-ChildItem shaders -Recurse -Filter *.comp` |
-| `docs/` | **43 篇 `.md`**（含 `history/history.md` 与 `release-notes/`） | `Get-ChildItem docs -Recurse -Filter *.md` |
-| 最大源文件 | `expr_glsl_gen.hpp` **3435** 行、`compute_cpu_engine.hpp` **2788**、`compute_engine.hpp` **2217**、`src/text_train.cpp` **1808**、`gui.py` **1735**、`backend/compute_vk_backend.hpp` **1055**（v1.8.1 拆 4 片段后回落） | 逐文件 `(Get-Content $f).Count` |
-| ctest | **50 个测试** = 37 个测试目标（`list(APPEND NN_TEST_TARGETS` 计数）+ 13 个变体/附加（`cnn_test_gpu`、`cnn_test_f16`、`cnn_test_f16_gpu`、`rapt_test_f16`、`rapt_test_f16_gpu`、`batchnorm_test_gpu`、`t1_58_test_gpu`、`bitnet_struct_test_gpu`、`write_epoch_test_gpu`、`ternary_gemm_test_gpu`、`adam_quant_test_gpu`、`fusion_custom_layer_example`、`expr_fuse_test`）；**无 Vulkan 的树只注册 48 条**（`fusion_custom_layer_example` / `expr_fuse_test` 是 GPU 专属门禁） | `ctest --test-dir build -N` |
-| 引擎接口 | **52 个 virtual 方法**；`L2-VIOLATIONS: 0`；宿主桥 41 处（仅披露） | `pwsh -File bench/doc_inventory.ps1` |
+| `docs/` | **46 篇 `.md`**（含 `history/history.md` 与 `release-notes/`） | `Get-ChildItem docs -Recurse -Filter *.md` |
+| 最大源文件 | `expr_glsl_gen.hpp` **3435** 行、`compute_cpu_engine.hpp` **2788**、`compute_gpu_engine.hpp` **2610**、`compute_engine.hpp` **2217**、`expr_dsl.hpp` **1973**、`gui.py` **1864**、`backend/compute_vk_backend.hpp` **1073**（v1.8.1 拆 4 片段后回落）。**`src/text_train.cpp` 已不在榜**——P1-1 模块化后 1830 → **396** 行（循环/恢复/断点拆到 `cli/text_train_*.hpp`） | 逐文件 `(Get-Content $f).Count` |
+| ctest | **51 个测试** = 38 个测试目标（`list(APPEND NN_TEST_TARGETS` 计数）+ 13 个变体/附加（`cnn_test_gpu`、`cnn_test_f16`、`cnn_test_f16_gpu`、`rapt_test_f16`、`rapt_test_f16_gpu`、`batchnorm_test_gpu`、`t1_58_test_gpu`、`bitnet_struct_test_gpu`、`write_epoch_test_gpu`、`ternary_gemm_test_gpu`、`adam_quant_test_gpu`、`fusion_custom_layer_example`、`expr_fuse_test`）；**无 Vulkan 的树只注册 49 条**（`fusion_custom_layer_example` / `expr_fuse_test` 是 GPU 专属门禁） | `ctest --test-dir build -N` |
+| 引擎接口 | **52 个 virtual 方法**；`L2-VIOLATIONS: 0`；宿主桥 39 处（仅披露，2026-10-16 实测；P4-2 拆掉 RAPT 逐头 host 往返后由 41 回落） | `pwsh -File bench/doc_inventory.ps1` |
 | 版本 | git tag **v1.8.2**；`CMakeLists.txt` 的 `project(... VERSION 1.8.2)`（与 tag 对齐；口径仍为 **git tag 是版本权威**）；`release-notes/` 有 `v1.5.0.md`、`v1.5.1.md`（2026-10-15 补写）、`v1.6.0.md`、`v1.7.0.md`、`v1.8.1.md`、`v1.8.2.md`（v1.6.1 / v1.7.1 / v1.8.0 无独立发布说明） | `git describe` + 读 `CMakeLists.txt` |
 | CI | `.github/workflows/cmake-single-platform.yml`：clang++ / Ninja / Release / `NN_ENABLE_NATIVE=OFF`，Linux + Windows；**开 `NN_ENABLE_TESTS` 并跑 ctest**（普通 + `NN_BIND_DEBUG=1` 各一轮，P0-1） | 读该 workflow |
 
 > 口径说明：表中行数均为**总行数**（实测刷新）。
-> `50`（GPU 树）/ `48`（无 Vulkan 树）是当前唯一正确计数；`--preset` 各树同口径（GPU 是否可用决定
+> `51`（GPU 树）/ `49`（无 Vulkan 树）是当前唯一正确计数；`--preset` 各树同口径（GPU 是否可用决定
 > 两条 GPU 专属门禁是否注册）。文档中其它 ctest 计数写法属**历史记录**：已完成行（如 P2-3/P2-8 的
 > "47/47"）与 `docs/history/history.md` 的旧数字是当时的验收事实，不属计数口径冲突；**新增/修改文档
 > 时写当前值**。口径差异来源见 §3 工程化第 4 条。
@@ -95,7 +95,7 @@
 | C5 | `.bin` 无整文件校验和与尾部完整性标记 | `model_serialization.hpp` 版本常量附近的注释（明示"若引入需升 MODEL_VERSION"） | 截断/损坏的模型文件无法与合法文件区分 |
 | C6 | ~~`gpt_test` 偶发失败未定位~~ **✅ 已定性（2026-10-15）：未复现 + 同机完全确定**。278 次直跑（200 串行 + 8 并发 + 40 串行 + 30 次 `taskset -c 0,1` 2 核超订）**零失败且日志逐字节一致**（单一 md5）⇒ 不存在数值随机性；历史 1/62 只能是环境差异（编译器/CPU/FMA）或当次进程级异常。已加环境指纹行（`[env] 编译器/标准库/构建/线程数/FMA`）使未来任何失败自带坐标；**不加 retry/skip**（输出确定 ⇒ 失败必属环境或代码变化，重试会掩盖回归） | 13 原条目 §9.5（62 次直跑 1 次失败、日志被覆盖）；本轮证据与复现命令见 `docs/history/history.md` | 剩余风险 = ≤1.5%（95% 上界，本机口径）的 CI 偶发红；已在失败日志自描述上闭环 |
 | C7 | RAPT / CNN 未接 f16：`Conv2D` 权重/偏置/梯度硬编码 `Precision::F32` | `compute_layer_conv.hpp:148`（权重）、`:151`（偏置）、`:154`/`:155`（权重/偏置梯度）；RAPT 头内 32 处 `dsl::compute*` 调用未接精度实参 | f16 只覆盖 MLP/GPT 路径，CNN/RAPT 用户得不到显存收益 |
-| C8 | `host_bridge_uses` 计数与文档不一致（曾实测 40，13/17 记 41） | `pwsh -File bench/doc_inventory.ps1` 第 [4] 节 | **✅ 已回正（2026-10-15 复测：实测 41 = 文档 41）**——本行原记录的是旧版本上的偏差；披露项，从来不是违规 |
+| C8 | `host_bridge_uses` 计数与文档不一致（曾实测 40，13/17 记 41） | `pwsh -File bench/doc_inventory.ps1` 第 [4] 节 | **✅ 已回正（2026-10-16 复测：实测 39 = §2 文档 39）**——P4-2 拆掉 RAPT 逐头 host 往返后该计数由 41 回落到 39，文档已随本轮刷新；披露项，从来不是违规 |
 | C9 | f16 训练**降速**：`--f16` 同窗比 f32 慢 11–17%（118.4 vs 101.0 / 107.1 ms/step），与「f16 省带宽应更快」预期相反。**✅ 已兑现（2026-10-14）**：P2-11（编译期精度特化）+ P2-13（K 切分/细 tile 变体）后 40HX `--f16` **1013 vs f32 1027 ms（−1.4%）**、850M（无 f16 ALU）**2005 vs 2038 ms（−1.6%）**，峰值显存 818 → **606 MiB** | [`24-f16-training-defects.md`](24-f16-training-defects.md) §4；`docs/benchmarks/2026-09-25-vulkan-vs-cuda.md`、`2026-10-06-vulkan-vs-torch.md`；`docs/history/history.md`「设备侧 kernel 表按阶段归因」 | 原缺口已关闭；剩余"墙钟 − 设备 kernel ≈4.2%"归 P4-1、单算子调参归 P4-2 |
 | C10 | **RAPT GPU 训练比同配置 GPT 慢 ≈16×**（同一命令只换 `--model rapt`，40HX/d128·h4·L4·ff512）。**✅ 已归因（2026-10-15，850M 实测 + A/B 验证）**：本机 b8/seq128/d128·h4·L4·ff512 复现为 **5.5×**（RAPT step 741.81 ms vs GPT 134.84 ms / 3 步）。**原怀疑方向被证伪**（host 侧扫描派发 = 0.1–0.3% 墙钟）；真因是两项独立成本：**① `to_matrix` host 往返 = RAPT 墙钟的 75%**（exclusive 573.82 ms/3 步；来源 = `rms_norm_forward_` 的**逐头** 1/rms 收集：每 block 每 step 2 × batch×heads ≤ 64 次下载，b8/h4/L4 = **256 次/step**，每次 `download_vector` 触发整条流水线 drain ⇒ 258 次 begin/end_batch per step）。**A/B 证据**：`--checkpoint-every 1`（forward 侧不收集 ⇒ 无下载）令 RAPT **forward 659.88 → 160.77 ms（4.1×）**，与 GPT forward 103.19 ms 同量级。**② 设备侧 `scan_prefix` kernel = 530.40 ms 设备时间里的 340 ms**（≈113 ms/step，单次 8–10 ms @ dk=32/seq=128/BH=32）⇒ 扫的是 kernel **本身**耗时，不是启动/staging 常数 | GitHub **issue #15**（2026-10-01 开，唯一未进本文台账的待办，本行即其登记入口）；RAPT 路径 = `compute_layer_rapt.hpp` + 扫描原语（`docs/development/06` §扫描原语）；实测证据 `docs/history/history.md`「C10 归因」条 | 结论：**归 P4-2**，两把杠杆分开做——(a) 把逐头 1/rms 缓存改成**设备侧**拼装（`insert_rows` 进 (BH,seq) 缓冲，避免 download+再 upload；注意 f16 下 dst 精度须与被消费处一致）+ 逐头循环批量化（同一循环还有 1060 次 `slice_rows`/step）；(b) `scan_prefix` kernel 调参（P4-2 的逐 op 项）。 **✅ (a) 已修（2026-10-15，P4-2）**：逐头 1/rms 收集改设备侧拼装后同配置 **step 741.81 → 521.68 ms（−29.7%）**、`to_matrix` 768→0、begin/end_batch 774→6、忙率 69.3%→84.0%，数值逐位不变（CPU f32/f16 `rapt_test` 输出逐字节一致）；**✅ (b) 已修（2026-10-15，P4-2b）**：`scan_prefix` 专用路径改行归属 + 4 路展开 + `dk ≤ 32` 窄共享变体，单次 **7.4–7.9 → 1.64 ms**、同会话 e2e **step 888.24 → 510.24 ms（−42.6%）**，数值**逐位不变**（`rapt_test --gpu`/`--f16 --gpu` stdout md5 前后相同 + 新门禁 `scan_bitwise_test` 61 用例 CPU↔GPU 逐位一致）。**新暴露的 e2e 瓶颈**：host 侧 staging 等待（`copy_from` 355.67/510 ms ≈66% 墙钟）。见 §4.5 P4-2 行。 |
 
@@ -107,7 +107,7 @@
 | E2 | 无 `install()` / export，无 `CMakePresets.json` | `CMakeLists.txt` 实测 `install(` 0 处；根目录无 `CMakePresets.json` | **嵌入路径已完成**：门面目标 `neuralnet::nn` + `NN_ENABLE_GPU`/`NN_BUILD_APPS` 开关 + `nn_enable_gpu_fusion` 树外可用（见 `docs/usage/05-consume-as-library.md`、样例 `examples/downstream/`）；**剩余**：`install()`/`find_package`（用户裁定本轮不做）；`CMakePresets.json` **已于 2026-10-11 补上**（`release`/`dev`/`debug`/`portable`/`cpu`/`probes` + build/test/workflow preset，见 `CONTRIBUTING.md` §1） |
 | E3 | `CMakeLists.txt` 版本与 git tag 不一致，且缺 v1.5.1 release note | `CMakeLists.txt` 的 `project(...)` 行（**已对齐 v1.6.0**）；`docs/release-notes/` 仍缺 v1.5.1 | 版本可读性缺失；分发产物无对应变更说明（release note 缺口仍在） |
 | E4 | 文档内 ctest 计数曾自相矛盾（19 vs 20） | `AGENTS.md` §12 已统一为实测 21（19 目标 + `cnn_test_gpu` + `fusion_custom_layer_example`） | 已修；口径差异来源见 §2 口径说明 |
-| E5 | `src/text_train.cpp` 1746 行、34 处 `std::exit` | 该文件（CLI 解析 + 训练循环 + TDR 恢复 + checkpoint 混杂） | 任一改动牵动全文件；恢复逻辑是 C4 的前置阻塞 |
+| E5 | ~~`src/text_train.cpp` 1746 行、34 处 `std::exit`~~ **✅ 已解决（P1-1 模块化，2026-10-16）**：1830 → **396 行**（入口只留接线），训练循环 / 恢复 / 断点三块拆到 `include/neuralnet.cpp/cli/text_train_{config,loop,recovery,checkpoint}.hpp`，三模块一律返回 `Result` 不终止进程——`std::exit` 全部集中在 **CLI 参数解析层**（`cli/text_train_config.hpp`） | 原坐标（CLI 解析 + 训练循环 + TDR 恢复 + checkpoint 混杂） | 原影响面（任一改动牵动全文件）已解除；C4 的前置阻塞解除，P1-2 可直接开工 |
 | E6 | 单文件多职责：`compute_vk_backend.hpp` 5174 行 | 该文件（fence / staging / dispatch / 算子混装） | header-only 项目里增量编译是主要开发成本 |
 | E7 | `README.md` 与实际不符：死链 `docs/history/history.md`、mojibake、声称链式 `add<LayerType>()`、文档索引缺 13–17 | `README.md:21`、`:35`、`:63`、`:269`、索引表（`:23` 起） | 新用户第一入口即误导；`add<T>(args...)` 是返回 `Result<void>` 的模板方法，**无链式 API** |
 | E8 | `bench/doc_align_audit.ps1` 的 [A] 只检查**反引号里的文件名**，markdown 链接目标不查 | 该脚本 [A] 段正则 | **✅ 已修（2026-10-15）**：[A] 扩展为同时校验 markdown 链接的**目标可达性**（相对路径按文档所在目录解析；行内代码段先剥离，避免把示例链接误当链接）；实测当场抓到 `todo/25-release-requirements.md` 的 `../CONTRIBUTING.md` 死链并一并修掉。README 的 `07-zipt-algorithm.md` 旧死链已在 P0-2 迭代中修 |
@@ -180,7 +180,7 @@ P4 = 持续优化方向（底座已稳后继续加杠杆，2026-10-14 立项，�
 
 | 项目 | 目标 | 验收口径 | 成本 | 依赖 |
 |---|---|---|---|---|
-| **P1-1 `text_train` 模块化** ⚡ **第一刀已落（2026-10-15）：退出码语义** | 抽 `train_loop` / `recovery` / `checkpoint` 模块；退出码语义修正（保存失败不得成功退出） | 现有关键路径回归逐字节一致；新增恢复路径单测；`std::exit` 只在 CLI 参数解析层出现 | 中（1746 行文件拆解，34 处 `std::exit`） | 无，但它是 P1-2 的前置 **已做**：`--save-interval` 的 .nnckpt 写失败从"只打印警告、照常 exit 0"改为**记账 + 收尾非零退出**（推理模型仍写出，错误行明确列出失败次数）；实测：把 ckpt 路径占成目录 ⇒ 退出码 1 + 错误行，正常路径仍 0（`/tmp/nn_exit_bad2` 口径）。**未做**：`train_loop`/`recovery`/`checkpoint` 的模块抽取与 `std::exit` 收敛（现 1808 行、~40 处 std::exit，其中绝大多数在 `parse_args` 属允许层，loop/recovery 内的需随模块化一起改）。 |
+| **P1-1 `text_train` 模块化** ✅ **已完成（2026-10-16）**<br>（2026-10-15 第一刀 = 退出码语义） | 抽 `train_loop` / `recovery` / `checkpoint` 模块；退出码语义修正（保存失败不得成功退出） | 现有关键路径回归逐字节一致；新增恢复路径单测；`std::exit` 只在 CLI 参数解析层出现 | 中（1746 行文件拆解，34 处 `std::exit`） | 无，但它是 P1-2 的前置 —— **已完成，P1-2 已解锁**。**落地形态**：`src/text_train.cpp` 1830 → **396 行**（只留接线与唯一出口 `main`），四模块落 `include/neuralnet.cpp/cli/`：`text_train_config.hpp`（`TrainConfig` + `--help` + argv 解析 =**唯一允许 `std::exit` 的层**）、`text_train_loop.hpp`（epoch × step + 非阻塞 loss 回读 + 梯度累积/裁剪 + 测试评估 + `--max-steps` + 定期断点 + `NN_NAN_TRACE`/`NN_MEM_STATS` 探针）、`text_train_recovery.hpp`（`--resume`：角色门禁 / 按文件规格重建 / 载参）、`text_train_checkpoint.hpp`（`.nnckpt` 路径派生 + 保存记账 + 收尾退出码 + `.nnmodel` 产出）。**三模块不终止进程**：错误一律 `Result` 上抛，`main` 是唯一出口（错误 → 打印 + 退出码 1）；探针中止经 `abort_code = 9` 回报（旧 `return 9` 语义不变）。**验收证据（2026-10-16，clang 24 + Release + `NN_ENABLE_NATIVE=OFF` 的 `build-rv`）**：① **关键路径逐字节一致**——21 个场景（f32 / `--f16` / `--model rapt` / `--t1_58` / `--grad-log` / `--checkpoint-every 1` / `--activation-offload` / `--accum-steps 2` / `step_cosine` / `--max-norm` / 单窗口多 epoch）改动前后 stdout/stderr **逐行相同**（仅时间字段归一）、退出码相同、`.nnmodel`/`.nnckpt` **md5 逐位相同**；② 错误路径文案仅 2 处有意变更（`Error: X` → `推理模型保存失败: X`、数据集打开错误去掉 `[nn] … (expr) at file:line` 噪声），角色门禁与断点失败文案**逐字未变**；③ 新门禁 `text_train_modules_test`（断点路径派生 / 角色门禁 / 断点往返参数逐位一致 / 记账与退出码 / 推理模型角色）；④ `ctest` 49/49（无 Vulkan 树；GPU 用例 77 = skip）、`doc_inventory` 新增第 [6] 节门禁（三模块 + `src/text_train.cpp` 不得出现 `std::exit`/`NN_EXIT`/`NN_UNWRAP`）PASS。过程与盘点见 `docs/history/history.md`「P1-1（第二刀）」。 |
 | **P1-2 checkpoint 优化器状态** | `.bin` 增加可选优化器状态段（Adam m/v，`MODEL_VERSION` 5 → 6）；`Optimizer` 基类加 `save_state/load_state`；恢复路径接线 | 老文件缺段 = 冷启动语义；save→load→save SHA256 逐字节一致；TDR 模拟重启后动量非零且 loss 轨迹连续 | 中 | **P1-1**（否则恢复逻辑继续膨胀） |
 | **P1-3 危险精度组合启动期告警** ✅ **已完成 2026-10-13** | **不单独定义**——需求、口径、验收一律引用 [`24-f16-training-defects.md`](24-f16-training-defects.md) §2.3 / §5 F1（口径：仅警告，不退出、不加确认开关）。**落地**：`include/neuralnet.cpp/cli/cli_precision_warning.hpp`（`nn::cli::dangerous_precision_warning`）+ `text_train`/`mnist_train` 调用点 + 门禁 `src/cli_precision_warning_test.cpp`（单测组合矩阵 + 子进程捕获 stderr 断言退出码不变） | 见 24 号台账 F1 验收口径 | 小 | 无 |
 | **P1-4 `gpt_test` flaky 定位** ✅ **已完成 2026-10-15** | **未复现（278 次直跑零失败，含 2 核超订）且同机逐字节确定** ⇒ 定性为"环境差异或进程级异常"，非测试随机性。**未加 retry/skip**（输出确定 ⇒ 失败必对应环境或代码变化）；改为加环境指纹行 + 复用 P0-1 的 `--output-on-failure` 日志留存。证据/统计口径/复现命令见 `docs/history/history.md` 的同名条目与本文 §3.1 C6 行 | 连续大样本直跑零失败 ✅；结论入 history ✅ | 小–中 | P0-1 ✅ |
@@ -241,7 +241,7 @@ ZiPT 恢复、LRLA、CUDA、分布式（7 项）。
 |---|---|---|
 | 13 §1 线程池归约分块统一 | **不做** | 归约已是确定性分段且 1/8-worker/串行逐字节一致；剩余差异（`parallel_transform`/`parallel_for_*` 用 `chunk_count()`，`row_reduce`/`col_reduce` 各自行块）**无正确性问题，只是概念一致性**。历史上 `Tensor::cpu_get_ptr` 的 8-70× 教训说明动热路径风险远大于收益。归档见 `docs/history/history.md` |
 | 13 §2 超大 header 拆分 | **做（P2-7）** | 唯一被确认的日常成本是增量编译。**前置**：先补编译/链接期冒烟（P0-1 + P1-5），否则拆分期间 ODR/include 次序问题无网可抓 |
-| 13 §3 `text_train` 模块化 | **做（P1-1）** | `src/text_train.cpp` 1746 行、34 处 `std::exit`，CLI/训练/恢复/checkpoint 混杂；退出码语义有真实缺陷。**它同时是 §7 的前置** |
+| 13 §3 `text_train` 模块化 | **✅ 已完成（P1-1，2026-10-16）** | 原判据：`src/text_train.cpp` 1746 行、34 处 `std::exit`，CLI/训练/恢复/checkpoint 混杂；退出码语义有真实缺陷。**它同时是 P1-2 的前置** —— 已拆为四个 `cli/text_train_*.hpp` 模块 + 396 行入口，见 §4.2 P1-1 行 |
 | 13 §4 gui.py 声明式字段表 | **做（P2-6）** | 实测 6 个 Tab、7 处 `collect_args` 手工罗列，漏参风险真实。与 §5.3 绘制节流同批做（同一文件、同一批次验收） |
 | 13 §5.1 F16C 快路径 | **条件触发（P2-8）** | 纯软件位操作在 f16 热点链上是真实开销，但收益未量化。**触发条件（三条同时）**：① CPUID 探测可行；② `NN_ENABLE_NATIVE` ON/OFF 两态都能构建；③ `f16_cpu_probe` 全量对拍逐位一致。历史次正规移位 UB 教训（`docs/development/05-mixed-precision.md` §12.12）要求对拍先行 |
 | 13 §5.2 CPU f32→f16→f32 双趟 | **不做** | 该双趟是**量化模拟语义**，删除会改变行为；收益是热路径一次全量转换，属低量级。若将来有真实调用方依赖"直接返回"语义，另立 API 区分而非删除 |
@@ -290,8 +290,8 @@ ZiPT 恢复、LRLA、CUDA、分布式（7 项）。
 | 基线 | 口径 | 当前值 / 复现 |
 |---|---|---|
 | build | 全绿、零告警（`-Werror`） | `cmake -B build -G Ninja -DNN_ENABLE_TESTS=ON && cmake --build build` |
-| ctest | **实测 50**（37 目标 + 13 变体/附加；无 Vulkan 树 48）；需 Vulkan 用例退出码 77 = skip | `ctest --test-dir build` |
-| L2 分层审计 | `L2-VIOLATIONS: 0`（宿主桥用量只披露） | `pwsh -File bench/doc_inventory.ps1` 第 [4] 节（实测：virtual 52 / host_bridge 41） |
+| ctest | **实测 51**（38 目标 + 13 变体/附加；无 Vulkan 树 49）；需 Vulkan 用例退出码 77 = skip | `ctest --test-dir build` |
+| L2 分层审计 | `L2-VIOLATIONS: 0`（宿主桥用量只披露） | `pwsh -File bench/doc_inventory.ps1` 第 [4] 节（实测：virtual 52 / host_bridge 39） |
 | CPU 字节锚 | `--steps 20` hash = `6f8849f14da23110` | 逐位一致 |
 | GPU 字节锚 | dev2 hash = `8ef51b2927253c50` | 逐位一致（GPU 档位按 17 §6 容差规则） |
 | scan 产物 | `fused_registry.hpp`（**唯一产物**；`expr_specs.bin` 已随构建期单步删除） | `tools/scan_exprs.cpp` + `tools/fused_generate.hpp` 产物 |
@@ -301,11 +301,17 @@ ZiPT 恢复、LRLA、CUDA、分布式（7 项）。
 
 ### 8.2 本轮新增门禁（P0 后生效）
 
-1. **CI 必须执行 ctest**：日志需出现当前全部用例（**50**，无 Vulkan 树 48）；77 = skip 不算失败（P0-1）。
-2. **开发文档不得出现 ctest 计数的旧写法**：统一写实测 **49**（GPU 树）/ 47（无 Vulkan 树）——已完成行与 history 归档里的旧数字是当时记录，不算冲突（P0-2 ✅）。
+1. **CI 必须执行 ctest**：日志需出现当前全部用例（**51**，无 Vulkan 树 49）；77 = skip 不算失败（P0-1）。
+2. **开发文档不得出现 ctest 计数的旧写法**：统一写实测 **51**（GPU 树）/ **49**（无 Vulkan 树）——已完成行与 history 归档里的旧数字是当时记录，不算冲突（P0-2 ✅）。
 3. **BatchNorm 行为门禁**：构造 batchnorm 规格必须有可观测结果（报错或正确层），不允许静默降级（P0-3）。**✅ 已满足**：真层 + `batchnorm_test` 工厂断言。
 4. **危险精度组合**：启动期**告警**（仅警告、不失败、不改退出码）——口径与细则见 [`24-f16-training-defects.md`](24-f16-training-defects.md) §2.3 / §5 F1（P1-3）。
 5. **审计覆盖补强**：`bench/doc_align_audit.ps1` 的 [A] **✅ 已扩展到 markdown 链接目标**（E8，2026-10-15）；新增死链会在审计里以 [A] 计数非 0 暴露。
+
+6. **`text_train` 模块不得终止进程（P1-1，2026-10-16 起生效）**：`pwsh -File bench/doc_inventory.ps1` 第 [6] 节
+   断言 `cli/text_train_{loop,recovery,checkpoint}.hpp` 与 `src/text_train.cpp` 里**不出现** `std::exit` /
+   `NN_EXIT` / `NN_UNWRAP`（这三种写法都会直接终止进程）——三模块的错误一律经 `Result` 上抛，进程唯一出口是
+   `main`（CLI 参数解析层是另一个例外，见 `cli/text_train_config.hpp`）。P1-2 的 checkpoint 状态段与
+   `--resume` 接线必须保持这条不变量：新增错误检查用 `NN_TRY` / `NN_TRY_MSG` / `NN_FAIL`。
 
 ### 8.3 验收纪律
 
