@@ -843,7 +843,8 @@ struct ParamBlob
 }
 
 [[nodiscard]] inline Result<ParamEntry> param_blob_to_entry(
-    ComputeEngine &engine, const detail::ParamBlob &b)
+    ComputeEngine &engine, const detail::ParamBlob &b,
+    WeightLoadIntent intent = WeightLoadIntent::Inference)
 {
     ParamEntry e;
     e.rows = static_cast<std::size_t>(b.rows);
@@ -891,6 +892,38 @@ struct ParamBlob
                 : nn::trit_pack::bytes_per_row(k);
             if (b.payload.size() != rows * per_row)
                 NN_FAIL("序列化：打包载荷长度与形状不一致");
+            Matrix tm(rows, 1);
+            if (b.aux.size() != tm.size() * sizeof(Scalar))
+                NN_FAIL("序列化：tau（aux）长度与形状不一致");
+            std::memcpy(tm.span().data(), b.aux.data(), b.aux.size());
+            // ── P1-7：Trainable ⇒ 反量化成 f32 latent（warm start / QAT 续训）──
+            // 载荷 → latent 的转换在**宿主侧**（L3 是宿主字节/Matrix 的唯一落点；
+            // L2 层不得碰 Matrix）。τ 随条目一起交给层（aux）：层按文件 τ 重建
+            // 打包派生物，故首次 forward 的 wq/τ 与文件里的模型逐位一致。
+            // 公式与两条不变量的依据见 ternary_pack.hpp 的 `latent_row_scale`。
+            if (intent == WeightLoadIntent::Trainable)
+            {
+                Matrix lat(rows, k);
+                std::vector<std::uint32_t> words(wpr);
+                const auto ts = tm.span();
+                auto ls = lat.span();
+                for (std::size_t r = 0; r < rows; ++r)
+                {
+                    detail::decode_packed_row(base3, b.payload.data() + r * per_row,
+                                              k, words.data());
+                    nn::trit_pack::dequant_row(words.data(), k, ts[r],
+                                               ls.data() + r * k);
+                }
+                auto lt = engine.from_matrix(lat, Precision::F32);
+                NN_TRY_CHECK(lt);
+                auto tt = engine.from_matrix(tm, Precision::F32);
+                NN_TRY_CHECK(tt);
+                e.kind = ParamKind::TernaryLatent;
+                e.precision = Precision::F32;
+                e.payload = std::move(*lt);
+                e.aux = std::move(*tt);
+                return e;
+            }
             Matrix cont(rows, wpr);
             std::vector<std::uint32_t> words(wpr);
             auto cs = cont.span();
@@ -905,10 +938,6 @@ struct ParamBlob
             NN_TRY_CHECK(ct);
             e.kind = ParamKind::TernaryPacked2;   // 运行期形态：内核只认 2-bit 容器
             e.payload = std::move(*ct);
-            Matrix tm(rows, 1);
-            if (b.aux.size() != tm.size() * sizeof(Scalar))
-                NN_FAIL("序列化：tau（aux）长度与形状不一致");
-            std::memcpy(tm.span().data(), b.aux.data(), b.aux.size());
             auto tt = engine.from_matrix(tm, Precision::F32);
             NN_TRY_CHECK(tt);
             e.aux = std::move(*tt);
@@ -1195,9 +1224,14 @@ struct LoadedTrainState
 // v5：per-tensor precision tag（读取时自动识别 f32/f16）
 // v4：无 precision tag（所有矩阵为 f32）
 // v8：读参数前先做整文件校验和校验；并跳过训练状态段（读它用 load_train_state）
+// intent（P1-7）：三值层的**打包载荷**是"进部署只读态"还是"反量化成可训练
+//    latent"——推理侧默认 `Inference`（0.25 B/权重）；训练侧的 warm start /
+//    QAT 续训传 `Trainable`（`.nnckpt` 的 TernaryLatent 载荷两种意图同结果）。
 [[nodiscard]] inline Result<std::string> load_model(const std::string &filename, Model &model,
                                                    uint32_t *version_out = nullptr,
-                                                   ModelRole *role_out = nullptr)
+                                                   ModelRole *role_out = nullptr,
+                                                   WeightLoadIntent intent =
+                                                       WeightLoadIntent::Inference)
 {
     std::ifstream ifs(filename, std::ios::binary);
     if (!ifs)
@@ -1248,7 +1282,7 @@ struct LoadedTrainState
             for (std::size_t i = 0; i < n; ++i)
             {
                 NN_TRY(b, detail::read_param_blob(ifs));
-                NN_TRY(e, param_blob_to_entry(engine, *b));
+                NN_TRY(e, param_blob_to_entry(engine, *b, intent));
                 NN_TRY(r, L.import_param(i, *e));
             }
         }

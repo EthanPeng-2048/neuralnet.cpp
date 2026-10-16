@@ -5,14 +5,15 @@
 //      形状/配方/起点一律由状态段决定，显式给出 A/B 类旗标即报错；数据集身份
 //      不一致硬报错（无逃生阀）；优化器状态（含 `t`）随之恢复。
 //      角色语义（v8，docs/todo/23 §2.1.1）：`.nnckpt` = 断点续训、
-//      `.nnmodel` = warm start（SFT，CLI 全权）；唯一拒绝的组合是三值 `.nnmodel`
-//      （打包形态无 latent，见 18 §4.2 P1-7）。v5/v6/v7 老文件放行（零破坏）。
+//      `.nnmodel` = warm start（SFT，CLI 全权）。**P1-7 起没有需要拒绝的组合**：
+//      三值 `.nnmodel` 的打包载荷在载入时按文件 τ 反量化成 f32 latent
+//      （`WeightLoadIntent::Trainable`）⇒ 同样可续训。v5/v6/v7 老文件放行（零破坏）。
 //   ② **按文件规格重建模型**：规格是加载时的权威来源（缺键 = None → 旧文件
 //      零破坏）；GPT / ALiBi-GPT 走同一条 `build_gpt_model_from_spec`，RAPT
 //      独立路径。命令行给出的 `spec` 会在成功时被文件规格覆盖。
 //   ③ **载入参数**：`load_model`（回报内嵌词表的字节数）。
 //   非致命失败（读不到规格 / 载入参数失败）与旧行为一致：打印提示后**继续从头
-//   训练**，不算错误；角色矛盾 / 禁列旗标 / 数据集身份不符才是错误
+//   训练**，不算错误；禁列旗标 / 数据集身份不符才是错误
 //   （调用方按 CLI 错误处理）。
 //
 // 本模块**不终止进程**（P1-1 口径：`std::exit` 只允许出现在 CLI 参数解析层）。
@@ -44,27 +45,10 @@ namespace nn::cli
 // ── 角色语义（v8；2026-10-16 裁定，docs/todo/23 §2.1.1）──────────────────
 //   · Checkpoint（`.nnckpt`）⇒ **断点续训**：状态段是唯一权威（A/B 类参数禁列）。
 //   · Model（`.nnmodel`）⇒ **warm start**（CLI 全权）：SFT / 换数据集续训的入口，
-//     优化器冷启动、step/lr 从 0 起算。
+//     优化器冷启动、step/lr 从 0 起算。三值模型同样走这里 —— 打包载荷在载入时
+//     按文件 τ 反量化成 f32 latent（P1-7），故不存在"只能从头训练"的组合。
 //   · v7 及以下 / 头部不合法 ⇒ 放行（旧断点零破坏；不存在或损坏的断点由后续
 //     `peek_model_spec` 给出既有的"加载模型失败: …，将从头训练"提示）。
-// 唯一仍被拒绝的组合：**三值（T1_58）的 `.nnmodel`** —— 它的载荷是打包形态，
-// 载入后 `BitLinear` 是 `packed_only_` 部署只读态（`backward()` 明确报错），
-// 续训需要"打包 → latent 反量化"入口（单独立项 = 18 §4.2 P1-7）。
-[[nodiscard]] inline nn::Result<void> check_resume_target(
-    const std::string& path, const nn::ModelSpec& spec)
-{
-    uint32_t version = 0;
-    auto role_r = nn::peek_model_role(path, &version);
-    if (!role_r || version < 7 || *role_r == nn::ModelRole::Checkpoint)
-        return {};
-    if (spec.weight_quant == nn::WeightQuant::T1_58)
-        NN_FAIL("错误: --resume 的 " + path +
-                " 是推理模型（.nnmodel）且权重为三值（T1_58）：打包形态没有 latent，\n"
-                "  载入后是只读部署态（backward() 会报错）。\n"
-                "  · 三值模型的续训入口（打包 → latent 反量化载入）尚未落地，见 docs/todo/18 §4.2 P1-7；\n"
-                "  · 请改用训练时 --save-interval 产出的 .nnckpt 续训。");
-    return {};
-}
 
 // ── 断点状态采纳（P1-2 第三刀 B）────────────────────────────────────────
 // 读断点的训练状态段，并按"状态段权威"改写 cfg：断点自带精度 profile / 曲线形状 /
@@ -110,7 +94,8 @@ struct ResumeStateAdoption
         role_r && version >= 7 && *role_r == nn::ModelRole::Checkpoint;
     if (role_r && version >= 7 && *role_r == nn::ModelRole::Model)
     {
-        out << "从推理模型 warm start（.nnmodel）：配方与步计数由命令行给出，优化器冷启动\n";
+        out << "从推理模型 warm start（.nnmodel）：配方与步计数由命令行给出，优化器冷启动"
+               "（三值模型的权重按文件 τ 反量化成 f32 latent，P1-7）\n";
         return result;
     }
     if (!is_checkpoint) return result;   // 老文件 / 打不开：交给 resume_text_train 的老语义
@@ -242,11 +227,15 @@ struct TextTrainResume
             << std::endl;
         return result;
     }
-    // 角色语义（v8）：Checkpoint = 断点续训；Model = warm start（SFT）。
-    // 唯一拒绝的组合：三值 .nnmodel（打包形态无 latent，见 P1-7）。
-    NN_TRY_CHECK(check_resume_target(cfg.resume_path, *spec_result));
 
     auto file_spec = std::move(*spec_result);
+    // 角色（v8）：Checkpoint = 断点续训；Model = warm start（SFT）。两者都按
+    // **可训练**意图载入：三值 Model 角色的打包载荷按文件 τ 反量化成 f32 latent
+    // （P1-7），dense / `.nnckpt` 路径与逐位不变（意图只影响打包载荷那一条分支）。
+    uint32_t file_version = 0;
+    const auto role_r = nn::peek_model_role(cfg.resume_path, &file_version);
+    const bool model_role =
+        role_r && file_version >= 7 && *role_r == nn::ModelRole::Model;
     // RAPT 独立构建路径
     if (file_spec.is_rapt())
     {
@@ -276,7 +265,8 @@ struct TextTrainResume
     else
         out << "旧格式模型文件，使用命令行参数\n";
 
-    auto load_result = nn::load_model(cfg.resume_path, model);
+    auto load_result = nn::load_model(cfg.resume_path, model, nullptr, nullptr,
+                                      nn::WeightLoadIntent::Trainable);
     if (!load_result)
     {
         err << "加载模型失败: " << load_result.error().message << "，将从头训练。\n"
@@ -285,6 +275,9 @@ struct TextTrainResume
     }
     result.weights_loaded = true;
     result.vocab_bytes = load_result->size();
+    if (model_role && file_spec.weight_quant == nn::WeightQuant::T1_58)
+        out << "三值（T1_58）推理模型：按文件 τ 反量化打包权重为 f32 latent ⇒ 可续训"
+               "（首次 forward 与推理文件逐位一致）\n";
     out << "已加载模型: " << cfg.resume_path;
     if (!load_result->empty())
         out << " (含嵌入词表 " << load_result->size() << " 字节)";

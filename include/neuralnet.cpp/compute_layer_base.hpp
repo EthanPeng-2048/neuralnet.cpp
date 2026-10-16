@@ -232,6 +232,23 @@ enum class ModelRole : std::uint8_t
     return (r == ModelRole::Checkpoint) ? "checkpoint(.nnckpt)" : "model(.nnmodel)";
 }
 
+// ── 参数载入意图（P1-7）────────────────────────────────────────────────
+// 同一个文件（三值层为打包形态）有两种载入方式——**角色**回答"这份文件是什么"，
+// **意图**回答"载入方要拿它做什么"，两者正交：
+//   · `Inference`：进**部署只读态**（`BitLinear::packed_only_`，0.25 B/权重，
+//     `backward()` 明确报错）——`text_infer` / `mnist_infer` 用；
+//   · `Trainable`：把打包权重按文件 τ **反量化**成 f32 latent（warm start /
+//     QAT 续训入口）——首次 forward 与文件里的模型逐位一致（量化器不动点 +
+//     播种量化缓存，见 `ternary_pack.hpp` 的 `latent_row_scale` 与
+//     `BitLinear::import_param`）。
+// Dense 参数不受影响（两种意图同一条路径，逐位不变）。`.nnckpt` 的三值层写的是
+// TernaryLatent：它本来就带 latent，故两种意图都得到可训练态（零差异）。
+enum class WeightLoadIntent : std::uint8_t
+{
+    Inference = 0,
+    Trainable = 1,
+};
+
 // 单个参数条目的形态。载荷是 `Tensor`（**不是** Matrix → 不触 L2 铁律）：
 // 宿主上传/下载与字节编码都在序列化层（L3）。
 struct ParamEntry
@@ -240,7 +257,8 @@ struct ParamEntry
     Precision precision = Precision::F32;
     std::size_t rows = 0;   // 逻辑形状（= 权重形状，供载入期校验）
     std::size_t cols = 0;
-    Tensor aux;             // 形态附加载荷（三值：τ，形状 (rows,1)）
+    Tensor aux;             // 形态附加载荷（打包三值：τ，形状 (rows,1)；
+                            //  TernaryLatent + τ = 反量化 warm start，P1-7）
     Tensor payload;         // 主体载荷
 };
 

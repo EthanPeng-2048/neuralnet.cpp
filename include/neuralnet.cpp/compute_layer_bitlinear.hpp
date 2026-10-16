@@ -172,6 +172,10 @@ public:
     // 为空张量，但下标不变）。kind 随**文件角色**分流：
     //   Checkpoint(.nnckpt) → TernaryLatent（f32 latent，续训用）
     //   Model(.nnmodel)     → TernaryPacked2（2 bit/权重容器 + τ）
+    // 载入侧另有**意图**这一维（`WeightLoadIntent`，P1-7）：Model 角色的打包
+    // 载荷既可以进只读部署态（Inference），也可以由序列化层按文件 τ 反量化成
+    // f32 latent 后作为 `TernaryLatent + aux(τ)` 交进来（Trainable ⇒ warm
+    // start / QAT 续训）——后者在下面的 import_param 里播种量化缓存。
     // 序列化层负责把容器在盘上编码成 base-3（TernaryPacked3，1.6 bpw）并在载入
     // 时解回 2-bit 容器——层只认运行期形态（L2 不碰宿主字节/Matrix）。
     [[nodiscard]] std::size_t param_count() override { return 2; }
@@ -236,7 +240,33 @@ public:
                     ensure_quant_buffer_();
                 }
                 quant_valid_ = false;
-                return import_into_(latent_w_, entry);
+                NN_TRY_CHECK(import_into_(latent_w_, entry));
+                // ── P1-7：反量化 warm start（aux = 文件里的 τ）────────────────
+                // 反量化本身在序列化层（宿主侧逐位解码；L2 不碰宿主字节/Matrix），
+                // 层这边只做**播种**：直接用文件 τ 重建打包派生物。这样首次
+                // forward 的 wq/τ 与文件里的模型**逐位相同**，不经过"用自己的
+                // absmean 重算 τ"那一步——重算只会得到同一个值的 ±1 ulp，却会让
+                // "首次 forward 逐位复现"这条验收失去确定性。
+                // τ 是权威 ⇒ 重算出的 trit 必然与文件一致（见 ternary_pack.hpp
+                // 的 latent_row_scale：非零位置 |L| = τ·K/n ≥ τ > 0.5τ）。
+                if (!entry.aux.valid()) return {};   // .nnckpt 语义：无 τ，首 forward 自行量化
+                if (entry.aux.precision() != Precision::F32)
+                    NN_FAIL("BitLinear::import_param: 反量化 warm start 的 τ 必须是 f32");
+                if (entry.aux.rows() != out_features_ || entry.aux.cols() != 1)
+                    NN_FAIL("BitLinear::import_param: τ 形状与层不匹配（期望 " +
+                            std::to_string(out_features_) + "x1）");
+                tau_ = entry.aux;
+                // 播种的是**打包**缓存 ⇒ 把缓冲形态钉成打包（覆盖此前的 A/B
+                // `set_ternary_pack_enabled(false)`；要改形态在载入之后再调它）。
+                force_pack_ = 1;
+                use_packed_ = true;
+                ensure_quant_buffer_();
+                NN_TRY(packed, engine_ref().trit_pack(latent_w_, tau_));
+                wq_packed_ = std::move(*packed);
+                quant_epoch_ = latent_w_.write_epoch();
+                quant_valid_ = true;
+                ++quantize_calls_;
+                return {};
             }
             case ParamKind::TernaryPacked2:
             {

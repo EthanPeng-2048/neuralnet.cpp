@@ -761,7 +761,13 @@ int main(int argc, char *argv[])
 
     if (cfg.load_existing)
     {
-        auto load_result = nn::load_model(cfg.resume_path, model);
+        // 训练侧载入 = 可训练意图（P1-7）：三值 Model 角色的打包载荷按文件 τ
+        // 反量化成 f32 latent，否则 `backward()` 会落在只读部署态上报错。
+        // ⚠ 本路径的 role 门禁（下面）仍只收 Checkpoint 角色 —— `.nnckpt` 的三值层
+        // 写 TernaryLatent，两种意图同结果，故这里传 Trainable 是**与语义一致的前置**
+        // （mnist 侧的 role 语义接线是 P1-2 的遗留项，见 docs/history/history.md）。
+        auto load_result = nn::load_model(cfg.resume_path, model, nullptr, nullptr,
+                                          nn::WeightLoadIntent::Trainable);
         if (load_result)
         {
             std::cout << "已加载模型: " << cfg.resume_path << "\n" << std::endl;
