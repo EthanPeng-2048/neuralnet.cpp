@@ -7,6 +7,10 @@
 > **取代**：本文件替代早先的 `23-model-format-v7-and-engine-capability.md`（那版的"NNQT 独立
 > 格式 + 部署标签"已被裁决取消）。
 
+> **增补（2026-10-16）**：§2.1.1 = P1-2 的**训练状态段（v8）**与 role 语义细化（**已立项、未实施**）——
+> 状态段是**唯一权威**（A/B 类参数禁止再由 CLI 给出）、数据集身份硬错、`.nnmodel` 恢复放开以支持 SFT。
+> 裁定正文与验收口径在 [`18-roadmap.md`](18-roadmap.md) §4.2 P1-2 行 / §3.4 M6 / §8.2 门禁 7。
+
 ---
 
 ## 0. 裁决汇总（三轮）
@@ -107,7 +111,7 @@ matmul / matmul_with_bias / add_inplace / accumulate / row_reduce_sum / col_redu
 | 角色 | 文件 | 内容 | 谁写 | 谁读 |
 |---|---|---|---|---|
 | **模型**（推理） | `*.nnmodel`（`.bin` 的接替者） | 推理所需的**全部**参数：Dense 层参数 + 三值层的**打包形态** + τ。**不含**"训练才需要"的参数 | `text_train`/`mnist_train` 收尾的 `--save`（默认 `gpt_model.nnmodel`） | `text_infer` / `mnist_infer` / 任何人 |
-| **训练断点** | `*.nnckpt` | 模型 + **训练参数**：三值层 latent（f32）+（未来）优化器状态条目 | `--save-interval`（周期性）、需要续训时 | `--resume`（只认这个角色） |
+| **训练断点** | `*.nnckpt` | 模型 + **训练参数**：三值层 latent（f32）+ 训练状态段（v8；见 §2.1.1，**未实施**） | `--save-interval`（周期性）、需要续训时 | `--resume`（Checkpoint 角色；v8 起状态段为唯一权威） |
 
 **v7 文件头**：`magic "NNNN" | version=7 | Scalar precision | role u8 | spec_len + spec kvrec`
 —— `role`（Model / Checkpoint）是**文件属性**，不是"模型状态"：它只回答"这份文件是什么"，
@@ -140,6 +144,50 @@ matmul / matmul_with_bias / add_inplace / accumulate / row_reduce_sum / col_redu
 **旧文件**：v5/v6 的 `*.bin` 仍可读（零破坏，`role` 缺失按 Model 处理）；**写一律 v7 + 新扩展名**；
 CLI/GUI 的默认保存名同步改为 `.nnmodel`（`.bin` 不再被写入）。
 
+### 2.1.1 训练状态段（v8；**P1-2 立项，未实施**，2026-10-16 裁定）
+
+**一句话**：断点是**训练的可续点**，不是"更大的模型文件"——状态段里的一切都是**断点权威**，
+CLI 不再有发言权。
+
+**段布局（v8，追加在 tokenizer 之后；老文件按版本回落）**
+
+```
+[magic][version=8][precision][role][spec_len][spec]        ← 头部（同 v7）
+[参数条目 …][extra state …][tokenizer_len][tokenizer]       ← 同 v7（role 决定参数形态）
+[state_len u64][state kvrec][优化器状态条目 …]               ← 新增；role=Checkpoint 非空，Model 写 0
+[sha256 32B][magic "NNEND" 5B]                              ← P2-1：整文件校验和 + 尾部完整性标记
+```
+
+**状态段内容（四类）**
+
+| 类 | 内容 | 为什么必须有 |
+|---|---|---|
+| 计数器 | global_step / epoch / epoch 内步号 / 当前 lr | 续训起点；`--resume-epoch/--resume-step` 从"必填"降级为"禁止再填" |
+| 优化器状态 | Adam m/v **+ `t`**、SGD momentum、Muon、AdamWQuant 的 f16 状态与逐行尺度（经 `Optimizer::save_state/load_state`） | 缺 `t` 会让偏置修正在重启后从 0 重算 ⇒ 前几百步更新量偏小，"loss 轨迹连续"不成立 |
+| 训练配方 | 精度 profile 四槽 + weight_quant、lr 调度配方与**曲线形状**（`total_epochs`/`total_steps`）、batch_size / accum_steps / max_norm / stride | 曲线形状**是配方**（`total_epochs = --epochs`、`total_steps = steps_per_epoch × epochs`），不是"跑多久"；profile 今天完全不进文件 ⇒ `--f16` 断点忘带旗标会被静默重建成 f32 |
+| 数据集身份 | `.nndataset` 文件 sha256 + tokens/docs/windows/`steps_per_epoch`/loss_scope | 身份不匹配 ⇒ **硬报错、无逃生阀**（理由见下） |
+
+**role 语义（冻结）**
+
+| role | `--resume` 行为 |
+|---|---|
+| `Checkpoint`（`.nnckpt`） | 状态段是唯一权威：除"完全不改变训练"的参数（保存路径 / 保存间隔 / log 间隔 / `--gpu` / 激活卸载 / `--max-steps` / 探针环境变量 / 数据集**路径**）外，**任何显式给出的训练参数都报错**（按旗标名判定、不看值）。禁列 = 形状与配方（`--d-model`…/`--optimizer`/`--lr`/`--min-lr`/`--weight-decay`/`--beta1`/`--beta2`/`--lr-schedule`/`--warmup-epochs`/`--warmup-steps`/`--batch-size`/`--accum-steps`/`--max-norm`/`--epochs`/`--f16`/`--t1_58`/`--precision-*`）+ 计数器（`--resume-epoch`/`--resume-step`）。 |
+| `Model`（`.nnmodel`） | **CLI 全权**：文件只提供权重与规格（架构仍以文件为准），优化器冷启动、step/lr 从 0 起算——这是 **SFT / 换数据集续训**的入口。⚠ 三值模型的 `.nnmodel` 载荷是打包形态，载入后进 `packed_only_` 部署态、`backward()` 明确报错 ⇒ 三值 SFT 需要「打包 → latent 反量化载入」（单独立项，见 18 §4.2 P1-7 / §3.4 M6）。 |
+
+**为什么数据集必须硬错、且不需要逃生阀**：数据集变 ⇒ 窗口数变 ⇒ `steps_per_epoch` 变 ⇒
+① step_cosine 的 `total_steps`、② `global_step = epoch*steps_per_epoch + step`、③ epoch 边界与
+`--resume-step` 的含义**同时**改变 ⇒ "同一断点 + 不同数据集"**不存在正确的续训语义**，放行等于
+放行一个自欺的续训。合法出口就是上表的 `Model` 行：换数据集 = 新任务 ⇒ 从 `.nnmodel` warm start。
+
+**为什么状态段走 role 门控而不是独立格式**：checkpoint = model 的**超集**，两者共享头部、spec、
+参数条目与词表；独立格式要把参数形态协议复制一遍、让推理侧嗅探两个 magic。而 `.nnckpt` 还要能被
+`text_infer` 直接读来做推理自检（裁决第 3 条的"测试推理"用途）⇒ **同一容器 + role 字节**是唯一
+自然的表达。（独立格式 + 独立版本号、无差别忽略 CLI、数据集逃生阀三条均已在 2026-10-16 裁定中否决，
+过程见 `docs/history/history.md`。）
+
+**数据集路径 vs 身份**：路径是**位置**（机器相关，CLI/位置参数优先），身份是**内容**（断点权威）。
+resume 时不给数据集参数可回落断点里记的路径；给了路径则照常打开、按 sha256 校验身份。
+
 ### 2.2 参数形态协议（取代 `dynamic_cast` 与 `Layer::sub_layers()`）
 
 ```cpp
@@ -150,8 +198,9 @@ virtual Result<void>      import_param(std::size_t index, const ParamEntry& entr
 
 - `ParamEntry` = { kind, precision, rows, cols, aux(Tensor), payload(Tensor) }（`Tensor`，非 `Matrix`
   → 不触 L2 铁律；宿主上传/下载在序列化层）。
-- 叶子层声明**可接受形态集合**（如 `BitLinear` = {TernaryLatent, TernaryPacked2, TernaryPacked3}，
-  `Linear` = {Dense}），载入时用于 §2.1 的第 4 步校验。
+- 叶子层声明**可接受形态集合**（如 `BitLinear` = {TernaryLatent, TernaryPacked2}，
+  `Linear` = {Dense}），载入时用于 §2.1 的第 4 步校验。**盘上的 base-3 载荷（kind=3）由序列化层
+  在读盘时转回 2-bit 容器**（布局唯一来源 `ternary_pack.hpp`）⇒ 层只见到 kind=2，故不在集合里。
 - **删除 `Layer::sub_layers()`**（裁决第 2 条）：kind 已定参数级 + 载入走参数协议后，层树枚举没有
   消费者。复合层仍然是正当的（转发参数、组织多层激活等），只是承载的是**参数转发**而不是**层枚举**。
 - **不引入只读态/可训练态**（裁决第二轮第 2 条）：打包形态的层没有 latent ⇒ `backward()` 返回

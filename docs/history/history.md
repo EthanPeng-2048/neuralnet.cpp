@@ -4691,3 +4691,69 @@ setup 路径上的错误不再带 `(expr) at file:line`（如需保留可另立�
 循环内 `// ── 定期保存 checkpoint`、收尾 `// ── 保存模型`；TDR 重启续训段
 （`// TDR 重启续训：resume 时本 epoch 内跳过已完成的前 start_step 步`）与循环状态
 （`step`/`epoch`/loss 累加器/`stop_training`）耦合最紧，抽它需要先定义状态结构。
+
+# P1-2 设计裁定：`.nnckpt` 训练状态段 + role 语义（2026-10-16）
+
+**类型**：演进记录（裁定）+ 否决方案。**状态**：已裁定，未实施（落地见 18 §4.2 P1-2 行 + 门禁 §8.2 第 7 条；
+设计正文见 `docs/todo/23` §2.1.1）。
+
+**背景**：原 P1-2 只写"`.bin` 增加可选优化器状态段（Adam m/v）"。设计讨论中把范围扩到"断点 = 训练的可续点"，
+并顺带查证出三处**静默错误**（下面的"依据"），它们决定了最终口径。
+
+**裁定（三条）**
+
+1. **不做独立格式、不独立版本号**：`.nnckpt` 继续是同一容器里的 **role 字节**（v7 的"一份格式两种角色"），
+   v8 只追加 role 门控的**训练状态段**——计数器 / 优化器状态（Adam m/v **+ `t`**、momentum、Muon、
+   AdamWQuant 的 f16 状态与逐行尺度）/ 训练配方（精度 profile 四槽、lr 调度配方与**曲线形状**、
+   batch_size/accum_steps/max_norm/stride）/ 数据集身份（`.nndataset` sha256 + tokens/docs/windows/
+   `steps_per_epoch`/loss_scope）。`MODEL_VERSION` **7 → 8**，与 P2-1（尾部 `[sha256][NNEND]`）同批升版。
+2. **role 决定 CLI 的发言权**：`Checkpoint` ⇒ 除"完全不改变训练"的参数（保存路径/保存间隔/log 间隔/`--gpu`/
+   激活卸载/`--max-steps`/探针环境变量/数据集**路径**）外，**任何显式给出的训练参数都报错**（按**旗标名**
+   判定、**不看值**；`--epochs` 与 `--resume-epoch/--resume-step` 同在禁列）；`Model` ⇒ **CLI 全权**，
+   并**放开 `--resume` 对 `.nnmodel` 的支持**（SFT warm start：优化器冷启动、step/lr 从 0）。
+3. **数据集身份不匹配 = 硬报错，且不提供逃生阀**；合法出口是第 2 条的 `Model` 行（换数据集 = 新任务）。
+   三值模型的"打包 → latent 反量化载入"**单独立项**（18 §4.2 P1-7 / §3.4 M6），不塞进 P1-2。
+
+**依据（本轮实测锚，均为当前代码事实）**
+
+- **精度 profile 完全不进文件**：`spec_to_kv` 只写形状与 `weight_quant`（`model_serialization.hpp:287`），
+  而恢复重建用的是 **CLI 的 `cfg.precision`**（`cli/text_train_recovery.hpp:104`）。于是 `--f16` 训出的断点、
+  resume 时忘带 `--f16`（或反之）→ 架构校验照样过（`spec_matches` 只比形状类字段，`model_spec.hpp:192`）、
+  参数按"异精度经引擎 cast"静默转换（`compute_layer_base.hpp:424` 的 `import_into_`）⇒ **整轮训练静默换回 f32**。
+  三值侧因为 `effective_weight_quant`（`compute_layer_base.hpp:187`）与层能力校验会当场报错，f16 侧毫无保护。
+  ⇒ "配方必须随断点走"不是洁癖，是修真缺陷。
+- **数据集/`--epochs`/`--batch-size` 三者都能改变 lr 曲线**：`lr_sched_cfg.total_epochs = cfg.epochs`
+  （`cli/text_train_loop.hpp:365`）、`step_lr_cfg.total_steps = steps_per_epoch × cfg.epochs`（`:414`）、
+  `global_step = epoch*steps_per_epoch + step`（`:538`）。数据集一改 ⇒ 窗口数变 ⇒ `steps_per_epoch` 变 ⇒
+  曲线形状 + 步号语义 + epoch 边界**同时**变 ⇒ "同一断点 + 不同数据集"不存在正确的续训语义
+  ⇒ 硬错是语义必需，逃生阀提供的是假续训。同理：`--epochs` 不是"跑多久"而是配方，故入禁列；
+  "本次跑多久"由 C 类的 `--max-steps` 表达。
+- **只存 m/v 不够**：Adam 偏置修正按 `t` 走（`compute_optimizer.hpp:299` 的 `t_` + `bias_correction_(t_next)`），
+  丢了 `t` 重启后前几百步更新量偏小——P1-2 原验收项"loss 轨迹连续"就过不了。
+- **三值续训确实没有入口**：`.nnmodel` 载荷是打包形态，`BitLinear::import_param` 走 `TernaryPacked2` 分支后进
+  `packed_only_` 部署态，`backward()` 直接报错（`compute_layer_bitlinear.hpp:394`「部署态只读（没有 latent 可更新）」）
+  ⇒ 三值模型的 SFT 需要反量化载入路径（新立 P1-7）。
+- **版本号现实**：v7 已被"文件角色"改动占用（`model_serialization.hpp:62`）；P1-2 原行写的 `5 → 6` 是过期口径
+  （v1.7.0/v1.8.x 时期的"抢号提示"）。本轮把 18 号与 `docs/todo/19` 的提示刷新为 **7 → 8**；
+  release note 作为历史文档保留原样（它写的"谁后落地谁顺延"正是已发生的事实）。
+
+**被否决的方案（含否决理由）**
+
+| 方案 | 否决理由 |
+|---|---|
+| `.nnckpt` 独立格式 + 独立版本号 | v7 的"一份格式两种角色"是 2026-10-11 既定裁决（23 §0/§2.1），独立格式要把头部/spec/参数条目/词表读写复制一遍、让推理侧嗅探两个 magic；而 `.nnckpt` 还要能被 `text_infer` 直接读做推理自检 ⇒ 同容器 + role 字节是唯一自然表达 |
+| "无差别忽略 CLI"（原提议：ckpt 恢复时忽略一切 CLI 输入） | 会把 `.nnmodel` warm start 一起堵死（SFT 没有配方可读）；且与"不静默降级"口径冲突 |
+| 折中三档（文件为默认 + CLI 显式覆盖 + 冲突仅警告） | 用户裁定收紧为**显式给出即报错**：A/B 类参数在断点续训里没有合法用途，警告留给"值相同"的徒劳场景之外没有信息量 |
+| 数据集不匹配仅警告 / 提供 `--allow-dataset-change` 逃生阀 | 见依据第 2 条：网格改变后"续训"无正确语义，逃生阀 = 假续训 |
+| 保留 CLI 覆盖 batch_size（"OOM 后要改"） | 论据不成立：本训练路径稳态显存不膨胀、不存在"训到一半显存变大"；恢复主机显存不小时的出口是 CPU 引擎或从 `.nnmodel` 重开（写进 23 §2.1.1 作为已知取舍） |
+
+**连带影响（后续落地时不得漏）**
+
+- **反转 P1-1 落地的角色门禁**：`--resume` 由"只认 Checkpoint"改为"Model 也接受（CLI 全权）"。
+  该门禁文案是 P1-1 验收里"**逐字未变**"的用户可见契约（`docs/todo/23` §2.1），
+  落地时要同步 `text_train_modules_test` 的"Model 必须被拒"用例与 18 §5 的对应行。
+- 禁列校验需要**旗标名**信息（解析层的默认值无法与用户输入区分）：`parse_text_train_args` 记录"本进程显式
+  给出的 A/B 类旗标"名单，恢复路径发现非空即报错（+ 单测覆盖禁列）。
+- GUI 的 `--resume-epoch/--resume-step` 字段随 role 禁用；`bench/gui_cli_audit.py` 纳入门禁。
+- 只读 `peek_train_state(path)`：加载权重前即可显示断点的 epoch/step/lr 与数据集身份（也是数据集校验失败时的
+  诊断面）。

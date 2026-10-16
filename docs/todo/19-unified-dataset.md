@@ -339,8 +339,9 @@ dataset_convert csv   <train.csv> [<test.csv>] -o <out.nndataset>   # 阶段四�
 - 读取按版本分派：**v5 及以下读其内嵌 JSON**（现行为原样），**v6 读嵌入的 kvrec**——
   旧模型零破坏、不需要模型转换工具（裁决 #7）；
 - `read_tokenizer`（`model_serialization.hpp`）加 v6 分支；
-- ⚠ **版本号抢号提示**：roadmap P1-2（checkpoint 优化器状态）也计划 `MODEL_VERSION 5 → 6`。
-  谁先落地谁占 6，另一项顺延 7；两项都碰版本段，**建议同批合并升版**（与 P2-1 校验和同理）。
+- ⚠ **版本号现状（2026-10-16 刷新）**：v6 由本项（嵌入词表 kvrec）占用，v7 由「文件角色 + 参数级 kind」
+  （[`23`](23-library-design-cleanup-and-model-file-roles.md)）占用；roadmap P1-2（`.nnckpt` 训练状态段）
+  与 P2-1（整文件校验和 + 尾部完整性标记）**合并升 `7 → 8`**（18 §4.2 裁定）。
 
 ---
 
