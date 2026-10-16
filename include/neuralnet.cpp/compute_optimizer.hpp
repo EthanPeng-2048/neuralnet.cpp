@@ -190,6 +190,50 @@ public:
         }
         return {};
     }
+
+    // ══ 断点状态导出/载入（P1-2，docs/todo/18 §4.2 / docs/todo/23 §2.1.1）══
+    // 契约（改这四个函数前先读）：
+    //   · 张量**顺序**是格式契约：一旦随版本发布就不得改变（要改 = 升
+    //     `TRAIN_STATE_VERSION` 并在载入侧分支）。当前顺序：
+    //       sgd            → 无状态（空列表）
+    //       sgd_momentum   → 每参数 1 个：velocities_[i]
+    //       muon           → 每参数 1 个：velocities_[i]
+    //       adam / adamw   → 每参数 2 个：m_[i], v_[i]（交替）
+    //       adamwquant     → 每参数 4 个：m16_[i], v16_[i], sm_[i], sv_[i]
+    //   · 数量/形状不符 → **明确报错**（不静默接受部分状态，也不冷启动兜过去）；
+    //   · 张量的精度由文件按张量记录（序列化层），这里按目标缓冲精度回写
+    //     （同精度零转换、异精度经引擎 cast；与参数形态协议同口径）；
+    //   · `state_step()` = 偏置修正计数器（Adam 家族的 `t`）。**丢它 = 重启后
+    //     前几百步更新量偏小**（18 §4.2 的"loss 轨迹连续"验收就卡在这里）。
+    [[nodiscard]] virtual Result<void> save_state(std::vector<Tensor>& out) const
+    {
+        (void)out;   // 默认：无状态（SGD）
+        return {};
+    }
+    [[nodiscard]] virtual Result<void> load_state(std::span<const Tensor> in)
+    {
+        if (!in.empty())
+            NN_FAIL("该优化器没有状态，但文件里的状态张量数 = " +
+                    std::to_string(in.size()));
+        return {};
+    }
+    [[nodiscard]] virtual std::uint64_t state_step() const noexcept { return 0; }
+    virtual void set_state_step(std::uint64_t) noexcept {}
+
+protected:
+    // 状态张量回写（`load_state` 的实现件）：形状必须一致；精度不同经引擎 cast。
+    [[nodiscard]] Result<void> restore_state_tensor_(
+        Tensor& dst, const Tensor& src, const char* what)
+    {
+        if (dst.rows() != src.rows() || dst.cols() != src.cols())
+            NN_FAIL(std::string("优化器状态形状不匹配（") + what + "）：期望 " +
+                    std::to_string(dst.rows()) + "x" + std::to_string(dst.cols()) +
+                    "，文件里是 " + std::to_string(src.rows()) + "x" +
+                    std::to_string(src.cols()));
+        if (dst.precision() == src.precision())
+            return engine_.copy_into(dst, src);
+        return engine_.cast_into(src, dst);
+    }
 };
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -277,6 +321,25 @@ public:
                 params_[i]);
             NN_TRY_CHECK(r);
         }
+        return {};
+    }
+
+    // ── 断点状态（P1-2）：每参数 1 个动量缓冲 ─────────────────────────────
+    [[nodiscard]] Result<void> save_state(std::vector<Tensor>& out) const override
+    {
+        NN_TRY(r, check_ready_());
+        for (const auto& v : velocities_) out.push_back(v);
+        return {};
+    }
+    [[nodiscard]] Result<void> load_state(std::span<const Tensor> in) override
+    {
+        NN_TRY(r, check_ready_());
+        if (in.size() != velocities_.size())
+            NN_FAIL("SGD + Momentum 状态张量数不匹配：期望 " +
+                    std::to_string(velocities_.size()) + "（每参数 1 个），实际 " +
+                    std::to_string(in.size()));
+        for (std::size_t i = 0; i < in.size(); ++i)
+            NN_TRY_CHECK(restore_state_tensor_(velocities_[i], in[i], "momentum"));
         return {};
     }
 };
@@ -455,6 +518,39 @@ public:
         NN_TRY_CHECK(seg.end());
         t_ = t_next;  // 全部参数成功才推进步数（失败时不推进）
         return {};
+    }
+
+    // ── 断点状态（P1-2）：每参数 m_[i], v_[i]（交替）+ 偏置修正计数 t_ ─────
+    [[nodiscard]] Result<void> save_state(std::vector<Tensor>& out) const override
+    {
+        NN_TRY(r, check_ready_());
+        for (std::size_t i = 0; i < m_.size(); ++i)
+        {
+            out.push_back(m_[i]);
+            out.push_back(v_[i]);
+        }
+        return {};
+    }
+    [[nodiscard]] Result<void> load_state(std::span<const Tensor> in) override
+    {
+        NN_TRY(r, check_ready_());
+        if (in.size() != 2 * m_.size())
+            NN_FAIL("Adam 状态张量数不匹配：期望 " + std::to_string(2 * m_.size()) +
+                    "（每参数 m/v 交替），实际 " + std::to_string(in.size()));
+        for (std::size_t i = 0; i < m_.size(); ++i)
+        {
+            NN_TRY_CHECK(restore_state_tensor_(m_[i], in[2 * i], "m"));
+            NN_TRY_CHECK(restore_state_tensor_(v_[i], in[2 * i + 1], "v"));
+        }
+        return {};
+    }
+    [[nodiscard]] std::uint64_t state_step() const noexcept override
+    {
+        return static_cast<std::uint64_t>(t_);
+    }
+    void set_state_step(std::uint64_t step) noexcept override
+    {
+        t_ = static_cast<std::size_t>(step);
     }
 };
 
@@ -696,6 +792,46 @@ public:
         return {};
     }
 
+    // ── 断点状态（P1-2）：每参数 4 个（m16/v16 载荷 + sm/sv 逐行尺度）+ t_ ──
+    // 载荷是 f16，尺度 f32 —— 文件按张量记录精度，故可直接往返（无需额外
+    // 记住"要除以尺度"之类语义：缩放态本身就是状态）。
+    [[nodiscard]] Result<void> save_state(std::vector<Tensor>& out) const override
+    {
+        NN_TRY(r, check_ready_());
+        for (std::size_t i = 0; i < m16_.size(); ++i)
+        {
+            out.push_back(m16_[i]);
+            out.push_back(v16_[i]);
+            out.push_back(sm_[i]);
+            out.push_back(sv_[i]);
+        }
+        return {};
+    }
+    [[nodiscard]] Result<void> load_state(std::span<const Tensor> in) override
+    {
+        NN_TRY(r, check_ready_());
+        if (in.size() != 4 * m16_.size())
+            NN_FAIL("AdamW（量化状态）状态张量数不匹配：期望 " +
+                    std::to_string(4 * m16_.size()) +
+                    "（每参数 m16/v16/sm/sv），实际 " + std::to_string(in.size()));
+        for (std::size_t i = 0; i < m16_.size(); ++i)
+        {
+            NN_TRY_CHECK(restore_state_tensor_(m16_[i], in[4 * i], "m16"));
+            NN_TRY_CHECK(restore_state_tensor_(v16_[i], in[4 * i + 1], "v16"));
+            NN_TRY_CHECK(restore_state_tensor_(sm_[i], in[4 * i + 2], "sm"));
+            NN_TRY_CHECK(restore_state_tensor_(sv_[i], in[4 * i + 3], "sv"));
+        }
+        return {};
+    }
+    [[nodiscard]] std::uint64_t state_step() const noexcept override
+    {
+        return static_cast<std::uint64_t>(t_);
+    }
+    void set_state_step(std::uint64_t step) noexcept override
+    {
+        t_ = static_cast<std::size_t>(step);
+    }
+
     // ── 诊断 / 测试视图 ───────────────────────────────────────────────────
     // 状态实际字节数（用于与 f32 Adam 的状态账对拍：后者 = Σ 2·rows·cols·4）
     [[nodiscard]] std::size_t state_bytes() const noexcept { return state_bytes_; }
@@ -930,6 +1066,24 @@ public:
                 NN_TRY_CHECK(r);
             }
         }
+        return {};
+    }
+
+    // ── 断点状态（P1-2）：每参数 1 个动量缓冲（Newton-Schulz 的中间量不驻留）──
+    [[nodiscard]] Result<void> save_state(std::vector<Tensor>& out) const override
+    {
+        NN_TRY(r, check_ready_());
+        for (const auto& v : velocities_) out.push_back(v);
+        return {};
+    }
+    [[nodiscard]] Result<void> load_state(std::span<const Tensor> in) override
+    {
+        NN_TRY(r, check_ready_());
+        if (in.size() != velocities_.size())
+            NN_FAIL("Muon 状态张量数不匹配：期望 " + std::to_string(velocities_.size()) +
+                    "（每参数 1 个动量缓冲），实际 " + std::to_string(in.size()));
+        for (std::size_t i = 0; i < in.size(); ++i)
+            NN_TRY_CHECK(restore_state_tensor_(velocities_[i], in[i], "momentum"));
         return {};
     }
 };

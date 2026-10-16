@@ -4804,3 +4804,36 @@ setup 路径上的错误不再带 `(expr) at file:line`（如需保留可另立�
 AdamWQuant 的 f16 状态与逐行尺度）；训练路径接线（写状态段、按状态段还原精度/计数器/曲线形状）；
 A/B 类**禁列校验**（显式给出即报错）；数据集身份门禁（硬错、无逃生阀）；`.nnmodel` 恢复放开
 （SFT warm start）；GUI 的 `--resume-epoch/--resume-step` 随 role 禁用。
+
+# P1-2（第二刀）：优化器断点状态 `save_state` / `load_state`（2026-10-16）
+
+**类型**：演进记录（功能补齐）。上一刀见「v8 训练状态段骨架」。
+
+**改法**
+
+- `Optimizer` 基类新增断点状态 API：`save_state(std::vector<Tensor>&)`（导出**只读别名**，
+  零拷贝）、`load_state(std::span<const Tensor>)`、`state_step()` / `set_state_step()`
+  （偏置修正计数 `t`）。默认实现 = 无状态（SGD）；有状态者各自 override。
+  **张量顺序随版本冻结**，契约写在基类 API 注释里（要改 = 升 `TRAIN_STATE_VERSION`）：
+  `sgd_momentum` / `muon` = 每参数 1 个动量缓冲；`adam` / `adamw` = `m,v` 交替；
+  `adamwquant` = `m16,v16,sm,sv`（f16 载荷 + f32 逐行尺度，缩放态本身就是状态，故往返即可）。
+- `restore_state_tensor_`（受保护实现件）：形状不符 → 明确报错；精度不同经引擎 cast
+  （与参数形态协议同口径：同精度零转换）。数量不符同样报错（**不静默接受部分状态**）。
+
+**验收（实测）**
+
+- 新门禁 `optimizer_state_test`（覆盖 = `nn::optimizer_table()` **全表**）：
+  ① 状态存在性 + 张量数符合表口径（无状态优化器不得导出非空，有状态者不得导出空 —— 新优化器
+  忘了实现 `save_state` 会在这里红）；② 重启后动量非零、Adam 家族 `state_step` 正确；
+  ③ **中途存状态 → 优化器析构（模拟进程死）→ 新建 + 载入 → 续跑 = 不中断直跑（参数逐位一致）**
+  （10 步、第 5 步打断、6 个优化器全过 —— 这是 18 §4.2"loss 轨迹连续"的可机械化形式）；
+  ④ 负例：有状态优化器**冷启动**续跑必须与直跑**不同**（否则 ③ 不具判别力）；无状态优化器（sgd）
+  冷启动续跑与直跑**相同**（如实断言：没有状态可丢，不是缺陷）；⑤ 数量偏少 / 形状不符 /
+  sgd 收到状态 → 三种都给明确报错。
+- `ctest --test-dir build-rv` **51/51**（GPU 用例 77 = skip）；`build-gpu` 注册 **53** 条
+  （计数已同步 AGENTS / 18 §2·§8.2 / 12）。审计 `doc_inventory`（L2 0 / 手写残留 0 /
+  终止调用 0）与 `doc_align_audit`（[A][D][E][F] 全 0）全绿。
+
+**未做（后续刀）**：训练路径接线（`--save-interval` 写状态段、`--resume` 走
+`load_train_state` + `load_state`、按状态段还原精度 profile / 计数器 / lr 曲线形状）；
+A/B 类禁列校验；数据集身份门禁；`.nnmodel` 恢复放开；GUI 同步。
