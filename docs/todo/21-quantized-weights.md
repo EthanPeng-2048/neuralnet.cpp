@@ -858,7 +858,7 @@ ctest **36/36**。
 | 角色 | 文件 | 三值层写什么 | 谁写 | 谁读 |
 |---|---|---|---|---|
 | **模型**（推理） | `*.nnmodel`（`.bin` 接替者） | **打包形态**：2-bit 容器按 **base-3（1.6 bpw）** 落盘 + τ | `text_train`/`mnist_train` 收尾的 `--save`（默认 `gpt_model.nnmodel`） | `text_infer` / `mnist_infer` |
-| **训练断点** | `*.nnckpt` | **f32 latent**（训练参数） | `--save-interval`（文件名 = `--save` 路径换 `.nnckpt`） | `--resume`（**只认这个角色**） |
+| **训练断点** | `*.nnckpt` | **f32 latent**（训练参数）+ 训练状态段（v8） | `--save-interval`（文件名 = `--save` 路径换 `.nnckpt`） | `--resume`（`.nnmodel` 亦收 = warm start，P1-2） |
 
 - **v7 文件头**：`magic "NNNN" | version=7 | Scalar 精度 | role 1B | spec kvrec`。
   参数区 = `[kind][precision][rows][cols][aux_len][payload_len][aux][payload]`，
@@ -870,16 +870,22 @@ ctest **36/36**。
   `ternary_pack.hpp`（`pack_row_base3` / `unpack_row_base3`），调用点收在序列化层（L3）。
 - **τ 按位落盘、按位载入**：重新量化会得到 `absmean(trit)·τ` 的比例差异，只有载入 τ
   才能逐位复现有效权重 τ∘W。
-- **推理只读**：`.nnmodel` 载入后三值层没有 latent ⇒ `backward()` 返回明确的前置条件
-  错误；`parameters()`/`param_gradients()` 不再 abort（裁决：**不引入**"可训练/不可
-  训练"状态，见 23 §2.2）。推理足迹 = 0.25 B/权重（2-bit 容器）+ base-3 盘上 1.6 bpw。
+- **推理只读**（默认意图）：`.nnmodel` 以 `WeightLoadIntent::Inference` 载入后三值层没有
+  latent ⇒ `backward()` 返回明确的前置条件错误；`parameters()`/`param_gradients()` 不再
+  abort。推理足迹 = 0.25 B/权重（2-bit 容器）+ base-3 盘上 1.6 bpw。
+- **三值可续训（P1-7）**：同一份 `.nnmodel` 以 `WeightLoadIntent::Trainable` 载入时，打包权重
+  按文件 τ **反量化**成 f32 latent（`L = trit·(τ·K/n)` = 量化器不动点，`ternary_pack.hpp` 的
+  `latent_row_scale`），层再用文件 τ 播种量化缓存 ⇒ 首次 forward 与推理文件**逐位一致**、可反向、
+  可更新。训练侧 CLI（`text_train`/`mnist_train` 的 `--resume`）一律走该意图 ⇒ SFT / QAT 有入口。
 - **零破坏**：v5/v6 的 `*.bin` 仍可读（文件头无 role 字节 → 按模型处理、按训练文件续训）；
   **写一律 v7**。统一入口 `peek_any_model_spec` / `load_any_model` / `peek_model_role`。
 
 **实测（本机 CPU + 102 / 40HX）**：`src/model_roles_test.cpp` ——
 [1] `.nnmodel` 载入后只读态 + 前向与保存前**逐位一致**；[2] `.nnckpt` 载入后 latent
 逐位一致且可继续反向；[3] 推理文件显著小于断点文件（base-3 + 无 latent）；
-[4] `peek_model_role` 与文件头一致；[5] 只读态按断点角色导出 → 明确报错。
+[4] `peek_model_role` 与文件头一致；[5] 只读态按断点角色导出 → 明确报错；
+[6]（P1-7）`Trainable` 意图载入 ⇒ 可训练态 + 打包字/τ 与文件**逐位一致** + 首次 forward
+与文件里的模型**逐位一致** + 逐行 `absmean(latent) == τ` + 8 步 Adam 后 latent 确实移动。
 历史数字（NNQT 11.9× 更小 / 峰值显存持平 / 免 latent 构建尚缺）见 `docs/history/history.md`。
 
 ### 4.16 P3 起步：int8 点积（W2A8）能力探测与路线判定（2026-10-11）

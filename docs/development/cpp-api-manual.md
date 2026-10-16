@@ -697,14 +697,24 @@ std::cout << nn::model_role_name(role) << "\n";
 nn::Model model = NN_UNWRAP(nn::build_gpt_model_from_spec(engine, s1));
 std::string embedded_tok;
 NN_UNWRAP(nn::load_any_model("gpt.nnmodel", model, &embedded_tok));
+
+// 载入意图（P1-7）：推理用默认 Inference（三值层进部署只读态，0.25 B/权重）；
+// 训练侧（三值模型的 SFT / QAT 续训）传 Trainable —— 打包权重按文件 τ 反量化成
+// f32 latent，首次 forward 与文件里的模型逐位一致、可反向、可更新。
+NN_UNWRAP(nn::load_model("ternary.nnmodel", model2, nullptr, nullptr,
+                         nn::WeightLoadIntent::Trainable));
 ```
 
 相关类型：
 
 - `nn::ModelRole`：`Model`（`.nnmodel`）/ `Checkpoint`（`.nnckpt`）；`nn::model_role_name(r)` 取名字。
+- `nn::WeightLoadIntent`：`Inference`（默认，部署只读态）/ `Trainable`（反量化成可训练 latent）；
+  与 `ModelRole` 正交——角色回答"这份文件是什么"，意图回答"载入方要拿它做什么"。`.nnckpt` 的三值层
+  写 TernaryLatent，两种意图同结果。
 - `nn::ParamKind`：`Dense` / `TernaryLatent` / `TernaryPacked2` / `TernaryPacked3` /（预留）`I8Packed4`；
   `nn::param_kind_name(k)` 取名字。形态由**拥有该参数的层**经 `Layer::export_param` /
-  `import_param` 决定，不被接受即 fail-fast（铁律 #14）。
+  `import_param` 决定，不被接受即 fail-fast（铁律 #14）。`TernaryLatent` 带 `aux`（τ）时表示
+  "反量化 warm start"：层按该 τ 播种量化缓存（首次 forward 逐位复现文件里的模型）。
 
 > 版本兼容：`load_model` 接受 v4 及以上自描述格式；v5/v6 老 `.bin` 仍可读
 > （v6 起内嵌 `.nnvocab` 词表）。v1–v3 在头校验阶段拒绝并提示重新训练保存。
