@@ -178,15 +178,20 @@ ceil(M/(4·(256/subgroup_size)))` 是布局契约**）。CPU 侧 `matmul_q_impl`
 [优化器状态张量条目]`，Model 角色写 0 长度；内容 = 计数器 / 优化器 `t` / 训练配方含精度
 四槽 / 数据集身份，`include/neuralnet.cpp/train_state.hpp`），文件尾是 **整文件校验和
 `[sha256 32B]["NNEND" 5B]`**（P2-1：`verify_model_integrity` 在 `load_model` / `load_train_state`
-里先行校验，截断/损坏明确报错）。载入 `.nnmodel` 后三值层是**只读**态（无 latent ⇒ `backward()`
-返回明确错误；`parameters()` 不再 abort）。CLI：`--save`（默认 `*.nnmodel`）写推理角色、
+里先行校验，截断/损坏明确报错）。载入 `.nnmodel` 后三值层的**载入意图**（`nn::WeightLoadIntent`，
+P1-7，2026-10-16）决定形态：`Inference`（默认）= 部署只读态（只有打包字 + τ，无 latent ⇒
+`backward()` 返回明确错误；`parameters()` 不再 abort）；`Trainable` = 按文件 τ **反量化**成 f32
+latent（序列化层宿主侧逐行解码，`ternary_pack.hpp` 的 `latent_row_scale`/`dequant_row`），层再用文件
+τ 播种量化缓存 ⇒ 与文件里的模型**首次 forward 逐位一致**且可反向/可更新 —— 这是三值模型的
+SFT / QAT 续训入口（训练侧 CLI 一律传 `Trainable`）。CLI：`--save`（默认 `*.nnmodel`）写推理角色、
 `--save-interval` 写 `*.nnckpt`；**`--resume` 的 role 语义（P1-2 第三刀，2026-10-16）**：
 `.nnckpt` ⇒ 断点续训，**形状/配方/计数器一律由状态段决定**，显式给出 A/B 类旗标即报错
 （禁列表 `nn::cli::kForbiddenResumeFlags`；仍允许 `--save`/`--save-interval`/`--log-interval`/
 `--max-steps`/`--gpu`/`--grad-log`/`--checkpoint-every`/`--activation-offload`/`--flush-interval`），
 数据集身份（sha256 + 网格三元组）不一致硬报错（无逃生阀，出口 = 从 `.nnmodel` 开新一轮）；
-`.nnmodel` ⇒ **warm start**（SFT 入口，CLI 全权、优化器冷启动），**唯一拒绝三值 `.nnmodel`**
-（打包形态无 latent ⇒ 指向 P1-7）；v5/v6/v7 老 `.bin`/`.nnmodel` 仍可读（v7 无状态段 ⇒ 冷启动语义）。
+`.nnmodel` ⇒ **warm start**（SFT 入口，CLI 全权、优化器冷启动；**P1-7 起三值 `.nnmodel` 同样放行**——
+原"必须拒绝"门禁与 `check_resume_target` 已随 P1-7 删除，不再存在被拒组合）；
+v5/v6/v7 老 `.bin`/`.nnmodel` 仍可读（v7 无状态段 ⇒ 冷启动语义）。
 断点状态段 = `train_state.hpp` 的 `TrainState`（含精度四槽与 lr 曲线形状）+ `Optimizer::save_state/
 load_state`（含 Adam 的 `t`）；读写 API = `CheckpointState` / `peek_train_state` / `load_train_state`。
 `text_infer` / `mnist_infer` 用 `peek_any_model_spec` + `load_any_model` + `peek_model_role`。
@@ -406,7 +411,7 @@ optimizer.step();
 
 - **表达式 DSL + AOT 融合**（`expr_dsl.hpp`/`expr_spec.hpp`/`expr_graph.hpp`）：Layer 用 `dsl::compute*` 写数学，CPU 模板路径直接求值、GPU 折成 `ExprSpec` 按 `expr_spec_key` 查预编译 shader（闭合世界，未命中硬报错）。
 - **IR-C 图融合**（`expr_graph.hpp` + `begin_expr/end_expr` + `dsl::start_expr/end_expr`）：P1 链 / P2 写穿多输出，**已接入 `Adam::step`/`AdamW::step`**；P3 跨链批量派发（`NN_IRC_NO_BATCH=1` A/B、`NN_IRC_TRACE=1` 观测）。混精度下的未登记复合结构**逐成员降级派发**（可观测，非错误），未登记**单节点**仍硬报错。全 f32 逐形态 GPU 对拍（`fused_gpu_test`）与图融合端到端（`expr_fuse_test`，多输出逐位 err=0）为回归锁。
-- **三值权重 `T1_58` / `BitLinear`**（`precision.hpp` + `compute_layer_bitlinear.hpp`）：**离散化不是舍入**、不进提升序、P1 里**不是存储精度**（只作 `param` 槽声明 + 层能力集合取值）；`BitLinear` = 打包权重 + `matmul_q`（训练/解码同一条路）。CLI `--precision-param t1_58` 与预设 `--t1_58` 均存在（词法唯一 `t1_58`；预设是"整份 profile 快捷方式"）。MLP 与 GPT 已接线；**RAPT / ViT 明确拒绝**。结构开关（**默认关**）：SubLN / GQA（`n_head_kv`，块映射）/ tied embedding / ReLU²，见 `docs/todo/22`。
+- **三值权重 `T1_58` / `BitLinear`**（`precision.hpp` + `compute_layer_bitlinear.hpp`）：**离散化不是舍入**、不进提升序、P1 里**不是存储精度**（只作 `param` 槽声明 + 层能力集合取值）；`BitLinear` = 打包权重 + `matmul_q`（训练/解码同一条路）。CLI `--precision-param t1_58` 与预设 `--t1_58` 均存在（词法唯一 `t1_58`；预设是"整份 profile 快捷方式"）。MLP 与 GPT 已接线；**RAPT / ViT 明确拒绝**。**续训入口（P1-7）**：三值 `.nnmodel` 用 `WeightLoadIntent::Trainable` 按文件 τ 反量化成 f32 latent（`L = trit·τ·K/n` = 量化器不动点）⇒ SFT / QAT 可续训；推理侧仍走默认 `Inference` 部署只读态。结构开关（**默认关**）：SubLN / GQA（`n_head_kv`，块映射）/ tied embedding / ReLU²，见 `docs/todo/22`。
 - **BitNet b1.58 2B4T 结构开关**：SubLN（子层内部，非 `NormType` 新值）/ GQA（`n_head_kv`，块映射 `kv=h/(n_head/n_head_kv)`，训练路径 `ExprViewKind::HeadGroup` 不展开 K/V）/ tied embedding（head 复用 `token_emb_`，`dW` 累加）/ ReLU²（`ReLU2GLU`）。`ModelSpec` 追加 `subln`/`n_head_kv`/`tie_embeddings`（缺键 = 旧语义，不升版本）。见 `docs/todo/22`。
 - **多精度**：`Precision`/`PrecisionProfile{param,compute,stable,optimizer}`；f16 走基类 NVI 边界 cast + 引擎 in-kernel f16 变体 + op-level f16 GEMM（`-DNN_SHADER_F16=1` 编第二份 SPIR-V）；`--f16` = `{param:F16, compute:F16, stable:F32, optimizer:F32}`。语义契约 `docs/development/05`。
 - **推理采样截断**（`SamplingConfig` + `sample_next_token_`，CPU 侧 host 采样）：temperature / top-k / top-p（核采样，保留集内重新归一化）/ 重复惩罚（可选 `repeat_window`）/ 固定种子（`has_seed`）；顺序固定 = 重复惩罚 → 温度 → top-k → top-p → softmax → 采样/贪心，**全部关闭时与旧路径逐位一致**（`sampling_test` 锁：下标 + 概率向量 + RNG 消耗序）；`text_infer` 暴露 `--top-k`/`--top-p`/`--repeat-penalty`/`--repeat-window`/`--seed`（同 seed 同 prompt ⇒ 同输出）。
@@ -420,7 +425,7 @@ optimizer.step();
 - **CNN 全引擎化**：`im2col`/`col2im` + `rearrange_3d`，无 PCIe 往返。
 - **分词器**：保序并行 `encode`（`set_encode_threads`，任意并行度逐字节一致）+ 零堆分配合并 + `encode_docs_parallel`。
 - **统一数据集**：KVRecord v2 / `.nnvocab`（旧 JSON 不直读，`dataset_convert vocab` 迁移）/ `.nndataset`（`nn::Dataset` 只读类，词表/掩码/test 子集随数据集）。`text_train` 位置参数是 `<dataset.nndataset>`（`--vocab`/`--test-file`/`--loss-scope`/`--no-cache` 已移除）。见 `docs/todo/19`。
-- **模型文件角色（v7）**：一份格式两种角色——`*.nnmodel`（推理，三值层写打包形态 base-3 1.6 bpw）与 `*.nnckpt`（训练断点，写 f32 latent）；参数级 `kind`（参数形态协议）；`--resume` **只认** `.nnckpt`。见 `docs/todo/23`。
+- **模型文件角色（v8）**：一份格式两种角色——`*.nnmodel`（推理，三值层写打包形态 base-3 1.6 bpw）与 `*.nnckpt`（训练断点，写 f32 latent + 训练状态段）；参数级 `kind`（参数形态协议）+ **载入意图** `WeightLoadIntent`（`Inference` 部署只读 / `Trainable` 反量化 warm start，P1-7）；`--resume` 两种角色都收（`.nnckpt` = 断点续训、`.nnmodel` = warm start）。见 `docs/todo/23`。
 - **错误处理宏族**：传播 `NN_TRY`/`NN_TRY_MSG`/`NN_TRY_CHECK`、解包+终止 `NN_UNWRAP(expr[, "语境"])`（**语义 = unwrap，不是 assert**；旧名 `NN_CHECK`/`NN_EASY_CHECK` 保留为等价别名）、解包+退出码 `NN_EXIT(expr, code[, "语境"])`、错误源 `NN_FAIL("msg")`。手写形态已全量迁宏（残留 0，门禁 `doc_inventory.ps1` §5 基线 0）。
 - **CPU 性能**：DSL 模板向量化/并行、`dsl::compute_into` 零分配原地更新、分块 GEMM（`BLOCK_SIZE=64`）。
 - **Vulkan 多设备选择**：`--gpu` / `NN_VULKAN_DEVICE`（`cli/cli_gpu_option.hpp`）。

@@ -157,9 +157,11 @@ CLI 不再有发言权。
 `optimizer_state_test`）；**第三刀已落地** —— 训练路径接线（`--save-interval` 写状态段、
 `--resume` 采纳状态段：精度 profile / 曲线形状 / 网格 / 起点 / 优化器 `t`）、A/B 类**禁列**
 （显式给出即报错，按旗标名判定）、数据集身份**硬错门禁**、`.nnmodel` **warm start 放行**
-（三值 `.nnmodel` 仍拒并指向 P1-7），端到端四例 + 单测见 `docs/history/history.md`
-「P1-2（第三刀）」；**待收口** —— GUI 的 `--resume-epoch/--resume-step` 随 role 禁用
-（`gui_cli_audit.py` 同步）。
+（第三刀时三值 `.nnmodel` 仍拒并指向 P1-7），端到端四例 + 单测见 `docs/history/history.md`
+「P1-2（第三刀）」；**第四刀 / 收口已落地** —— GUI 的 `--resume-epoch/--resume-step` 随 role 禁用
+（`gui_cli_audit.py` 同步）；**P1-7（2026-10-16）收掉了最后一条拒绝**：三值 `.nnmodel` 由
+`WeightLoadIntent::Trainable` 反量化成可训练 latent（见 18 §4.2 P1-7），`role` 一面已无"必须
+拒绝"的组合。
 
 **段布局（v8，追加在 tokenizer 之后；老文件按版本回落）**
 
@@ -184,7 +186,7 @@ CLI 不再有发言权。
 | role | `--resume` 行为 |
 |---|---|
 | `Checkpoint`（`.nnckpt`） | 状态段是唯一权威：除"完全不改变训练"的参数（保存路径 / 保存间隔 / log 间隔 / `--gpu` / 激活卸载 / `--max-steps` / 探针环境变量 / 数据集**路径**）外，**任何显式给出的训练参数都报错**（按旗标名判定、不看值）。禁列 = 形状与配方（`--d-model`…/`--optimizer`/`--lr`/`--min-lr`/`--weight-decay`/`--beta1`/`--beta2`/`--lr-schedule`/`--warmup-epochs`/`--warmup-steps`/`--batch-size`/`--accum-steps`/`--max-norm`/`--epochs`/`--f16`/`--t1_58`/`--precision-*`）+ 计数器（`--resume-epoch`/`--resume-step`）。 |
-| `Model`（`.nnmodel`） | **CLI 全权**：文件只提供权重与规格（架构仍以文件为准），优化器冷启动、step/lr 从 0 起算——这是 **SFT / 换数据集续训**的入口。⚠ 三值模型的 `.nnmodel` 载荷是打包形态，载入后进 `packed_only_` 部署态、`backward()` 明确报错 ⇒ 三值 SFT 需要「打包 → latent 反量化载入」（单独立项，见 18 §4.2 P1-7 / §3.4 M6）。 |
+| `Model`（`.nnmodel`） | **CLI 全权**：文件只提供权重与规格（架构仍以文件为准），优化器冷启动、step/lr 从 0 起算——这是 **SFT / 换数据集续训**的入口。三值模型的 `.nnmodel` 载荷是打包形态：载入由**意图**（`WeightLoadIntent`）分流——`Inference`（默认）进 `packed_only_` 部署只读态，`Trainable`（训练侧一律用）= 按文件 τ 反量化成 f32 latent ⇒ **三值 SFT / QAT 同样可续训**（P1-7，2026-10-16 落地，取代了原"唯一拒绝"那条门禁）。 |
 
 **为什么数据集必须硬错、且不需要逃生阀**：数据集变 ⇒ 窗口数变 ⇒ `steps_per_epoch` 变 ⇒
 ① step_cosine 的 `total_steps`、② `global_step = epoch*steps_per_epoch + step`、③ epoch 边界与

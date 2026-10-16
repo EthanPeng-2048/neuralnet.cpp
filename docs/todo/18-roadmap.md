@@ -133,7 +133,7 @@
 | M3 | ~~IR-C 跨表达式图融合不采用~~ **已恢复并接入训练路径（P1+P2）**：`begin_expr/end_expr` + 图融合（P1 链 / P2 写穿多输出）+ Adam/AdamW 接线；S6 自动窗口仍未接线 | `docs/todo/03-ir-optimization.md`；`docs/history/history.md`「IR-C 定位修正与恢复立项」「IR-C P2 收官」 | S6 之外的"能融的必须写进单个 `dsl::compute`"已放宽（跨表达式经录制段融合）；**P4 CE online-softmax fold 已落地（通用 FoldSpec 机制，5→3 kernel/step，见 `docs/history/history.md`「CE online-softmax 单趟 fold（P4）」）**；**P3 跨链批量派发已落地（`#b` 批量变体 + BDA 实例表 + 图内同签名分组 CAP 32）**：设备表读数口径 = 批量/非批量分列（用户裁定），`fused@optimizer` 归零、派发计入 `fused_b@optimizer` 行，**合计 1330 → 57 calls/20 步（2.85/step ≤ 6/step）**；批量 vs 逐个逐字节一致（含同组混形状）、字节锚逐位不变，见 `docs/history/history.md`「P3 跨链批量派发」 |
 | M4 | M7 存储多态未立项 | `docs/todo/17-unified-tensor-engine.md` §5 M7 行 | 新增第三后端仍需改 `compute_tensor.hpp` |
 | M5 | ZiPT / AttnZip 已整体移除，代码保留在 `legacy/zipt` 分支 | `docs/history/history.md`「ZiPT 移除」条 | 记忆压缩方向暂缺实现 |
-| M6 | **三值（T1_58）模型无法续训**：`.nnmodel` 载荷是打包形态，BitLinear 载入后进 `packed_only_` 部署态，`backward()` 直接报错（`compute_layer_bitlinear.hpp:394`「部署态只读」）⇒ 三值模型不能从推理模型做 SFT / QAT 续训（dense 模型不受影响） | `compute_layer_bitlinear.hpp`（`import_param` 的 `TernaryPacked*` 分支 + `packed_only_`）；`ternary_pack.hpp`（解码 + τ） | 三值模型的 SFT 入口缺失；**单独立项**（见 §4.2 P1-7 行） |
+| M6 | ~~**三值（T1_58）模型无法续训**~~ **✅ 已解决（P1-7，2026-10-16）**：原现象 = `.nnmodel` 载荷是打包形态，BitLinear 载入后进 `packed_only_` 部署态，`backward()` 直接报错（「部署态只读」）⇒ 三值模型不能从推理模型做 SFT / QAT 续训。**现在**：载入意图 `WeightLoadIntent::Trainable` 按文件 τ 反量化成 f32 latent（量化器不动点）+ 播种量化缓存 ⇒ 首次 forward 与推理文件逐位一致、可反向、可更新；`.nnmodel` 的 role 门禁（P1-2 的"唯一拒绝"）已删除 | `ternary_pack.hpp`（`latent_row_scale`/`dequant_row`）；`model_serialization.hpp`（`param_blob_to_entry` 意图分流 + `load_model`）；`compute_layer_bitlinear.hpp`（`TernaryLatent + aux(τ)` 播种分支）；`cli/text_train_recovery.hpp` | 缺口已关闭（见 §4.2 P1-7 行）；推理侧部署只读态不变（`Inference` 为默认意图） |
 
 ## 4. 路线图分期
 
@@ -150,7 +150,7 @@ P4 = 持续优化方向（底座已稳后继续加杠杆，2026-10-14 立项，�
 | 期 | 项数 | 项目 | 共同前置 |
 |---|---|---|---|
 | **P0** | 5 | CI 真跑测试（**✅**）、文档一致性回正（**✅ 2026-10-15**）、BatchNorm 禁止静默回落（**✅**）、CMake install/export + presets（嵌入路径 ✅ / install 用户裁定不做）、推理采样 top-k/top-p（**✅ 采样器 + CLI 半边 2026-10-15；GUI 多轮上下文归 P2-6**） | 无（P0-1 是所有人的前置） |
-| **P1** | 6 | `text_train` 模块化、checkpoint 优化器状态、危险精度组合启动期告警（细则见 [`24`](24-f16-training-defects.md)）、`gpt_test` flaky（**✅ 2026-10-15**）、CI 冒烟扩 MSVC Debug、**自定义层使用文档 + 精度自检**（P1-6） | P0-1；P1-6 无依赖 |
+| **P1** | 7 | `text_train` 模块化（**✅ 2026-10-16**）、checkpoint 优化器状态（P1-2，**✅ 2026-10-16**）、危险精度组合启动期告警（细则见 [`24`](24-f16-training-defects.md)）、`gpt_test` flaky（**✅ 2026-10-15**）、CI 冒烟扩 MSVC Debug、**自定义层使用文档 + 精度自检**（P1-6 **✅ 2026-10-14**）、**三值模型续训入口**（P1-7，**✅ 2026-10-16**） | P0-1；P1-6 无依赖 |
 | **P2** | 13 | `.bin` 校验和、Adafactor、RAPT/CNN f16、Dataset/DataLoader、Python/C 绑定、GUI 两项、header 拆分、F16C、step 内固定 I/O 开销（P2-9）、**原生 f16 算术用足（P2-10）**、**编译期精度特化（P2-11，已完成）**、**优化器 f16 批量派发（P2-12）**、**f16 K 切分/fine tile（P2-13）** | P0-1；P2-7 另需 P1-5；P2-6 另需 P0-5 |
 | **P3** | 8 | 由 §6 触发条件启动（含 CUDA、分布式） | 各自触发条件 |
 | **P4** | 4 | 性能利用率 / 算子性能 / 显存开销的**持续提升** + API 易用性与 **Fold 表达式自动化扫描**（见 §4.5；P4-2 的 C10 派生 (a)+(b) 均已完成 2026-10-15） | 各自见 §4.5 |
@@ -188,7 +188,15 @@ P4 = 持续优化方向（底座已稳后继续加杠杆，2026-10-14 立项，�
 | **P1-5 CI 冒烟扩到 MSVC Debug + 权重变化断言** | Debug 构建冒烟；训练 N 步后断言参数**确实变化**（防"loss 不动"类静默失败） | CI 中 MSVC Debug 目标编译通过；权重变化断言可检出冻结；大 TU 若触发 C1128 再出 `/bigobj` | 中 | P0-1。可复用 `f16_writeback_probe` 的"8 步 Adam 参数必须移动"思路 |
 | **P1-6 自定义层使用文档 + 精度自检**（文档部分 **✅ 已完成 2026-10-11**；精度自检 R2 **✅ 已完成 2026-10-14**） | ① 文档：已落 `docs/development/write-a-custom-layer.md`（层骨架模板 + 可复制 gradcheck 片段 + 七条契约 + GPU checklist；示例层经数值梯度检查实测通过 `max|num−an| = 4.7e-06`、50 步 Adam 收敛）。② 代码（**已完成**）：`Layer::init` NVI 在 `init_impl` 之后统一执行 `check_param_precision_()`——层声明的 `param` 槽是存储精度时，逐个校验 `parameters()` 的张量实际存储精度与之相同（`precision_bytes == 0` 的 T1_58 等非存储精度声明跳过）。**它当场抓到了 3 处真实静默降级**：Conv2D 的 w_/b_、RAPT 的 token_emb_、以及 `ReLULinearAttention` **从未把 profile 转发给它自持的 4 个 Linear**（RAPT 注意力投影权重在 `--f16` 下一直是 f32）——前两处在 P2-3 修掉，第三处由本自检在扫描期报错后发现并修复（现 47/47 全绿） | 文档：按模板能写出可训练的自定义层；自检：硬编码 F32 的层在 init 期被拒绝 | 小 | ✅ **已完成 2026-10-14** |
 
-| **P1-7 三值模型的续训入口（打包 → latent 反量化载入）** | 让 `--resume <x.nnmodel>`（role=Model，三值层为打包形态）能进入**可训练态**：载入时按文件内的 τ 把打包权重**反量化**成 f32 latent（`ternary_pack.hpp` 解码 + `BitLinear::import_param` 已有的「从打包只读态恢复可训练」分支），而不是落到 `packed_only_` 部署态 | 反量化载入后首次 forward 的 wq/τ 与文件内打包权重**逐位一致**（量化确定性）；随后 backward 可跑、8 步 Adam 参数确实移动；dense 模型路径逐位不变 | 小–中 | **单独立项（2026-10-16 裁定）**；前置 = P1-2 的 role 语义（`.nnmodel` resume 放开否则被门禁挡住） |
+| **P1-7 三值模型的续训入口（打包 → latent 反量化载入）** ✅ **已完成（2026-10-16）** | 让 `--resume <x.nnmodel>`（role=Model，三值层为打包形态）能进入**可训练态**：载入意图 `WeightLoadIntent`（与文件角色正交）分两路——`Inference`（默认）= 部署只读态、`Trainable` = 序列化层按文件 τ 把打包权重**反量化**成 f32 latent（`ternary_pack.hpp` 的 `latent_row_scale`/`dequant_row`，宿主侧逐行解码）+ 层按文件 τ **播种**量化缓存，不再落到 `packed_only_`。**反量化取量化器的不动点 `L = trit·(τ·K/n)`**（n = 该行非零 trit 数）：字面的 `trit·τ` 会让逐行 absmean 变成 `τ·n/K` ⇒ 续训一开始就是有效权重的尺度跳变（见「为什么不是 `trit·τ`」）。**层协议不变**：反量化后用 `TernaryLatent + aux(τ)` 交回 `import_param`，dense / `.nnckpt` 路径逐位不变 | 反量化载入后首次 forward 的 wq/τ 与文件内打包权重**逐位一致**（量化确定性：`model_roles_test` [6] 位级比对打包字 + τ）；随后 backward 可跑、8 步 Adam 参数确实移动（同一用例 + `text_train_modules_test` 的三值 GPT 端到端）；dense 文件两种意图参数逐位相同；逐行 `absmean(latent) == τ`（不动点，实测最差相对偏差 5.0e-08，`ternary_gemm_test` [8]） | 小–中 | ✅ **已完成 2026-10-16**；前置 P1-2 的 role 语义已落地。落点 = `ternary_pack.hpp`（反量化 helper）、`model_serialization.hpp`（`param_blob_to_entry` 的意图分流 + `load_model` 新实参）、`compute_layer_bitlinear.hpp`（播种缓存）、`cli/text_train_recovery.hpp`（删 `check_resume_target`、改传 `Trainable`）、`src/mnist_train.cpp`。验收证据见 `docs/history/history.md`「P1-7」条 |
+
+> **为什么不是 `trit·τ`（P1-7 落地时的实现口径，2026-10-16）**：本项目量化器的尺度定义是
+> **逐行 absmean**（`τ = (1/K)·Σ|W|`），所以"把 trit 乘回 τ"得到的 latent **不在量化器的像里**：
+> 它的逐行 absmean 是 `τ·n/K`（n = 该行非零 trit 数，≤ K）⇒ 第一次参数写回后重算 τ 就是
+> `τ·n/K`，有效权重 `wq·τ` 随之缩 `n/K` 倍 —— 对 warm start 而言这是"载入后第一步就换了模型"。
+> 取 `L = trit·(τ·K/n)` 则两条不变量同时成立：行 L1 质量 = `K·τ`（⇒ `absmean(L) == τ`，与训练时
+> latent 的定义同源）且非零幅值 `τ·K/n ≥ τ > 0.5τ`（⇒ 再量化复现**同一组 trit**）。首次 forward 与
+> 文件逐位一致由"层按文件 τ 播种量化缓存"保证（`τ` 与容器字都逐位来自文件，不经过重算）。
 
 > **P1-2 状态（2026-10-16）：✅ 四刀全部落地** —— ①v8 段布局 + 整文件校验和（含 P2-1）②`Optimizer::save_state/load_state` 全表
 > ③训练路径接线 + A/B 禁列 + 数据集身份硬错门禁 + role 语义（`.nnmodel` warm start ）④GUI 收口。
@@ -332,6 +340,15 @@ ZiPT 恢复、LRLA、CUDA、分布式（7 项）。
    断点续训模式下 `collect_args` 不发任何禁列键（并显示一行模式提示），`.nnmodel` warm start 仍 CLI 全权；
    `bench/gui_cli_audit.py` 新增 [6] 节（禁列集合 ↔ `kForbiddenResumeFlags` 逐项一致 + 两种 role 下的
    收集行为 + C 类不被误砍）。
+
+8. **三值模型可续训（P1-7，2026-10-16 起生效）**：训练侧路径（`text_train` / `mnist_train` 的
+   `--resume`）载入参数一律走 `WeightLoadIntent::Trainable`；三值 `.nnmodel` 的打包载荷必须被
+   **反量化成可训练 latent**（不得落进 `packed_only_` 部署态），且首次 forward 的 `wq`/`τ` 与文件里的
+   打包权重**逐位一致**（层用文件 τ 播种量化缓存）。**门禁**：`model_roles_test` [6]（打包字 + τ 位级比对、
+   首次 forward 逐位一致、`absmean(latent) == τ`、8 步 Adam 后 latent 移动、dense 两种意图逐位相同）、
+   `ternary_gemm_test` [8]（反量化 helper 的三条不变量）、`text_train_modules_test`（三值 GPT 走通
+   `resume_text_train` + 8 步 Adam，首次 forward 与文件逐位一致）。推理侧默认意图 `Inference`
+   不变（部署只读态 = 0.25 B/权重）。
 
 ### 8.3 验收纪律
 

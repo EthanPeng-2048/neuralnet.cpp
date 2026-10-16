@@ -4918,3 +4918,75 @@ A/B 类禁列校验；数据集身份门禁；`.nnmodel` 恢复放开；GUI 同�
 
 **未做**：`mnist_train` 侧的 `--resume` 仍走旧语义（它不写状态段，故禁列不适用）；
 `train_pkg.py` 的打包配置里仍会记录形状/配方（与"断点权威"并存时以 CLI 侧报错兜底）。
+
+# P1-7：三值模型的续训入口（打包 → latent 反量化）（2026-10-16）
+
+**类型**：演进记录（新能力 + 收掉最后一条"必须拒绝"）。背景（18 §3.4 M6）：三值
+`.nnmodel`（role=Model）的载荷是打包形态，载入后 `BitLinear` 落在 `packed_only_` 部署只读态
+⇒ `backward()` 明确报错 ⇒ 三值模型没有 SFT / QAT 续训入口（dense 不受影响）。前置 P1-2 的
+role 语义已落地，本轮开工。
+
+**改法**
+
+- **载入意图与文件角色正交**：`compute_layer_base.hpp` 新增
+  `WeightLoadIntent{Inference, Trainable}` —— 角色（`ModelRole`）回答"这份文件是什么"，意图回答
+  "载入方要拿它做什么"。`load_model(...)` 追加**带默认值**的 `intent = Inference` ⇒ 既有调用方
+  （`text_infer` / `mnist_infer` / 测试）零改动、逐位不变。
+- **反量化在序列化层（宿主侧）**：`param_blob_to_entry(engine, blob, intent)` 遇到
+  `TernaryPacked2/3` 且 `intent == Trainable` 时逐行解码 + 反量化成稠密 f32 latent，返回
+  `TernaryLatent + aux(τ)`；`Inference` 分支逐字未动（部署只读态）。
+- **反量化取值 = 量化器的不动点**（`ternary_pack.hpp` 新增 `latent_row_scale` / `dequant_row`）：
+  `L = trit·(τ·K/n)`（n = 该行非零 trit 数）。**为什么不是字面的 `trit·τ`**：本仓的 τ 定义是**逐行
+  absmean**，`trit·τ` 反代回去的逐行 absmean 是 `τ·n/K` ⇒ 第一次参数写回后重算 τ 就跳 `n/K` 倍
+  ⇒ 有效权重 `wq·τ` 整体缩水，等于"warm start 一开步就换了个模型"。`trit·τ·K/n` 让两条不变量
+  同时成立：① 行 L1 质量 = `K·τ`（⇒ `absmean(L) == τ`，与训练时 latent 同定义）；② 非零幅值
+  `τ·K/n ≥ τ > 0.5τ`（⇒ 用同一个 τ 再量化**复现同一组 trit**）。
+- **层侧只做"播种"**（`BitLinear::import_param` 的 `TernaryLatent` 分支）：`aux(τ)` 有效时用**文件 τ**
+  重建打包派生物（`engine.trit_pack(latent, τ_file)`，trit 必与文件一致）、登记写版本、
+  `packed_only_ = false` ⇒ 首次 forward 的 wq/τ **逐位来自文件**，不经"用自己的 absmean 重算 τ"
+  那一步；`.nnckpt`（无 `aux`）路径逐字不变（缓存作废、首次 forward 自行量化）。
+- **CLI**：`cli/text_train_recovery.hpp` **删除 `check_resume_target`**（P1-2 第三刀的"唯一拒绝"）
+  并把载入改为 `Trainable`，`adopt_resume_state` / `resume_text_train` 各增一行三值提示；
+  `mnist_train` 的 `--resume` 同样传 `Trainable`（其 role 门禁仍只收 Checkpoint，P1-2 遗留项）；
+  `text_train --help` 的 `--resume` 文案重写（原文案仍写"`.nnmodel` 会被拒绝"，属 P1-2 之后的过时文案）。
+
+**验收（实测）**
+
+- 单测（本机 clang 24 + Release + `NN_ENABLE_NATIVE=OFF`、无 Vulkan 的 `build-rv`），`ctest` **51/51**
+  （GPU 用例 77 = skip）：
+  ① `model_roles_test` 新增 [6]（三值 MLP）：Trainable 载入后**不是** `packed_only_`；打包字（**位级**
+  比较 —— 容器是"f32 张量承载原始字"，字里可能是 NaN 位型，浮点比较会误报）与 τ 与源模型**逐位一致**；
+  首次 forward 与源模型（= 文件里的模型）**逐位一致**且 `quantize_calls() == 1`（播种缓存命中，不重算）；
+  反量化公式逐位 + 逐行 `absmean(latent) == τ`；8 步 Adam（forward/CE/backward/step）后 latent
+  **移动 512/512**、`quantize_calls() > 1`（写版本驱动重算）；dense 文件两种意图载入参数逐位一致。
+  ② `ternary_gemm_test` 新增 [8]（纯宿主）：K ∈ {17,32,37}、含全零行 / 全非零行 / 近零行 ⇒
+  公式逐位、同 τ 再打包**容器字逐位相同**、逐行 absmean == τ（实测相对偏差 worst **5.012e-08**）、
+  n = 0 行整行 0（不产生 inf/NaN）。
+  ③ `text_train_modules_test`：三值 GPT 走通 `resume_text_train`（**不再被拒**）、同精度口径下首次
+  forward 与推理文件逐位一致、8 步 Adam 移动 **3728/4496** 个参数项；另覆盖"不给精度旗标也能载入
+  （BitLinear 由文件规格确定）"。
+- **端到端（本机 CPU 树，`/tmp/p11/tiny.nndataset`）**：① `--t1_58 … --max-steps 2 --save q1.nnmodel`
+  （loss 9.0023 → 8.9979）；② `--resume q1.nnmodel --max-steps 2 --save q2.nnmodel --save-interval 1`
+  （**不给** `--t1_58`）⇒ 横幅 + "三值（T1_58）推理模型：按文件 τ 反量化打包权重为 f32 latent ⇒ 可续训"
+  + warm start 提示，loss **8.9346 → 8.9115**（无尺度跳变），写出 `q2.nnmodel`（1.49 MB）与
+  `q2.nnckpt`（6.82 MB = latent + 状态段）；③ `--resume q2.nnckpt --max-steps 1` ⇒ 采纳状态段
+  （epoch=3 / 44 个优化器张量 / 步计数 2），loss 8.8909 ⇒ **「三值预训练 → `.nnmodel` warm start（QAT）
+  → `.nnckpt` 断点续训」一条链闭合**（此前第 ② 步必然报错并指向 P1-7）。
+- 门禁：`bench/doc_inventory.ps1` 第 [4] 节 `L2-VIOLATIONS: 0`（`host_bridge_uses` 39 不变，反量化在
+  L3 宿主侧，未在 L2 引入 Matrix/IO 动词）、第 [6] 节 PASS；`bench/gui_cli_audit.py` 退出码 0
+  （六节；禁列 32 项一致，`.nnmodel` warm start"照发参数"符合角色语义）。
+
+**已知取舍（如实记录）**
+
+- **精度 profile 仍由命令行给出**（Model 角色 = CLI 全权；文件只记 `weight_quant`，这是 P1-2 已裁定的
+  口径）。所以"首次 forward 逐位一致"是**同精度口径**下成立：`--resume` 一个 `--t1_58` 训出的模型而
+  **不带**任何精度旗标 ⇒ BitLinear 仍由文件规格确定，但 compute/stable 槽走 CLI 默认（f32）⇒ 前向数值
+  不同。测试两条口径都覆盖（带 `--t1_58` 逐位一致；不带也能载入并前向/反向）。
+- 反量化在宿主侧（L3）：一次性 O(rows·K) 逐行解码 + 上传；**推理路径（默认意图）不付这份成本**。
+- **GPU 路径本轮未在本机实测**（受限沙箱内 `/dev/nvidia*` 不可见 ⇒ GPU 用例 77 = skip）。改动本身
+  引擎无关：反量化全在宿主，播种只经 `trit_pack`（两引擎都已实现；"引擎 `trit_pack` = 宿主 `pack_row`
+  逐位一致"由 `ternary_gemm_test` [2] 在 GPU 树上把关）。
+
+**未做**：`mnist_train` 的 role 语义仍只收 Checkpoint 角色（P1-2 遗留项，另一案；它的 `.nnmodel`
+目前仍会被自己的门禁拒绝，与 text_train 不一致）；没有为"warm start 未给精度旗标"加告警（CLI 全权
+是既定口径，见上）。
