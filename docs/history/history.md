@@ -4837,3 +4837,56 @@ A/B 类**禁列校验**（显式给出即报错）；数据集身份门禁（硬
 **未做（后续刀）**：训练路径接线（`--save-interval` 写状态段、`--resume` 走
 `load_train_state` + `load_state`、按状态段还原精度 profile / 计数器 / lr 曲线形状）；
 A/B 类禁列校验；数据集身份门禁；`.nnmodel` 恢复放开；GUI 同步。
+
+# P1-2（第三刀）：训练路径接线 + role 语义落地（2026-10-16）
+
+**类型**：演进记录（行为变更）。前两刀见本文件上方两条。
+
+**改法**
+
+- **写侧**：`TrainConfig` 增 `explicit_train_flags`（解析层按**旗标名**登记本进程真正
+  出现过的 A/B 类旗标 —— 默认值与用户输入无法区分，故必须在解析期记）；禁列表
+  `kForbiddenResumeFlags` + `is_forbidden_resume_flag` / `forbidden_resume_flags_text`
+  （报错文案与帮助共用一口径）。`TextTrainCheckpointLog::save` 收 `TrainState` + 优化器
+  状态张量，新增 `note_failure`（状态导出失败 = 同一记账口径，P1-1 语义不变）。
+  `text_train_loop.hpp` 增 `make_train_state`（counters = **下一步的位置**、epoch 边界
+  归一化、`global_step` 与 step 级调度同定义、recipe = 本进程实际配方、dataset = 身份 +
+  网格）与 `save_ckpt_with_state`；`src/text_train.cpp` 计算数据集身份
+  （`sha256_file_hex` + tokens/docs/windows/steps_per_epoch/loss_scope）注入循环。
+- **读侧**：`adopt_resume_state`（新）在**建模型/建优化器之前**把断点状态读出来并改写
+  cfg —— 形状/架构按文件 spec（两种角色都适用：文件就是那个模型，不可能把 16 维断点
+  warm start 成 128 维；顺带让配置横幅与真实模型一致，消掉一次被丢弃的建模），
+  Checkpoint 再按状态段覆盖精度 profile / 曲线形状 / 网格 / 起点（A/B 类全量）；
+  显式给出 A/B 旗标即报错。`load_optimizer_state`（新）在建优化器之后恢复张量与
+  Adam 的 `t`。`verify_dataset_identity`（新）＝硬错、无逃生阀，报错列出逐项差异
+  （sha256 / tokens / docs / windows / steps_per_epoch / loss_scope）。
+- **role 语义落地（2026-10-16 裁定的执行）**：`check_resume_role` → `check_resume_target`：
+  `.nnckpt` = 断点续训（状态段唯一权威）；`.nnmodel` = **warm start 放行**（SFT 入口，
+  CLI 全权、优化器冷启动）；唯一仍拒绝 = **三值 `.nnmodel`**（打包形态无 latent ⇒
+  `backward()` 报错），文案指向 P1-7 与 `.nnckpt`。**这是对 P1-1 落地门禁文案的有意反转**
+  （P1-1 验收里那行"逐字未变"的用户可见契约在此修订，裁定见 d069583）。
+
+**验收（实测）**
+
+- **端到端四例（本机 CPU 树）**：① 首轮 1 步 → 断点；② 无 A/B 旗标续训 ⇒ 采纳状态段
+  （横幅显示断点的 16/2/1/32 与 batch=2/epochs=3，证明形状与配方都来自断点）；
+  ③ 显式 `--lr` 续训 ⇒ **退出码 1** + 禁列文案（列出被禁旗标与仍允许的 C 类）；
+  ④ 换数据集续训 ⇒ **退出码 1** + 身份差异文案（sha256 / token 数 / 两侧路径）；
+  ⑤ 三值 `.nnmodel` 续训 ⇒ **退出码 1** + 指向 P1-7。
+- 单测：`text_train_modules_test` 新增 [6] 接线用例（`save_ckpt_with_state` → `peek_train_state`
+  → 新建优化器 → `load_optimizer_state`；断言 epoch 边界归一化 / `t` 恢复 / blob 数 /
+  配方与身份落盘 / 身份门禁接线一致）与 role 语义改写（dense `.nnmodel` 走通 warm start、
+  三值被拒、禁列谓词与解析层登记）；`train_state_test` 新增 [9] **save → load → save
+  逐字节一致**（f32 状态；P1-2 验收口径）。
+- `ctest --test-dir build-rv` **51/51**；`build-gpu`（g++ 15 + Vulkan）四个受影响目标
+  零告警编译通过。
+
+**已知取舍（如实记录）**：f16 优化器状态张量经 `load_train_state` 会**物化为 f32**，
+若把它原样再 `save` 会被提升成 f32 编码（**值逐位不变**）。生产路径不存在这种再写
+（save 一律从活状态导出），故未在接口上引入精度回写提示；`save→load→save` 的逐字节验收
+按 f32 状态（默认 profile 的常态）成立。
+
+**未做（第四刀 · 收口）**：GUI 的 `--resume-epoch/--resume-step` 随 role 禁用与
+`gui_cli_audit.py` 门禁同步（当前 GUI 训练页在 ckpt 续训时会撞上禁列报错——报错文案清晰，
+但 GUI 应主动不发这些旗标）；`mnist_train` 的 `--resume` 尚未接同一套语义（它不写状态段，
+本轮范围外）。

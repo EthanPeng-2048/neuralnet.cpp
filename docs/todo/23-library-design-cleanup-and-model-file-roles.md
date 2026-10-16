@@ -154,8 +154,12 @@ CLI 不再有发言权。
 `peek_train_state` / `load_train_state` / `verify_model_integrity`）+ 回归用例
 `train_state_test`（含"剥成 v7 仍可加载"的零破坏用例）；**第二刀已落地** ——
 `Optimizer::save_state` / `load_state` / `state_step`（全表覆盖，含"重启续跑 = 直跑"的逐位门禁
-`optimizer_state_test`）；**待续** —— 训练路径接线（写状态段 + 按状态段还原精度/计数器/lr 曲线
-形状）、禁列校验、数据集身份门禁、`.nnmodel` 恢复放开、GUI 同步。
+`optimizer_state_test`）；**第三刀已落地** —— 训练路径接线（`--save-interval` 写状态段、
+`--resume` 采纳状态段：精度 profile / 曲线形状 / 网格 / 起点 / 优化器 `t`）、A/B 类**禁列**
+（显式给出即报错，按旗标名判定）、数据集身份**硬错门禁**、`.nnmodel` **warm start 放行**
+（三值 `.nnmodel` 仍拒并指向 P1-7），端到端四例 + 单测见 `docs/history/history.md`
+「P1-2（第三刀）」；**待收口** —— GUI 的 `--resume-epoch/--resume-step` 随 role 禁用
+（`gui_cli_audit.py` 同步）。
 
 **段布局（v8，追加在 tokenizer 之后；老文件按版本回落）**
 
