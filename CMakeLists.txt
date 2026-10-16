@@ -640,6 +640,15 @@ if(NN_BUILD_APPS OR NN_ENABLE_TESTS)
     nn_add_executable(train_state_test src/train_state_test.cpp)
     list(APPEND NN_TEST_TARGETS train_state_test)
 
+    # ── P0-5 尾项：多轮对话闭环（prompt 构建 + CLI --turn/--reply-out 接线）──
+    # [1] 对话模板结构；[2] ★ 上下文不丢（第 N 轮 prompt 以第 N-1 轮为前缀）；
+    # [3] 助手轮 tokens 原样回灌；[4] 整轮截断（system + 末轮恒保留）；
+    # [5] 纯文本词表回退；[6] 真实 text_infer 子进程端到端（prompt 与库逐 token
+    # 一致、--reply-out == 生成 token 解码）；[7] CLI 负例（--turn 形状/互斥）。
+    # app 缺失 → 77 = SKIP（CLI 半边跳过）。
+    nn_add_executable(chat_prompt_test src/chat_prompt_test.cpp)
+    list(APPEND NN_TEST_TARGETS chat_prompt_test)
+
     # ── P1-2：优化器断点状态（save_state/load_state + 重启轨迹连续）────────
     # 覆盖 = kOptimizerTable 全表：状态存在性/非零 + 步计数器；中途存状态→重启续跑
     # 与直跑参数**逐位一致**（含冷启动负例做判别力检查）；张量数/形状不符报错。

@@ -857,6 +857,32 @@ auto out = NN_UNWRAP(gpt->generate(engine, prompt, 200, cfg));
 （`sampling_test` 锁该等价性：返回下标、概率向量、RNG 消耗序三者相同）。
 完整流程（加载模型含内嵌词表 → 编码 → 生成 → 解码）见 `src/text_infer.cpp`。
 
+**多轮对话 prompt 构建（P0-5 尾项）**：`Tokenizer::chat_prompt` 把
+（system + 交替的 user/assistant 轮次）编成模型可吃的 token 序列 —— 对话词表套
+`BOS<|system|>…<|end_of_system|><|user|>…<|end_of_user|><|assistant|>…` 模板，
+末轮是 user 时补 `<|assistant|>`（待生成）；无对话标记的词表退化为轮次文本按换行相接。
+超 `max_tokens`（调用方通常传模型 `spec.seq_len`）时从**最旧**的一问一答整轮丢弃
+（system 块与末轮恒保留，丢弃后仍以 user 起头）。
+
+```cpp
+// ChatTurn{user, text, tokens}：text 走本词表 encode；tokens 非空则**原样灌入**
+// （把上一轮生成的 token 直接回灌，避免 decode → encode 往返漂移）
+std::vector<nn::Tokenizer::ChatTurn> history{
+    {true,  "你好", {}},
+    {false, "",     last_generated_tokens},   // 上一轮的生成结果
+    {true,  "再讲一遍", {}},
+};
+std::size_t dropped = 0;
+std::vector<std::size_t> prompt =
+    tok->chat_prompt(history, "你是一个有用的AI助手。", spec.seq_len, &dropped);
+auto out = NN_UNWRAP(gpt->generate(engine, prompt, 200, cfg, tok->eos_id()));
+```
+
+**"上下文不丢"的可验证形式**：第 N 轮的 prompt 以第 N-1 轮的 prompt 为
+**逐 token 前缀**（`chat_prompt_test` 锁这条不变式）。`text_infer` 的两条多轮路径
+都走它：`--interactive`（进程内累积历史，助手轮用生成的原 token 回灌）与
+`--turn <role>:<text>` + `--reply-out <path>`（一次一问、历史由调用方自带，GUI 用）。
+
 ---
 
 ## 16. 剖析与诊断

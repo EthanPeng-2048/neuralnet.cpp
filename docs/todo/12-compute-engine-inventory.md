@@ -8,8 +8,8 @@
 >
 > **当前数字**（2026-10-16 实测）：引擎 virtual **52 个方法**（`bench/doc_inventory.ps1` 口径。注意 `rg -c "\bvirtual\b"` 在 `compute_engine.hpp` 里原始计 **54** 处 = 52 方法 + 析构 1 + 注释里的词 1，勿混用口径）；Layer/Loss/Optimizer 直调 **28 个**（含 `begin_expr`——由 `Adam::step`/`AdamW::step` 打开 IR-C 录制段；含 `cast_into`——层内结果按 profile 落精度；其余 26 个
 > 只服务 DSL lowering / 序列化 / CLI / 适配层 / 测试，见 §2）；CPU 求值机制 **2 套**
-> （DSL 模板路径 + IR 解释器，见 §3）；ctest **51** 个（**无 Vulkan 树**；GPU 树 **53**）＝
-> **38 个测试目标 + 13 个变体/附加**（**完整枚举只写在 `docs/todo/18` §2 / `AGENTS.md` §7**，
+> （DSL 模板路径 + IR 解释器，见 §3）；ctest **52** 个（**无 Vulkan 树**；GPU 树 **54**）＝
+> **41 个测试目标 + 13 个变体/附加**（**完整枚举只写在 `docs/todo/18` §2 / `AGENTS.md` §7**，
 > 此处不重复以免漂移）。其中 `fused_gpu_test` = 融合 shader **逐形态** GPU 对拍；`expr_graph_test` = IR-C 图融合分析（CPU 12 用例）；`error_macro_test`
 > = 错误处理宏族（`NN_UNWRAP`/`NN_EXIT`/`NN_TRY_MSG`/`NN_FAIL`）；`kvrec_test`/`nnvocab_test`/`dataset_test`
 > = 统一数据集（KVRecord v2 / `.nnvocab` / `.nndataset`，见 `docs/todo/19`）；

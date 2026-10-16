@@ -237,6 +237,124 @@ public:
         return markers_.system != npos;
     }
 
+    // ═══════════════════════════════════════════════════════════════════════
+    //  多轮对话 prompt 构建（P0-5 尾项，2026-10-16）
+    // ═══════════════════════════════════════════════════════════════════════
+    // 一轮对话 = 角色 + 内容。`turns` 严格交替且以 user 起头：
+    //   [user, assistant, user, assistant, ..., user]
+    // 末轮可以是 user（★ 待生成：以 <|assistant|> 收尾）或 assistant（完整记录）。
+    //
+    // 内容两种给法（`tokens` 优先）：
+    //   · `text`   —— 文本，由本词表 encode；
+    //   · `tokens` —— 已经确定的 token（如上一轮生成的 token），**原样灌入**，
+    //                 避免 decode → encode 的往返漂移（多轮闭环的默认做法）。
+    struct ChatTurn
+    {
+        bool user = true;                 // true = 用户轮，false = 助手轮
+        std::string text;                 // 文本轮（tokens 为空时使用）
+        std::vector<std::size_t> tokens;  // 非空 = 直接用这些 token
+    };
+
+    // 把 (system + 历史轮次) 编成模型可吃的 token 序列。
+    //
+    //   对话词表（has_dialogue_markers）：
+    //     [BOS]<|system|>…<|end_of_system|> <|user|>…<|end_of_user|>
+    //     <|assistant|>…<|end_of_assistant|> … <|user|>…<|end_of_user|><|assistant|>
+    //     （system_prompt 为空 → 不产生 system 块；末轮 user 补 `<|assistant|>`）
+    //   纯文本词表（无标记）：轮次文本按 `\n` 相接（历史即上下文），BOS 前缀。
+    //
+    // 截断（max_tokens > 0）：从**最旧**处按**轮次对（一问一答）**整轮丢弃 ——
+    // system 块与末轮恒保留，且丢弃后序列仍以 user 起头（标记结构不破）；
+    // `*dropped_turns` 回报被丢弃的轮次数（默认不关心）。对话词表下若
+    // "system 块 + 末轮"本身已超限，则原样返回（宁可超限也不切断标记结构，交由
+    // generate 的滑动窗口兜底）；纯文本词表无结构约束，超限部分直接截尾。
+    // max_tokens == 0 = 不截断。
+    [[nodiscard]] std::vector<std::size_t>
+    chat_prompt(std::span<const ChatTurn> turns, std::string_view system_prompt = {},
+                std::size_t max_tokens = 0, std::size_t *dropped_turns = nullptr) const
+    {
+        if (dropped_turns != nullptr) *dropped_turns = 0;
+        if (turns.empty()) return {};
+
+        const auto toks_of = [this](const ChatTurn &t) {
+            return t.tokens.empty() ? encode(t.text) : t.tokens;
+        };
+        const bool dialogue = has_dialogue_markers();
+        const std::size_t bos = bos_id();
+        const auto push_marker = [](std::vector<std::size_t> &v, std::size_t id) {
+            if (id != npos) v.push_back(id);
+        };
+
+        // ── 逐块编码：块 0 = system（可选），其余块 = 一轮对话 ──────────
+        std::vector<std::vector<std::size_t>> blocks;
+        blocks.reserve(turns.size() + 1);
+
+        if (dialogue && !system_prompt.empty())
+        {
+            std::vector<std::size_t> b;
+            push_marker(b, system_marker_id());
+            const auto s = encode(std::string(system_prompt));
+            b.insert(b.end(), s.begin(), s.end());
+            push_marker(b, end_system_marker_id());
+            blocks.push_back(std::move(b));
+        }
+        const std::size_t head_blocks = blocks.size();  // 恒保留块数（system 块，0 或 1）
+
+        for (std::size_t i = 0; i < turns.size(); ++i)
+        {
+            const ChatTurn &t = turns[i];
+            const bool is_last = (i + 1 == turns.size());
+            std::vector<std::size_t> b;
+            if (dialogue)
+            {
+                push_marker(b, t.user ? user_marker_id() : assistant_marker_id());
+                const auto c = toks_of(t);
+                b.insert(b.end(), c.begin(), c.end());
+                push_marker(b, t.user ? end_user_marker_id() : end_assistant_marker_id());
+                if (t.user && is_last) push_marker(b, assistant_marker_id());  // 待生成
+            }
+            else
+            {
+                if (i > 0)  // 轮次之间一个换行（token 序列由词表自身决定）
+                {
+                    const auto sep = encode("\n");
+                    b.insert(b.end(), sep.begin(), sep.end());
+                }
+                const auto c = toks_of(t);
+                b.insert(b.end(), c.begin(), c.end());
+            }
+            blocks.push_back(std::move(b));
+        }
+
+        // ── 整轮丢弃（最旧优先）+ 组装 ────────────────────────────────
+        // 恒保留：BOS + system 块（head_blocks）；keep_from 起是保留的轮次。
+        // 一次丢一问一答（两轮）：历史以 user 起头 ⇒ 丢偶数轮后仍以 user 起头。
+        std::size_t total = (bos != npos) ? 1 : 0;
+        for (const auto &b : blocks) total += b.size();
+        std::size_t keep_from = head_blocks;
+        if (max_tokens > 0)
+            while (keep_from + 2 < blocks.size() && total > max_tokens)
+            {
+                total -= blocks[keep_from].size() + blocks[keep_from + 1].size();
+                keep_from += 2;
+            }
+        if (dropped_turns != nullptr) *dropped_turns = keep_from - head_blocks;
+
+        std::vector<std::size_t> out;
+        out.reserve(total);
+        if (bos != npos) out.push_back(bos);
+        for (std::size_t i = 0; i < head_blocks; ++i)  // 恒保留块（system）
+            out.insert(out.end(), blocks[i].begin(), blocks[i].end());
+        for (std::size_t i = keep_from; i < blocks.size(); ++i)
+            out.insert(out.end(), blocks[i].begin(), blocks[i].end());
+
+        // 纯文本：无标记结构 ⇒ 超限直接截尾（保留最近 max_tokens 个 token）
+        if (!dialogue && max_tokens > 0 && out.size() > max_tokens)
+            out.erase(out.begin(),
+                      out.end() - static_cast<std::ptrdiff_t>(max_tokens));
+        return out;
+    }
+
     // ── 从词表中恢复对话标记 ID（加载后调用） ─────────────────
     // 扫描词表查找 <|system|> 等标记字符串，若已存在则绑定已有 ID，
     // 若不存在则追加到词表末尾。随后追加额外保留特殊 token。

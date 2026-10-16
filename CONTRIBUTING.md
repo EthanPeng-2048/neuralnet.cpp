@@ -144,8 +144,8 @@ clang-format -i path/to/new_file.hpp
    裁定后再实施」的习惯（`docs/todo/` 就是项目开发者的工作区）。
 3. 提交前自查：
    ```bash
-   cmake --preset dev && cmake --build --preset dev && ctest --preset dev   # 测试必须绿（当前口径：无 Vulkan 48 项 / 开 GPU 50 项）
-   python bench/gui_cli_audit.py         # 改了 gui.py / cli_controllers.py / 任一 CLI 选项后必跑（五节：含声明式字段表 ↔ Controller 闭包；当前 exit 0）
+   cmake --preset dev && cmake --build --preset dev && ctest --preset dev   # 测试必须绿（当前口径：无 Vulkan 52 项 / 开 GPU 54 项）
+   python bench/gui_cli_audit.py         # 改了 gui.py / cli_controllers.py / 任一 CLI 选项后必跑（七节：声明式字段表 ↔ Controller 闭包、断点续训禁列、多轮对话闭环；当前 exit 0）
    python bench/gui_draw_logic_audit.py    # 改了画板绘制路径后必跑（桩替换 customtkinter，无需 GUI）
    python bench/gui_draw_runtime_audit.py  # 同上（真机：功能闭环 + 拖动开销对照；无显示时 77 = SKIP）
    python scripts/audit_modern_style.py  # 现代 C++ 风格（裸指针 / new / delete / malloc）；⚠ 见下

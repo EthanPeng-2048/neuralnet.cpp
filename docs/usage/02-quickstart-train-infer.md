@@ -155,6 +155,11 @@ GPT 训练需要一份文本语料（如 `datasets/llm_corpus.txt`，用 `script
 ./build/text_infer --model gpt_model.bin --prompt "Hello" --seed 7 \
     --top-k 40 --top-p 0.9 --repeat-penalty 1.2
 
+# 多轮对话（历史自带：GUI 的「💬 发送（多轮）」发的就是这条形状）
+./build/text_infer --model gpt_model.nnmodel --seed 7 \
+    --turn user:"你好" --turn assistant:"你好！有什么可以帮你的？" --turn user:"再讲一遍" \
+    --reply-out reply.txt
+
 # 使用 GPU
 ./build/text_infer --model gpt_model.bin --gpu --prompt "Hello"
 ```
@@ -166,7 +171,10 @@ GPT 训练需要一份文本语料（如 `datasets/llm_corpus.txt`，用 `script
 | `--model <path>` | `gpt_model.bin` | 模型文件路径 |
 | `--vocab <path>` | `bpe_vocab.nnvocab` | 词表 `.nnvocab` 路径（仅模型未嵌入时） |
 | `--prompt <text>` | `Hello` | 输入提示文本 |
-| `--interactive` | 禁用 | 交互式生成模式 |
+| `--interactive` | 禁用 | 交互式生成模式（**多轮**：上下文累积保留，输入 `quit`/`exit` 退出） |
+| `--turn <role>:<text>` | 空 | 追加一轮对话历史（`role` = `user`/`assistant`，**可重复**）。给了它即进入多轮对话模式：按词表的对话标记拼 prompt（`BOS<|system|>…<|user|>…<|end_of_user|><|assistant|>`），**末条必须是 `user`**（模型回答的就是这一轮）；角色必须 user/assistant 交替 |
+| `--reply-out <path>` | 空 | 多轮模式：把本轮回复（纯文本）另写一份到该文件（GUI 靠它取回复，不解析日志） |
+| `--system <text>` | `你是一个有用的AI助手。` | 对话模式的系统提示（`--turn` 与 `--interactive` 共用） |
 | `--max-tokens <n>` | `200` | 最大生成 token 数 |
 | `--temperature <t>` | `1.0` | 温度参数（0=贪心） |
 | `--top-k <n>` | `0` | top-k 截断：只保留概率最高的 n 个候选（0=关闭） |
@@ -181,6 +189,23 @@ GPT 训练需要一份文本语料（如 `datasets/llm_corpus.txt`，用 `script
 归一化）→ softmax → 采样/贪心；全部开关关闭时与旧版（仅 temperature）
 输出**逐位一致**（`sampling_test` 锁这条等价性）。`--temperature 0` 与
 `--top-k 1` 都是贪心（等价）。
+
+**多轮对话（连续 N 轮不丢上下文）**：每轮把**整段历史**编进 prompt —— 第 N 轮
+的 prompt 以第 N-1 轮的 prompt 为**逐 token 前缀**（`chat_prompt_test` 锁这条
+不变式），历史因此不会"每轮从零起算"。两条用法：
+
+- `--interactive`：一个进程内跑完整场对话，历史留在进程里；助手轮用**生成的原
+  token** 回灌（不经 decode → encode 往返），超 `seq_len` 时打印丢弃了哪几轮。
+- `--turn … --reply-out …`：**一次一问、历史由调用方自带**（脚本 / GUI 用）。
+  每次进程只回答最后一轮，回复同时打印并写进 `--reply-out`；上下文接续由调用方
+  把上一轮的回复作为 `--turn assistant:<text>` 传回来。GUI 的「💬 发送（多轮）」
+  就是这个形状。
+
+两种用法共用同一条 prompt 构建（`Tokenizer::chat_prompt`）：对话词表下套标记模板，
+超 `seq_len` 时**从最旧的一问一答开始整轮丢弃**（system 块与末轮恒保留，标记结构
+不破）；无对话标记的词表退化为轮次文本按换行相接。多轮模式与 `--prompt`、
+`--interactive` **互斥**（显式给出即报错），形状不合法（`role` 写错 / 不交替 /
+末条不是 `user`）同样报错，不静默降级。
 
 ---
 
@@ -686,13 +711,23 @@ python gui.py
 3. **设置生成参数** — 最大 token 数（默认 200）、温度（0=贪心，>1=更随机，默认 1.0）
 4. **输入提示文本** — 在输入框中输入起始文本（如 "Hello"）
 5. **点击 "▶ 生成文本"** — 在输出区域显示生成结果
+6. **多轮对话** — 在同一个输入框里输入这一轮的话 → 点 **"💬 发送（多轮）"**：
+   每轮把**整段历史**（含模型自己之前的回复）交给 CLI，所以连续 N 轮上下文不丢；
+   "对话记录"面板显示当前历史与轮数，**"🧹 清空对话"** 开一场新对话（下一轮从零起算）。
+   系统提示可在上面的「系统提示（多轮对话）」框里改（对应 CLI `--system`）。
+   采样参数（温度 / top-k / top-p / 重复惩罚 / 种子）**每轮都可以改** —— 多轮协议是
+   无状态的（历史每轮随参数一起传回 CLI），不像 stdin 交互模式那样被启动参数钉死。
 
 **可选项：**
 - ✅ **显示 Token ID** — 调试用，显示每个 token 的 ID
 - ✅ **GPU 加速** — 支持 Vulkan（下拉选择设备）
 
-> **CLI 专属**：多轮 stdin 交互模式（`text_infer --interactive`）不在 GUI 内暴露——
-> GUI 本身就是交互外壳。
+> **两种多轮实现的取舍**：GUI 走 `--turn` + `--reply-out` 的无状态协议（历史在
+> `ChatSession` 里，每轮随命令行一起传回 CLI）——代价是每轮重新编码整段历史
+> （本项目推理本就不带跨轮 KV cache，代价与一次 prefill 同量级），换来的是
+> 每轮可改参数、进程崩了历史还在、GUI 无需解析 stdin 交互的输出流。
+> CLI 的 `--interactive` 则把历史留在进程内（助手轮用生成的原 token 回灌），
+> 适合终端里连着聊。
 
 ---
 

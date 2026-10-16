@@ -15,6 +15,7 @@ neuralnet.cpp GUI - 基于CustomTkinter的图形界面
 import customtkinter as ctk
 import queue
 import subprocess
+import tempfile
 import threading
 import time
 import os
@@ -34,6 +35,8 @@ from cli_controllers import (
     TokenizerInferController,
     GptTrainController,
     GptInferController,
+    ChatSession,
+    DEFAULT_SYSTEM_PROMPT,
     RunState,
     Metric,
 )
@@ -453,6 +456,13 @@ class ParamsMixin:
 
     def _field_active(self, f: Field) -> bool:
         return True
+
+    def _field(self, name: str) -> Field:
+        """按表名取 Field（取值/设值走 `_value_of` / `_set_field`）"""
+        for f in self.fields():
+            if f.name == name:
+                return f
+        raise KeyError(f"字段表里没有 {name}")
 
     def collect_args(self) -> Dict[str, Any]:
         return collect_fields(self.fields(), self._value_of, self._field_active)
@@ -914,12 +924,21 @@ class TabBase(ParamsMixin, ctk.CTkFrame):
     def _on_run(self):
         if self._running:
             return
+        self.output._clear()
+        self._run_args(self.collect_args())
+
+    def _run_args(self, args: Dict[str, Any], on_done: Optional[Callable[[int], None]] = None):
+        """统一的运行路径（`_on_run` 与多轮对话等功能共用）。
+
+        `on_done(code)` 在 **worker 线程**里于子进程退出后调用 —— 需要摸 UI 的
+        收尾动作必须自己 `self.after(0, …)` 回主线程（见 `GptInferTab._on_send`）。
+        """
+        if self._running:
+            return
         self._running = True
         self.run_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
         self.status_lbl.configure(text="运行中...", text_color="#22c55e")
-        self.output._clear()
-
         self.controller.set_output_callback(
             lambda line: self.after(0, self.output.append, line))
         self.controller.set_error_callback(
@@ -929,14 +948,18 @@ class TabBase(ParamsMixin, ctk.CTkFrame):
         self.controller.set_completion_callback(
             lambda code: self.after(0, self._on_complete, code))
 
-        args = self.collect_args()
-
         def worker():
             try:
-                self.controller.run(**args)
+                code = self.controller.run(**args)
             except Exception as e:
                 self.after(0, self.output.append, f"[异常] {e}")
                 self.after(0, self._finish)
+                return
+            if on_done is not None:
+                try:
+                    on_done(code)
+                except Exception as e:   # 收尾异常不吞：显示出来，别让对话静默停住
+                    self.after(0, self.output.append, f"[收尾异常] {e}")
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -1846,7 +1869,9 @@ class GptInferTab(TabBase):
     def fields(cls) -> Tuple[Field, ...]:
         """GPT 推理页字段表（P2-6）。prompt 用多行文本框（kind="text"；
         `_value_of` 会 strip，空则不发 —— 与旧 `get("1.0","end").strip()` 同）。
-        采样开关留空/为 0 时不发（`--top-k 0` 与不传等价，CLI 侧默认即关）。"""
+        采样开关留空/为 0 时不发（`--top-k 0` 与不传等价，CLI 侧默认即关）。
+        `system_prompt`（→ `--system`）与「💬 发送（多轮）」构成多轮对话闭环
+        （P0-5 尾项）：每轮把整段历史交给 CLI（见 `ChatSession`）。"""
         return (
             _file("model_path", "模型路径", arg="model",
                   filetypes=[("模型文件", "*.nnmodel *.bin *.pt *.nnpkg")]),
@@ -1863,12 +1888,35 @@ class GptInferTab(TabBase):
             _b("show_tokens_var", "显示token", arg="show_tokens", emit="always"),
             _sep("── 提示文本 (prompt) ──"),
             Field("prompt_box", "", "text", "Once upon a time", arg="prompt", width=340),
+            _sep("── 多轮对话 (P0-5) ──"),
+            Field("system_prompt", "系统提示（多轮对话）", "text",
+                  DEFAULT_SYSTEM_PROMPT, arg="system", width=340),
             _v("gpu", "engine == GPU (Vulkan) 时才发"),
         )
 
     def __init__(self, master):
         super().__init__(master, GptInferController())
-        self._build_fields(self.params_frame, 0)
+        row = self._build_fields(self.params_frame, 0)
+
+        # ── 多轮对话面板（P0-5 尾项）：对话记录 + 发送 / 清空 ──────────
+        # 每轮把**整段历史**交给 CLI（ChatSession.ask → 重复的 --turn），
+        # 回复经 --reply-out 落文件取回 —— 上下文不依赖子进程状态。
+        self.chat = ChatSession()
+        self._pending_user: Optional[str] = None
+        self.chat_box = ctk.CTkTextbox(self.params_frame, width=340, height=150,
+                                       wrap="word", font=("Consolas", 11),
+                                       state="disabled")
+        self.chat_box.grid(row=row, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        btns = ctk.CTkFrame(self.params_frame, fg_color="transparent")
+        btns.grid(row=row + 1, column=0, columnspan=2, sticky="w", pady=(0, 6))
+        ctk.CTkButton(btns, text="💬 发送（多轮）", width=140,
+                      fg_color="#7c3aed", hover_color="#6d28d9",
+                      command=self._on_send).pack(side="left")
+        ctk.CTkButton(btns, text="🧹 清空对话", width=100,
+                      command=self._on_clear_chat).pack(side="left", padx=(8, 0))
+        self.chat_lbl = ctk.CTkLabel(btns, text="", text_color="#888")
+        self.chat_lbl.pack(side="left", padx=(10, 0))
+        self._render_chat()
 
     def collect_args(self):
         """表驱动收集 + 一处后处理（engine → --gpu）"""
@@ -1876,6 +1924,70 @@ class GptInferTab(TabBase):
         if args.pop("engine", "CPU") == "GPU (Vulkan)":
             args["gpu"] = True
         return args
+
+    # ── 多轮对话（P0-5 尾项）────────────────────────────────────
+    def _render_chat(self):
+        self.chat_box.configure(state="normal")
+        self.chat_box.delete("1.0", "end")
+        text = self.chat.transcript(self._pending_user)
+        if text:
+            self.chat_box.insert("1.0", text)
+            self.chat_box.see("end")
+        self.chat_box.configure(state="disabled")
+        n = self.chat.turn_count()
+        self.chat_lbl.configure(
+            text=f"{n} 轮（下一轮带上全部历史）" if n else "尚无对话")
+
+    def _on_clear_chat(self):
+        """开始新对话：历史清空（下一轮不再带之前的上下文）"""
+        sys_prompt = self._value_of(self._field("system_prompt")) or DEFAULT_SYSTEM_PROMPT
+        self.chat = ChatSession(sys_prompt)
+        self._pending_user = None
+        self._render_chat()
+        self.output.append("[对话] 已清空历史（下一轮从零起算）")
+
+    def _on_send(self):
+        """发送一轮：整段历史 + 本轮输入 → CLI；回复经 --reply-out 取回落账"""
+        if self._running:
+            return
+        text = self._value_of(self._field("prompt_box")).strip()
+        if not text:
+            return
+        args = self.collect_args()
+        args.pop("prompt", None)     # 多轮模式：末条 --turn user:… 即本轮输入
+        fd, reply_path = tempfile.mkstemp(prefix="nn_chat_", suffix=".txt")
+        os.close(fd)
+        args["turns"] = self.chat.ask(text)
+        args["reply_out"] = reply_path
+        self._pending_user = text
+        self._render_chat()
+        self._run_args(args, on_done=lambda code: self._on_turn_done(code, text, reply_path))
+
+    def _on_turn_done(self, code: int, user_text: str, reply_path: str):
+        """worker 线程：进程退出后取回复文件 → 回主线程落账（失败则历史不变）"""
+        reply = ""
+        try:
+            with open(reply_path, "r", encoding="utf-8", errors="replace") as f:
+                reply = f.read()
+        except OSError as e:
+            self.after(0, self.output.append, f"[对话] 读取回复文件失败: {e}")
+        finally:
+            try:
+                os.remove(reply_path)
+            except OSError:
+                pass
+
+        def finish():
+            self._pending_user = None
+            if code == 0:
+                self.chat.commit(user_text, reply.rstrip("\n"))
+                self.output.append(f"[对话] 第 {self.chat.turn_count()} 轮完成"
+                                   f"（历史 {len(self.chat.turns)} 条，下一轮全部带上）")
+            else:
+                self.output.append(f"[对话] 本轮失败（退出码 {code}）：历史未变，可重发")
+            self._render_chat()
+
+        self.after(0, finish)
 
 
 # ================================================================

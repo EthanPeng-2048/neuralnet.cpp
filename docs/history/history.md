@@ -5016,3 +5016,102 @@ emitter / ZiPT 恢复 / LRLA / CUDA / 分布式）——IR-C 已落地故不在�
 P0-4 的 `install()/find_package` 与 P2-9）；剩 13 项 = 部分完成 5（P0-5 / P2-4 / P2-10 / P4-2 / P4-4）
 + 未做 6（P1-5 / P2-2 / P2-7 / P2-5 条件触发 / P4-1 / P4-3）+ RV 待办 2（RV-05 / RV-12）。
 **下一项主线 = P1-5**（P2-7 的前置），见 27 号 §4 象限（三）。
+
+# P0-5 尾项：多轮对话闭环（库 + CLI + GUI，2026-10-16）
+
+**类型**：功能交付（P0-5 的剩余半边）。P0-5 的采样器 + CLI 采样开关已于 2026-10-15 交付
+（见本文件「P0-5 推理采样」条），剩余半边 = **"多轮对话闭环（连续 N 轮不丢上下文）"**，
+由本文件「docs 台账回正」条 ③ 确认为**真缺口**而非标记问题：CLI 的 `--interactive`
+每轮只把当轮输入拼进 prompt（第 2 轮起就看不到第 1 轮），`gui.py` 更是没有任何
+上下文/历史处理（每轮从零起算）。
+
+**改了什么（四层，唯一真源在最下层）**
+
+1. **库层**（`domain_tokenizer_base.hpp`）：新增 `Tokenizer::ChatTurn`（`user` / `text` /
+   `tokens`）与 `Tokenizer::chat_prompt(turns, system_prompt, max_tokens, *dropped_turns)` ——
+   多轮 prompt 构建的**唯一实现**。对话词表套训练时的标记模板
+   （`BOS<|system|>…<|end_of_system|><|user|>…<|end_of_user|><|assistant|>…`；末轮是 user 时补
+   `<|assistant|>` 待生成，末轮是 assistant 时以 `<|end_of_assistant|>` 收尾）；无对话标记的词表
+   退化为轮次文本按 `\n` 相接 + BOS。内容两种给法：`text` 走 `encode`，`tokens` **原样灌入**
+   （上一轮生成的 token 回灌不必过 decode → encode，避免 BPE 往返漂移）。
+   超 `max_tokens`（调用方传模型 `spec.seq_len`）时**从最旧的一问一答（轮次对）整轮丢弃**：
+   system 块与末轮恒保留、丢弃后序列仍以 user 起头（标记结构不破）、丢弃轮数经出参回报；
+   对话词表下若"system 块 + 末轮"本身超限则原样返回（宁愿超限也不切断标记结构，由 `generate`
+   的滑动窗口兜底）；纯文本词表无结构约束，超限直接截尾。
+2. **CLI**（`src/text_infer.cpp`）：① `--interactive` 修掉"每轮从零"——进程内累积 `history`，
+   每轮把**整段历史**交给 `chat_prompt`，助手轮用生成的原 token 回灌，超限时打印
+   `[上下文] 已达 seq_len=… 上限：丢弃最旧 N 轮`；② 新增 `--turn <role>:<text>`（可重复）
+   + `--reply-out <path>` + `--system <text>`（**无状态多轮协议**：一次一问、历史由调用方自带、
+   回复落盘），GUI/脚本据此接续上下文；③ 形状校验放在**参数解析期**（role 写错 / 首条不是 user /
+   不交替 / 末条不是 user / `--turn` 与 `--prompt`·`--interactive` 并用 / `--reply-out` 无 `--turn`
+   → 报错退出，不静默降级）；④ 单轮路径（`--prompt`）**逐字未动**（采样默认 ≡ 旧路径的等价性
+   由 `sampling_test` 继续锁）。
+3. **GUI**（`cli_controllers.py` + `gui.py`）：`ChatSession` 持有交替的 `(role, text)` 历史
+   （不变量：user 起头、assistant 收尾；本轮输入**先拼进参数、回复到达后才落账** ⇒ 生成失败
+   历史不变，不会留下 CLI 会拒的"连续两个 user 轮"）；`GptInferController._format_args` 把
+   `turns` 翻成逐个 `--turn`、`reply_out` 翻成 `--reply-out`、`system` 翻成 `--system`。
+   「GPT 推理」页新增「对话记录」面板 + **「💬 发送（多轮）」** + **「🧹 清空对话」**
+   （字段表新增「系统提示（多轮对话）」→ `--system`）；`TabBase` 把回调装配 + worker 线程抽成
+   `_run_args(args, on_done)`（单次运行与多轮共用），回复经临时文件 `--reply-out` 取回后
+   在主线程落账并刷新面板。
+4. **门禁**：新测试目标 `chat_prompt_test`（ctest **53 → 54**；无 Vulkan 树 **51 → 52**）+
+   `bench/gui_cli_audit.py` 新增第 **[7]** 节。
+
+**为什么是"每轮把整段历史交回 CLI"（而不是把 stdin 交互模式接进 GUI）**：stdin 交互的
+历史只活在子进程里，GUI 拿不到；而 GUI 需要"每轮可改采样参数"（持久进程会把参数钉死在启动时）、
+需要在进程崩掉后保留历史、还需要从输出流里认出"这一轮回复到哪结束"（stdout 非 tty 时是块缓冲，
+`>>> ` 提示无换行 ⇒ 流式解析脆弱）。无状态协议把这些都消掉：代价只有每轮重编码整段历史
+（本项目推理本来就不带跨轮 KV cache，一次 prefill 的量级）。CLI 侧仍保留 `--interactive`
+给终端用户（历史留在进程内 + 生成 token 原样回灌）。
+
+**实测（本机，CPU 树 `build/cpu` = Release + Tests）**
+
+1. **上下文不丢（端到端，真模型 `gpt_model.nnmodel`）**：空系统提示下两轮
+   `--turn user:"hi there" --turn assistant:"…" --turn user:"bye now"`，
+   第 2 轮 prompt = `256, 8194, 104, 105, 401, 8195, 8196, 1259, 486, 7536, 4655, 2272, 3603, 8197, 8194, 1104, 960, 8195, 8196`
+   —— **第 1 轮的 prompt（前 7 个 token）逐 token 原样是第 2 轮的前缀**，其后是第 1 轮生成的
+   3 个 token + `<|end_of_assistant|>` + `<|user|>` + 新输入 + `<|end_of_user|>` + `<|assistant|>`。
+   该链路走的是 **GUI 的真实通道**（`ChatSession.ask()` → `GptInferController._build_command` →
+   `text_infer`），不是手工拼命令。
+2. **`--interactive` 多轮**（`printf 'hi\nyo\nquit\n' | text_infer --interactive --show-tokens`）：
+   第 2 轮的 prompt = 第 1 轮全部 + 第 1 轮生成 token（`4498, 3614, 855`，**原 token 回灌**）+
+   `<|end_of_assistant|>` + `<|user|>` + `yo` + `<|end_of_user|>` + `<|assistant|>`。
+3. **截断可见**：小模型 `seq_len=64` + 默认系统提示下三轮 `--turn` 会打印
+   `多轮对话: 3 轮 (对话标记模板) → 进入上下文 1 轮（seq_len=64 上限，丢弃最旧 2 轮）`，
+   随后 prompt 只剩 system 块 + 末轮（标记结构完整）。
+4. **门禁**：`chat_prompt_test` 全绿（库级 5 节 + 真实 `text_infer` 子进程：CLI 的 prompt tokens
+   与库侧 `chat_prompt` **逐 token 一致**、`--reply-out` 内容 == 生成 token 的解码、
+   7 条负例各自非零退出且 stderr 说明原因）；`python bench/gui_cli_audit.py` 退出码 0（七节）；
+   `bench/doc_inventory.ps1`（L2-VIOLATIONS 0 / HANDWRITTEN-RESIDUE 0 / TERMINATING-CALLS 0）与
+   `bench/doc_align_audit.ps1`（[A][D][E][F] 全 0）PASS。
+5. **三组「编译器 × 标准库」验证**（2026-10-16，全部含新用例、全部零告警 `-Werror`）：
+
+   | 环境 | 编译器 / 标准库 | 构建 | ctest |
+   |---|---|---|---|
+   | 本机（Linux，`build/cpu`） | clang 24 + libstdc++（Release + CPU-only） | 零告警 | **52/52** |
+   | `102` WSL（`~/nn-verify/build`） | clang 24 + **libc++** | 零告警 | **52/52** |
+   | `102` WSL（同目录 `build-gcc`） | g++ 15.2 + libstdc++ | 零告警 | **52/52** |
+
+   同一轮另跑过：本机 GPU 树（`build-gpu`）新用例构建 + 运行通过、`ctest -N` 注册 **54** 条
+   ——**全量 GPU ctest 未跑**（本轮结论只依赖 CPU 树，与 P1-7 的 GPU 口径说明同类）。
+
+**实现时踩到的坑（值得记）**：`chat_prompt` 首版把"恒保留前缀的块数（`head_blocks`）"与
+"组装起点（`first`）"当成同一个量（`first = head_blocks`）——于是有 system 块时**整个 system 块
+被静默跳过**（`--show-tokens` 一看就少 30 来个 token）。这正是"用 `--show-tokens` 做逐 token
+断言"的价值：`chat_prompt_test` [1] 的模板逐 token 比对会立刻红，而不是等用户发现"系统提示
+好像没生效"。修法 = 两个量分开（恒保留 `0..head_blocks`、丢弃只发生在 `keep_from` 之后）。
+
+**已知取舍（如实记录）**
+
+- GUI 路径每轮把整段历史重新 encode 一次并重放 prefill：没有跨轮 KV cache 复用（本项目
+  推理侧本来就没有跨请求 cache）。**取**：每轮可改参数、历史在 GUI 手里、无 stdin 协议。
+- GUI 的 assistant 轮以**文本**回灌（`--turn assistant:<text>`，由 CLI 侧重编码），
+  不是 token —— 无状态协议只能传文本；`--interactive` 路径用原 token（有进程内状态）。
+  BPE 下 decode → encode 不保证逐 id 往返，故两轮的上下文会有极小的重编码差异；对"上下文
+  不丢"（前缀不变式）无影响（前缀断言在 CLI e2e 里用的是同一条 `--turn` 形状）。
+- 超 `seq_len` 时按"一问一答"整轮丢弃（不是按 token 滑窗），故极端长单轮仍可能超限 ——
+  交给 `generate` 的滑动窗口兜底（它保留尾部的 `<|assistant|>` 开标记）。
+- 系统提示默认值仍在**两处**字面量：`src/text_infer.cpp` 的 `--system` 默认与
+  `cli_controllers.py` 的 `DEFAULT_SYSTEM_PROMPT`（GUI 字段默认）。`chat_prompt_test` 的
+  CLI 端到端显式传 `--system SYS`，避免把这份字面量复制进测试；两份默认值若漂移，GUI 与 CLI
+  的默认行为差异只在"用户没改系统提示"时可见（GUI 总是显式发 `--system`）。

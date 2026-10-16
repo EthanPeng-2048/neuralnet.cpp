@@ -18,6 +18,10 @@
       kwargs 键，喂给对应 Controller 后必须真的产生影响（生成 flag 或位置参数）。
       → 抓"表里加了一行、控制器不认"（表单是死的）；与 [1]（手写场景 → flag 存在性）
       互补：[1] 验"发出去的 flag 都存在"，[5] 验"表里的每一行都发得出去"。
+  [6] 断点续训（P1-2）：`.nnckpt` 的 A/B 类参数禁列（GUI 集合 ↔ CLI 表 ↔ 收集行为）。
+  [7] GUI 多轮对话闭环（P0-5 尾项）：`ChatSession` 每轮把**全部历史**编成
+      `--turn <role>:<text>`（第 N 轮的参数以第 N-1 轮的参数为前缀 ⇒ 上下文不丢），
+      且 `GptInferTab._on_send` 确实把它交给 CLI（静态查"_on_send 里没写历史"）。
 
 退出码非 0 = 存在可行动问题。历史/有意为之的差异在此显式登记为白名单。
 """
@@ -36,6 +40,7 @@ from cli_controllers import (  # noqa: E402
     MnistTrainController, MnistInferController,
     TokenizerTrainController, TokenizerInferController,
     GptTrainController, GptInferController,
+    ChatSession, DEFAULT_SYSTEM_PROMPT,
 )
 
 # flag 词法：允许 `_`（唯一的带下划线 flag 是精度预设 `--t1_58`，见
@@ -52,7 +57,9 @@ EXES = ["mnist_train", "mnist_infer", "text_train", "text_infer",
         "tokenizer_train", "tokenizer_infer"]
 
 # ── 有意不暴露在 GUI 的 CLI 参数 ──
-#   --interactive : GUI 本身即交互外壳
+#   --interactive : stdin 交互外壳；GUI 的多轮走**无状态**的 --turn 协议
+#                   （每轮把整段历史交回 CLI，见 ChatSession / [7]），
+#                   不再需要套一个 stdin 循环（进程内的历史 GUI 也拿不到）
 #   --t1_58       : 三值预设的**别名**（等价 --precision-param t1_58）；GUI 的
 #                   "精度预设"下拉填的是 precision_param 字段，三条命令在
 #                   docs/todo/21 §4.10 里已声明等价，故此处不算缺口
@@ -137,6 +144,12 @@ CASES.append(("text_infer", GptInferController(), dict(
     model="g.bin", vocab="v.json", prompt="hello", max_tokens=200,
     temperature=1.0, top_k=40, top_p=0.9, repeat_penalty=1.2,
     repeat_window=64, seed=7, gpu=True, show_tokens=True)))
+# 多轮对话（P0-5 尾项）：turns = 历史逐轮 + 本轮输入，回复走 --reply-out。
+# 与 gui.py 的 ChatSession.ask() 同形（CLI 侧校验：user 起头、交替、末条 user）。
+CASES.append(("text_infer", GptInferController(), dict(
+    model="g.bin", vocab="v.json", max_tokens=50, system=DEFAULT_SYSTEM_PROMPT,
+    turns=["user:第一问", "assistant:第一答", "user:第二问"],
+    reply_out="/tmp/nn_chat_reply.txt")))
 
 
 def audit_gui_to_cli() -> int:
@@ -495,10 +508,86 @@ def audit_ckpt_resume_filter() -> int:
     return bad
 
 
+# ══════════════════════════════════════════════════════════════════════
+# [7] GUI 多轮对话闭环（P0-5 尾项）
+# ══════════════════════════════════════════════════════════════════════
+# 缺口原文（18 §3.3 X1 / 27 §3 象限（二））："GUI 推理页每轮都从零起算"。
+# 现行设计 = **无状态协议**：每轮把整段历史经重复的 `--turn <role>:<text>` 交回
+# CLI，回复经 `--reply-out <path>` 取回（`ChatSession`）。本节把"上下文不丢"
+# 落到可断言的参数面上：
+#   ① 第 N 轮的 `turns` 以第 N-1 轮的 `turns` 为**前缀**（历史逐轮累积）；
+#   ② 角色恒 user/assistant 交替、末条 user（= CLI `--turn` 的硬校验形状）；
+#   ③ 回复 commit 后成为下一轮的第 2k 条 `--turn`（闭环：模型自己的话也进上下文）；
+#   ④ `GptInferTab._on_send` 真的把这些交给 CLI（静态查"忘了传历史"）；
+#   ⑤ `--turn` / `--reply-out` / `--system` 都在 `text_infer --help` 里（真的收）。
+def audit_chat_multi_turn() -> int:
+    print("\n=== [7] GUI 多轮对话闭环（P0-5 尾项：连续 N 轮不丢上下文）===")
+    bad = 0
+
+    def check(ok: bool, label: str):
+        nonlocal bad
+        if not ok:
+            print(f"  [BAD] {label}")
+            bad += 1
+
+    # ① ② 上下文逐轮累积 + 交替形状
+    s = ChatSession("SYS")
+    prev: list = []
+    for i in range(1, 6):
+        cur = s.ask(f"第{i}问")
+        if i > 1:
+            check(cur[:len(prev)] == prev,
+                  f"第 {i} 轮的参数应以上一轮为前缀（上下文丢了：{prev} → {cur}）")
+        check(len(cur) == 2 * (i - 1) + 1, f"第 {i} 轮 turns 条数 = 2(i-1)+1")
+        check(cur[-1] == f"user:第{i}问", f"第 {i} 轮末条必须是本轮 user 输入")
+        roles = [t.split(":", 1)[0] for t in cur]
+        check(all(r == ("user" if k % 2 == 0 else "assistant") for k, r in enumerate(roles)),
+              f"第 {i} 轮角色必须 user/assistant 交替（CLI --turn 校验同口径）")
+        s.commit(f"第{i}问", f"第{i}答")
+        prev = cur
+        # ③ 回复闭环：commit 之后，模型的回复出现在下一轮的历史里
+        nxt = s.ask(f"第{i+1}问")
+        check(f"assistant:第{i}答" in nxt, f"第 {i} 轮的回复应进下一轮上下文")
+        check(nxt[len(nxt) - 2] == f"assistant:第{i}答", "回复位置 = 末条 user 之前")
+
+    check(s.turn_count() == 5, "turn_count = 已完成的问答对数")
+    check(s.transcript("新问").count("[你]") == 6, "显示：5 条历史 user + 1 条待回复")
+
+    # 清空 = 新对话（下一轮从零起算）
+    s.clear()
+    check(s.ask("新问题") == ["user:新问题"], "清空后 ask 不带任何历史")
+    check(s.turn_count() == 0, "清空后轮数归零")
+
+    # ④ GUI 侧真的把历史交给 CLI（静态：_on_send 的源码必须含这三样）
+    try:
+        tree = ast.parse((ROOT / "gui.py").read_text(encoding="utf-8"))
+        src = ""
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef) and node.name == "GptInferTab":
+                for sub in node.body:
+                    if isinstance(sub, ast.FunctionDef) and sub.name == "_on_send":
+                        src = ast.get_source_segment(
+                            (ROOT / "gui.py").read_text(encoding="utf-8"), sub) or ""
+        missing = [tok for tok in ("self.chat.ask(", '"turns"', '"reply_out"',
+                                   "self._run_args(") if tok not in src]
+        check(not missing, f"GptInferTab._on_send 应把历史与回复通道交给 CLI，缺: {missing}")
+    except Exception as exc:   # pragma: no cover
+        check(False, f"解析 gui.py 的 _on_send 失败: {exc}")
+
+    # ⑤ CLI 真的收这几个参数
+    flags = cli_help_flags("text_infer")
+    missing_cli = sorted({"--turn", "--reply-out", "--system"} - flags)
+    check(not missing_cli, f"text_infer --help 缺少多轮参数: {missing_cli}")
+    if bad == 0:
+        print("  [OK ] 5 轮上下文逐轮累积（前缀不变式）+ 回复闭环 + 清空归零")
+        print("  [OK ] GptInferTab._on_send ↔ CLI 参数面（--turn/--reply-out/--system）")
+    return bad
+
+
 def main() -> int:
     bad = (audit_gui_to_cli() + audit_phantom_options() + audit_gui_attrs()
            + audit_optimizer_names() + audit_field_tables()
-           + audit_ckpt_resume_filter())
+           + audit_ckpt_resume_filter() + audit_chat_multi_turn())
     print(f"\n{'PASS' if not bad else 'FAIL'}  可行动问题={bad}")
     return 1 if bad else 0
 

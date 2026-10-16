@@ -49,12 +49,12 @@
 
 | 维度 | 实测 | 复现 |
 |---|---|---|
-| `include/` | **79 个 `.hpp` / 44209 行** | `Get-ChildItem include -Recurse -Filter *.hpp` + 逐文件 `Get-Content` 计数 |
-| `src/` | **81 个 `.cpp` / 27314 行** | 同上换 `src -Filter *.cpp` |
+| `include/` | **79 个 `.hpp` / 44758 行** | `Get-ChildItem include -Recurse -Filter *.hpp` + 逐文件 `Get-Content` 计数 |
+| `src/` | **82 个 `.cpp` / 28771 行** | 同上换 `src -Filter *.cpp` |
 | `shaders/` | **22 个 `.comp`** | `Get-ChildItem shaders -Recurse -Filter *.comp` |
 | `docs/` | **46 篇 `.md`**（含 `history/history.md` 与 `release-notes/`） | `Get-ChildItem docs -Recurse -Filter *.md` |
-| 最大源文件 | `expr_glsl_gen.hpp` **3435** 行、`compute_cpu_engine.hpp` **2788**、`compute_gpu_engine.hpp` **2610**、`compute_engine.hpp` **2217**、`expr_dsl.hpp` **1973**、`gui.py` **1864**、`backend/compute_vk_backend.hpp` **1073**（v1.8.1 拆 4 片段后回落）。**`src/text_train.cpp` 已不在榜**——P1-1 模块化后 1830 → **396** 行（循环/恢复/断点拆到 `cli/text_train_*.hpp`） | 逐文件 `(Get-Content $f).Count` |
-| ctest | **53 个测试** = 40 个测试目标（`list(APPEND NN_TEST_TARGETS` 计数）+ 13 个变体/附加（`cnn_test_gpu`、`cnn_test_f16`、`cnn_test_f16_gpu`、`rapt_test_f16`、`rapt_test_f16_gpu`、`batchnorm_test_gpu`、`t1_58_test_gpu`、`bitnet_struct_test_gpu`、`write_epoch_test_gpu`、`ternary_gemm_test_gpu`、`adam_quant_test_gpu`、`fusion_custom_layer_example`、`expr_fuse_test`）；**无 Vulkan 的树只注册 51 条**（`fusion_custom_layer_example` / `expr_fuse_test` 是 GPU 专属门禁） | `ctest --test-dir build -N` |
+| 最大源文件 | `expr_glsl_gen.hpp` **3435** 行、`compute_cpu_engine.hpp` **2788**、`compute_gpu_engine.hpp` **2610**、`compute_engine.hpp` **2217**、`expr_dsl.hpp` **1973**、`gui.py` **2038**、`backend/compute_vk_backend.hpp` **1073**（v1.8.1 拆 4 片段后回落）。**`src/text_train.cpp` 已不在榜**——P1-1 模块化后 1830 → **396** 行（循环/恢复/断点拆到 `cli/text_train_*.hpp`） | 逐文件 `(Get-Content $f).Count` |
+| ctest | **54 个测试** = 41 个测试目标（`list(APPEND NN_TEST_TARGETS` 计数）+ 13 个变体/附加（`cnn_test_gpu`、`cnn_test_f16`、`cnn_test_f16_gpu`、`rapt_test_f16`、`rapt_test_f16_gpu`、`batchnorm_test_gpu`、`t1_58_test_gpu`、`bitnet_struct_test_gpu`、`write_epoch_test_gpu`、`ternary_gemm_test_gpu`、`adam_quant_test_gpu`、`fusion_custom_layer_example`、`expr_fuse_test`）；**无 Vulkan 的树只注册 52 条**（`fusion_custom_layer_example` / `expr_fuse_test` 是 GPU 专属门禁） | `ctest --test-dir build -N` |
 | 引擎接口 | **52 个 virtual 方法**；`L2-VIOLATIONS: 0`；宿主桥 39 处（仅披露，2026-10-16 实测；P4-2 拆掉 RAPT 逐头 host 往返后由 41 回落） | `pwsh -File bench/doc_inventory.ps1` |
 | 版本 | git tag **v1.8.2**；`CMakeLists.txt` 的 `project(... VERSION 1.8.2)`（与 tag 对齐；口径仍为 **git tag 是版本权威**）；`release-notes/` 有 `v1.5.0.md`、`v1.5.1.md`（2026-10-15 补写）、`v1.6.0.md`、`v1.7.0.md`、`v1.8.1.md`、`v1.8.2.md`（v1.6.1 / v1.7.1 / v1.8.0 无独立发布说明） | `git describe` + 读 `CMakeLists.txt` |
 | CI | `.github/workflows/cmake-single-platform.yml`：clang++ / Ninja / Release / `NN_ENABLE_NATIVE=OFF`，Linux + Windows；**开 `NN_ENABLE_TESTS` 并跑 ctest**（普通 + `NN_BIND_DEBUG=1` 各一轮，P0-1） | 读该 workflow |
@@ -117,7 +117,7 @@
 
 | # | 现象 | 坐标 | 影响面 |
 |---|---|---|---|
-| X1 | ~~推理无 top-k / top-p 采样截断~~ **✅ 采样器 + CLI 半边已完成（2026-10-15，P0-5）**：`SamplingConfig`（temperature / top-k / top-p / repeat_penalty / repeat_window / seed）+ `text_infer` 五个开关（`--top-k`/`--top-p`/`--repeat-penalty`/`--repeat-window`/`--seed`）+ GUI GPT 推理 Tab 同步暴露 + 新门禁 `sampling_test` | 采样器在 `compute_layer_base.hpp`（CPU 侧 host 采样，**不进 AOT 闭合世界**）；`src/text_infer.cpp` 的开关 + `src/sampling_test.cpp` | **剩余（2026-10-16 回正）**：GUI 的多轮上下文闭环演示 —— 原划给 P2-6 批次，但 P2-6 收口（2026-10-15）时**未包含**它（`gui.py` 实测无上下文/历史处理）⇒ 重新登记为独立待办，见 §4.1 P0-5 行与 [`27`](27-execution-plan.md) §3 象限（二） |
+| X1 | ~~推理无 top-k / top-p 采样截断 / 无多轮上下文~~ **✅ 两半全完成（P0-5：采样器 2026-10-15 / 多轮闭环 2026-10-16）**：**采样** = `SamplingConfig`（temperature / top-k / top-p / repeat_penalty / repeat_window / seed）+ `text_infer` 五个开关（`--top-k`/`--top-p`/`--repeat-penalty`/`--repeat-window`/`--seed`）+ GUI GPT 推理 Tab 同步暴露 + 门禁 `sampling_test`。**多轮** = `Tokenizer::chat_prompt`（对话标记模板 + 按整轮截断）+ `--interactive`（进程内累积）/ `--turn`+`--reply-out`（历史自带、一次一问）+ GUI 多轮面板（`ChatSession`）+ 门禁 `chat_prompt_test` / `bench/gui_cli_audit.py` [7] | 采样器在 `compute_layer_base.hpp`（CPU 侧 host 采样，**不进 AOT 闭合世界**）；多轮 prompt 构建在 `domain_tokenizer_base.hpp`，CLI 在 `src/text_infer.cpp`，GUI 历史在 `cli_controllers.py`（`ChatSession`）+ `gui.py` | **闭合（2026-10-16）**：`--interactive` 此前每轮只拼当轮输入（**每轮从零起算**）、GUI 完全无历史；现两条路径都带完整历史，且"上下文不丢"落到可断言形式 = 第 N 轮 prompt 以第 N-1 轮为**逐 token 前缀**（见 §4.1 P0-5 行） |
 | X2 | ~~无 Dataset / DataLoader 抽象，文本训练数据加载不成体系~~ **前半已解决（19 号设计阶段一~三）**：`nn::Dataset` + `.nndataset`/`.nnvocab` 统一格式 + `dataset_gen`/`dataset_convert`，text_train 只吃数据集；**剩 DataLoader/流式** | ~~`src/text_train.cpp` 内联数据路径；`train_pkg.py` / `cli_controllers.py` 各自处理~~（已收编，见 `docs/todo/19-unified-dataset.md`） | 流式大语料仍不可行（`load_text` 一次性物化，P2-4 后半解决） |
 | X3 | 无 Python / C 绑定 | 仓库仅有 `gui.py` 这一 Python 入口（subprocess 调 CLI） | 生态集成只能走命令行 + 文件 |
 | X4 | `gui.py` 六个 Tab、7 处手写 `collect_args` | `gui.py`（`def collect_args` 实测 7 处） | 加 CLI 选项要手改多处，漏参风险（13 §4 的"五个 Tab / 1471-1500"坐标已过期） |
@@ -149,7 +149,7 @@ P4 = 持续优化方向（底座已稳后继续加杠杆，2026-10-14 立项，�
 
 | 期 | 项数 | 项目 | 共同前置 |
 |---|---|---|---|
-| **P0** | 5 | CI 真跑测试（**✅**）、文档一致性回正（**✅ 2026-10-15**）、BatchNorm 禁止静默回落（**✅**）、CMake install/export + presets（嵌入路径 ✅ / install 用户裁定不做）、推理采样 top-k/top-p（采样器 + CLI 半边 ✅ 2026-10-15；GUI 多轮上下文闭环 **未交付**，见 §4.1 P0-5 行） | 无（P0-1 是所有人的前置） |
+| **P0** | 5 | CI 真跑测试（**✅**）、文档一致性回正（**✅ 2026-10-15**）、BatchNorm 禁止静默回落（**✅**）、CMake install/export + presets（嵌入路径 ✅ / install 用户裁定不做）、**推理采样 top-k/top-p + 多轮对话闭环（✅ 2026-10-16，两半齐，见 §4.1 P0-5 行）** | 无（P0-1 是所有人的前置） |
 | **P1** | 7 | `text_train` 模块化（**✅ 2026-10-16**）、checkpoint 优化器状态（P1-2，**✅ 2026-10-16**）、危险精度组合启动期告警（细则见 [`24`](24-f16-training-defects.md)）、`gpt_test` flaky（**✅ 2026-10-15**）、CI 冒烟扩 MSVC Debug、**自定义层使用文档 + 精度自检**（P1-6 **✅ 2026-10-14**）、**三值模型续训入口**（P1-7，**✅ 2026-10-16**） | P0-1；P1-6 无依赖 |
 | **P2** | 13 | `.bin` 校验和（**✅ 2026-10-16，随 P1-2 同批交付**）、Adafactor、RAPT/CNN f16、Dataset/DataLoader、Python/C 绑定、GUI 两项、header 拆分、F16C、step 内固定 I/O 开销（P2-9）、**原生 f16 算术用足（P2-10）**、**编译期精度特化（P2-11，已完成）**、**优化器 f16 批量派发（P2-12）**、**f16 K 切分/fine tile（P2-13）** | P0-1；P2-7 另需 P1-5；P2-6 另需 P0-5 |
 | **P3** | 7 | 由 §6 触发条件启动（含 CUDA、分布式）——IR-C 已落地故已移出本档（2026-10-16 计数回正：原写 8） | 各自触发条件 |
@@ -171,7 +171,7 @@ P4 = 持续优化方向（底座已稳后继续加杠杆，2026-10-14 立项，�
 | **P0-2 文档一致性回正** ✅ **已完成 2026-10-15** | ① ctest 计数统一（当时实测 **48**〔GPU 树〕/ **46**〔无 Vulkan 树〕；同日 P0-5 加 `sampling_test` 后为 **49** / **47**、P4-2b 再加 `scan_bitwise_test` 后为 **50** / **48**，口径与历史数字的处理见 §2 口径说明）；② `CMakeLists.txt` 版本与 tag 对齐（v1.8.2）；③ 补 `docs/release-notes/v1.5.1.md`（2026-10-15 依据 `git log v1.5.0..v1.5.1` 与 history 两条归档**补写**）；④ `README.md` 死链/mojibake/链式 API 声明/索引（已在前一轮迭代修完）。**⑤ 门禁补强（原 E8）**：`bench/doc_align_audit.ps1` 的 [A] 扩展到 markdown 链接目标，并修掉它当场抓到的 `todo/25` → `../CONTRIBUTING.md` 死链 | `bench/doc_align_audit.ps1` 的 [A][B][D][E][F] 可行动项为 0（2026-10-15 复测：[A] 0 / [D] 0 / [E] 0 / [F] 0）；文档中 ctest 计数统一写当前值（当时 48，现 49） | 小–中（纯文档 + 审计脚本一段） | P0-1（否则改动无法被自动验证） |
 | **P0-3 BatchNorm 禁止静默回落** ✅ **已完成（真实现路线）** | **已实施**：`compute_layer_mlp.hpp` 新增 `BatchNorm` 层（训练/推理双态、running 统计 EMA + `extra_state` 序列化、`forward_recompute` 抑制 EMA），`make_norm_layer` 真分支；`scan_exprs` 模型 pass 补推理态 fwd+bwd 覆盖（GPU 闭合世界）；新增断言测试 `batchnorm_test`（+`--gpu` 变体），ctest 21 → 23，scan 结构 84 → 91（库内口径；样例收集器 93） | 构造 batchnorm 规格给出真层（可观测、不再静默降级）；ctest 含 `batchnorm_test`；详见 `docs/history/history.md`「BatchNorm 落地」条 | 已完成 | 无 |
 | **P0-4 CMake install/export + CMakePresets** ⚡ **嵌入路径已完成（用户裁定拆分）** | **已实施**：门面目标 `neuralnet::nn`（`add_subdirectory` + 一行 link + 一个 include 即用；C++26/线程/`NN_HAS_VULKAN`/SPIR-V 头/Vulkan/shader 顺序全经接口传递）、`NN_ENABLE_GPU=AUTO\|ON\|OFF`、`NN_BUILD_APPS` 嵌入默认 OFF、`nn_enable_gpu_fusion` 树外可用（`NN_LIB_SOURCE_DIR/BINARY_DIR` CACHE 跨作用域 + GPU 不可用时 stub 报错）、消费方编译选项（`-Wno-pass-failed`/`-fexperimental-library`/`/utf-8`）随门面传递；样例 `examples/downstream/`（CPU/GPU 双路径实测通过）+ 指南 `docs/usage/05-consume-as-library.md`。**剩余**：`install()`/`find_package(neuralnet.cpp)`（用户裁定本轮不做）；`CMakePresets.json` ✅ 已于 2026-10-11 落地（`cmake --preset dev/portable/cpu/probes`，历史记录见 `docs/history/history.md` 的 presets 条） | 嵌入口径 ✅：干净构建目录里 `cmake -S examples/downstream` CPU 与 GPU（`NN_ENABLE_GPU=ON`）两路径均编译、链接、运行通过（GPU 路径含 scan 收集 91 条 = 库内口径），fusion 树外调用可用；install 口径待剩余部分 | 已完成（嵌入）/ 小–中（剩余） | P0-1（preset 需进 CI 才不腐化） |
-| **P0-5 推理采样 top-k / top-p + 多轮对话闭环** ⚡ **采样器 + CLI 半边已完成（2026-10-15）** | **已实施**：`nn::SamplingConfig`（temperature / top_k / top_p / repeat_penalty / repeat_window / seed）落在 `compute_layer_base.hpp`，共用采样器按"重复惩罚 → 温度 → top-k → top-p → softmax → 采样/贪心"固定顺序；`GPTModel`/`RAPTModel::generate` 新增配置重载（旧 temperature 重载保留、语义 = 全默认）；`text_infer` 暴露 `--top-k` / `--top-p` / `--repeat-penalty` / `--repeat-window` / `--seed`，GUI GPT 推理 Tab 同步（`bench/gui_cli_audit.py` 退出码 0）。**门禁**：新测试目标 `sampling_test`（默认配置 ≡ 旧路径逐位一致 + top-k/top-p/重复惩罚/种子语义 + `top_k=1` ≡ 贪心 + 同 seed 可复现）。**实测**：`--seed 7 --top-k 40 --top-p 0.9 --repeat-penalty 1.2` 连跑 3 次输出逐 token 相同，换 seed 即不同。**三组口径**：本机 clang24+libstdc++ **49/49**、102 WSL clang24+**libc++** **47/47**（libc++ 当场抓到 `{1}` 当 span 实参的移植性错误并修掉）、102 WSL g++15.2+libstdc++ **47/47** | 同 prompt 在 top-k / top-p 下输出可复现（同 seed）✅；**剩余**：GUI 的多轮对话闭环（连续 N 轮不丢上下文）**未交付、重新登记**：原划给 P2-6 批次、P2-6 收口时未包含（`gui.py` 实测无上下文/历史处理）⇒ 见 27 号 §3 象限（二） | 中 | 无。命名冲突：`--topk` 属 `mnist_infer`、`--top` 属 `tokenizer_infer`；新开关取 `--top-k`/`--top-p`，无冲突 |
+| **P0-5 推理采样 top-k / top-p + 多轮对话闭环** ✅ **两半全完成（采样 2026-10-15 / 多轮闭环 2026-10-16）** | **采样半边（已实施）**：`nn::SamplingConfig`（temperature / top_k / top_p / repeat_penalty / repeat_window / seed）落在 `compute_layer_base.hpp`，共用采样器按"重复惩罚 → 温度 → top-k → top-p → softmax → 采样/贪心"固定顺序；`GPTModel`/`RAPTModel::generate` 新增配置重载（旧 temperature 重载保留、语义 = 全默认）；`text_infer` 暴露 `--top-k` / `--top-p` / `--repeat-penalty` / `--repeat-window` / `--seed`，GUI GPT 推理 Tab 同步；门禁 `sampling_test`。**多轮闭环半边（2026-10-16，P0-5 尾项）**：① prompt 构建唯一真源 = `Tokenizer::chat_prompt`（`domain_tokenizer_base.hpp`）：对话标记模板（`BOS<|system|>…<|end_of_system|><|user|>…<|end_of_user|><|assistant|>`，末轮 user 补 `<|assistant|>`）+ 内容两种给法（`text` 走 encode / `tokens` **原样灌入**）；超 `seq_len` 时从**最旧的一问一答整轮丢弃**（system 块与末轮恒保留、丢弃后仍以 user 起头），无标记词表退化为换行相接 + 截尾。② CLI：`--interactive` 从"每轮只拼当轮输入"改为**进程内累积历史**（助手轮用生成的原 token 回灌，超限打印丢弃轮数）；新增 `--turn <role>:<text>`（可重复，历史自带、一次一问）与 `--reply-out <path>`（回复落盘 → 调用方不解析日志）与 `--system <text>`；形状不合法（role 写错 / 不交替 / 末条不是 user / 与 `--prompt`·`--interactive` 并用）**解析期报错**。③ GUI：「GPT 推理」页新增「对话记录」面板 + **「💬 发送（多轮）」** + **「🧹 清空对话」**（历史 = `cli_controllers.py` 的 `ChatSession`，**无状态协议**：每轮把整段历史随采样参数一起传回 CLI）；字段表新增「系统提示（多轮对话）」（→ `--system`）；`TabBase._run_args` 抽出共用运行路径。**门禁**：`chat_prompt_test`（模板结构 / ★前缀不变式 / tokens 回灌 / 整轮截断 / 纯文本回退 / 真实 `text_infer` 子进程端到端：prompt tokens 与库逐 token 一致 + `--reply-out` == 生成 token 解码 / 7 条 CLI 负例）+ `bench/gui_cli_audit.py` 第 **[7]** 节（Python 侧参数面：第 N 轮 args 以第 N-1 轮为前缀、回复闭环、清空归零、`_on_send` 真的传历史）。**实测（三组「编译器 × 标准库」，2026-10-16）**：本机 clang 24 + libstdc++（`build/cpu`，Release + CPU-only）**52/52**；`102` WSL clang 24 + **libc++**（`~/nn-verify/build`）**52/52**；`102` WSL g++ 15.2 + libstdc++（同目录 `build-gcc`）**52/52**——三棵树均零告警（`-Werror`）且都含新用例 `chat_prompt_test`。本机 GPU 树（`build-gpu`，Release + Vulkan）新用例已构建并运行通过、`ctest -N` 注册 **54** 条，但**全量 GPU ctest 未跑**（本项结论只依赖 CPU 树）。`gui_cli_audit` 退出码 0（七节） | 采样：同 prompt 在 top-k / top-p 下输出可复现（同 seed）✅。多轮：**连续 N 轮不丢上下文** ✅ —— 可验证形式 = 第 N 轮的 prompt 以第 N-1 轮为**逐 token 前缀**（`chat_prompt_test` [2] 库级 + [6] CLI 端到端；GUI 侧 `gui_cli_audit` [7] 在参数层同款断言）；GUI 侧真机链路已实测（`ChatSession` → `GptInferController` → `text_infer`：第 2 轮 prompt = 第 1 轮 prompt + 第 1 轮生成 token + `<|end_of_assistant|>` + `<|user|>` + 新输入 + `<|end_of_user|>` + `<|assistant|>`）；超 `seq_len` 时按一问一答丢弃并有可见提示 | 中 | 无。命名冲突：`--topk` 属 `mnist_infer`、`--top` 属 `tokenizer_infer`；新开关取 `--top-k`/`--top-p`，无冲突。多轮开关取 `--turn`/`--reply-out`/`--system`，亦无冲突 |
 
 > **口径说明（与本文 §4 前置清单的差异）**：任务书前置清单把"危险精度组合 fail-fast"列在 P0；
 > 该项归 **P1**，且口径已定为**仅告警**（不退出、不加确认开关）——细则与验收一律见
@@ -305,7 +305,7 @@ ZiPT 恢复、LRLA、CUDA、分布式（7 项）。
 | 基线 | 口径 | 当前值 / 复现 |
 |---|---|---|
 | build | 全绿、零告警（`-Werror`） | `cmake -B build -G Ninja -DNN_ENABLE_TESTS=ON && cmake --build build` |
-| ctest | **实测 51**（38 目标 + 13 变体/附加；无 Vulkan 树 49）；需 Vulkan 用例退出码 77 = skip | `ctest --test-dir build` |
+| ctest | **实测 54**（41 目标 + 13 变体/附加；无 Vulkan 树 52）；需 Vulkan 用例退出码 77 = skip | `ctest --test-dir build` |
 | L2 分层审计 | `L2-VIOLATIONS: 0`（宿主桥用量只披露） | `pwsh -File bench/doc_inventory.ps1` 第 [4] 节（实测：virtual 52 / host_bridge 39） |
 | CPU 字节锚 | `--steps 20` hash = `6f8849f14da23110` | 逐位一致 |
 | GPU 字节锚 | dev2 hash = `8ef51b2927253c50` | 逐位一致（GPU 档位按 17 §6 容差规则） |
@@ -316,8 +316,8 @@ ZiPT 恢复、LRLA、CUDA、分布式（7 项）。
 
 ### 8.2 本轮新增门禁（P0 后生效）
 
-1. **CI 必须执行 ctest**：日志需出现当前全部用例（**51**，无 Vulkan 树 49）；77 = skip 不算失败（P0-1）。
-2. **开发文档不得出现 ctest 计数的旧写法**：统一写实测 **53**（GPU 树）/ **51**（无 Vulkan 树）——已完成行与 history 归档里的旧数字是当时记录，不算冲突（P0-2 ✅）。
+1. **CI 必须执行 ctest**：日志需出现当前全部用例（**54**，无 Vulkan 树 52）；77 = skip 不算失败（P0-1）。
+2. **开发文档不得出现 ctest 计数的旧写法**：统一写实测 **54**（GPU 树）/ **52**（无 Vulkan 树）——已完成行与 history 归档里的旧数字是当时记录，不算冲突（P0-2 ✅）。
 3. **BatchNorm 行为门禁**：构造 batchnorm 规格必须有可观测结果（报错或正确层），不允许静默降级（P0-3）。**✅ 已满足**：真层 + `batchnorm_test` 工厂断言。
 4. **危险精度组合**：启动期**告警**（仅警告、不失败、不改退出码）——口径与细则见 [`24-f16-training-defects.md`](24-f16-training-defects.md) §2.3 / §5 F1（P1-3）。
 5. **审计覆盖补强**：`bench/doc_align_audit.ps1` 的 [A] **✅ 已扩展到 markdown 链接目标**（E8，2026-10-15）；新增死链会在审计里以 [A] 计数非 0 暴露。
@@ -349,6 +349,16 @@ ZiPT 恢复、LRLA、CUDA、分布式（7 项）。
    `ternary_gemm_test` [8]（反量化 helper 的三条不变量）、`text_train_modules_test`（三值 GPT 走通
    `resume_text_train` + 8 步 Adam，首次 forward 与文件逐位一致）。推理侧默认意图 `Inference`
    不变（部署只读态 = 0.25 B/权重）。
+
+9. **多轮对话上下文不丢（P0-5 尾项，2026-10-16 起生效）**：多轮 prompt 的构建只有一条路
+   （`Tokenizer::chat_prompt`），且必须满足两条可断言的不变量：① **第 N 轮的 prompt 以第 N-1 轮
+   的 prompt 为逐 token 前缀**（"上下文不丢"的可验证形式）；② 超 `seq_len` 时按**整轮（一问一答）**
+   丢弃 —— system 块与末轮恒保留、丢弃后仍以 user 起头（标记结构不破），且丢弃轮数可观测。
+   `--turn` 的形状不合法（role 写错 / 不交替 / 末条不是 user / 与 `--prompt`·`--interactive` 并用）
+   **解析期报错**，不得静默降级；GUI/脚本侧一律经 `--turn`（整段历史随采样参数一起传回）+ `--reply-out`
+   （回复落盘），不得靠解析 CLI 日志取回复。**门禁**：`chat_prompt_test`（库级 5 节 + 真实 `text_infer`
+   子进程端到端 + 7 条负例；app 缺失时 77 = skip）、`bench/gui_cli_audit.py` 第 [7] 节（Python 侧
+   参数面：前缀不变式 / 回复闭环 / 清空归零 / `_on_send` 真的传历史）。
 
 ### 8.3 验收纪律
 

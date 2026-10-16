@@ -50,6 +50,56 @@ class Metric:
     timestamp: Optional[float] = None
 
 
+# ── 多轮对话记录（P0-5 尾项，2026-10-16）──────────────────────────────────
+# 与 CLI 的 `--system` 默认值同源（见 src/text_infer.cpp 的 InferConfig）。
+DEFAULT_SYSTEM_PROMPT = "你是一个有用的AI助手。"
+
+
+class ChatSession:
+    """GPT 推理页的多轮对话记录（GUI 多轮上下文闭环的唯一实现）。
+
+    **闭环口径**：每轮把**整段历史**交给 CLI —— 历史经重复的 `--turn
+    <role>:<text>` 传入，回复经 `--reply-out <path>` 取回（不解析日志）。
+    上下文不依赖子进程内的状态，所以：每轮都能改采样参数、进程崩了历史还在、
+    也不需要为 stdin 交互模式写一套流式解析（见 `docs/history/history.md`
+    「P0-5 尾项」条）。
+
+    不变量：`turns` **严格交替且以 user 起头、以 assistant 收尾**（= 已完成的
+    一问一答）。CLI 对 `--turn` 的校验与此一致（`src/text_infer.cpp`）；本轮
+    输入在 `ask()` 里现拼、回复到达后才由 `commit()` 落账 —— 生成失败 ⇒ 历史
+    不变（不会留下"两个连续 user 轮"这种 CLI 会拒的形状）。
+    """
+
+    def __init__(self, system_prompt: str = DEFAULT_SYSTEM_PROMPT):
+        self.system_prompt = system_prompt
+        self.turns: List[Tuple[str, str]] = []   # [(role, text)]，交替、末轮 assistant
+
+    def clear(self) -> None:
+        """开始新对话（下一轮不再带任何历史）"""
+        self.turns.clear()
+
+    def ask(self, user_text: str) -> List[str]:
+        """本轮交给 CLI 的 `turns` 参数 = 全部历史 + 本轮用户输入（不落账）"""
+        return [f"{role}:{text}" for role, text in self.turns] + [f"user:{user_text}"]
+
+    def commit(self, user_text: str, reply_text: str) -> None:
+        """回复到达后把 (user, assistant) 两轮落账（保持交替不变量）"""
+        self.turns.append(("user", user_text))
+        self.turns.append(("assistant", reply_text))
+
+    def turn_count(self) -> int:
+        """已完成的问答轮数（= 一问一答的对数）"""
+        return len(self.turns) // 2
+
+    def transcript(self, pending_user: Optional[str] = None) -> str:
+        """显示用文本；`pending_user` = 本条已发出、回复尚未到达的输入"""
+        lines = [f"[{'你' if role == 'user' else '模型'}] {text}"
+                 for role, text in self.turns]
+        if pending_user is not None:
+            lines.append(f"[你] {pending_user}\n        ← 生成中…")
+        return "\n".join(lines)
+
+
 class CLIController(ABC):
     """
     CLI控制器抽象基类
@@ -1024,7 +1074,20 @@ class GptInferController(CLIController):
         # 提示文本
         if "prompt" in kwargs:
             args.extend(["--prompt", self._format_arg_value(kwargs["prompt"])])
-        
+
+        # 多轮对话（P0-5 尾项）：
+        #   turns      = ["user:…", "assistant:…", …]（交替）→ 逐个 --turn
+        #   reply_out  = 本轮回复落盘路径（GUI 靠它取回复，不解析日志）
+        #   system     = 对话模板的系统提示（--system）
+        for turn in kwargs.get("turns", None) or []:
+            args.extend(["--turn", self._format_arg_value(turn)])
+
+        if "reply_out" in kwargs:
+            args.extend(["--reply-out", self._format_arg_value(kwargs["reply_out"])])
+
+        if "system" in kwargs:
+            args.extend(["--system", self._format_arg_value(kwargs["system"])])
+
         # 交互模式
         if kwargs.get("interactive", False):
             args.append("--interactive")
