@@ -324,8 +324,10 @@ ZiPT 恢复、LRLA、CUDA、分布式（7 项）。
    **状态（2026-10-16）：① ② ③ ④ 全部落地并有门禁**——①③ 见 `text_train_modules_test` [6] 与
    端到端四例（`docs/history/history.md`「P1-2（第三刀）」）、② 见 `train_state_test` [9]、
    ④ 见 `train_state_test` [5]；优化器侧见 `optimizer_state_test`（重启续跑 = 直跑逐位一致）。
-   **尚未收口**：GUI 训练页在 ckpt 续训时仍会发 A/B 旗标（会撞禁列报错，文案清晰但应主动不发）
-   ⇒ `gui.py` 侧按 role 禁用那些字段并与 `bench/gui_cli_audit.py` 同步（第四刀）。
+   **已收口（2026-10-16 第四刀）**：`gui.py` 按**文件头的 role 字节**识别 `.nnckpt`（`model_file_role`），
+   断点续训模式下 `collect_args` 不发任何禁列键（并显示一行模式提示），`.nnmodel` warm start 仍 CLI 全权；
+   `bench/gui_cli_audit.py` 新增 [6] 节（禁列集合 ↔ `kForbiddenResumeFlags` 逐项一致 + 两种 role 下的
+   收集行为 + C 类不被误砍）。
 
 ### 8.3 验收纪律
 

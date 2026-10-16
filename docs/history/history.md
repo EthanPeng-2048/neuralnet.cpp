@@ -4890,3 +4890,31 @@ A/B 类禁列校验；数据集身份门禁；`.nnmodel` 恢复放开；GUI 同�
 `gui_cli_audit.py` 门禁同步（当前 GUI 训练页在 ckpt 续训时会撞上禁列报错——报错文案清晰，
 但 GUI 应主动不发这些旗标）；`mnist_train` 的 `--resume` 尚未接同一套语义（它不写状态段，
 本轮范围外）。
+
+# P1-2（第四刀）：GUI 侧收口（断点续训禁列）（2026-10-16）
+
+**类型**：演进记录（客户端对齐）。第三刀把 CLI 的禁列规则落地后，GUI 训练页仍会照发
+形状/配方旗标 ⇒ ckpt 续训必然撞报错（文案清晰但不该由用户承担）。本刀让 GUI 按角色主动收敛。
+
+**改法（`gui.py`）**
+
+- `model_file_role(path)`：读模型文件头第 10 字节的 role（v7+；布局 `magic|version|precision|role`），
+  返回 `model` / `checkpoint` / `None`。GUI 因此**按文件真实角色**决策，不靠扩展名猜。
+- `CKPT_RESUME_FORBIDDEN_KEYS`（kwargs 键集合，唯一真源指向 CLI 的 `kForbiddenResumeFlags`）；
+  `GptTrainTab.collect_args` 在断点续训模式下把这些键**全部弹出**（`.nnmodel` warm start 不受影响）。
+- 表格里新增一行模式提示（`group="ckpt_resume"`，仅该模式下可见）：形状/配方/计数器来自断点，
+  本页对应输入不发送。
+
+**门禁（`bench/gui_cli_audit.py` 新增 [6] 节，三判据）**
+
+① gui 的禁列集合 ↔ CLI 头文件 `kForbiddenResumeFlags` **逐项一致**（键→旗标用字段的 arg/name
+映射，`--model`/`--norm`/`--t1_58` 三个例外显式登记）——两边任一漂移都会红；
+② 造一个 v8 头指向 Checkpoint 角色 ⇒ `collect_args()` 禁列键 0 泄漏；
+③ 指向 Model 角色 ⇒ 禁列键**照发**（防止把 SFT 的配方面一起砍掉），且 C 类（`save`/`log_interval`）
+在任何模式下都保留。
+
+**验证**：`python bench/gui_cli_audit.py` 退出码 0（六节全绿，`可行动问题=0`）；
+`gui.py` 经 AST 语法检查通过（无 customtkinter 环境的导入由既有桩模块承担）。
+
+**未做**：`mnist_train` 侧的 `--resume` 仍走旧语义（它不写状态段，故禁列不适用）；
+`train_pkg.py` 的打包配置里仍会记录形状/配方（与"断点权威"并存时以 CLI 侧报错兜底）。
