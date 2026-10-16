@@ -5,7 +5,9 @@
 //
 //  用途：数据集配套的源文本内容摘要（`source.sha256`，19 号设计 §4.3）——
 //  失效判断基于内容摘要而非文件大小（同大小不同内容不会骗过）。
-//  单文件 header-only，输入一次性给足（语料摘要在生成期算，流式留待 P2-4）。
+//  接口分两层：增量（`Sha256State` + `sha256_update` + `sha256_finalize`）
+//  与一次性（`sha256_digest` / `sha256_hex`）。P2-1 的"整文件校验和"与
+//  `core_file.hpp::sha256_file_prefix` 都用增量层（大文件分块，不全读进内存）。
 // ══════════════════════════════════════════════════════════════════════════
 
 #include <array>
@@ -112,12 +114,10 @@ inline void sha256_update(Sha256State &st, std::string_view data)
         st.block[st.block_len++] = static_cast<std::uint8_t>(data[pos]);
 }
 
-inline std::array<std::uint8_t, 32> sha256_digest(std::string_view data)
+// 收尾：填充 0x80 + 零 + 64 位大端比特长度 → 32 字节摘要。
+// 增量调用的最后一击（`st` 只能收尾一次；之后再 update 得到的值无定义）。
+inline std::array<std::uint8_t, 32> sha256_finalize(Sha256State &st)
 {
-    Sha256State st;
-    sha256_update(st, data);
-
-    // 收尾：填充 0x80 + 零 + 64 位大端比特长度
     const std::uint64_t bits = st.total * 8;
     st.block[st.block_len++] = 0x80;
     if (st.block_len > 56)
@@ -142,12 +142,19 @@ inline std::array<std::uint8_t, 32> sha256_digest(std::string_view data)
     return out;
 }
 
+// 一次性：输入给足即得摘要
+inline std::array<std::uint8_t, 32> sha256_digest(std::string_view data)
+{
+    Sha256State st;
+    sha256_update(st, data);
+    return sha256_finalize(st);
+}
+
 }  // namespace detail
 
-// SHA-256 十六进制摘要（64 个小写 hex 字符）
-[[nodiscard]] inline std::string sha256_hex(std::string_view data)
+// SHA-256 十六进制摘要（64 个小写 hex 字符）——摘要字节 / 原始输入两个重载
+[[nodiscard]] inline std::string sha256_hex(const std::array<std::uint8_t, 32> &d)
 {
-    const auto d = detail::sha256_digest(data);
     static const char *digits = "0123456789abcdef";
     std::string out;
     out.reserve(64);
@@ -157,6 +164,11 @@ inline std::array<std::uint8_t, 32> sha256_digest(std::string_view data)
         out.push_back(digits[b & 0xF]);
     }
     return out;
+}
+
+[[nodiscard]] inline std::string sha256_hex(std::string_view data)
+{
+    return sha256_hex(detail::sha256_digest(data));
 }
 
 }  // namespace nn

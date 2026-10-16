@@ -632,6 +632,13 @@ if(NN_BUILD_APPS OR NN_ENABLE_TESTS)
     nn_add_executable(text_train_modules_test src/text_train_modules_test.cpp)
     list(APPEND NN_TEST_TARGETS text_train_modules_test)
 
+    # ── P1-2 + P2-1：v8 训练状态段 + 整文件校验和（role 门禁 / 往返 / 截断）──
+    # [1] TrainState ⇄ kvrec 往返；[2] Checkpoint 往返（状态 + 优化器张量逐位）；
+    # [3] role 门禁；[4] Model 角色状态段长度为 0；[5] 校验和（翻字节/截断报错）；
+    # [6] load_model 跳过状态段后参数逐位一致；[7] 数据集身份差异说明；
+    # [8] 剥成 v7 后仍可加载（零破坏）。全 CPU、秒级、临时目录自建自清。
+    nn_add_executable(train_state_test src/train_state_test.cpp)
+    list(APPEND NN_TEST_TARGETS train_state_test)
     # ── RV-04 优化器元数据表（唯一真源 ↔ 工厂）+ RV-03 同目标写序回归 ──────
     # [1] 表内每个 name 都能被 create_optimizer 构造、名单文本与表一致；
     # [2] AdamW（wd≠0）单步 vs 手写参考 + 顺序对调的负例；

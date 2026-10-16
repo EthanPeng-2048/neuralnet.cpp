@@ -170,13 +170,18 @@ ceil(M/(4·(256/subgroup_size)))` 是布局契约**）。CPU 侧 `matmul_q_impl`
 （RB=64）+ 稠密微内核**（`multiply_to`/`transpose_multiply_to`）——逐元素直算比稠密慢
 ~70×，禁止回退到那种写法。**动这块前先量**：`layer_bench --op matmul,matmul_q,matmul_q_bw
 --f16 --inner N` 的配对 A/B + 端到端（训练/解码/显存/CPU）口径见 docs 21 §4.14。
-④ **模型文件角色（v7，**已取代原 NNQT 独立格式**，见 docs 23）**：**一份格式、两种角色** ——
+④ **模型文件角色（v8，**已取代原 NNQT 独立格式**，见 docs 23）**：**一份格式、两种角色** ——
 `*.nnmodel`（推理：三值层写**打包形态**，盘上 base-3 1.6 bpw + τ）与 `*.nnckpt`
-（训练断点：写 f32 latent）。文件头 = `magic|version=7|精度|role 1B|spec`；参数区是
+（训练断点：写 f32 latent）。文件头 = `magic|version=8|精度|role 1B|spec`；参数区是
 **参数级 `kind`** 条目，由拥有该参数的层经 `Layer::export_param` / `import_param` 决定
-形态（参数形态协议）；载入 `.nnmodel` 后三值层是**只读**态（无 latent ⇒ `backward()`
+形态（参数形态协议）；spec 之后是 **role 门控的训练状态段**（`[state_len][TrainState kvrec]
+[优化器状态张量条目]`，Model 角色写 0 长度；内容 = 计数器 / 优化器 `t` / 训练配方含精度
+四槽 / 数据集身份，`include/neuralnet.cpp/train_state.hpp`），文件尾是 **整文件校验和
+`[sha256 32B]["NNEND" 5B]`**（P2-1：`verify_model_integrity` 在 `load_model` / `load_train_state`
+里先行校验，截断/损坏明确报错）。载入 `.nnmodel` 后三值层是**只读**态（无 latent ⇒ `backward()`
 返回明确错误；`parameters()` 不再 abort）。CLI：`--save`（默认 `*.nnmodel`）写推理角色、
-`--save-interval` 写 `*.nnckpt`、`--resume` **只认** `.nnckpt`；v5/v6 老 `.bin` 仍可读。
+`--save-interval` 写 `*.nnckpt`、`--resume` **只认** `.nnckpt`（Checkpoint 角色；`.nnmodel` 的
+放开随 P1-2 第二刀落地）；v5/v6/v7 老 `.bin`/`.nnmodel` 仍可读（v7 无状态段 ⇒ 冷启动语义）。
 `text_infer` / `mnist_infer` 用 `peek_any_model_spec` + `load_any_model` + `peek_model_role`。
 **`Layer::sub_layers()` 已删除**（层树枚举没有消费者）；参数下标转发走**受保护的**
 `param_children()`（仅供参数协议，不是对外结构契约）。
@@ -357,7 +362,7 @@ optimizer.step();
 | `todo/04-memory-optimization.md` | 显存优化：L1 激活重计算（梯度检查点）/ L2 内存池整块归还（均已实施）；L3 远期 |
 | `todo/08-pitfalls-and-lessons.md` | **踩坑警示录，改代码前读** |
 | `todo/10-development-standards.md` | C++ 编码规范全文 |
-| `todo/12-compute-engine-inventory.md` | **引擎接口盘点（复现：`bench/doc_inventory.ps1`）：52 个 virtual 方法、Layer 直调 28 个（基础设施/数据搬运/状态扫描/fold 执行（自登记）/IR-C 录制段开合/三值打包/张量形变/精度落盘）、两套 CPU 求值机制（DSL 模板 + IR 解释器）、ctest 51 个测试（无 Vulkan 树 49）；演进记录见 `docs/history/history.md`** |
+| `todo/12-compute-engine-inventory.md` | **引擎接口盘点（复现：`bench/doc_inventory.ps1`）：52 个 virtual 方法、Layer 直调 28 个（基础设施/数据搬运/状态扫描/fold 执行（自登记）/IR-C 录制段开合/三值打包/张量形变/精度落盘）、两套 CPU 求值机制（DSL 模板 + IR 解释器）、ctest 52 个测试（无 Vulkan 树 50）；演进记录见 `docs/history/history.md`** |
 | `todo/14-f16-stable-gpu-loss-frozen.md` | **故障报告（2026-09-26；2026-10-13 ✅ 已修/根因订正）：GPU `stable=f16` 训练 loss 打印冻结（权重不冻结）——真因 = CE 的 (1,1) loss 归约按 `stable=f16` 落盘溢出，非回读链；触发矩阵、测试覆盖缺口、证据与复现** |
 | `todo/17-unified-tensor-engine.md` | **统一 Tensor/ComputeEngine/MemoryPool 底层架构总纲（2026-09-30 裁定；M1-M6 全部已实施 2026-09-30，仅 M7 未立项）：访问不变量（Tensor 存储私有、一切经引擎，已立为铁律 #11）、InitSpec 声明式初始化、批量 read/write、Matrix 降级为宿主 I/O 载体（L2+ 禁用 = 铁律 #12）、内存池契约统一、`import` 跨设备拉取、Layer 删每调用 engine 形参（M6 段 C，Loss/DSL/辅助对象保留形参见 §8）；吸收原 15 未实施的 P2-P6（改期 M1-M7）。立项前先读本文件 + §5 分期 + §8** |
 | `todo/18-roadmap.md` | **未来方向路线图 + 未完成项裁定台账（2026-10-01，13 号清单的承接者）：P0-P4 分期（P4 = 持续优化方向，2026-10-14 立项）、13 号逐条裁定（做/条件触发/不做）、触发式立项条件、非目标、门禁与验收口径。查"某件事该不该做、做到什么算完成、避免重复立项"时读本文；**执行排序不在本文**（见 `todo/27-execution-plan.md`）** |

@@ -4757,3 +4757,50 @@ setup 路径上的错误不再带 `(expr) at file:line`（如需保留可另立�
 - GUI 的 `--resume-epoch/--resume-step` 字段随 role 禁用；`bench/gui_cli_audit.py` 纳入门禁。
 - 只读 `peek_train_state(path)`：加载权重前即可显示断点的 epoch/step/lr 与数据集身份（也是数据集校验失败时的
   诊断面）。
+
+# P1-2 / P2-1（第一刀）：v8 训练状态段骨架 + 整文件校验和（2026-10-16）
+
+**类型**：演进记录（格式升版）。**范围**：只做**格式与读写**，不动训练路径（一次改太多的接口面
+无法逐项验收）。裁定归档见上一节。
+
+**落地**
+
+- `MODEL_VERSION 7 → 8`；spec 之后新增 **role 门控状态段**
+  `[state_len u64][TrainState kvrec][优化器状态张量条目 × N]`（Model 角色写 0 长度；
+  老文件缺段 = 冷启动语义）。文件尾新增 `[sha256 32B]["NNEND" 5B]`（P2-1）。
+- 校验和**边写边算**：`detail::HashingStreamBuf` 把哈希塞进 `streambuf`，写路径的流类型从
+  `std::ofstream&` 放宽到 `std::ostream&` ⇒ 无需"写完再读回来算一遍"，也不需要把整文件拼在内存里。
+  读侧 `verify_model_integrity` 分块（1 MiB）流式校验；`load_model` / `load_train_state` 先行校验，
+  截断/损坏在解析参数之前就明确报错（旧缺陷 C5：静默载入错误权重）。
+- 新头 `include/neuralnet.cpp/train_state.hpp`：`TrainState`（计数器 / 优化器 `t` 与 blob 数 /
+  训练配方含**精度四槽与 lr 曲线形状** / 数据集身份）+ kvrec 编解码（浮点字段 `bit_cast` 到 u64
+  落盘、缺键 = 默认值、保留精度值如 BF16 读回即报错）+ `dataset_mismatch_reason`（硬报错口径的
+  差异说明：逐项列出变了什么）。
+- 新 API：`save_model(..., const CheckpointState&)`（**role 门禁**：Model 角色携带状态段即报错；
+  张量无状态也报错）、`peek_train_state`、`load_train_state`（张量物化为 f32 并记录**文件里的**
+  每张量精度）、`verify_model_integrity`。
+- L0 补件：`core_sha256.hpp` 增 `sha256_finalize`（增量收尾）与 `sha256_hex(摘要)` 重载；
+  `core_file.hpp` 增 `sha256_file_prefix` / `sha256_file_hex`（流式，大文件不全读）。
+- 顺带收口：`read_param_blob` 的"未信任长度防御"抽成 `ensure_blob_fits_`，新增 `skip_param_blob`
+  —— 读状态段与读权重各需跳过对方时按条目头 seek 过去（载荷读进内存再丢掉，在大模型上一条
+  embedding 就是几百 MB）。
+
+**验证（实测）**
+
+- 新门禁 `train_state_test`（8 组）：kvrec 往返全字段一致；Checkpoint 往返（状态逐项一致 +
+  f32/f16 张量逐位 + 每张量精度记录）；role 门禁两条负例；Model 角色状态段**字节级**为 0；
+  校验和（完好通过 / 翻一字节 / 截断各自明确报错，且 `load_model` 同步失败）；`load_model`
+  跳过状态段后**参数逐位一致**；数据集身份差异说明；**把 v8 文件剥成 v7 后仍能 `load_model`**。
+- `ctest --test-dir build-rv` **50/50**（GPU 用例 77 = skip）；`build-gpu` 注册 **52** 条（计数
+  已同步 AGENTS / 18 / 12）。
+- 端到端（本机 CPU 树）：`text_train` 写出 v8 文件（`state_len=0`、尾部 `NNEND`、role/version 字节
+  经字节级核对）→ `text_infer` 读 `.nnmodel` / `.nnckpt` 两角色均正常 → `--resume` 该断点续训正常；
+  **P1-1 期间产出的 v7 真实文件**（`/tmp/p11/ref_final/*`）仍可加载且生成结果与改动前一致
+  （零破坏的现场证据，非仅单测）。
+- 审计：`doc_inventory`（L2-VIOLATIONS 0 / HANDWRITTEN-RESIDUE 0 / TERMINATING-CALLS 0）与
+  `doc_align_audit`（[A]0 [D]0 [E]0 [F]0）全绿。
+
+**未做（后续刀）**：`Optimizer::save_state/load_state`（Adam m/v + `t`、SGD momentum、Muon、
+AdamWQuant 的 f16 状态与逐行尺度）；训练路径接线（写状态段、按状态段还原精度/计数器/曲线形状）；
+A/B 类**禁列校验**（显式给出即报错）；数据集身份门禁（硬错、无逃生阀）；`.nnmodel` 恢复放开
+（SFT warm start）；GUI 的 `--resume-epoch/--resume-step` 随 role 禁用。

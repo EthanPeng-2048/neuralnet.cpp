@@ -49,12 +49,12 @@
 
 | 维度 | 实测 | 复现 |
 |---|---|---|
-| `include/` | **78 个 `.hpp` / 43424 行** | `Get-ChildItem include -Recurse -Filter *.hpp` + 逐文件 `Get-Content` 计数 |
-| `src/` | **79 个 `.cpp` / 26574 行** | 同上换 `src -Filter *.cpp` |
+| `include/` | **79 个 `.hpp` / 44055 行** | `Get-ChildItem include -Recurse -Filter *.hpp` + 逐文件 `Get-Content` 计数 |
+| `src/` | **80 个 `.cpp` / 27028 行** | 同上换 `src -Filter *.cpp` |
 | `shaders/` | **22 个 `.comp`** | `Get-ChildItem shaders -Recurse -Filter *.comp` |
 | `docs/` | **46 篇 `.md`**（含 `history/history.md` 与 `release-notes/`） | `Get-ChildItem docs -Recurse -Filter *.md` |
 | 最大源文件 | `expr_glsl_gen.hpp` **3435** 行、`compute_cpu_engine.hpp` **2788**、`compute_gpu_engine.hpp` **2610**、`compute_engine.hpp` **2217**、`expr_dsl.hpp` **1973**、`gui.py` **1864**、`backend/compute_vk_backend.hpp` **1073**（v1.8.1 拆 4 片段后回落）。**`src/text_train.cpp` 已不在榜**——P1-1 模块化后 1830 → **396** 行（循环/恢复/断点拆到 `cli/text_train_*.hpp`） | 逐文件 `(Get-Content $f).Count` |
-| ctest | **51 个测试** = 38 个测试目标（`list(APPEND NN_TEST_TARGETS` 计数）+ 13 个变体/附加（`cnn_test_gpu`、`cnn_test_f16`、`cnn_test_f16_gpu`、`rapt_test_f16`、`rapt_test_f16_gpu`、`batchnorm_test_gpu`、`t1_58_test_gpu`、`bitnet_struct_test_gpu`、`write_epoch_test_gpu`、`ternary_gemm_test_gpu`、`adam_quant_test_gpu`、`fusion_custom_layer_example`、`expr_fuse_test`）；**无 Vulkan 的树只注册 49 条**（`fusion_custom_layer_example` / `expr_fuse_test` 是 GPU 专属门禁） | `ctest --test-dir build -N` |
+| ctest | **52 个测试** = 39 个测试目标（`list(APPEND NN_TEST_TARGETS` 计数）+ 13 个变体/附加（`cnn_test_gpu`、`cnn_test_f16`、`cnn_test_f16_gpu`、`rapt_test_f16`、`rapt_test_f16_gpu`、`batchnorm_test_gpu`、`t1_58_test_gpu`、`bitnet_struct_test_gpu`、`write_epoch_test_gpu`、`ternary_gemm_test_gpu`、`adam_quant_test_gpu`、`fusion_custom_layer_example`、`expr_fuse_test`）；**无 Vulkan 的树只注册 50 条**（`fusion_custom_layer_example` / `expr_fuse_test` 是 GPU 专属门禁） | `ctest --test-dir build -N` |
 | 引擎接口 | **52 个 virtual 方法**；`L2-VIOLATIONS: 0`；宿主桥 39 处（仅披露，2026-10-16 实测；P4-2 拆掉 RAPT 逐头 host 往返后由 41 回落） | `pwsh -File bench/doc_inventory.ps1` |
 | 版本 | git tag **v1.8.2**；`CMakeLists.txt` 的 `project(... VERSION 1.8.2)`（与 tag 对齐；口径仍为 **git tag 是版本权威**）；`release-notes/` 有 `v1.5.0.md`、`v1.5.1.md`（2026-10-15 补写）、`v1.6.0.md`、`v1.7.0.md`、`v1.8.1.md`、`v1.8.2.md`（v1.6.1 / v1.7.1 / v1.8.0 无独立发布说明） | `git describe` + 读 `CMakeLists.txt` |
 | CI | `.github/workflows/cmake-single-platform.yml`：clang++ / Ninja / Release / `NN_ENABLE_NATIVE=OFF`，Linux + Windows；**开 `NN_ENABLE_TESTS` 并跑 ctest**（普通 + `NN_BIND_DEBUG=1` 各一轮，P0-1） | 读该 workflow |
@@ -305,7 +305,7 @@ ZiPT 恢复、LRLA、CUDA、分布式（7 项）。
 ### 8.2 本轮新增门禁（P0 后生效）
 
 1. **CI 必须执行 ctest**：日志需出现当前全部用例（**51**，无 Vulkan 树 49）；77 = skip 不算失败（P0-1）。
-2. **开发文档不得出现 ctest 计数的旧写法**：统一写实测 **51**（GPU 树）/ **49**（无 Vulkan 树）——已完成行与 history 归档里的旧数字是当时记录，不算冲突（P0-2 ✅）。
+2. **开发文档不得出现 ctest 计数的旧写法**：统一写实测 **52**（GPU 树）/ **50**（无 Vulkan 树）——已完成行与 history 归档里的旧数字是当时记录，不算冲突（P0-2 ✅）。
 3. **BatchNorm 行为门禁**：构造 batchnorm 规格必须有可观测结果（报错或正确层），不允许静默降级（P0-3）。**✅ 已满足**：真层 + `batchnorm_test` 工厂断言。
 4. **危险精度组合**：启动期**告警**（仅警告、不失败、不改退出码）——口径与细则见 [`24-f16-training-defects.md`](24-f16-training-defects.md) §2.3 / §5 F1（P1-3）。
 5. **审计覆盖补强**：`bench/doc_align_audit.ps1` 的 [A] **✅ 已扩展到 markdown 链接目标**（E8，2026-10-15）；新增死链会在审计里以 [A] 计数非 0 暴露。
