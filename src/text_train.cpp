@@ -108,6 +108,19 @@ namespace
     std::cout << "滑动窗口: seq_len=" << cfg.seq_len << " stride=" << stride
               << " 样本数=" << window_offsets.size() << "\n" << std::endl;
 
+    // ── 数据集身份（P1-2 断点门禁的"内容"侧）────────────────────────────
+    // 路径是**位置**（机器相关、CLI 优先），sha256 + 网格三元组是**身份**
+    // （断点权威）。身份不同 ⇒ 窗口网格、step 号语义、lr 曲线形状全变 ⇒
+    // 续训路径硬报错（出口 = 从 .nnmodel 开新一轮，docs/todo/23 §2.1.1）。
+    nn::DatasetIdentity dataset_identity;
+    dataset_identity.path = cfg.text_path;
+    NN_TRY_MSG(sha_r, "计算数据集身份失败", nn::sha256_file_hex(cfg.text_path));
+    dataset_identity.sha256 = std::move(*sha_r);
+    dataset_identity.num_tokens = token_flow.size();
+    dataset_identity.num_docs = dataset.info().num_docs;
+    dataset_identity.num_windows = window_offsets.size();
+    dataset_identity.loss_scope = loss_scope;
+
     // ── 打印配置 ─────────────────────────────────────────────
     std::cout << "========================================\n";
     std::cout << "  GPT 文本生成训练\n";
@@ -342,6 +355,7 @@ namespace
         .pad_id = pad_id,
         .vocab_size = tokenizer->vocab_size(),
         .stride = stride,
+        .dataset_identity = dataset_identity,
         .mem_probe = mem_probe,
     };
     NN_TRY_MSG(loop_r, "训练循环失败", nn::cli::run_text_train_loop(loop_in));

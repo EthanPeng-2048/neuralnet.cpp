@@ -107,7 +107,11 @@ void test_role_gate_and_roundtrip(const std::filesystem::path& dir)
                                                     kTokenizerBytes),
                      "text_train_modules_test: 写推理模型失败");
     nn::cli::TextTrainCheckpointLog log;
-    log.save(ckpt_file, original, spec, kTokenizerBytes, std::cerr);
+    nn::TrainState ckpt_state;   // P1-2：断点带训练状态段（本用例不挂优化器状态张量）
+    ckpt_state.counters.epoch = 1;
+    ckpt_state.recipe.optimizer = "adam";
+    const std::vector<nn::Tensor> no_blobs;
+    log.save(ckpt_file, original, spec, kTokenizerBytes, ckpt_state, no_blobs, std::cerr);
     CHECK(log.failures() == 0, "断点写到可写路径不应记账失败");
 
     // 门禁：推理模型被拒绝（文案 = 用户可见契约，docs/todo/23 §2.1）
@@ -175,7 +179,9 @@ void test_ckpt_accounting(const std::filesystem::path& dir)
     std::filesystem::create_directories(occupied);
     nn::cli::TextTrainCheckpointLog log;
     std::ostringstream err;
-    log.save(occupied.string(), model, spec, kTokenizerBytes, err);
+    nn::TrainState ckpt_state;
+    const std::vector<nn::Tensor> no_blobs;
+    log.save(occupied.string(), model, spec, kTokenizerBytes, ckpt_state, no_blobs, err);
     CHECK(log.failures() == 1, "写失败的断点必须计入 1 次");
     CHECK(err.str().find("[ckpt] 保存失败") != std::string::npos, "错误行应带 [ckpt] 标记");
     CHECK(err.str().find("第 1 次") != std::string::npos, "错误行应带第几次（P1-1 文案）");
@@ -187,7 +193,8 @@ void test_ckpt_accounting(const std::filesystem::path& dir)
           "收尾错误行应说明退出码");
 
     // 成功路径：不增计数、退出码 0、不打印
-    log.save((dir / "ok.nnckpt").string(), model, spec, kTokenizerBytes, err);
+    log.save((dir / "ok.nnckpt").string(), model, spec, kTokenizerBytes, ckpt_state,
+             no_blobs, err);
     CHECK(log.failures() == 1, "成功保存不应增加失败计数");
     std::ostringstream err_ok;
     CHECK(nn::cli::text_train_ckpt_exit_code(0, err_ok) == 0, "无失败时退出码必须为 0");

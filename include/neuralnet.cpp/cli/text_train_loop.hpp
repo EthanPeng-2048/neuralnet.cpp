@@ -51,6 +51,76 @@
 
 namespace nn::cli
 {
+// ── 断点状态装配（P1-2）────────────────────────────────────────────────
+// `counters` 记的是**下一步的位置**（epoch 边界已归一化）⇒ 续训直接拿它当起点
+// （`--resume-epoch/--resume-step` 因此退出舞台）；`global_step` 与 step 级调度
+// 的索引同定义（= epoch·steps_per_epoch + step）；`lr` 只作显示/交叉校验
+// （权威值由调度按步号重算）。`recipe` = 本进程**实际使用**的配方（续训时已由
+// 状态段回写 cfg），`dataset` = 身份 + 网格。
+[[nodiscard]] inline nn::TrainState make_train_state(
+    const TrainConfig& cfg, const nn::DatasetIdentity& identity,
+    std::size_t steps_per_epoch, std::size_t epoch, std::size_t step_done,
+    double current_lr, std::uint64_t optimizer_step)
+{
+    nn::TrainState s;
+    std::size_t e = epoch, st = step_done;
+    if (steps_per_epoch > 0 && st >= steps_per_epoch) { ++e; st = 0; }
+    s.counters.epoch = e;
+    s.counters.step_in_epoch = st;
+    s.counters.global_step =
+        static_cast<std::uint64_t>(e) * static_cast<std::uint64_t>(steps_per_epoch) + st;
+    s.counters.lr = current_lr;
+
+    s.recipe.precision = cfg.precision;
+    s.recipe.optimizer = cfg.optimizer_name;
+    s.recipe.lr_schedule = cfg.lr_schedule;
+    s.recipe.lr = static_cast<double>(cfg.lr);
+    s.recipe.min_lr = static_cast<double>(cfg.min_lr);
+    s.recipe.weight_decay = static_cast<double>(cfg.weight_decay);
+    s.recipe.beta1 = static_cast<double>(cfg.beta1);
+    s.recipe.beta2 = static_cast<double>(cfg.beta2);
+    s.recipe.max_norm = static_cast<double>(cfg.max_norm);
+    s.recipe.epochs = static_cast<std::uint64_t>(cfg.epochs);
+    s.recipe.total_steps = static_cast<std::uint64_t>(steps_per_epoch) *
+                           static_cast<std::uint64_t>(cfg.epochs);
+    s.recipe.warmup_epochs = static_cast<std::uint64_t>(cfg.warmup_epochs);
+    s.recipe.warmup_steps = static_cast<std::uint64_t>(cfg.warmup_steps);
+    s.recipe.batch_size = static_cast<std::uint64_t>(cfg.batch_size);
+    s.recipe.accum_steps = static_cast<std::uint64_t>(cfg.accum_steps);
+    s.recipe.stride = static_cast<std::uint64_t>(cfg.stride);
+    s.recipe.lr_per_epoch.clear();
+    s.recipe.lr_per_epoch.reserve(cfg.lr_per_epoch.size());
+    for (nn::Scalar v : cfg.lr_per_epoch)
+        s.recipe.lr_per_epoch.push_back(static_cast<double>(v));
+
+    s.dataset = identity;
+    s.dataset.steps_per_epoch = static_cast<std::uint64_t>(steps_per_epoch);
+    s.optimizer_step = optimizer_step;
+    return s;
+}
+
+// 写一次**带训练状态**的断点：导出优化器状态张量 → 装配状态 → 记账式保存。
+// 任何一步失败都只记账（P1-1 口径：磁盘/导出抖动不终止训练，收尾非零退出）。
+inline void save_ckpt_with_state(
+    const std::string& path, nn::Model& model, const nn::ModelSpec& spec,
+    const std::string& tokenizer_bytes, const TrainConfig& cfg,
+    const nn::DatasetIdentity& identity, TextTrainCheckpointLog& log,
+    std::size_t epoch, std::size_t step_done, std::size_t steps_per_epoch,
+    double current_lr, nn::Optimizer& optimizer, std::ostream& err)
+{
+    std::vector<nn::Tensor> blobs;
+    auto sr = optimizer.save_state(blobs);
+    if (!sr)
+    {
+        log.note_failure("优化器状态导出失败: " + sr.error().message, err);
+        return;
+    }
+    const nn::TrainState state = make_train_state(cfg, identity, steps_per_epoch,
+                                                 epoch, step_done, current_lr,
+                                                 optimizer.state_step());
+    log.save(path, model, spec, tokenizer_bytes, state, blobs, err);
+}
+
 // ══ 非有限值追踪探针（NN_NAN_TRACE=1；探针门见 core_config.hpp）═══════════
 // 探针门：默认构建（未 -DNN_ENABLE_PROBES=ON）里**整块不编译**——训练循环里
 // 连判定分支都不存在（调用点同样被 #if 包住），环境变量 NN_NAN_TRACE 无效。
@@ -321,6 +391,9 @@ struct TextTrainLoopInput
     std::size_t pad_id = 0;
     std::size_t vocab_size = 0;
     std::size_t stride = 0;
+    // 数据集身份（P1-2）：路径 / sha256 / tokens / docs / windows / loss_scope。
+    // steps_per_epoch 由本模块按窗口数 ÷ batch_size 填（同一真源）。
+    nn::DatasetIdentity dataset_identity{};
     TextTrainMemProbe mem_probe{};
 };
 
@@ -823,9 +896,13 @@ struct TextTrainLoopOutcome
             {
                 prof.start("ckpt");
                 // 训练断点（Checkpoint 角色）：含训练参数（三值层 = f32 latent）。
-                // 路径派生 / 失败记账与文案都在 checkpoint 模块里。
-                ckpt_log.save(text_train_ckpt_path(cfg.save_path), model, in.spec,
-                              in.tokenizer_bytes, std::cerr);
+                // 路径派生 / 失败记账与文案都在 checkpoint 模块里；状态段装配见下。
+                save_ckpt_with_state(text_train_ckpt_path(cfg.save_path), model,
+                                     in.spec, in.tokenizer_bytes, cfg,
+                                     in.dataset_identity, ckpt_log, epoch,
+                                     /*step_done=*/step + 1, steps_per_epoch,
+                                     static_cast<double>(optimizer_current_lr),
+                                     optimizer, std::cerr);
             }
 
             // ── --max-steps 到达：本步已完成更新与保存，退出步循环 ──
