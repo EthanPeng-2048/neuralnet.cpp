@@ -54,32 +54,19 @@
             output = std::move(*output_res);
         }
 
-        // 2. 分配描述符集
-        auto ds_r = alloc_desc_set(pipeline.descriptor_layout());
+        // 2. 分配并写入描述符集（未使用的 binding 绑定 A 作为占位）
+        VkBuffer a_buf = A.buffer().impl();
+        const VkBuffer bindings[4]{
+            a_buf,
+            B ? B->buffer().impl() : a_buf,
+            C ? C->buffer().impl() : a_buf,
+            output.buffer().impl(),
+        };
+        auto ds_r = alloc_desc_set_for(pipeline.descriptor_layout(), bindings);
         NN_TRY_CHECK(ds_r);
         VkDescriptorSet desc_set = *ds_r;
 
-        // 3. 写入描述符集（未使用的 binding 绑定 A 作为占位）
-        VkBuffer a_buf = A.buffer().impl();
-        VkDescriptorBufferInfo buf_infos[4]{
-            {a_buf, 0, VK_WHOLE_SIZE},
-            {B ? B->buffer().impl() : a_buf, 0, VK_WHOLE_SIZE},
-            {C ? C->buffer().impl() : a_buf, 0, VK_WHOLE_SIZE},
-            {output.buffer().impl(), 0, VK_WHOLE_SIZE},
-        };
-        VkWriteDescriptorSet writes[4]{};
-        for (int i = 0; i < 4; ++i)
-        {
-            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            writes[i].dstSet = desc_set;
-            writes[i].dstBinding = static_cast<uint32_t>(i);
-            writes[i].descriptorCount = 1;
-            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            writes[i].pBufferInfo = &buf_infos[i];
-        }
-        vkUpdateDescriptorSets(device_.device(), 4, writes, 0, nullptr);
-
-        // 4. 获取 command buffer
+        // 3. 获取 command buffer
         auto cmd_r = acquire_cmd();
         if (!cmd_r)
         {
@@ -88,7 +75,7 @@
         }
         auto [cmd, owns_cmd] = *cmd_r;
 
-        // 5. 录制
+        // 4. 录制
         record_input_barriers(cmd, {a_buf});
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
             pipeline.handle());
@@ -430,57 +417,27 @@
 
             // 3. 描述符集：#ks = N 输入 + 1 部分和；#kr = N 输入 + 部分和 + 输出
             const std::size_t n_in = inputs.size();
-            auto ds1_r = alloc_desc_set(ks_pipe.descriptor_layout());
+            std::vector<VkBuffer> ks_bindings(n_in + 1);
+            std::vector<VkBuffer> kr_bindings(n_in + 2);
+            for (std::size_t i = 0; i < n_in; ++i)
+            {
+                ks_bindings[i] = inputs[i]->impl();
+                kr_bindings[i] = inputs[i]->impl();
+            }
+            ks_bindings[n_in] = partial.buffer().impl();
+            kr_bindings[n_in] = partial.buffer().impl();
+            kr_bindings[n_in + 1] = output.buffer().impl();
+
+            auto ds1_r = alloc_desc_set_for(ks_pipe.descriptor_layout(), ks_bindings);
             NN_TRY_CHECK(ds1_r);
             VkDescriptorSet ds_ks = *ds1_r;
-            auto ds2_r = alloc_desc_set(kr_pipe.descriptor_layout());
+            auto ds2_r = alloc_desc_set_for(kr_pipe.descriptor_layout(), kr_bindings);
             if (!ds2_r)
             {
                 release_desc_set_now(ds_ks);
                 NN_TRY_CHECK(ds2_r);
             }
             VkDescriptorSet ds_kr = *ds2_r;
-            {
-                // #ks：N 输入 + 部分和（binding N）
-                std::vector<VkDescriptorBufferInfo> infos(n_in + 1);
-                std::vector<VkWriteDescriptorSet> writes(n_in + 1);
-                for (std::size_t i = 0; i < n_in; ++i)
-                    infos[i] = {inputs[i]->impl(), 0, VK_WHOLE_SIZE};
-                infos[n_in] = {partial.buffer().impl(), 0, VK_WHOLE_SIZE};
-                for (std::size_t i = 0; i < infos.size(); ++i)
-                {
-                    writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-                    writes[i].dstSet = ds_ks;
-                    writes[i].dstBinding = static_cast<std::uint32_t>(i);
-                    writes[i].descriptorCount = 1;
-                    writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-                    writes[i].pBufferInfo = &infos[i];
-                }
-                vkUpdateDescriptorSets(device_.device(),
-                    static_cast<std::uint32_t>(infos.size()), writes.data(),
-                    0, nullptr);
-            }
-            {
-                // #kr：N 输入 + 部分和（binding N）+ 最终输出（binding N+1）
-                std::vector<VkDescriptorBufferInfo> infos(n_in + 2);
-                std::vector<VkWriteDescriptorSet> writes(n_in + 2);
-                for (std::size_t i = 0; i < n_in; ++i)
-                    infos[i] = {inputs[i]->impl(), 0, VK_WHOLE_SIZE};
-                infos[n_in] = {partial.buffer().impl(), 0, VK_WHOLE_SIZE};
-                infos[n_in + 1] = {output.buffer().impl(), 0, VK_WHOLE_SIZE};
-                for (std::size_t i = 0; i < infos.size(); ++i)
-                {
-                    writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-                    writes[i].dstSet = ds_kr;
-                    writes[i].dstBinding = static_cast<std::uint32_t>(i);
-                    writes[i].descriptorCount = 1;
-                    writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-                    writes[i].pBufferInfo = &infos[i];
-                }
-                vkUpdateDescriptorSets(device_.device(),
-                    static_cast<std::uint32_t>(infos.size()), writes.data(),
-                    0, nullptr);
-            }
 
             // 4. 录制：inputs 屏障 → #ks → partial 屏障 → #kr → 输出屏障
             auto cmd_r = acquire_cmd();
@@ -552,15 +509,10 @@
         }
 
         // 2. 分配描述符集（N 输入 + 1 输出；分派变体 = 2N + 2；extras 追加 k 个输出）
-        auto ds_r = alloc_desc_set(pipeline.descriptor_layout());
-        NN_TRY_CHECK(ds_r);
-        VkDescriptorSet desc_set = *ds_r;
-
         const std::size_t n_in = inputs.size();
         const std::size_t n_bindings =
             is_disp ? (2 * n_in + 2) : (n_in + 1 + extra_outs.size());
-        std::vector<VkDescriptorBufferInfo> buf_infos(n_bindings);
-        std::vector<VkWriteDescriptorSet> writes(n_bindings);
+        std::vector<VkBuffer> bindings(n_bindings);
         if (is_disp)
         {
             // 同一 VkBuffer 绑两次（f32 视图 / f16 视图）；输入对是 readonly、
@@ -568,32 +520,24 @@
             // → 另一个从不访问（无别名风险）。
             for (std::size_t i = 0; i < n_in; ++i)
             {
-                buf_infos[i] = {inputs[i]->impl(), 0, VK_WHOLE_SIZE};
-                buf_infos[n_in + i] = {inputs[i]->impl(), 0, VK_WHOLE_SIZE};
+                bindings[i] = inputs[i]->impl();
+                bindings[n_in + i] = inputs[i]->impl();
             }
-            buf_infos[2 * n_in] = {output.buffer().impl(), 0, VK_WHOLE_SIZE};
-            buf_infos[2 * n_in + 1] = {output.buffer().impl(), 0, VK_WHOLE_SIZE};
+            bindings[2 * n_in] = output.buffer().impl();
+            bindings[2 * n_in + 1] = output.buffer().impl();
         }
         else
         {
             for (std::size_t i = 0; i < n_in; ++i)
-                buf_infos[i] = {inputs[i]->impl(), 0, VK_WHOLE_SIZE};
-            buf_infos[n_in] = {output.buffer().impl(), 0, VK_WHOLE_SIZE};
+                bindings[i] = inputs[i]->impl();
+            bindings[n_in] = output.buffer().impl();
             // P2 多输出：bex<k> 绑定在主输出之后（与生成器 binding 同序）
             for (std::size_t k = 0; k < extra_outs.size(); ++k)
-                buf_infos[n_in + 1 + k] = {extra_outs[k]->buffer().impl(), 0, VK_WHOLE_SIZE};
+                bindings[n_in + 1 + k] = extra_outs[k]->buffer().impl();
         }
-        for (std::size_t i = 0; i < n_bindings; ++i)
-        {
-            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            writes[i].dstSet = desc_set;
-            writes[i].dstBinding = static_cast<std::uint32_t>(i);
-            writes[i].descriptorCount = 1;
-            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            writes[i].pBufferInfo = &buf_infos[i];
-        }
-        vkUpdateDescriptorSets(device_.device(),
-            static_cast<std::uint32_t>(n_bindings), writes.data(), 0, nullptr);
+        auto ds_r = alloc_desc_set_for(pipeline.descriptor_layout(), bindings);
+        NN_TRY_CHECK(ds_r);
+        VkDescriptorSet desc_set = *ds_r;
 
         // 3. 获取 command buffer
         auto cmd_r = acquire_cmd();
@@ -912,18 +856,11 @@
 
         // 描述符：key#b pipeline 只绑 binding 0（实例表）——复用 per-pipeline
         // 描述符机制
-        auto ds_r = alloc_desc_set(pipeline.descriptor_layout());
+        // 批量变体只有一个 binding：实例表
+        const VkBuffer instance_table = inst_buf->impl();
+        auto ds_r = alloc_desc_set_for(pipeline.descriptor_layout(), {&instance_table, 1});
         NN_TRY_CHECK(ds_r);
         VkDescriptorSet desc_set = *ds_r;
-        VkDescriptorBufferInfo inst_bi{inst_buf->impl(), 0, VK_WHOLE_SIZE};
-        VkWriteDescriptorSet w{};
-        w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        w.dstSet = desc_set;
-        w.dstBinding = 0;
-        w.descriptorCount = 1;
-        w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        w.pBufferInfo = &inst_bi;
-        vkUpdateDescriptorSets(device_.device(), 1, &w, 0, nullptr);
 
         // command buffer
         auto cmd_r = acquire_cmd();
@@ -1113,35 +1050,17 @@
             // pass1 读输入（f16_in → f16 pipeline，ds/layout 随之）；
             // pass2 读 f32 partials → 恒 f32 pipeline（f16 shader 读 f32
             // partials = 静默错值，必须分开）
-            auto ds1_r = alloc_desc_set(in_pipe.descriptor_layout());
+            const VkBuffer pass1_bindings[2]{
+                input.buffer().impl(), partial.buffer().impl()};
+            const VkBuffer pass2_bindings[2]{
+                partial.buffer().impl(), output.buffer().impl()};
+            auto ds1_r = alloc_desc_set_for(in_pipe.descriptor_layout(), pass1_bindings);
             NN_TRY_CHECK(ds1_r);
             VkDescriptorSet ds1 = *ds1_r;
-            auto ds2_r = alloc_desc_set(pipelines_.get(PipelineId::reduce).descriptor_layout());
+            auto ds2_r = alloc_desc_set_for(
+                pipelines_.get(PipelineId::reduce).descriptor_layout(), pass2_bindings);
             NN_TRY_CHECK(ds2_r);
             VkDescriptorSet ds2 = *ds2_r;
-
-            VkDescriptorBufferInfo infos1[2]{
-                {input.buffer().impl(), 0, VK_WHOLE_SIZE},
-                {partial.buffer().impl(), 0, VK_WHOLE_SIZE},
-            };
-            VkDescriptorBufferInfo infos2[2]{
-                {partial.buffer().impl(), 0, VK_WHOLE_SIZE},
-                {output.buffer().impl(), 0, VK_WHOLE_SIZE},
-            };
-            VkWriteDescriptorSet writes[4]{};
-            for (int i = 0; i < 2; ++i)
-            {
-                writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-                writes[i].dstSet = ds1;
-                writes[i].dstBinding = static_cast<uint32_t>(i);
-                writes[i].descriptorCount = 1;
-                writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-                writes[i].pBufferInfo = &infos1[i];
-                writes[2 + i] = writes[i];
-                writes[2 + i].dstSet = ds2;
-                writes[2 + i].pBufferInfo = &infos2[i];
-            }
-            vkUpdateDescriptorSets(device_.device(), 4, writes, 0, nullptr);
 
             auto cmd_r = acquire_cmd();
             if (!cmd_r)
@@ -1188,26 +1107,11 @@
         }
 
         // 2. 分配描述符集（随 in_pipe：f16_in 时输入按 float16_t 读）
-        auto ds_r = alloc_desc_set(in_pipe.descriptor_layout());
+        const VkBuffer bindings[2]{
+            input.buffer().impl(), output.buffer().impl()};
+        auto ds_r = alloc_desc_set_for(in_pipe.descriptor_layout(), bindings);
         NN_TRY_CHECK(ds_r);
         VkDescriptorSet desc_set = *ds_r;
-
-        // 3. 写入描述符集
-        VkDescriptorBufferInfo buf_infos[2]{
-            {input.buffer().impl(), 0, VK_WHOLE_SIZE},
-            {output.buffer().impl(), 0, VK_WHOLE_SIZE},
-        };
-        VkWriteDescriptorSet writes[2]{};
-        for (int i = 0; i < 2; ++i)
-        {
-            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            writes[i].dstSet = desc_set;
-            writes[i].dstBinding = static_cast<uint32_t>(i);
-            writes[i].descriptorCount = 1;
-            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            writes[i].pBufferInfo = &buf_infos[i];
-        }
-        vkUpdateDescriptorSets(device_.device(), 2, writes, 0, nullptr);
 
         // 4. 获取 command buffer
         auto cmd_r = acquire_cmd();
@@ -1288,27 +1192,12 @@
         }
         GpuTensor output = *owned;
 
-        // 2. 分配描述符集
-        auto ds_r = alloc_desc_set(pipeline.descriptor_layout());
+        // 2. 分配并写入描述符集
+        const VkBuffer bindings[2]{
+            input.buffer().impl(), output.buffer().impl()};
+        auto ds_r = alloc_desc_set_for(pipeline.descriptor_layout(), bindings);
         NN_TRY_CHECK(ds_r);
         VkDescriptorSet desc_set = *ds_r;
-
-        // 3. 写入描述符集
-        VkDescriptorBufferInfo buf_infos[2]{
-            {input.buffer().impl(), 0, VK_WHOLE_SIZE},
-            {output.buffer().impl(), 0, VK_WHOLE_SIZE},
-        };
-        VkWriteDescriptorSet writes[2]{};
-        for (int i = 0; i < 2; ++i)
-        {
-            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            writes[i].dstSet = desc_set;
-            writes[i].dstBinding = static_cast<uint32_t>(i);
-            writes[i].descriptorCount = 1;
-            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            writes[i].pBufferInfo = &buf_infos[i];
-        }
-        vkUpdateDescriptorSets(device_.device(), 2, writes, 0, nullptr);
 
         // 4. 获取 command buffer
         auto cmd_r = acquire_cmd();
@@ -1645,29 +1534,11 @@
             NN_FAIL("GPU backend not initialized");
         if (!has(PipelineId::cast))
             NN_FAIL("cast_gpu: cast pipeline not available");
-        auto ds_r = alloc_desc_set(pipelines_.get(PipelineId::cast).descriptor_layout());
+        const VkBuffer bindings[2]{src.impl(), dst.impl()};
+        auto ds_r = alloc_desc_set_for(
+            pipelines_.get(PipelineId::cast).descriptor_layout(), bindings);
         NN_TRY_CHECK(ds_r);
         VkDescriptorSet desc_set = *ds_r;
-
-        VkDescriptorBufferInfo binfo[2] = {
-            {src.impl(), 0, VK_WHOLE_SIZE},
-            {dst.impl(), 0, VK_WHOLE_SIZE},
-        };
-        VkWriteDescriptorSet writes[2];
-        for (std::uint32_t i = 0; i < 2; ++i)
-        {
-            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            writes[i].pNext = nullptr;
-            writes[i].dstSet = desc_set;
-            writes[i].dstBinding = i;
-            writes[i].dstArrayElement = 0;
-            writes[i].descriptorCount = 1;
-            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            writes[i].pImageInfo = nullptr;
-            writes[i].pBufferInfo = &binfo[i];
-            writes[i].pTexelBufferView = nullptr;
-        }
-        vkUpdateDescriptorSets(device_.device(), 2, writes, 0, nullptr);
 
         auto cmd_r = acquire_cmd();
         if (!cmd_r)
@@ -1715,30 +1586,11 @@
             NN_FAIL("GPU backend not initialized");
         if (!has(PipelineId::trit_pack))
             NN_FAIL("trit_pack_gpu: trit_pack pipeline not available");
-        auto ds_r = alloc_desc_set(pipelines_.get(PipelineId::trit_pack).descriptor_layout());
+        const VkBuffer bindings[3]{w.impl(), tau.impl(), packed.impl()};
+        auto ds_r = alloc_desc_set_for(
+            pipelines_.get(PipelineId::trit_pack).descriptor_layout(), bindings);
         NN_TRY_CHECK(ds_r);
         VkDescriptorSet desc_set = *ds_r;
-
-        VkDescriptorBufferInfo binfo[3] = {
-            {w.impl(), 0, VK_WHOLE_SIZE},
-            {tau.impl(), 0, VK_WHOLE_SIZE},
-            {packed.impl(), 0, VK_WHOLE_SIZE},
-        };
-        VkWriteDescriptorSet writes[3];
-        for (std::uint32_t i = 0; i < 3; ++i)
-        {
-            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            writes[i].pNext = nullptr;
-            writes[i].dstSet = desc_set;
-            writes[i].dstBinding = i;
-            writes[i].dstArrayElement = 0;
-            writes[i].descriptorCount = 1;
-            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            writes[i].pImageInfo = nullptr;
-            writes[i].pBufferInfo = &binfo[i];
-            writes[i].pTexelBufferView = nullptr;
-        }
-        vkUpdateDescriptorSets(device_.device(), 3, writes, 0, nullptr);
 
         auto cmd_r = acquire_cmd();
         if (!cmd_r)
@@ -1821,31 +1673,11 @@
                 NN_FAIL("matmul_q_gpu: matmul_q pipeline not available");
             pipe = &pipelines_.get(PipelineId::matmul_q);
         }
-        auto ds_r = alloc_desc_set(pipe->descriptor_layout());
+        const VkBuffer bindings[4]{
+            packed.impl(), tau.impl(), b.impl(), c.impl()};
+        auto ds_r = alloc_desc_set_for(pipe->descriptor_layout(), bindings);
         NN_TRY_CHECK(ds_r);
         VkDescriptorSet desc_set = *ds_r;
-
-        VkDescriptorBufferInfo binfo[4] = {
-            {packed.impl(), 0, VK_WHOLE_SIZE},
-            {tau.impl(), 0, VK_WHOLE_SIZE},
-            {b.impl(), 0, VK_WHOLE_SIZE},
-            {c.impl(), 0, VK_WHOLE_SIZE},
-        };
-        VkWriteDescriptorSet writes[4];
-        for (std::uint32_t i = 0; i < 4; ++i)
-        {
-            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            writes[i].pNext = nullptr;
-            writes[i].dstSet = desc_set;
-            writes[i].dstBinding = i;
-            writes[i].dstArrayElement = 0;
-            writes[i].descriptorCount = 1;
-            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            writes[i].pImageInfo = nullptr;
-            writes[i].pBufferInfo = &binfo[i];
-            writes[i].pTexelBufferView = nullptr;
-        }
-        vkUpdateDescriptorSets(device_.device(), 4, writes, 0, nullptr);
 
         auto cmd_r = acquire_cmd();
         if (!cmd_r)
@@ -2104,26 +1936,10 @@
         GpuTensor output = *owned;
 
         // 分配描述符集
-        auto ds_r = alloc_desc_set(pipeline.descriptor_layout());
+        const VkBuffer bindings[2]{A.buffer().impl(), output.buffer().impl()};
+        auto ds_r = alloc_desc_set_for(pipeline.descriptor_layout(), bindings);
         NN_TRY_CHECK(ds_r);
         VkDescriptorSet desc_set = *ds_r;
-
-        // 写入描述符集
-        VkDescriptorBufferInfo buf_infos[2]{
-            {A.buffer().impl(), 0, VK_WHOLE_SIZE},
-            {output.buffer().impl(), 0, VK_WHOLE_SIZE},
-        };
-        VkWriteDescriptorSet writes[2]{};
-        for (int i = 0; i < 2; ++i)
-        {
-            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            writes[i].dstSet = desc_set;
-            writes[i].dstBinding = static_cast<uint32_t>(i);
-            writes[i].descriptorCount = 1;
-            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            writes[i].pBufferInfo = &buf_infos[i];
-        }
-        vkUpdateDescriptorSets(device_.device(), 2, writes, 0, nullptr);
 
         // 获取 command buffer
         auto cmd_r = acquire_cmd();
@@ -2211,25 +2027,10 @@
             output = std::move(*out_res);
         }
 
-        auto ds_r = alloc_desc_set(pipe.descriptor_layout());
+        const VkBuffer bindings[2]{x.buffer().impl(), output.buffer().impl()};
+        auto ds_r = alloc_desc_set_for(pipe.descriptor_layout(), bindings);
         NN_TRY_CHECK(ds_r);
         VkDescriptorSet desc_set = *ds_r;
-
-        VkDescriptorBufferInfo buf_infos[2]{
-            {x.buffer().impl(), 0, VK_WHOLE_SIZE},
-            {output.buffer().impl(), 0, VK_WHOLE_SIZE},
-        };
-        VkWriteDescriptorSet writes[2]{};
-        for (int i = 0; i < 2; ++i)
-        {
-            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            writes[i].dstSet = desc_set;
-            writes[i].dstBinding = static_cast<uint32_t>(i);
-            writes[i].descriptorCount = 1;
-            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            writes[i].pBufferInfo = &buf_infos[i];
-        }
-        vkUpdateDescriptorSets(device_.device(), 2, writes, 0, nullptr);
 
         auto cmd_r = acquire_cmd();
         if (!cmd_r)
@@ -2305,25 +2106,10 @@
             output = std::move(*out_res);
         }
 
-        auto ds_r = alloc_desc_set(pipe.descriptor_layout());
+        const VkBuffer bindings[2]{col.buffer().impl(), output.buffer().impl()};
+        auto ds_r = alloc_desc_set_for(pipe.descriptor_layout(), bindings);
         NN_TRY_CHECK(ds_r);
         VkDescriptorSet desc_set = *ds_r;
-
-        VkDescriptorBufferInfo buf_infos[2]{
-            {col.buffer().impl(), 0, VK_WHOLE_SIZE},
-            {output.buffer().impl(), 0, VK_WHOLE_SIZE},
-        };
-        VkWriteDescriptorSet writes[2]{};
-        for (int i = 0; i < 2; ++i)
-        {
-            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            writes[i].dstSet = desc_set;
-            writes[i].dstBinding = static_cast<uint32_t>(i);
-            writes[i].descriptorCount = 1;
-            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            writes[i].pBufferInfo = &buf_infos[i];
-        }
-        vkUpdateDescriptorSets(device_.device(), 2, writes, 0, nullptr);
 
         auto cmd_r = acquire_cmd();
         if (!cmd_r)
@@ -2394,25 +2180,10 @@
         NN_TRY_CHECK(out_res);
         GpuTensor output = std::move(*out_res);
 
-        auto ds_r = alloc_desc_set(pipe.descriptor_layout());
+        const VkBuffer bindings[2]{x.buffer().impl(), output.buffer().impl()};
+        auto ds_r = alloc_desc_set_for(pipe.descriptor_layout(), bindings);
         NN_TRY_CHECK(ds_r);
         VkDescriptorSet desc_set = *ds_r;
-
-        VkDescriptorBufferInfo buf_infos[2]{
-            {x.buffer().impl(), 0, VK_WHOLE_SIZE},
-            {output.buffer().impl(), 0, VK_WHOLE_SIZE},
-        };
-        VkWriteDescriptorSet writes[2]{};
-        for (int i = 0; i < 2; ++i)
-        {
-            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            writes[i].dstSet = desc_set;
-            writes[i].dstBinding = static_cast<uint32_t>(i);
-            writes[i].descriptorCount = 1;
-            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            writes[i].pBufferInfo = &buf_infos[i];
-        }
-        vkUpdateDescriptorSets(device_.device(), 2, writes, 0, nullptr);
 
         auto cmd_r = acquire_cmd();
         if (!cmd_r)
@@ -2490,27 +2261,11 @@
         GpuTensor output = *owned;
 
         // 分配描述符集
-        auto ds_r = alloc_desc_set(pipeline.descriptor_layout());
+        const VkBuffer bindings[3]{
+            table.buffer().impl(), indices.buffer().impl(), output.buffer().impl()};
+        auto ds_r = alloc_desc_set_for(pipeline.descriptor_layout(), bindings);
         NN_TRY_CHECK(ds_r);
         VkDescriptorSet desc_set = *ds_r;
-
-        // 写入描述符集
-        VkDescriptorBufferInfo buf_infos[3]{
-            {table.buffer().impl(), 0, VK_WHOLE_SIZE},
-            {indices.buffer().impl(), 0, VK_WHOLE_SIZE},
-            {output.buffer().impl(), 0, VK_WHOLE_SIZE},
-        };
-        VkWriteDescriptorSet writes[3]{};
-        for (int i = 0; i < 3; ++i)
-        {
-            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            writes[i].dstSet = desc_set;
-            writes[i].dstBinding = static_cast<uint32_t>(i);
-            writes[i].descriptorCount = 1;
-            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            writes[i].pBufferInfo = &buf_infos[i];
-        }
-        vkUpdateDescriptorSets(device_.device(), 3, writes, 0, nullptr);
 
         // 获取 command buffer
         auto cmd_r = acquire_cmd();
@@ -2580,27 +2335,12 @@
         const uint32_t num = static_cast<uint32_t>(indices.rows() * indices.cols());
 
         // 分配描述符集
-        auto ds_r = alloc_desc_set(pipe.descriptor_layout());
+        // dst 使用 uint 视图用于原子操作
+        const VkBuffer bindings[3]{
+            dst.buffer().impl(), indices.buffer().impl(), grad.buffer().impl()};
+        auto ds_r = alloc_desc_set_for(pipe.descriptor_layout(), bindings);
         NN_TRY_CHECK(ds_r);
         VkDescriptorSet desc_set = *ds_r;
-
-        // 写入描述符集（dst 使用 uint 视图用于原子操作）
-        VkDescriptorBufferInfo buf_infos[3]{
-            {dst.buffer().impl(), 0, VK_WHOLE_SIZE},
-            {indices.buffer().impl(), 0, VK_WHOLE_SIZE},
-            {grad.buffer().impl(), 0, VK_WHOLE_SIZE},
-        };
-        VkWriteDescriptorSet writes[3]{};
-        for (int i = 0; i < 3; ++i)
-        {
-            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            writes[i].dstSet = desc_set;
-            writes[i].dstBinding = static_cast<uint32_t>(i);
-            writes[i].descriptorCount = 1;
-            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            writes[i].pBufferInfo = &buf_infos[i];
-        }
-        vkUpdateDescriptorSets(device_.device(), 3, writes, 0, nullptr);
 
         // 获取 command buffer
         auto cmd_r = acquire_cmd();

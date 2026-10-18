@@ -514,27 +514,14 @@
         if (!initialized_)
             NN_FAIL("GPU backend not initialized");
         const auto t_disp_start = std::chrono::steady_clock::now();
-        auto ds_r = alloc_desc_set(pipeline.descriptor_layout());
+        const std::size_t n = inputs.size() + 1;
+        std::vector<VkBuffer> bindings(n);
+        for (std::size_t i = 0; i < inputs.size(); ++i)
+            bindings[i] = inputs[i].buffer().impl();
+        bindings[n - 1] = output.buffer().impl();
+        auto ds_r = alloc_desc_set_for(pipeline.descriptor_layout(), bindings);
         NN_TRY_CHECK(ds_r);
         VkDescriptorSet desc_set = *ds_r;
-
-        const std::size_t n = inputs.size() + 1;
-        std::vector<VkDescriptorBufferInfo> buf_infos(n);
-        std::vector<VkWriteDescriptorSet> writes(n);
-        for (std::size_t i = 0; i < inputs.size(); ++i)
-            buf_infos[i] = {inputs[i].buffer().impl(), 0, VK_WHOLE_SIZE};
-        buf_infos[n - 1] = {output.buffer().impl(), 0, VK_WHOLE_SIZE};
-        for (std::size_t i = 0; i < n; ++i)
-        {
-            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            writes[i].dstSet = desc_set;
-            writes[i].dstBinding = static_cast<uint32_t>(i);
-            writes[i].descriptorCount = 1;
-            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            writes[i].pBufferInfo = &buf_infos[i];
-        }
-        vkUpdateDescriptorSets(device_.device(),
-            static_cast<uint32_t>(n), writes.data(), 0, nullptr);
 
         auto cmd_r = acquire_cmd();
         if (!cmd_r)

@@ -252,6 +252,54 @@
         return desc_set;
     }
 
+    // ── 辅助：分配描述符集并把 buffers[i] 绑到 binding i ──────────────────
+    // 取代每个算子各写一遍的 "VkDescriptorBufferInfo[N] + VkWriteDescriptorSet[N]
+    // + vkUpdateDescriptorSets" 样板。失败路径自己归还集合（RV-15 语义），
+    // 调用方只需 NN_TRY_CHECK。
+    //
+    // 16 个以内走栈上数组（原语算子最多 4 个绑定，融合 extras 也在上限内）；
+    // 超过时退回堆——保持旧实现"支持任意 N"的行为不变。
+    [[nodiscard]] Result<VkDescriptorSet> alloc_desc_set_for(
+        VkDescriptorSetLayout layout, std::span<const VkBuffer> buffers)
+    {
+        auto ds_r = alloc_desc_set(layout);
+        if (!ds_r)
+            return ds_r;
+        const VkDescriptorSet desc_set = *ds_r;
+        if (buffers.empty())
+            return desc_set;
+
+        constexpr std::size_t kInline = 16;
+        VkDescriptorBufferInfo inline_infos[kInline];
+        VkWriteDescriptorSet inline_writes[kInline];
+        std::vector<VkDescriptorBufferInfo> heap_infos;
+        std::vector<VkWriteDescriptorSet> heap_writes;
+        VkDescriptorBufferInfo* infos = inline_infos;
+        VkWriteDescriptorSet* writes = inline_writes;
+        if (buffers.size() > kInline)
+        {
+            heap_infos.resize(buffers.size());
+            heap_writes.resize(buffers.size());
+            infos = heap_infos.data();
+            writes = heap_writes.data();
+        }
+
+        for (std::size_t i = 0; i < buffers.size(); ++i)
+        {
+            infos[i] = {buffers[i], 0, VK_WHOLE_SIZE};
+            writes[i] = {};
+            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[i].dstSet = desc_set;
+            writes[i].dstBinding = static_cast<std::uint32_t>(i);
+            writes[i].descriptorCount = 1;
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[i].pBufferInfo = &infos[i];
+        }
+        vkUpdateDescriptorSets(device_.device(),
+            static_cast<std::uint32_t>(buffers.size()), writes, 0, nullptr);
+        return desc_set;
+    }
+
     // ── 辅助：提交前释放描述符集（**错误分支专用**，RV-15）──────────────
     // 语义与 alloc_desc_set 的登记规则严格对齐：
     //   batch 模式：集合已在 frames_[batch_frame_].desc_sets 名下 → **此处不得
