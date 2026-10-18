@@ -15,6 +15,10 @@
 //      ③ 图分析的回归：同目标两节点必须建出顺序边、融合不得把它们合组、
 //         故意反序时 validate_dst_order 必须 fail-fast。
 //
+//  [4] P1-5 训练冒烟：小 MLP + Adam 跑 8 步，断言 loss 有限且下降、参数**确实
+//      移动**；并用"同一快照自比"的负例证明检测器能识别"完全没动"的冻结。
+//      本项不依赖 GPU，MSVC Debug CPU-only CI 会直接跑到。
+//
 //  构建/运行：cmake -B build -DNN_ENABLE_TESTS=ON && cmake --build build
 //            ctest --test-dir build -R optimizer_test
 // ───────────────────────────────────────────────────────────────────────────
@@ -105,7 +109,8 @@ nn::ExprSpec make_binary(nn::ExprOp op)
 // ── [1] RV-04：元数据表 ↔ 工厂 ─────────────────────────────────────────────
 void test_optimizer_table()
 {
-    nn::CpuEngine eng;
+    auto eng_owner = nn::CpuEngine::create();
+    nn::CpuEngine& eng = *eng_owner;
     const auto table = nn::optimizer_table();
     CHECK(!table.empty(), "优化器表非空");
 
@@ -171,7 +176,8 @@ void test_adamw_order()
     const Scalar lr = 0.05f, b1 = 0.9f, b2 = 0.999f, eps = 1e-8f, wd = 0.1f;
     const std::size_t rows = 3, cols = 4;
 
-    nn::CpuEngine eng;
+    auto eng_owner = nn::CpuEngine::create();
+    nn::CpuEngine& eng = *eng_owner;
     nn::Tensor p = make_tensor(eng, rows, cols, 0.5f, 0.03f);
     nn::Tensor g = make_tensor(eng, rows, cols, -0.2f, 0.02f);
     const std::vector<Scalar> p0 = read_back(eng, p);
@@ -217,7 +223,8 @@ void test_adamw_order()
 // ── [3] RV-03：同目标写序的图分析（建边 / 不合组 / 反序 fail-fast）────────
 void test_dst_order_hazard()
 {
-    nn::CpuEngine eng;
+    auto eng_owner = nn::CpuEngine::create();
+    nn::CpuEngine& eng = *eng_owner;
     const std::size_t rows = 2, cols = 3;
     nn::Tensor p = make_tensor(eng, rows, cols, 0.5f, 0.1f);
     nn::Tensor x = make_tensor(eng, rows, cols, 1.0f, 0.0f);
@@ -260,6 +267,134 @@ void test_dst_order_hazard()
     std::printf("[OK] test_dst_order_hazard\n");
 }
 
+// ── [4] P1-5：训练冒烟 + 权重变化检测（防"loss 不动"类静默冻结）──────────
+// 与 f16_writeback_probe 的"8 步 Adam 参数必须移动"同一思想，但跑纯 CPU f32，
+// 因而在没有 Vulkan 的 MSVC Debug job 里也会执行（不会 77 跳过）。
+double l1_move(const std::vector<Scalar>& before, const std::vector<Scalar>& after)
+{
+    if (before.size() != after.size()) return -1.0;
+    double sum = 0.0;
+    for (std::size_t i = 0; i < before.size(); ++i)
+        sum += std::fabs(static_cast<double>(after[i]) - static_cast<double>(before[i]));
+    return sum;
+}
+
+bool detect_movement(const std::vector<Scalar>& before, const std::vector<Scalar>& after)
+{ return l1_move(before, after) > 1e-3; }
+
+std::vector<Scalar> snapshot_params(nn::CpuEngine& eng, nn::Model& model)
+{
+    std::vector<Scalar> out;
+    for (auto& t : model.parameters())
+    {
+        auto m = eng.to_matrix(t.get(), nn::Precision::F32);
+        if (!m)
+        {
+            std::printf("[FAIL] 参数快照: %s\n", m.error().message.c_str());
+            ++g_fail;
+            return {};
+        }
+        out.insert(out.end(), m->span().begin(), m->span().end());
+    }
+    return out;
+}
+
+void test_weight_movement_smoke()
+{
+    auto eng_owner = nn::CpuEngine::create();
+    nn::CpuEngine& eng = *eng_owner;
+    nn::PrecisionProfile prof;   // 默认全 f32
+    auto m_r = nn::build_mnist_mlp_model(eng, nn::MNIST_LAYER_DIMS, nn::NormType::LayerNorm, prof);
+    CHECK(m_r.has_value(), "训练冒烟：build_mnist_mlp_model");
+    if (!m_r) return;
+    nn::Model& model = *m_r;
+
+    auto opt = nn::create_optimizer("adam", eng, model.parameters(), model.param_gradients(),
+                                    Scalar{0.02f}, Scalar{0.0f}, prof);
+    CHECK(opt != nullptr, "训练冒烟：create_optimizer(adam)");
+    if (!opt) return;
+
+    const std::size_t in_dim = nn::MNIST_LAYER_DIMS.front();
+    constexpr std::size_t B = 8, C = 10;
+    nn::Matrix X(in_dim, B), Y(C, B);
+    for (std::size_t k = 0; k < in_dim; ++k)
+        for (std::size_t b = 0; b < B; ++b)
+            X.set_value(k, b, ((k * 7 + b * 3) % 11) * 0.09f - 0.5f);
+    for (std::size_t c = 0; c < C; ++c)
+        for (std::size_t b = 0; b < B; ++b)
+            Y.set_value(c, b, (c == (b % C)) ? 1.0f : 0.0f);
+
+    auto xt = eng.from_matrix(X);
+    auto yt = eng.from_matrix(Y);
+    CHECK(xt.has_value() && yt.has_value(), "训练冒烟：输入/目标上传");
+    if (!xt || !yt) return;
+
+    const std::vector<Scalar> before = snapshot_params(eng, model);
+    CHECK(!before.empty(), "训练冒烟：参数快照非空");
+    if (before.empty()) return;
+
+    nn::CrossEntropyLoss loss;
+    Scalar first = 0.0f, last = 0.0f;
+    bool all_finite = true;
+    for (int s = 0; s < 8; ++s)
+    {
+        if (auto r = model.zero_grad(); !r)
+        {
+            CHECK(false, "训练冒烟：zero_grad");
+            return;
+        }
+        auto logits = model.forward(*xt);
+        if (!logits)
+        {
+            CHECK(false, "训练冒烟：forward");
+            return;
+        }
+        std::vector<std::size_t> labels(B);
+        std::vector<Scalar> mask(B, Scalar{1});
+        for (std::size_t b = 0; b < B; ++b)
+            labels[b] = b % C;
+        auto ls = loss.forward_sparse(eng, *logits, labels, mask, C);
+        if (!ls)
+        {
+            CHECK(false, "训练冒烟：loss");
+            return;
+        }
+        if (s == 0) first = *ls;
+        last = *ls;
+        all_finite = all_finite && std::isfinite(*ls);
+        auto gl = loss.backward();
+        if (!gl)
+        {
+            CHECK(false, "训练冒烟：loss.backward");
+            return;
+        }
+        auto bw = model.backward(*gl);
+        if (!bw)
+        {
+            CHECK(false, "训练冒烟：model.backward");
+            return;
+        }
+        auto st = opt->step();
+        if (!st)
+        {
+            CHECK(false, "训练冒烟：optimizer.step");
+            return;
+        }
+    }
+
+    const std::vector<Scalar> after = snapshot_params(eng, model);
+    CHECK(after.size() == before.size(), "训练冒烟：训练前后快照大小一致");
+    const double moved = l1_move(before, after);
+    std::printf("    loss %.6f → %.6f（8 步），参数 L1 位移 %.6g\n", static_cast<double>(first),
+                static_cast<double>(last), moved);
+    CHECK(all_finite, "8 步训练 loss 全部有限");
+    CHECK(last < first, "8 步训练 loss 下降");
+    CHECK(detect_movement(before, after), "8 步 Adam 后参数确实移动（防静默冻结）");
+    // 负例：同一快照自比必须判为"没有移动"——证明上面的检测器不是恒真断言
+    CHECK(!detect_movement(before, before), "冻结检测器：未更新的参数必须判为无移动");
+    std::printf("[OK] test_weight_movement_smoke\n");
+}
+
 } // namespace
 
 int main()
@@ -267,6 +402,7 @@ int main()
     test_optimizer_table();
     test_adamw_order();
     test_dst_order_hazard();
+    test_weight_movement_smoke();
 
     if (g_fail == 0)
     {

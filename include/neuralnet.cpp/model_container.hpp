@@ -3,7 +3,7 @@
 // ── model_container.hpp — 引擎化模型容器 ───────────────────────────────────
 //
 // 架构铁律：
-//   1. Model 持有 EngineLease（非拥有、可失效），所有 forward/backward 委托给
+//   1. Model 持有 shared_ptr<ComputeEngine>（强引用），所有 forward/backward 委托给
 //      Layer::forward(Tensor) / Layer::backward(Tensor)（M6 段 C 起 engine 由 init 绑定，不再作形参）。
 //   2. Model 不包含任何 GPU-resident 中间结果缓存或 forward_gpu/backward_gpu
 //      路径 —— 设备分发完全由 ComputeEngine 实现负责。
@@ -24,7 +24,7 @@
 #include <vector>
 
 #include "core_assert.hpp"
-#include "core_engine_lease.hpp"
+#include "core_engine_id.hpp"
 #include "compute_layer.hpp"
 #include "model_spec.hpp"
 
@@ -34,7 +34,7 @@ namespace nn
 class Model
 {
 private:
-    EngineLease engine_;
+    std::shared_ptr<ComputeEngine> engine_;
     std::vector<std::unique_ptr<Layer>> layers_;
     // 可选架构规格：由 build_*_from_spec 工厂在构建时设置，供 load_model
     // 校验文件头部与模型架构是否一致。为空表示未记录（跳过校验，向后兼容）。
@@ -48,7 +48,9 @@ private:
 
 public:
     Model() = default;
-    explicit Model(ComputeEngine& engine) : engine_(engine.lease()) {}
+    explicit Model(ComputeEngine& engine) : engine_(engine.weak_from_this().lock()) {}
+    explicit Model(std::shared_ptr<ComputeEngine> engine)
+        : engine_(std::move(engine)) {}
 
     // 不可拷贝（unique_ptr 语义），可移动
     Model(const Model&) = delete;
@@ -63,8 +65,14 @@ public:
     [[nodiscard]] ComputeEngine& engine(
         std::source_location loc = std::source_location::current()) const
     {
-        // 未绑定 / 引擎已销毁 → 终止并打印调用点（不会解引用悬垂指针）。
-        return engine_.require("Model", loc);
+        if (!engine_)
+        {
+            const std::string msg =
+                "[model-lifetime] Model: 未绑定引擎（构造时引擎必须由 shared_ptr 管理）";
+            detail::fatal_at("NN_FATAL", loc.file_name(),
+                             static_cast<int>(loc.line()), msg.c_str());
+        }
+        return *engine_;
     }
 
     // ── 构建网络（通用模板接口） ────────────────────────────────────────
@@ -200,8 +208,8 @@ public:
     {
         if (layers_.empty())
             NN_FAIL("Model::forward: no layers");
-        if (!engine_.alive())
-            NN_FAIL("Model::forward: engine 未绑定或已销毁（engine 必须比 Model 活得久）");
+        if (!engine_)
+            NN_FAIL("Model::forward: engine 未绑定（构造时引擎必须由 shared_ptr 管理）");
         Tensor x = input;
         for (std::size_t li = 0; li < layers_.size(); ++li)
         {
@@ -218,8 +226,8 @@ public:
     {
         if (layers_.empty())
             NN_FAIL("Model::backward: no layers");
-        if (!engine_.alive())
-            NN_FAIL("Model::backward: engine 未绑定或已销毁（engine 必须比 Model 活得久）");
+        if (!engine_)
+            NN_FAIL("Model::backward: engine 未绑定（构造时引擎必须由 shared_ptr 管理）");
         Tensor g = grad_output;
         for (std::size_t i = layers_.size(); i-- > 0;)
         {

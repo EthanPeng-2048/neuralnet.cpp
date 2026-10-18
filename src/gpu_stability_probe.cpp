@@ -95,9 +95,9 @@ namespace
     }
 
     // 设备引擎（GPU 在首个 GpuBackend::instance() 前已注入 NN_VULKAN_DEVICE）
-    nn::Result<std::unique_ptr<nn::ComputeEngine>> make_engine(bool gpu)
+    nn::Result<std::shared_ptr<nn::ComputeEngine>> make_engine(bool gpu)
     {
-        std::unique_ptr<nn::ComputeEngine> eng;
+        std::shared_ptr<nn::ComputeEngine> eng;
         if (gpu)
         {
 #ifdef NN_HAS_VULKAN
@@ -108,14 +108,14 @@ namespace
             // 及全部 GPU 测试入口同法。无显式 selector 时 initialize() 内部
             // 仍按 "显式 > NN_VULKAN_DEVICE 环境变量 > 自动打分" 读设备选择。
             NN_TRY(ir, backend.initialize());
-            eng = std::make_unique<nn::GpuEngine>(backend);
+            eng = nn::GpuEngine::create(backend);
 #else
             NN_FAIL("built without Vulkan (NN_HAS_VULKAN)");
 #endif
         }
         else
         {
-            eng = std::make_unique<nn::CpuEngine>();
+            eng = nn::CpuEngine::create();
         }
         return eng;
     }

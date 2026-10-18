@@ -249,7 +249,8 @@ int main(int argc, char* argv[])
     }
     else
     {
-        nn::CpuEngine eng;
+        auto eng_owner = nn::CpuEngine::create();
+        nn::CpuEngine& eng = *eng_owner;
         test_state_bytes(eng, "CPU");
         test_scales(eng, "CPU");
         test_zero_grad_first_step(eng, "CPU");

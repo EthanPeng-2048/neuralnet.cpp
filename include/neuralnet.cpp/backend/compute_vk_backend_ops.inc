@@ -849,7 +849,8 @@
         // 延迟队列（铁律 6，与其余录制期资源同款）。
         auto inst_r = GpuBuffer::create_device_local(
             device_.device(), alloc_pool(), table.size() * sizeof(std::uint32_t),
-            VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            keepalive());
         NN_TRY_CHECK(inst_r);
         std::shared_ptr<GpuBuffer> inst_buf =
             std::make_shared<GpuBuffer>(std::move(*inst_r));
@@ -1037,23 +1038,15 @@
 
         if (two_pass)
         {
-            if (!reduce_partial_ ||
-                static_cast<uint32_t>(reduce_partial_->rows()) != nchunk ||
-                static_cast<uint32_t>(reduce_partial_->cols()) != cols)
-            {
-                auto pres = GpuTensor::create_empty(nchunk, cols, *this);
-                NN_TRY_CHECK(pres);
-                reduce_partial_ = std::move(*pres);
-            }
-            const GpuTensor& partial = *reduce_partial_;
+            NN_TRY_CHECK(ensure_reduce_partial_(nchunk, cols));
 
             // pass1 读输入（f16_in → f16 pipeline，ds/layout 随之）；
             // pass2 读 f32 partials → 恒 f32 pipeline（f16 shader 读 f32
             // partials = 静默错值，必须分开）
             const VkBuffer pass1_bindings[2]{
-                input.buffer().impl(), partial.buffer().impl()};
+                input.buffer().impl(), reduce_partial_.buffer};
             const VkBuffer pass2_bindings[2]{
-                partial.buffer().impl(), output.buffer().impl()};
+                reduce_partial_.buffer, output.buffer().impl()};
             auto ds1_r = alloc_desc_set_for(in_pipe.descriptor_layout(), pass1_bindings);
             NN_TRY_CHECK(ds1_r);
             VkDescriptorSet ds1 = *ds1_r;
@@ -1083,7 +1076,7 @@
             ts_dispatch(cmd, "reduce", (cols + 31u) / 32u, nchunk, 1);
 
             // partials：写 → 读（同 cmd 内跨 dispatch 依赖）
-            record_input_barriers(cmd, {partial.buffer().impl()});
+            record_input_barriers(cmd, {reduce_partial_.buffer});
 
             // pass2：合并 partials（rows = nchunk ≤ 8，复用 mode1 整表路径；
             // 输入 = f32 partials → 恒 f32 pipeline）
@@ -1751,7 +1744,8 @@
         auto b = GpuBuffer::create_device_local(
             device_.device(), *memory_pool_, cnt_pad * 2u,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT
-                | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+                | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            keepalive());
         NN_TRY_CHECK(b);
         return GpuTensorF16(std::make_shared<GpuBuffer>(std::move(*b)), rows, cols);
     }
@@ -1868,11 +1862,13 @@
         // 1. 创建临时 GPU buffers（byte count = 元素数 × sizeof(float)，§6.3）
         auto a_buf = GpuBuffer::create_device_local(
             device_.device(), *memory_pool_, M * K * sizeof(float),
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            keepalive());
         NN_TRY_CHECK(a_buf);
         auto b_buf = GpuBuffer::create_device_local(
             device_.device(), *memory_pool_, K * N * sizeof(float),
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            keepalive());
         NN_TRY_CHECK(b_buf);
         // 2. 上传数据
         auto a_tensor = GpuTensor(std::make_shared<GpuBuffer>(std::move(*a_buf)), M, K);

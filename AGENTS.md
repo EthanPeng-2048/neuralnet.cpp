@@ -20,7 +20,7 @@ cmake -B build -G Ninja -DNN_ENABLE_TESTS=ON && cmake --build build && ctest --t
 ```
 
 - 链接报 `permission denied`（`build/` 下 exe 正在运行被占用 → 构建中止，易误判为"未改动"）：追加 `-- -k 0` 让 ninja 跳过失败目标继续构建其余目标；被占用目标仍需关掉进程后重链。
-- 编译器与标准库：**CMakeLists 不指定**（编译器由 CMake 默认探测或调用方 `CXX=...` / `-DCMAKE_CXX_COMPILER` 决定，标准库跟随编译器默认）；**CI 显式指定 clang++**（Linux/Windows，避免 GCC 独有警告在 `-Werror` 下失败）。标准库编译/链接两侧必须一致（否则链接期大量 `std::__cxx11::*` 未定义）。CMake 3.30+；已验证四组「编译器 × 标准库」**各自全新构建 + ctest**：clang 24 + libc++（本机 Linux）、g++ 15.2 + libstdc++（WSL，CPU-only）、clang 23 + MSVC STL 与 MSVC cl 19.51 + MSVC STL（Windows/102）——**MSVC 侧必须带 `/Zc:preprocessor`**（已写进 `CMakeLists.txt` 的目录级与接口选项）：cl.exe **默认的传统预处理器**把 `__VA_ARGS__` 代入嵌套宏时按"单个实参"处理，`NN_UNWRAP(x, msg)` 会静默退化成逗号表达式（条件恒真、检查永不触发），`NN_EXIT(x, code, msg)` 则直接 `C3861`；打开该开关后两者都按标准展开（详见 `docs/history/history.md` 的构建系统条目）。
+- 编译器与标准库：**CMakeLists 不指定**（编译器由 CMake 默认探测或调用方 `CXX=...` / `-DCMAKE_CXX_COMPILER` 决定，标准库跟随编译器默认）；**CI 主矩阵显式指定 clang++**（Linux/Windows，避免 GCC 独有警告在 `-Werror` 下失败），另有一个 **MSVC Debug 冒烟 job**（`msvc-debug`：Windows + Visual Studio 17 2022 生成器 = cl.exe、`NN_ENABLE_GPU=OFF` 纯 CPU、Debug + ctest（除已知 C11 外全跑）；P1-5，2026-10-18 起）。标准库编译/链接两侧必须一致（否则链接期大量 `std::__cxx11::*` 未定义）。CMake 3.30+；已验证四组「编译器 × 标准库」**各自全新构建 + ctest**：clang 24 + libc++（本机 Linux）、g++ 15.2 + libstdc++（WSL，CPU-only）、clang 23 + MSVC STL 与 MSVC cl 19.51 + MSVC STL（Windows/102）——**MSVC 侧必须带 `/Zc:preprocessor`**（已写进 `CMakeLists.txt` 的目录级与接口选项）：cl.exe **默认的传统预处理器**把 `__VA_ARGS__` 代入嵌套宏时按"单个实参"处理，`NN_UNWRAP(x, msg)` 会静默退化成逗号表达式（条件恒真、检查永不触发），`NN_EXIT(x, code, msg)` 则直接 `C3861`；打开该开关后两者都按标准展开（详见 `docs/history/history.md` 的构建系统条目）。**MSVC Debug 另有两条实测必需的开关**：`/bigobj`（`text_train.cpp` 触发 C1128）与 `/STACK:8388608`（9 个测试默认 1 MB 栈触发 `0xC00000FD`），均已写进 `CMakeLists.txt`；102 上 VS 2026 / cl 19.51 Debug CPU-only 实测 **CI 口径 51/51、完整 52/52 ctest 通过**（2026-10-18，后者含 `rapt_test_f16`）。
 - **clang + libc++ 的口径差异**：`-Werror` 下 libc++ 会对"记录类型但从未使用"的局部变量报 `-Wunused-variable`（同一代码在 libstdc++ 下不报）——clean 构建四种组合时会先撞到，属**真实死变量**，删掉即可（先例：`src/kvrec_test.cpp` 的 `std::string ls;`）。
 - 构建选项：`NN_ENABLE_NATIVE`（默认 ON，开启 `-march=native`，分发/CI 用 `OFF` 生成可移植基线）；`NN_ENABLE_TESTS`（默认 OFF）；`NN_ENABLE_PCH`（默认 ON，见下）；`NN_ENABLE_PROBES`（默认 OFF，见下条）。
 - **预设构建（`CMakePresets.json`，2026-10-11 落地）**：`cmake --preset <名>` + `cmake --build --preset <名>` + `ctest --preset <名>`；`cmake --list-presets` 看全部。六个 preset = `release`（Release+native，无测试）/ `dev`（+`NN_ENABLE_TESTS`）/ `debug`（`-O0 -g`）/ `portable`（`NN_ENABLE_NATIVE=OFF`，发布/CI 口径）/ `cpu`（`NN_ENABLE_GPU=OFF`，纯 CPU 最短路径）/ `probes`（+`NN_ENABLE_PROBES`）。`binaryDir` = `build/<preset名>`；另有 `caller` 无关的 `build`/`test`/`workflow` preset（`cmake --workflow --preset dev` 一条命令走完）。**preset 只描述本仓的构建口径，不改变 CMakeLists 的默认值**——不带 preset 的 `cmake -B build -G Ninja` 行为与以前逐字相同。
@@ -283,19 +283,19 @@ GPT 序列展平: 列序 i = b*seq + t（batch-major，全局唯一约定）
 
 ```cpp
 #include <neuralnet.cpp/nn.hpp>
-nn::CpuEngine engine;                       // 或 nn::GpuEngine（NN_HAS_VULKAN）
-auto model_r = nn::build_gpt_model(engine, vocab, d_model, seq, heads, d_ff, layers);
+auto engine = nn::CpuEngine::create();      // 或 nn::GpuEngine::create(gpu_backend)
+auto model_r = nn::build_gpt_model(*engine, vocab, d_model, seq, heads, d_ff, layers);
 nn::Model model = std::move(*model_r);
 // 优化器工厂：sgd / sgd_momentum / adam / adamw / muon
-auto optimizer = nn::create_optimizer("adamw", engine,
+auto optimizer = nn::create_optimizer("adamw", *engine,
     model.parameters(), model.param_gradients(), /*lr=*/1e-4, /*wd=*/0.01);
 
 nn::CrossEntropyLoss ce_loss;
 // 每 step（GPT 用 forward_sparse 稀疏路径，不物化 one-hot）：
 model.zero_grad();
-auto x = engine.from_matrix(batch);         // Matrix → Tensor
+auto x = engine->from_matrix(batch);        // Matrix → Tensor
 auto logits = model.forward(*x);
-auto loss = ce_loss.forward_sparse(engine, *logits, labels, loss_mask, vocab);
+auto loss = ce_loss.forward_sparse(*engine, *logits, labels, loss_mask, vocab);
 auto grad = ce_loss.backward();             // (vocab, total) 梯度
 model.backward(*grad);
 optimizer.step();
@@ -401,7 +401,7 @@ optimizer.step();
 ### 已知问题
 
 - **GPU `stable=f16` 训练 loss 打印冻结（✅ 2026-10-13 已修，原判断已订正）**：真因**不是** loss 回读链，而是 **CE 的 `(1,1)` loss 归约输出按 `stable=f16` 落盘溢出**（`Σ ≈ -log(vocab)·N` 超 65504 → inf → NaN；旧报告里的 `4.0137 ≈ 65504/num_valid` 是饱和表现）。修法 = `compute_loss.hpp` 稀疏（`fused_forward_sparse_`）与稠密两条链的 `(1,1)` reduce 输出**恒 `Precision::F32`**。实测（850M）：`seq256/b32` 由 `inf` → `9.0056→8.6922`；`stable=f16` 120 步无 NaN。回归门禁见 `docs/todo/14-f16-stable-gpu-loss-frozen.md` 与 24 号 §3.1。推荐路径仍是 `--f16`（stable/optimizer=f32）。
-- **数值性限制**：四字段全 f16 不可训练——`optimizer=f16` 单独即令 Adam 更新爆炸、`stable=f16` 链约 200 步 NaN，见 `docs/development/05-mixed-precision.md` §12.5；常规 f32 训练健康收敛。
+- **f16 两套计划（2026-10-18）**：**Plan A = 标准 `--f16`（参考 PyTorch AMP）**——`--f16`（param/compute=f16，stable/optimizer=f32）是推荐默认，补动态 loss scaling / master weights；**Plan B = 全流程真 f16**——四字段全 f16，支持 f16 计算的设备全程零 f16↔f32 转换，不支持时只由引擎在算子内部隐式转换（Layer/DSL/CLI 零手写 cast）。F5 后四字段全 f16 已可训练，但 CE 标量仍是 F32 补丁、matmul/归约仍有 f32 累加、native16 未全覆盖，**不等于真 f16**。细则见 `docs/todo/26-f16-speedup-plan.md` §8.A/§8.B。
 - **不存在的 CLI 参数**：`--tdr-retry`/`--max-tdr-retries` 与 `mnist_train --osc-guard`/`--osc-window`/`--osc-threshold`（**均已移除**：前两者从未实现，后三者属"帮助声明了、解析分支不存在"的幽灵选项，已从帮助/控制器/GUI 三层清除，详见 `docs/history/history.md`「GUI / CLI 参数一致性清理」）。
 - **`text_train --model zipt` 启动即中止（未修）** → **已随 ZiPT 整体移除而消失**：AttnZip/ZiPT 已从主线移除（`--model zipt` 现在直接报"未知模型架构"并给出迁移提示），代码保留在 **`legacy/zipt` 分支**。**恢复前提（两条同时满足）**：① **算法层**——压缩向量必须因果（压缩器只能看当前位置之前的内容）；② **代码层**——实现质量对齐 RAPT/GPT（支持 `forward_recompute` 梯度检查点与 activation offload、CLI/序列化/测试齐备）。裁决依据见 `docs/history/history.md`「ZiPT 移除」条。已移除的 API：`ZiPTModel`/`ZiPTBlock`/`CrossAttention`、`build_zipt_model*`/`make_zipt_spec`/`ZiPTConfig`/`ZIPT_MEMORY_TOKENS`、`ModelSpec::is_zipt()` 与 `memory_tokens`/`window` 字段、CLI `--model zipt`/`--window`/`--memory-tokens`、`zipt_test`；`ModelType` 的 6 号枚举保留为 `Reserved_ZiPT` 占位，用于对旧 `.bin`（type=6）给出明确错误。
 

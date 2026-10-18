@@ -458,7 +458,8 @@ bool make_cli_fixture(const std::filesystem::path &dir, CliFixture &fx)
     CHECK(saved.has_value(), "写出 .nnvocab");
     if (!saved) return false;
 
-    nn::CpuEngine engine;
+    auto engine_owner = nn::CpuEngine::create();
+    nn::CpuEngine& engine = *engine_owner;
     const auto spec = nn::make_gpt_spec(fx.tok.vocab_size(), 16, 64, 2, 32, 1);
     auto model_r = nn::build_gpt_model_from_spec(engine, spec, nn::PrecisionProfile{});
     CHECK(model_r.has_value(), "建 tiny GPT");

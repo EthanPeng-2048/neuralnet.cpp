@@ -415,7 +415,8 @@ int main(int argc, char* argv[])
 
     // CPU 对照（始终跑）
     {
-        nn::CpuEngine cpu;
+        auto cpu_owner = nn::CpuEngine::create();
+        nn::CpuEngine& cpu = *cpu_owner;
         nn::ComputeEngine& padapter = cpu;   // P-1：原 PrecisionEngine 已下沉
         std::printf("── CPU ──\n");
         probe_cast_rounding(padapter, "cpu");
@@ -433,7 +434,8 @@ int main(int argc, char* argv[])
             std::fprintf(stderr, "GPU 初始化失败: %s\n", init_r.error().message.c_str());
             return 77;  // ctest SKIP
         }
-        nn::GpuEngine gpu(backend);
+        auto gpu_owner = nn::GpuEngine::create(backend);
+        nn::GpuEngine& gpu = *gpu_owner;
         nn::ComputeEngine& adapter = gpu;   // P-1：原 PrecisionEngine 已下沉
         std::printf("── GPU（%s）──\n", backend.device().device_name().c_str());
         probe_cast_rounding(adapter, "gpu");

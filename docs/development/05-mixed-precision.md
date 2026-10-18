@@ -10,6 +10,9 @@
 > 归约 / matmul 段 / fold）** + **op-level f16 GEMM**）均为**当前实现**；当前 `--f16` 实测峰值显存
 > 低于 f32（§12.11）。当前状态、实测结论与已知问题见 **§12**；各轮实施过程与 A/B 流水见
 > `docs/history/history.md`。
+> **2026-10-18 口径更新**：F5 之后四字段全 f16（`profile_all_f16()`）已可训练；「全流程真 f16」
+> 作为独立目标恢复为活跃计划（[`../todo/26-f16-speedup-plan.md`](../todo/26-f16-speedup-plan.md) §8）。
+> 本文 §9.4 / §12.5 中「不可训练」的旧结论只适用于 **F5 之前**。
 > **范围**：f16 + f32（bf16 / f64 仅枚举占位）。
 > **配套**：`01-compute-engine-development.md`（引擎开发）、`../usage/03-compute-engine-usage.md`（引擎使用）、`08-pitfalls-and-lessons.md`（踩坑）。
 
@@ -265,9 +268,16 @@ P = F32：参考即自身，不舍入（= 现状行为）
 | 归约 | f32 累加 + 输出舍入 | 边界 cast | in-kernel f16 变体（读写 f16、累加 f32——无 f16 归约硬件） |
 | 数据操作（clone/slice/gather…） | 按 P 字节拷贝 | 按 P 字节拷贝 | 同左（`supports_native_data_move()` 对 f16 直接放行，无边界 cast） |
 
+> 上表是**当前实现**；真 f16 计划要求 capable 设备取消 f32 累加与任何 f16↔f32 转换，见
+> [`../todo/26-f16-speedup-plan.md`](../todo/26-f16-speedup-plan.md) §8。
+
 ### 7.4 f16 GEMM（计算侧主收益点）
 
 定义（Q4 特化）：**f16 输入、f32 累加、f16 输出（round-half-to-even）**。当前实现：
+
+> **口径区分（2026-10-18）**：本节描述**当前实现**；[`../todo/26-f16-speedup-plan.md`](../todo/26-f16-speedup-plan.md)
+> §8 的“全流程真 f16”是更高目标——支持 f16 计算的设备要求取消 f16↔f32 转换（包括 f32 累加），
+> 累加误差改用 f16 分块/补偿方案。不要把本节的“f32 累加”当作真 f16 的验收口径。
 
 - **一份 .comp 用 `glslc -DNN_SHADER_F16=1` 编出两份 SPIR-V**（`matmul_tiled.comp` / `batched_matmul.comp` / `matmul_gemv.comp`，CMake `nn_embed_shader(... -DNN_SHADER_F16=1)`）：`#if defined(NN_SHADER_F16)` 分支把缓冲声明为 `float16_t`、别名槽改 `uvec2`（4×half=8B）、`unpackHalf2x16` 解 vec4、读写点 `float()`/`float16_t()` 转换；**f32 分支留在 `#else` 逐字未动**（宏展开后与裸写 f32 同形 → SPIR-V 字节零差异，零回归由构造保证）。共享 tile / vec4 外积 / 分块 / 双缓冲 / barrier 节奏两版同构，只有全局加载与写出的元素类型不同。
 - **依赖与分派**：`GL_EXT_shader_16bit_storage` + 设备 `storageBuffer16BitAccess`（后端仅在该能力为真时创建 f16 pipeline，否则句柄空 → 自动回退边界 cast）；对齐判据复用 f32 的「元素下标 %4==0」条件（f16 `uvec2` 8B 对齐 ⇔ f32 `vec4` 16B 对齐）。
@@ -380,7 +390,7 @@ loss = ce.forward_sparse(engine, logits, labels, mask, vocab,
 - 权重/嵌入表由工厂按 `param` 创建；优化器状态按 `optimizer` 创建。
 - 优化器更新算子全部显式：参数更新 P = `param`（in-place，存储不变），状态更新 P = `optimizer`。
 - **per-layer 覆盖 = Phase 2**：`p_` 本就是每层成员，改成员即覆盖（如末层 head 强制 F32），纯增量。
-- CLI 入口的 `--f16` 标志 = `profile_f16()` = **{param=F16, compute=F16, stable=F32, optimizer=F32}**（§9.4"全 f16（激进）"行）；`text_train`/`mnist_train` 另有 `--precision-param/compute/stable/optimizer` 逐字段覆盖，`mem_probe` 有 `--f16` / `--f16-all`。master-weights 配方 {param=F32, compute=F16, stable=F32, optimizer=F32} 对应 `profile_master_weights()`。
+- CLI 入口的 `--f16` 标志 = `profile_f16()` = **{param=F16, compute=F16, stable=F32, optimizer=F32}**（§9.4"f16 存储"行）；`text_train`/`mnist_train` 另有 `--precision-param/compute/stable/optimizer` 逐字段覆盖，`mem_probe` 有 `--f16` / `--f16-all`。master-weights 配方 {param=F32, compute=F16, stable=F32, optimizer=F32} 对应 `profile_master_weights()`。
 - **精度预设（2026-10-10 新增）**：CLI `--t1_58` = `profile_t1_58()` = **{param=T1_58, compute=F16, stable=F32, optimizer=F32}** —— 定义上就是 `profile_f16()` 把 `param` 换成三值（另三槽在同一函数里派生 → 不可能与 `--f16` 漂移），即"**其他默认 f16，模型参数 1.58**"。三值只描述**权重**（`T1_58` 不是存储精度），落地点是 `BitLinear`，见 `docs/todo/21-quantized-weights.md` §4.10。
 
 ### 9.4 典型配方
@@ -388,14 +398,23 @@ loss = ce.forward_sparse(engine, logits, labels, mask, vocab,
 | 配方 | param | compute | stable | optimizer |
 |---|---|---|---|---|
 | 全 f32（现状/默认，`profile_f32()`） | F32 | F32 | F32 | F32 |
-| 全 f16（激进）——即 CLI `--f16` = `profile_f16()` | F16 | F16 | F32 | F32 |
+| **f16 存储（推荐安全配方）**——即 CLI `--f16` = `profile_f16()` | F16 | F16 | F32 | F32 |
 | **三值权重 + f16 存储——即 CLI `--t1_58` = `profile_t1_58()`** | T1_58 | F16 | F32 | F32 |
 | **master-weights（经典混合精度，`profile_master_weights()`）** | F32 | F16 | F32 | F32 |
-| 四字段全 f16（`profile_all_f16()`，实验配方） | F16 | F16 | F16 | F16 |
+| **四字段全 f16（真 f16 目标）**——`profile_all_f16()` | F16 | F16 | F16 | F16 |
 
 （`stable` 可放宽为 F16，用户自担溢出风险，见 §12.4。）
 
-**注意区分**：`--f16` 只把 **param/compute** 设为 F16，stable/optimizer 留 F32；**四字段全 F16 实测不可用于训练**（`optimizer=F16` 状态下溢爆炸；`stable=F16` 的 CE 溢出**已修**、见 §12.5，但该配方仍因 optimizer 槽不可训练），仅供显式实验。同理 `--t1_58` 只把 **param** 换成三值（`T1_58` 只描述权重、不是存储精度）：compute/stable/optimizer 与 `--f16` 逐字段相同；字面"四槽全 f16 + 三值权重"= `--t1_58 --precision-stable f16 --precision-optimizer f16`。
+**注意区分**：`--f16` 只把 **param/compute** 设为 F16，stable/optimizer 留 F32，是默认推荐的安全配方。
+四字段全 F16 在 **F5（2026-10-14）后已可训练**：Adam 状态缩放 `S=4096` 把 m/v 移出 f16 下溢区，
+CE 的 `(1,1)` loss 标量归约当前恒 F32（见 §12.5）——这是 F5 的数值补丁，**与真 f16 的零转换目标
+冲突**，R2 要改成 f16 安全归约；tiny GPT 20 步与 GPU 500 步记录见
+[`../todo/24-f16-training-defects.md`](../todo/24-f16-training-defects.md) §4.6。但它仍是**实验配方**：
+长跑质量、全模型覆盖与一键 CLI 预设尚未完成，产品化计划见
+[`../todo/26-f16-speedup-plan.md`](../todo/26-f16-speedup-plan.md) §8。不要把「F5 前不可训练」的
+旧结论当作当前事实。同理 `--t1_58` 只把 **param** 换成三值（`T1_58` 只描述权重、不是存储精度）：
+compute/stable/optimizer 与 `--f16` 逐字段相同；字面"四槽全 f16 + 三值权重"=
+`--t1_58 --precision-stable f16 --precision-optimizer f16`。
 
 ---
 
@@ -508,22 +527,24 @@ loss = ce.forward_sparse(engine, logits, labels, mask, vocab,
 9. **序列化**：v5 f16 模型 save/load 往返逐字节；v4 文件按全 f32 读入；tag 互锁校验生效。
 10. **错误路径**：BF16 / F64 使用 → 清晰 `Result` 报错（"精度未实现"）。
 
-### 12.3 Phase 2 清单（当前：第 1、2 项已完成，其余为待办）
+### 12.3 Phase 2 清单（当前：第 1、2 项已完成；第 8 项已恢复为活跃计划）
 
 1. ✅ in-kernel f16 融合：`ExprPrecSig` 精度签名 + `GlslEmitter` f16 变体 + 手写 GEMM `-D` 双份 SPIR-V（机制见 §11.1，实测见 §12.6–§12.11）。
 2. per-layer `PrecisionProfile` 覆盖（`p_` 成员已就位，纯增量）。
 3. bf16（兼容路径精度，§7.1 注）。
 4. f16 权重镜像缓存（消除按 op cast 的带宽开销）。
-5. tensor core f16 FMA GEMM（f16 FMA + f32 累加，§7.4 未实现项）。
+5. tensor core f16 FMA GEMM（当前实现用 f32 累加，§7.4；真 f16 目标要求 f16 累加/分块补偿，见 §12.13）。
 6. f64（若出现需求）。
-7. loss scaling（若 f16 溢出监控显示必要）。
+7. **动态 loss scaling（GradScaler 语义）**——Plan A 的标准项（§12.13 A1.1）；F5 的 optimizer state scaling 不能替代它。Plan B 可复用为数值缓解技术。
+8. **全流程真 f16（四槽全 F16）产品化**——F5 已关闭「能不能训练」，本项关闭「支持 f16 的设备能不能全程零转换、全模型、可发布地训练」：一键 `--f16-all`、零转换普查、native16 全覆盖、logits/CE 融合、全模型/全设备长跑与质量基线。细则见 [`../todo/26-f16-speedup-plan.md`](../todo/26-f16-speedup-plan.md) §8（R0–R6）。
 
 ### 12.4 已知限制（显式，写入用户预期）
 
-1. **无 loss scaling**：f16 范围 65504，f16 matmul 输出 / 大归约可能溢出 inf。`stable = F32` 把 softmax / LayerNorm 移出 f16 是第一道防线；训练侧应监控 inf/nan；loss scaling 列 Phase 2。**注**：CE 的 (1,1) loss 标量归约输出**已恒 F32**（2026-10-13；不再随 `stable` 落 f16——它是跨 `batch×seq` 的求和，量级 ∝ N，按 f16 落盘必溢出）。其它**聚合类标量**若按 f16 落盘需各自评估（同一条不变量：f16 只适合量级有界的中间量）。
+1. **当前无训练循环 loss scaling（Plan A A1.1 补）**：f16 范围 65504，f16 matmul 输出 / 大归约可能溢出 inf。`stable = F32` 把 softmax / LayerNorm 移出 f16 是第一道防线；训练侧应监控 inf/nan。**注**：CE 的 (1,1) loss 标量归约输出当前**恒 F32**（2026-10-13 的溢出修复）。这是 F5 的数值补丁，**不是真 f16 的终态**：真 f16 计划（todo/26 §8.B）要求用 per-token 平均/分块缩放把它改回 f16 安全归约。
 2. **CPU f16（无 f16 ISA）省内存不省时间**（逐元素 decode/encode 开销）。
 3. **跨设备 f16 容差内相等，不字节一致**（§11.2）——不要写"CPU f16 与 GPU f16 逐字节对拍"的测试。
 4. **bf16 / f64 未实现**，使用 → 清晰报错。
+5. **全流程真 f16 仍是实验配方**：F5 后 `optimizer=f16` 可训练，但 `|g| ≳ 0.0625` 时 `v` 会溢出 f16（实践配 `--max-norm`）；`stable=f16` 的 softmax / Norm 尾数与长跑质量仍待 R2 硬化；当前 matmul/归约/CE 仍有 f32 累加或 F32 标量，**不满足真 f16 的零转换门禁**；RAPT f16 另有已知 NaN（[`../todo/18-roadmap.md`](../todo/18-roadmap.md) §3.1 C11）。产品化门禁见 [`../todo/26-f16-speedup-plan.md`](../todo/26-f16-speedup-plan.md) §8。
 
 ---
 
@@ -544,15 +565,16 @@ loss = ce.forward_sparse(engine, logits, labels, mask, vocab,
 **机制结论（当前有效）**
 
 - **边界 cast 的代价**：适配层对**每个**未命中变体的算子把 f16 入参抬成 f32 副本（再按 P 落回）。被 k 个算子读取的张量要 k 份 f32 副本——典型是 `(vocab, batch·seq)` 量级的 logits 被 loss 链读 4~6 次。**LM head 计算精度固定为 `stable`（F32）** → logits 与 f32 基线同构、loss 链零 cast。结论：**边界 cast 只能拿"存储减半"，拿不到"峰值下降"**（训练峰值由 transient 决定）——这是 in-kernel f16（§12.6 起）的存在理由；变体命中时不再走该路径（§11.1 三条路径）。
-- **数值结论（当前）**：GPU 上 `profile_f16`（param+compute f16）与 f32 **轨迹一致**——同初值/同超参 3.4776→3.1822 vs 3.4776→3.1803，最大相对偏差 **6e-4**（§7.2 语义成立）。**四字段全 f16（`profile_all_f16`）不可用于训练**：`optimizer=F16` 时 Adam 的 v≈g²~1e-10 下溢到 0 → 更新爆炸（loss 7.9→3.6e4）；两者同时 f16 时 loss 恒定（更新被 f16 舍入吃光）。故 CLI `--f16` = `profile_f16()` = {param:F16, compute:F16, stable:F32, optimizer:F32}（§9.4）。
-  **订正（2026-10-13）**：原记的「`stable=F16` 时 CE 链 ~200 步 NaN」**根因是 CE 的 (1,1) loss 归约按 `stable=f16` 落盘溢出**（大 token 数下 Σ≈ -log(vocab)·N 超 f16 上限 65504 → ±inf，进而 NaN），**已修**：`compute_loss.hpp` 两条链的 (1,1) 归约输出恒 F32。修复后 GPU `--precision-stable f16`（param/compute/stable f16）连跑 120 步健康（8208 vocab、seq 256、batch 8：6.9→5.76）。`optimizer=F16` 的爆炸**照旧**（不属本修）。详见 [`../todo/24-f16-training-defects.md`](../todo/24-f16-training-defects.md) §2.1/§3.1。
+- **数值结论（当前）**：GPU 上 `profile_f16`（param+compute f16）与 f32 **轨迹一致**——同初值/同超参 3.4776→3.1822 vs 3.4776→3.1803，最大相对偏差 **6e-4**（§7.2 语义成立）。**四字段全 f16（`profile_all_f16`）在 F5 前不可训练**：`optimizer=F16` 时 Adam 的 v≈g²~1e-10 下溢到 0 → 更新爆炸（loss 7.9→3.6e4）；两者同时 f16 时 loss 恒定（更新被 f16 舍入吃光）。**F5（2026-10-14）后已可训练**：Adam 状态缩放 `S=4096` 把 m/v 移出下溢区（更新量数学不变），tiny GPT 20 步与 GPU 500 步记录见 [`../todo/24-f16-training-defects.md`](../todo/24-f16-training-defects.md) §4.6。CLI `--f16` 仍是安全默认 = `profile_f16()` = {param:F16, compute:F16, stable:F32, optimizer:F32}（§9.4）；四字段全 f16 的产品化见 [`../todo/26-f16-speedup-plan.md`](../todo/26-f16-speedup-plan.md) §8。
+  **订正（2026-10-13）**：原记的「`stable=F16` 时 CE 链 ~200 步 NaN」**根因是 CE 的 (1,1) loss 归约按 `stable=f16` 落盘溢出**（大 token 数下 Σ≈ -log(vocab)·N 超 f16 上限 65504 → ±inf，进而 NaN），当时的修复是 `compute_loss.hpp` 两条链的 (1,1) 归约输出**恒 F32**。该补丁让训练健康（GPU 120 步、6.9→5.76），但**它是真 f16 的已知偏差**：R2 要改成 per-token 平均/分块缩放的 f16 安全归约，不能把 F32 标量当作永久例外。`optimizer=F16` 的爆炸当时不在本修范围，后由 **F5（2026-10-14）的 Adam 状态缩放**修复。详见 [`../todo/24-f16-training-defects.md`](../todo/24-f16-training-defects.md) §2.1/§3.1/§4.6。
+- **外部数值鲁棒性方案（2026-10-18）**：SR / GradientStabilizer / ECO / Unit Scaling / Peri-LN / 低精度 attention 的 `δ` 修复已列入真 f16 计划；其中 **SR / GradientStabilizer / ECO / attention `δ` 修复进入 R2.5**（SR/ECO 需局部 f32 临时量，按 **B-Mem** 口径不产生 f32 持久态），**Unit Scaling 与 Peri-LN 是模型级 R5.x 实验**。证据、边界与落地门禁见 [`../todo/26-f16-speedup-plan.md`](../todo/26-f16-speedup-plan.md) §8.B.7。
 - 边界 cast 期的分阶段实测 A/B 与探针数据（f32 3069 MiB / f16 4124 MiB 等）见 `docs/history/history.md`；**当前峰值数字见 §12.11**。
 
 **已知问题（当前）**
 
 1. **CPU 侧 f16 全模型训练发散（已修复）**（双根因与验证见 §12.12）；`f16_precision_test` 对应的容忍分支已改为硬失败。
 2. 边界 cast 的 transient 膨胀（见上）：**未命中变体的算子**仍走该路径，剩余归因与下一步见 §12.8 / §12.11。
-3. RAPT / CNN 的层内 DSL 调用**未显式传 P**（默认 F32）→ 这些链不参与 f16（正确性无虞，只是不省）。
+3. RAPT / CNN 的 f16 接线已完成（P2-3）；剩余覆盖问题不是“未传 P”，而是 RAPT f16 的已知 NaN（[`../todo/18-roadmap.md`](../todo/18-roadmap.md) §3.1 C11）与长跑质量验证。
 4. `--activation-offload` 下 f16 激活写入 slab 前被抬为 f32（正确，但该份激活不再减半）。
 
 ---
@@ -761,9 +783,54 @@ matmul 段 / 归约 / 目标传递三类变体落地后的同窗交错实测（f
 - 诊断开关沉淀（默认零开销）：`NN_F16_DEBUG=1` → 层内 `nn_dbg_scan` 逐中间量 max/非有限
   扫描 + `compute_into` 预绑定失败打印 + `accumulate`/`eval_into`/`prepare` 异常打印。
 - profile 单字段矩阵（f16_precision_test `NN_F16_DEBUG=1`）：param/compute/stable/CLI
-  四组均收敛且贴合 f32；仅 optimizer=F16 仍发散 —— §12.5 记录的**数值性**限制
-  （Adam v≈g²~1e-10 在 f16 下溢 → 更新爆炸），与本节两个缺陷无关。
+  四组均收敛且贴合 f32；`optimizer=F16` 的旧发散已由 F5 的 Adam 状态缩放修复
+  （§12.5 / todo/24 §4.6），与本节两个缺陷无关。
 - ctest 全绿（含新增断言）；`text_train --f16` CPU 可正常训练。
+
+---
+
+### 12.13 两套 f16 计划：标准 `--f16` 与全流程真 f16（2026-10-18）
+
+| 路线 | 配方 | 目标 | 转换策略 |
+|---|---|---|---|
+| **A 标准 `--f16`** | `profile_f16()` = `{F16,F16,F32,F32}`；可选 `profile_master_weights()` = `{F32,F16,F32,F32}` | 参考 PyTorch AMP：稳定训练/推理，允许 f32 累加与边界 cast | stable/optimizer 保持 f32；补动态 loss scaling（GradScaler 语义）与 master weights 对照 |
+| **B 全流程真 f16** | `profile_all_f16()` = `{F16,F16,F16,F16}` | 支持设备全程零 f16↔f32 转换；不支持设备只由引擎在算子内隐式转换 | capable：native16 全覆盖、零转换；incapable：转换只进 `*_impl` |
+
+**Plan A 当前事实**：`--f16` 已是推荐安全配方（f16 参数/激活 + f32 stable/optimizer），
+`profile_master_weights()` 已存在；**缺** GradScaler 语义的动态 loss scaling，且
+`bench/train_torch.py --dtype fp16` 是 `model.half()` 纯 fp16，不能代表 PyTorch AMP。
+严格 AMP 的默认映射（保留 `--f16` 还是切到 master weights）由 26 §8.A A0 先裁定，不先改语义。
+
+**Plan B 当前事实**
+
+| 项 | 状态 |
+|---|---|
+| `profile_all_f16()` | ✅ 可构造（四槽全 F16） |
+| `optimizer=f16` | ✅ F5 后可训练：Adam 状态缩放 `S=4096`，m/v 回到 f16 正常区 |
+| `stable=f16` 的 CE 标量 | 🟡 当前 `(1,1)` loss 归约输出恒 F32；这是 F5 的数值补丁，**与真 f16 冲突**，R2 要改成 f16 安全归约 |
+| 一键 CLI 预设 | ❌ `text_train` / `mnist_train` 尚无 `--f16-all`，目前只能拼三个旗标 |
+| 长跑与质量 | 🟡 已有单模型 500 步记录；缺 3 seeds、真实规模、全模型与 f32 同窗基线 |
+| capable 设备零转换 | ❌ 当前仍有 `#x`/边界 cast/`cast_into` 与 f32 累加路径；真 f16 要求 `cast` = 0、f32 临时量 = 0 |
+| f16 累加 / 归约 | ❌ matmul / reduce / fold / CE 仍存在 f32 累加器；真 f16 要求 native16 全链或分块/补偿实现 |
+| 原生 f16 ALU 覆盖 | ❌ `#a` 仍排除 fold/matmul/reduce；真 f16 要求覆盖全部计算结构 |
+| 无 `shaderFloat16` 设备 | 🟡 允许转换，但只能由引擎在算子内部隐式完成；尚未建立 Layer/DSL 零 cast 的自动门禁 |
+| RAPT f16 | 🟡 仍有已知 NaN（todo/18 §3.1 C11），R5 前必须关闭 |
+
+**“全流程真 f16”的定义（Plan B）**：`{param, compute, stable, optimizer}` 四槽全 F16 覆盖从张量进入引擎到
+输出离开引擎的整条计算图。**设备支持 f16 计算时，全程不允许任何 f16↔f32 转换**：native16 覆盖
+全部算子，load/store、算术、累加、常量与输出都保持 f16，不允许 `cast`/`cast_into`/f32 镜像/半真路径。
+**设备不支持 f16 计算时**，转换只允许发生在 `ComputeEngine` 的算子实现内部，由引擎自动插入；
+Layer/DSL/CLI/模型代码不得手写 cast，不得产生跨算子的 f32 驻留副本。模型文件 / 张量 I/O 保持
+f16；数据集 token/id 是整数；只有日志/调试打印这类宿主展示边界允许 f32。
+
+**后续计划**：**Plan A** = A1.1 动态 loss scaling → A1.2 master weights 对照 → A1.3 敏感链 f32
+→ A2 PyTorch AMP 长跑验收；**Plan B** = R0 口径统一 → R1 `--f16-all` 预设 → R2 零转换普查与真 f16
+数值硬化 → R3 logits/CE 融合（先补 CE backward 扫描）→ R4 native16 全覆盖（核心门禁）→ R5 全模型/
+全设备覆盖 → R6 转正。完整验收矩阵与旧结论（S0/S1/S2/S5）的处理见
+[`../todo/26-f16-speedup-plan.md`](../todo/26-f16-speedup-plan.md) §8。
+
+> 一句话：**F5 关闭了“能不能训练”；Plan A 关闭“标准混合精度能不能稳定可用”，
+> Plan B 关闭“支持 f16 的设备能不能全程零转换、全模型可发布”**。
 
 ---
 

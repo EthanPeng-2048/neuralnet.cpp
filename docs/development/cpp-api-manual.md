@@ -105,7 +105,8 @@ nn::Result<T>  = std::expected<T, nn::Error>;   // Error 含 .message
 
 int main()
 {
-    nn::CpuEngine engine;
+    auto engine_owner = nn::CpuEngine::create();
+    nn::CpuEngine& engine = *engine_owner;
     nn::Tensor t = engine.create_tensor(4, 4);          // 纯分配：查 .valid()
     NN_UNWRAP(t.valid(), "oom");                         // bool 条件也可直接喂给 NN_UNWRAP
     nn::Matrix m = NN_UNWRAP(engine.to_matrix(t));       // 解包 + 失败终止
@@ -131,7 +132,12 @@ target_link_libraries(my_app PRIVATE neuralnet::nn)
 
 ```cpp
 #include <neuralnet.cpp/nn.hpp>
-int main() { nn::CpuEngine engine; /* ... */ }
+int main()
+{
+    auto engine_owner = nn::CpuEngine::create();
+    nn::CpuEngine& engine = *engine_owner;
+    /* ... */
+}
 ```
 
 门面目标 `neuralnet::nn` 传递：C++26、include 目录、线程库、GPU 宏 `NN_HAS_VULKAN`、
@@ -146,19 +152,22 @@ SPIR-V 嵌入头目录、Vulkan 链接与 shader 生成顺序。嵌入时 `NN_BU
 
 ## 3. 引擎：选择与创建
 
-引擎是所有计算的宿主，必须**先于**任何持有其非拥有指针的对象（`nn::Model`、`nn::Tensor`）析构。
+引擎由 `shared_ptr` 管理。`Layer` / `Model` / `Optimizer` 会持有强引用，
+`Tensor` 只保存 8B `EngineId`；不再需要“引擎最后析构”的调用约定。
 
 ```cpp
 // ① CPU（默认，无额外依赖）
-nn::CpuEngine engine;
+auto engine_owner = nn::CpuEngine::create();
+nn::CpuEngine& engine = *engine_owner;
 
 // ② GPU（需 Vulkan，编译期宏 NN_HAS_VULKAN）
 #ifdef NN_HAS_VULKAN
-nn::GpuBackend& backend = nn::GpuBackend::instance();      // 进程单例
-auto r = backend.initialize("40HX");                       // 空串 = 自动选卡；也可传枚举索引 "2"
+auto backend = nn::GpuBackend::shared();                   // 进程共享，RAII 析构
+auto r = backend->initialize("40HX");                      // 空串 = 自动选卡；也可传枚举索引 "2"
 if (r)
 {
-    nn::GpuEngine gpu_engine(backend);
+    auto gpu_engine_owner = nn::GpuEngine::create(backend);
+    nn::GpuEngine& gpu_engine = *gpu_engine_owner;
 }
 else
 {
@@ -273,10 +282,10 @@ struct nn::PrecisionProfile {
 
 ```cpp
 nn::profile_f32();               // 全 F32（默认）
-nn::profile_f16();               // --f16：param=F16, compute=F16, stable=F32, optimizer=F32
+nn::profile_f16();               // Plan A 标准 --f16：param=F16, compute=F16, stable=F32, optimizer=F32
 nn::profile_t1_58();             // --t1_58：param=T1_58（其余三槽 = profile_f16）
-nn::profile_master_weights();    // f32 主权重 + f16 计算 + f32 稳定 / 优化器
-nn::profile_all_f16();           // 四槽全 F16（激进实验配方，当前数值上不可训练）
+nn::profile_master_weights();    // Plan A 的 AMP master-weights 形态：f32 主权重 + f16 计算 + f32 稳定/优化器
+nn::profile_all_f16();           // Plan B 真 f16：四槽全 F16；F5 后可训练，但 native16/零转换尚未完成，见 todo/26 §8
 ```
 
 两种用法：
@@ -636,7 +645,8 @@ NN_UNWRAP(opt->step());
 
 int main()
 {
-    nn::CpuEngine engine;
+    auto engine_owner = nn::CpuEngine::create();
+    nn::CpuEngine& engine = *engine_owner;
 
     // 1. 模型 + 优化器 + 损失
     nn::Model model = NN_UNWRAP(nn::build_mnist_mlp_model(engine));

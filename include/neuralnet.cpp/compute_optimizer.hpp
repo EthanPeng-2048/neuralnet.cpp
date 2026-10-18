@@ -45,7 +45,10 @@ namespace nn
 class Optimizer
 {
 protected:
-    ComputeEngine& engine_;              // 非拥有引用（永不为空）
+    // 强引用在前、引用在后：引用始终绑定到 *engine_owner_，优化器存活期间
+    // 引擎不会析构。声明顺序即初始化顺序。
+    std::shared_ptr<ComputeEngine> engine_owner_;
+    ComputeEngine& engine_;
     std::vector<TensorRef> params_;      // 非拥有引用（永不为空）
     std::vector<TensorRef> grads_;       // 非拥有引用（永不为空）
 
@@ -97,12 +100,23 @@ protected:
         return {};
     }
 
+    [[nodiscard]] static ComputeEngine& bind_engine_(
+        ComputeEngine& engine, std::shared_ptr<ComputeEngine>& owner)
+    {
+        owner = engine.weak_from_this().lock();
+        if (!owner)
+            NN_FATAL("Optimizer: 引擎必须由 shared_ptr 管理"
+                     "（使用 CpuEngine::create() / GpuEngine::create()）");
+        return *owner;
+    }
+
 public:
     Optimizer(ComputeEngine& engine,
               std::vector<TensorRef> params,
               std::vector<TensorRef> grads,
               PrecisionProfile precision = PrecisionProfile{})
-        : engine_(engine),
+        : engine_owner_(),
+          engine_(bind_engine_(engine, engine_owner_)),
           params_(std::move(params)),
           grads_(std::move(grads)),
           p_(precision) {}

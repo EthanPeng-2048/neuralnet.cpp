@@ -465,7 +465,7 @@ struct FusedBatchInst
 // GpuBackend — Vulkan 计算后端单例
 // ══════════════════════════════════════════════════════════════════════════
 
-class GpuBackend
+class GpuBackend : public std::enable_shared_from_this<GpuBackend>
 {
 private:
     VulkanDevice device_;
@@ -473,10 +473,21 @@ private:
     // 44 个原语/变体的"身份 + 布局 + 设备能力要求"是 pipeline_specs() 的
     // 一行表格；这里只保留目录句柄。缺失的变体 = 空句柄 = 上层回退。
     PipelineCatalog pipelines_;
-    // 列归约两段式 partials scratch（成员复用：batch 录制期被 cmd 引用，
-    // 局部销毁会踩铁律 6；形状变化时旧缓冲走 pending_destroys_ 延迟销毁，
-    // 对在飞录制安全。同一 batch 内多次使用由 cmd 内屏障串行化）
-    std::optional<GpuTensor> reduce_partial_;
+    // 列归约两段式 partials scratch（backend 自有的裸 VkBuffer）。
+    //
+    // 为什么不再是 GpuTensor：GpuBuffer 现在持有 shared_ptr<GpuBackend>
+    // keepalive；若 backend 再持有 GpuTensor，就会形成
+    // backend → GpuTensor → GpuBuffer → backend 的引用环，backend 永不析构。
+    // scratch 的生命周期严格短于 backend，直接由 VkBuffer + Allocation 管理。
+    struct ReduceScratch
+    {
+        VkBuffer buffer = VK_NULL_HANDLE;
+        MemoryPool::Allocation alloc{};
+        MemoryPool* pool = nullptr;
+        std::uint32_t rows = 0;
+        std::uint32_t cols = 0;
+    };
+    ReduceScratch reduce_partial_;
     // ── AOT 融合 kernel 目录 ────────────────────────────────────────────
     // 一个 key（expr_spec_key）对应一个 FusedKernel：pipeline + 该结构在
     // 运行期需要的全部形状/布局元数据。**注册时一次写定，运行期只读**。
@@ -691,6 +702,9 @@ public:
         {
             vkDeviceWaitIdle(device_.device());
 
+            // scratch 必须先于 memory pool 释放；它只由 backend 自己持有，
+            // 不经过 GpuBuffer 的延迟销毁队列。
+            destroy_reduce_partial_now_();
             flush_pending_destroys();
 
             destroy_scalar_readback_slots();
@@ -737,15 +751,31 @@ public:
     GpuBackend(GpuBackend&&) = delete;
     GpuBackend& operator=(GpuBackend&&) = delete;
 
+    // 进程共享 backend：函数局部 static shared_ptr，最后一个强引用释放时
+    // 正常执行析构（不再故意泄漏）。GpuBuffer 也持有强引用，因此
+    // Tensor/GpuBuffer 晚于 GpuEngine 析构仍安全。
+    [[nodiscard]] static std::shared_ptr<GpuBackend> shared()
+    {
+        static std::shared_ptr<GpuBackend> backend(new GpuBackend());
+        return backend;
+    }
+
+    // 独立实例（测试/多设备）：由调用方决定生命周期。
+    [[nodiscard]] static std::shared_ptr<GpuBackend> create()
+    {
+        return std::shared_ptr<GpuBackend>(new GpuBackend());
+    }
+
+    // 兼容旧入口：返回 shared() 的引用。新代码应直接持有 shared()。
     [[nodiscard]] static GpuBackend& instance()
     {
-        // 故意泄漏（进程退出时由 OS 回收）：避免静态析构顺序问题——
-        // 全局 GpuTensor 的析构可能晚于 backend，届时访问 instance() 会 UB。
-        // TODO(1.1, L1): 若作为库被长驻进程 embed，此泄漏会持续累积
-        //   （vkDestroyDevice/vkDestroyInstance/vkFreeMemory 永不调用）。
-        //   恢复方案：显式 shutdown() + 引用计数，或进程级一次清理。
-        static GpuBackend* backend = new GpuBackend();
-        return *backend;
+        static std::shared_ptr<GpuBackend> keepalive = shared();
+        return *keepalive;
+    }
+
+    [[nodiscard]] std::shared_ptr<GpuBackend> keepalive() noexcept
+    {
+        return weak_from_this().lock();
     }
 
     // ── 成员定义按主题拆分为 4 段（RV-08 物理拆分；纯移动，顺序即成员序）──
@@ -769,8 +799,10 @@ inline GpuBuffer::~GpuBuffer()
     if (buffer_ == VK_NULL_HANDLE)
         return;
 
-    auto& backend = GpuBackend::instance();
-    if (backend.is_initialized() && backend.needs_deferred_destroy())
+    // 本 keepalive 保证 backend 在析构全程存活；不再经全局 instance() 取
+    // 一个可能已经销毁的单例。
+    auto backend = std::move(backend_keepalive_);
+    if (backend && backend->is_initialized() && backend->needs_deferred_destroy())
     {
         // 延迟 vkDestroyBuffer（Vulkan 规范要求 buffer 在引用它的命令
         // 提交完成前不能被销毁）。两种延迟场景（needs_deferred_destroy）：
@@ -785,7 +817,7 @@ inline GpuBuffer::~GpuBuffer()
         // → 两个存活 buffer 内存重叠，违反 Vulkan 规范。
         // GpuBuffer 只经 MemoryPool 创建（create_device_local /
         // create_host_visible），pool_ 恒有效；alloc_ 无效时 free 为 no-op。
-        backend.defer_buffer_destroy(device_, buffer_, alloc_, pool_);
+        backend->defer_buffer_destroy(device_, buffer_, alloc_, pool_);
     }
     else
     {

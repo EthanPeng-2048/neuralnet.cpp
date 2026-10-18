@@ -240,7 +240,8 @@ void test_regalloc()
 // ── 测试 5：确定性（多次 canonicalize 结果一致） ────────────────────────
 void test_determinism()
 {
-    nn::CpuEngine eng;
+    auto eng_owner = nn::CpuEngine::create();
+    nn::CpuEngine& eng = *eng_owner;
     std::vector<nn::ExprSpec> specs;
 
     // 1) RoPE forward（真实 DSL 折叠路径）
@@ -301,7 +302,8 @@ void test_determinism()
 // ── 测试 6：语义等价（canonical 前后 CPU 求值一致） ─────────────────────
 void test_semantic_equivalence()
 {
-    nn::CpuEngine eng;
+    auto eng_owner = nn::CpuEngine::create();
+    nn::CpuEngine& eng = *eng_owner;
 
     // 含归约的 softmax 表达式（走 eval_expr 路径）
     {
@@ -451,7 +453,8 @@ void test_output_invariant()
 void test_reduce_preserved()
 {
     // softmax 表达式：归约指令 dst 与逐元素 dst 区段分离，Reduce 引用正确
-    nn::CpuEngine eng;
+    auto eng_owner = nn::CpuEngine::create();
+    nn::CpuEngine& eng = *eng_owner;
     nn::Tensor x = make_tensor(eng, 3, 7, -0.8f, 0.11f);
     auto expr = exp(leaf(x) - row_reduce_max(x))
               / row_reduce_sum(exp(leaf(x) - row_reduce_max(x)));

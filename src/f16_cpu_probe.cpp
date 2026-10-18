@@ -65,7 +65,8 @@ nn::Matrix rnd(std::size_t rows, std::size_t cols, unsigned seed,
 int main()
 {
     std::printf("f16_cpu_probe（profile_f16 组件级定位）\n");
-    nn::CpuEngine raw;
+    auto raw_owner = nn::CpuEngine::create();
+    nn::CpuEngine& raw = *raw_owner;
     nn::ComputeEngine& ad = raw;   // P-1：边界 cast 已下沉基类（原 PrecisionEngine）
     const auto prof = nn::profile_f16();
 

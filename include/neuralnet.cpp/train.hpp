@@ -13,13 +13,13 @@
 // 用法（完整训练循环骨架，签名细节见 AGENTS.md §8）：
 //     #include <neuralnet.cpp/train.hpp>
 //
-//     nn::CpuEngine engine;                       // 或 nn::GpuEngine（NN_HAS_VULKAN）
-//     nn::Model model(engine);
+//     auto engine = nn::CpuEngine::create();      // 或 nn::GpuEngine::create(backend)
+//     nn::Model model(*engine);
 //     NN_UNWRAP(model.add<nn::Linear>(784, 256));
 //     NN_UNWRAP(model.add<nn::ReLU>());
 //     NN_UNWRAP(model.add<nn::Linear>(256, 10));
 //
-//     auto opt = NN_UNWRAP(nn::create_optimizer("adam", engine,
+//     auto opt = NN_UNWRAP(nn::create_optimizer("adam", *engine,
 //                 model.parameters(), model.param_gradients(), 1e-3f, 0.01f));
 //     nn::CrossEntropyLoss loss_fn;
 //

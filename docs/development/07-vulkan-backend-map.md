@@ -63,18 +63,19 @@ capability 对象，引擎只读事实、不读 pipeline 句柄。
 
 | 对象 | 拥有者 | 生命周期要点 |
 |---|---|---|
-| `VulkanDevice` | `GpuBackend::device_` | 进程级单例（`GpuBackend::instance()` 故意泄漏） |
+| `VulkanDevice` | `GpuBackend::device_` | `GpuBackend::shared()` 进程共享；最后一个强引用释放时 RAII 析构 |
 | `MemoryPool` ×2（持久/瞬态） | `GpuBackend` | 所有 `GpuBuffer` 的子分配都来自其一 |
 | `StagingRing` | `GpuBackend` | 阻塞上传/下载路径；时间线信号量可选 |
 | `VulkanPipeline` ×44 | `GpuBackend` | `initialize()` 一次性创建；缺失 = 该变体不可用 |
 | 帧环 `frames_[6]` | `GpuBackend` | cmd + fence + 描述符集按帧归属；环槽复用前等 fence |
-| `GpuBuffer` | `shared_ptr`，被 `GpuTensorT` 共享 | 析构可能**延迟**到引用它的帧完成（`defer_buffer_destroy`） |
+| `GpuBuffer` | `shared_ptr`，被 `GpuTensorT` 共享；另持 `shared_ptr<GpuBackend>` keepalive | 析构可能**延迟**到引用它的帧完成（`defer_buffer_destroy`） |
 | `GpuTensorT<P>` | `shared_ptr`，被 `Tensor` 类型擦除持有 | 零拷贝 `with_shape` / 别名共享同一 `GpuBuffer` |
 
 两条容易踩的规则：
 
 1. **batch 录制期创建的张量不能立即销毁**。已录制的 descriptor set 仍引用
-   buffer；`GpuBuffer::~GpuBuffer` 会向 `GpuBackend` 登记延迟销毁。
+   buffer；`GpuBuffer::~GpuBuffer` 经自己持有的 backend keepalive 登记延迟销毁，
+   不再调用可能已销毁的全局 `instance()`。
 2. **写版本跟着 buffer 走，不跟着句柄走**。`GpuBuffer::write_epoch()` 是
    BitLinear 量化缓存的失效依据；任何新的直写路径必须补 `mark_written`。
 

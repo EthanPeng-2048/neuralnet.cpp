@@ -96,7 +96,8 @@ void ref_binary(Matrix& out, const Matrix& a, const Matrix& b, char op)
 
 int main()
 {
-    CpuEngine engine;
+    auto engine_owner = CpuEngine::create();
+    CpuEngine& engine = *engine_owner;
     ComputeEngine& eng = engine;
 
     std::cout << "========================================\n"

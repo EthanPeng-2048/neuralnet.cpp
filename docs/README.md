@@ -69,7 +69,8 @@
 | [`05-mixed-precision.md`](development/05-mixed-precision.md) | 多精度语义契约（写层/选 profile 必读）+ 实测限制 |
 | [`06-rapt-algorithm.md`](development/06-rapt-algorithm.md) | 线性注意力（RLA → RAPT → RLA-2）算法 + 扫描原语落地 |
 | [`07-vulkan-backend-map.md`](development/07-vulkan-backend-map.md) | Vulkan 后端结构地图（维护者）：调用链 / 所有权 / 依赖方向 / 扩展步骤 |
-| [`08-object-lifetimes.md`](development/08-object-lifetimes.md) | 引擎借用生命周期契约：EngineLease / Layer 状态机 / 引擎先析构的失败语义 |
+| [`08-object-lifetimes.md`](development/08-object-lifetimes.md) | 对象生命周期契约 v2：EngineId / shared_ptr 强所有权 / GPU buffer keepalive（迁移检查清单） |
+| [`09-engine-ownership.md`](development/09-engine-ownership.md) | 引擎/ backend 所有权设计：不变量、改动范围、API 影响、性能口径与实施顺序 |
 | [`20-custom-layer-ergonomics.md`](development/20-custom-layer-ergonomics.md) | 写自定义层的**实测报告**：接入契约与 7 个摩擦点（库外使用者视角） |
 
 ### todo/（给项目开发者）

@@ -272,8 +272,47 @@ jobs:
         path: ${{github.workspace}}/build/${{ matrix.archive-name }}
         retention-days: 1
 
+  # ══════════════════════════════════════════════════════════════════════
+  # P1-5：MSVC Debug 冒烟
+  # ══════════════════════════════════════════════════════════════════════
+  # 上面的 build 矩阵用 clang++ Release，覆盖不到：
+  #   ① cl.exe 的 Debug 代码生成 / STL 断言 / 迭代器调试；
+  #   ② 只在 Debug 下暴露的未初始化读、迭代器失效、assert 路径。
+  # 这里用 Visual Studio 生成器直接拿到 cl.exe（无需 vcvars 脚本），
+  # 纯 CPU（NN_ENABLE_GPU=OFF）以避开 Vulkan/glslc 变量，保持冒烟稳定；
+  # ctest 除一个已知不稳定数值问题外全跑（见下）；其中 optimizer_test
+  # 的 [4] 段断言 8 步训练参数确实移动。
+  msvc-debug:
+    name: MSVC Debug smoke (cl.exe, CPU-only)
+    runs-on: windows-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Configure CMake (MSVC Debug, CPU-only)
+      shell: pwsh
+      run: >
+        cmake -B build-msvc-debug
+        -G "Visual Studio 17 2022" -A x64
+        -DNN_ENABLE_NATIVE=OFF
+        -DNN_ENABLE_GPU=OFF
+        -DNN_ENABLE_TESTS=ON
+
+    - name: Build (Debug)
+      shell: pwsh
+      run: cmake --build build-msvc-debug --config Debug --parallel
+
+    # ⚠ rapt_test_f16 是已知的 RAPT f16 NaN（18 §3.1 C11）：用户已排查，怀疑是
+    #   设备/后端自身问题；Release 下不触发只是概率，不是"Debug 专有"。
+    #   修好前显式排除；其余用例全跑，避免这个已知不稳定项把 Debug job 永久染红。
+    - name: Test ctest (Debug)
+      shell: pwsh
+      run: >
+        ctest --test-dir build-msvc-debug -C Debug --output-on-failure
+        -E "^rapt_test_f16$"
+
   release:
-    needs: build
+    needs: [build, msvc-debug]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:

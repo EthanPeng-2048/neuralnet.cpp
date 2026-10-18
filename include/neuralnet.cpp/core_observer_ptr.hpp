@@ -14,9 +14,9 @@
 //   - 函数参数：表示可选的观察者输入
 //   - 返回值：表示可能为空的查询结果
 //
-// ⚠ 需要"借用是否仍然有效"可判定的场景（引擎被 Layer / Model / Tensor /
-//   ExprGraph 借用）请用 core_engine_lease.hpp 的 EngineLease：observer_ptr
-//   只能表达"不拥有"，不能检测对象是否已销毁。
+// ⚠ 引擎生命周期不要用 observer_ptr：Tensor 只保存 EngineId；Layer / Model /
+//   Optimizer / ExprGraph 持有 shared_ptr<ComputeEngine>。详见
+//   docs/development/09-engine-ownership.md。
 // ─────────────────────────────────────────────────────────────────────────
 
 #pragma once

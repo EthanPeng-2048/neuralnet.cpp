@@ -18,7 +18,8 @@
 namespace
 {
 const int g_scan_self_registered = [] {
-    nn::CpuEngine eng;
+    auto eng_owner = nn::CpuEngine::create();
+    nn::CpuEngine& eng = *eng_owner;
     constexpr std::size_t R = 5, C = 7, M = 3, K = 4, N = 2;
     auto x    = eng.create_tensor(R, C);
     auto g    = eng.create_tensor(R, 1);

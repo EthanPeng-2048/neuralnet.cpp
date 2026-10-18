@@ -1,29 +1,21 @@
-// ── layer_lifetime_test — 引擎借用生命周期契约 ───────────────────────────
+// ── layer_lifetime_test — EngineId + 强所有权生命周期 ─────────────────────
 //
-// 覆盖（core_engine_lease.hpp + Layer / Model / Tensor / ExprBlock）：
-//   [1] EngineLease 三态：unbound / alive / expired；令牌地址跨引擎不复用
-//   [2] Layer 状态机：unbound → ready；init 失败 → failed；失败后可重新
-//       init、可注入 profile（旧实现把"指针非空"当已 init，改 profile 会 abort）
-//   [3] 跨引擎重绑 → Result 错误（明确拒绝，不是 UB）
-//   [4] 引擎先析构：binding_state 仍 ready、engine_alive()==false；
-//       后续 forward 在子进程中以 [engine-lease] 消息终止（exit != 0）
-//   [5] 正常顺序（engine 活到 layer 之后）：forward 正常
-//   [6] Model：引擎析构后 forward 返回错误、engine() 子进程终止
-//   [7] Tensor：引擎析构后 bound() 仍 true、engine_alive()==false、
-//       engine() 子进程终止；EngineLease 仍是 8B
-//
-// 子进程模式：--expect-layer-abort / --expect-model-abort / --expect-tensor-abort
-// 退出码：0 = 通过，1 = 失败。
-// ───────────────────────────────────────────────────────────────────────────
+// v2 契约（docs/development/09-engine-ownership.md）：
+//   [1] EngineId：8B、平凡复制、进程内不复用；引擎不可栈上构造
+//   [2] Tensor 只保存 EngineId：引擎析构后仍可复制/析构，不存在悬垂指针
+//   [3] Layer 持有 shared_ptr<ComputeEngine>：外部 shared_ptr 释放后仍可 forward
+//   [4] Model 持有强引用：引擎随 Model 存活
+//   [5] 跨引擎重绑返回 Result 错误
+//   [6] Optimizer 持有强引用：外部引擎句柄释放后 step 仍安全
+//   [7] Layer 的 init 失败回滚与 profile 注入
+// ─────────────────────────────────────────────────────────────────────────
 
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
 #include <string>
-
-#ifndef _WIN32
-#include <sys/wait.h>
-#endif
+#include <type_traits>
+#include <vector>
 
 #include "neuralnet.cpp/nn.hpp"
 #include "test_common.hpp"
@@ -33,33 +25,6 @@ int g_fail = 0;
 namespace
 {
 
-constexpr int kSkip = -1;
-std::string g_self;
-
-int run_self(const char* args)
-{
-    const std::string cmd = "\"" + g_self + "\" " + args;
-    const int rc = std::system(cmd.c_str());
-    if (rc == -1)
-    {
-        std::printf("[SKIP] 无法启动子进程（system 返回 -1）\n");
-        return kSkip;
-    }
-    return rc;
-}
-
-int normalize_rc(int rc)
-{
-#ifdef _WIN32
-    return rc;
-#else
-    if (WIFEXITED(rc)) return WEXITSTATUS(rc);
-    if (WIFSIGNALED(rc)) return 128 + WTERMSIG(rc);
-    return rc;
-#endif
-}
-
-// ── 测试用层：init_impl 首次失败，之后成功 ────────────────────────────────
 class FlakyLayer : public nn::Layer
 {
 public:
@@ -85,220 +50,196 @@ protected:
     }
 };
 
-// ── [1] EngineLease 三态 + 令牌不复用 ────────────────────────────────────
-void test_lease_basics()
+void test_engine_id()
 {
-    nn::EngineLease unbound;
-    CHECK(!unbound.bound(), "默认构造的 lease 未绑定");
-    CHECK(!unbound.alive(), "默认构造的 lease 不 alive");
-    CHECK(unbound.get() == nullptr, "默认构造的 lease get() == nullptr");
+    static_assert(sizeof(nn::EngineId) == sizeof(void*),
+                  "EngineId 必须保持 8B");
+    static_assert(std::is_trivially_copyable_v<nn::EngineId>);
+    static_assert(!std::is_default_constructible_v<nn::CpuEngine>,
+                  "CpuEngine 不允许栈上构造（必须用 create()）");
+#ifdef NN_HAS_VULKAN
+    static_assert(!std::is_default_constructible_v<nn::GpuEngine>,
+                  "GpuEngine 不允许栈上构造（必须用 create()）");
+#endif
 
-    const nn::EngineLiveness* id1 = nullptr;
-    nn::EngineLease outer;
+    nn::EngineId unbound;
+    CHECK(!unbound.bound(), "默认 EngineId 未绑定");
+
+    auto e1 = nn::CpuEngine::create();
+    auto e2 = nn::CpuEngine::create();
+    CHECK(e1->id().bound() && e2->id().bound(), "引擎构造后带非零身份");
+    CHECK(e1->id() != e2->id(), "不同引擎身份不相等");
+
+    const nn::EngineId a = e1->id();
+    const nn::EngineId b = a;
+    CHECK(a == b, "EngineId 复制保持相等");
+}
+
+void test_tensor_survives_engine()
+{
+    nn::Tensor t;
+    nn::EngineId id;
     {
-        nn::CpuEngine engine;
-        outer = engine.lease();
-        CHECK(outer.bound() && outer.alive(), "引擎存活时 lease 有效");
-        CHECK(outer.get() == &engine, "lease.get() 指向原引擎");
-        CHECK(outer.identity() != nullptr, "lease 带令牌身份");
-        id1 = outer.identity();
+        auto engine = nn::CpuEngine::create();
+        t = engine->create_tensor(2, 2, nn::Precision::F32);
+        id = t.engine_id();
+        CHECK(t.bound(), "引擎产物出生即带身份");
+        CHECK(id == engine->id(), "Tensor::engine_id() == 创建引擎 id");
     }
-    CHECK(outer.expired(), "引擎析构后 lease 变 expired");
-    CHECK(!outer.alive(), "expired lease 不 alive");
-    CHECK(outer.get() == nullptr, "expired lease get() 永不返回悬垂指针");
-    CHECK(outer.identity() == id1, "expired 后身份仍稳定（同源比较可用）");
 
-    const nn::EngineLiveness* id2 = nullptr;
-    {
-        nn::CpuEngine engine2;
-        id2 = engine2.lease().identity();
-    }
-    CHECK(id1 != id2, "令牌地址跨引擎不复用（陈旧 lease 不会误认新引擎）");
-    CHECK(sizeof(nn::EngineLease) == sizeof(void*), "EngineLease 保持 8B");
+    // 引擎已析构：Tensor 只是 8 字节身份 + 共享存储，复制/析构都安全。
+    CHECK(t.bound(), "引擎析构后 Tensor 仍记录出生身份");
+    CHECK(t.engine_id() == id, "身份不随引擎析构改变");
+    nn::Tensor copy = t;
+    CHECK(copy.engine_id() == id, "Tensor 拷贝传播 EngineId");
+    CHECK(copy.rows() == 2 && copy.cols() == 2, "Tensor 元数据可安全读取");
 }
 
-// ── [2] Layer 状态机 + init 失败回滚 ─────────────────────────────────────
-void test_layer_state_machine()
-{
-    nn::CpuEngine engine;
-    FlakyLayer layer;
-
-    CHECK(layer.binding_state() == nn::Layer::BindingState::unbound,
-          "新层状态 = unbound");
-    CHECK(!layer.engine_alive(), "新层 engine_alive() == false");
-
-    auto r1 = layer.init(engine);
-    CHECK(!r1, "首次 init 按注入失败");
-    CHECK(layer.binding_state() == nn::Layer::BindingState::failed,
-          "init 失败后状态 = failed（不是 ready）");
-    CHECK(layer.engine_alive(), "失败后仍保留可诊断的引擎绑定");
-
-    // 旧实现：engine_ 非空 ⇒ set_precision_profile 误判"已 init"并 abort。
-    layer.set_precision_profile(nn::profile_f16());
-    CHECK(layer.precision_profile().compute == nn::Precision::F16,
-          "failed 状态允许修正 profile（旧实现会 abort）");
-
-    auto r2 = layer.init(engine);
-    CHECK(r2, "失败后可重新 init");
-    CHECK(layer.binding_state() == nn::Layer::BindingState::ready,
-          "重新 init 成功后状态 = ready");
-    CHECK(layer.engine_alive(), "ready 层 engine_alive() == true");
-}
-
-// ── [3] 跨引擎重绑拒绝 ───────────────────────────────────────────────────
-void test_cross_engine_reinit_rejected()
-{
-    nn::CpuEngine e1;
-    nn::CpuEngine e2;
-    FlakyLayer layer;
-    layer.attempts = 1;   // 让下一次 init_impl 直接成功（跳过注入的首次失败）
-    auto r1 = layer.init(e1);
-    CHECK(r1, "绑定 e1 成功");
-    auto r2 = layer.init(e2);
-    CHECK(!r2, "跨引擎重绑返回错误");
-    CHECK(!r2 && r2.error().message.find("另一个引擎") != std::string::npos,
-          "错误信息说明是跨引擎重绑");
-    CHECK(layer.engine_alive(), "拒绝后仍绑定 e1（未被改写）");
-}
-
-// ── [4] 引擎先析构：状态可判定 ───────────────────────────────────────────
-void test_engine_destroyed_before_layer()
+void test_layer_keeps_engine_alive()
 {
     std::unique_ptr<nn::Linear> layer;
     nn::Tensor x;
     {
-        nn::CpuEngine engine;
-        // Linear 的输入布局是 (in_features, batch)
-        auto xr = engine.try_create_tensor(4, 2, nn::Precision::F32);
-        CHECK(xr, "创建输入张量");
-        x = *xr;
+        auto engine = nn::CpuEngine::create();
+        x = engine->create_tensor(4, 2, nn::Precision::F32);
         layer = std::make_unique<nn::Linear>(4, 3);
-        auto ir = layer->init(engine);
-        CHECK(ir, "Linear init");
+        auto r = layer->init(*engine);
+        CHECK(r, "Linear init");
+        CHECK(layer->engine_alive(), "Layer 持有引擎强引用");
     }
 
-    CHECK(layer->binding_state() == nn::Layer::BindingState::ready,
-          "引擎销毁后层状态仍是 ready（绑定事实不变）");
-    CHECK(!layer->engine_alive(), "引擎销毁后 engine_alive() == false");
-
-    const int rc = normalize_rc(run_self("--expect-layer-abort"));
-    if (rc != kSkip)
-        CHECK(rc != 0, "引擎已销毁时 forward 终止（而不是 UB）");
+    // 外部 engine shared_ptr 已释放；Layer 的强引用让引擎继续存活。
+    CHECK(layer->engine_alive(), "外部句柄释放后 Layer 仍持有引擎");
+    auto y = layer->forward(x);
+    CHECK(y, "引擎由 Layer 保活，forward 正常");
+    CHECK(y && y->rows() == 3 && y->cols() == 2, "forward 形状正确");
 }
 
-// ── [5] 正常顺序不回归 ───────────────────────────────────────────────────
-void test_normal_order()
-{
-    nn::CpuEngine engine;
-    auto xr = engine.try_create_tensor(4, 2, nn::Precision::F32);
-    CHECK(xr, "创建输入张量");
-    nn::Linear layer(4, 3);
-    auto ir = layer.init(engine);
-    CHECK(ir, "正常 init");
-    auto y = layer.forward(*xr);
-    CHECK(y, "引擎存活时 forward 正常");
-    CHECK(y && y->rows() == 3 && y->cols() == 2, "forward 输出形状正确");
-}
-
-// ── [6] Model：引擎先析构 ────────────────────────────────────────────────
-void test_model_engine_destroyed()
+void test_model_keeps_engine_alive()
 {
     std::unique_ptr<nn::Model> model;
     nn::Tensor x;
     {
-        nn::CpuEngine engine;
-        auto xr = engine.try_create_tensor(4, 2, nn::Precision::F32);
-        CHECK(xr, "创建输入张量");
-        x = *xr;
-        model = std::make_unique<nn::Model>(engine);
-        auto ar = model->add<nn::Linear>(4, 3);
-        CHECK(ar, "Model::add");
+        auto engine = nn::CpuEngine::create();
+        x = engine->create_tensor(4, 2, nn::Precision::F32);
+        model = std::make_unique<nn::Model>(*engine);
+        auto r = model->add<nn::Linear>(4, 3);
+        CHECK(r, "Model::add");
     }
-    auto y = model->forward(x);
-    CHECK(!y, "引擎销毁后 Model::forward 返回错误");
-    CHECK(!y && y.error().message.find("已销毁") != std::string::npos,
-          "Model 错误信息说明引擎已销毁");
 
-    const int rc = normalize_rc(run_self("--expect-model-abort"));
-    if (rc != kSkip)
-        CHECK(rc != 0, "引擎已销毁时 Model::engine() 终止");
+    auto y = model->forward(x);
+    CHECK(y, "Model 持有引擎强引用，forward 正常");
+    CHECK(y && y->rows() == 3 && y->cols() == 2, "Model 输出形状正确");
 }
 
-// ── [7] Tensor：引擎先析构 ───────────────────────────────────────────────
-void test_tensor_engine_destroyed()
+void test_cross_engine_reinit_rejected()
 {
+    auto e1 = nn::CpuEngine::create();
+    auto e2 = nn::CpuEngine::create();
+    FlakyLayer layer;
+    layer.attempts = 1;   // 下一次 init_impl 直接成功
+    auto r1 = layer.init(*e1);
+    CHECK(r1, "绑定 e1 成功");
+    auto r2 = layer.init(*e2);
+    CHECK(!r2, "跨引擎重绑返回错误");
+    CHECK(!r2 && r2.error().message.find("另一个引擎") != std::string::npos,
+          "错误信息说明是跨引擎重绑");
+    CHECK(layer.engine_alive(), "拒绝后仍绑定 e1");
+}
+
+void test_optimizer_keeps_engine_alive()
+{
+    auto engine = nn::CpuEngine::create();
+    nn::Tensor p = engine->create_tensor(
+        2, 2, nn::Precision::F32, nn::InitSpec::constant(nn::Scalar{1}));
+    nn::Tensor g = engine->create_tensor(
+        2, 2, nn::Precision::F32, nn::InitSpec::constant(nn::Scalar{0.5}));
+    std::vector<nn::TensorRef> params{std::ref(p)};
+    std::vector<nn::TensorRef> grads{std::ref(g)};
+    auto opt = nn::create_optimizer("sgd", *engine, params, grads, 0.1f, 0.0f);
+    CHECK(opt != nullptr, "create_optimizer");
+
+    // 丢掉外部强引用；Optimizer 内部 keepalive 必须让 step 继续安全。
+    engine.reset();
+    auto step = opt->step();
+    CHECK(step, "Optimizer 持有引擎强引用，step 正常");
+}
+
+void test_gpu_buffer_outlives_engine()
+{
+#ifdef NN_HAS_VULKAN
+    // 独立 backend 的完整初始化在部分老卡上要几十秒；默认只跑 CPU 生命周期。
+    // 需要验证"最后一个 GpuBuffer 释放 → backend 正常析构"时手动设
+    // NN_GPU_LIFETIME_FULL=1。
+    if (std::getenv("NN_GPU_LIFETIME_FULL") == nullptr)
+        return;
+
     nn::Tensor t;
     {
-        nn::CpuEngine engine;
-        auto tr = engine.try_create_tensor(2, 2, nn::Precision::F32);
-        CHECK(tr, "创建张量");
-        t = *tr;
-        CHECK(t.bound() && t.engine_alive(), "存活引擎上的张量 bound + alive");
+        // 独立 backend（不是进程共享实例），这样作用域结束时确实是最后一个
+        // 强引用链的起点。初始化失败（CI 无 GPU）→ 本子用例跳过。
+        auto backend = nn::GpuBackend::create();
+        auto init = backend->initialize();
+        if (!init)
+        {
+            std::printf("[SKIP] GpuBuffer 生命周期：%s\n",
+                        init.error().message.c_str());
+            return;
+        }
+        auto engine = nn::GpuEngine::create(backend);
+        t = engine->create_tensor(16, 16, nn::Precision::F32);
+        CHECK(t.is_gpu() && t.valid(), "创建 GPU 张量");
     }
-    CHECK(t.bound(), "引擎销毁后 bound() 仍表示出生绑定存在");
-    CHECK(!t.engine_alive(), "引擎销毁后 engine_alive() == false");
 
-    const int rc = normalize_rc(run_self("--expect-tensor-abort"));
-    if (rc != kSkip)
-        CHECK(rc != 0, "引擎已销毁时 Tensor::engine() 终止");
+    // engine / backend 的局部 shared_ptr 都已释放；GpuBuffer 自己持有
+    // backend keepalive，因此这里的复制与析构都必须安全。
+    CHECK(t.valid() && t.is_gpu(), "GpuEngine 析构后 GPU 张量仍有效");
+    nn::Tensor copy = t;
+    CHECK(copy.valid(), "GPU 张量可安全复制");
+    t = nn::Tensor{};
+    CHECK(copy.valid(), "原句柄释放后副本仍有效");
+    // copy 在函数结束时析构：最后一个 buffer 释放 → backend 正常析构。
+#endif
+}
+
+void test_layer_init_failure_rollback()
+{
+    auto engine = nn::CpuEngine::create();
+    FlakyLayer layer;
+
+    CHECK(layer.binding_state() == nn::Layer::BindingState::unbound,
+          "新层状态 = unbound");
+    CHECK(!layer.engine_alive(), "新层未持有引擎");
+
+    auto r1 = layer.init(*engine);
+    CHECK(!r1, "首次 init 按注入失败");
+    CHECK(layer.binding_state() == nn::Layer::BindingState::failed,
+          "init 失败后状态 = failed");
+    CHECK(layer.engine_alive(), "失败后仍保留可诊断的引擎强引用");
+
+    layer.set_precision_profile(nn::profile_f16());
+    CHECK(layer.precision_profile().compute == nn::Precision::F16,
+          "failed 状态允许修正 profile");
+
+    auto r2 = layer.init(*engine);
+    CHECK(r2, "失败后可重新 init");
+    CHECK(layer.binding_state() == nn::Layer::BindingState::ready,
+          "重新 init 成功后状态 = ready");
 }
 
 } // namespace
 
-int main(int argc, char* argv[])
+int main()
 {
-    g_self = (argc > 0 && argv[0] != nullptr) ? argv[0] : "";
-
-    // ── 子进程模式（父进程 std::system 自举）─────────────────────────────
-    if (argc >= 2 && std::string(argv[1]) == "--expect-layer-abort")
-    {
-        std::unique_ptr<nn::Linear> layer;
-        nn::Tensor x;
-        {
-            nn::CpuEngine engine;
-            x = engine.create_tensor(4, 2, nn::Precision::F32);
-            layer = std::make_unique<nn::Linear>(4, 3);
-            (void)layer->init(engine);
-        }
-        std::printf("子进程：引擎已销毁，调用 forward\n");
-        (void)layer->forward(x);
-        std::printf("不应到达\n");
-        return 0;
-    }
-    if (argc >= 2 && std::string(argv[1]) == "--expect-model-abort")
-    {
-        std::unique_ptr<nn::Model> model;
-        {
-            nn::CpuEngine engine;
-            model = std::make_unique<nn::Model>(engine);
-            (void)model->add<nn::Linear>(4, 3);
-        }
-        std::printf("子进程：引擎已销毁，调用 Model::engine()\n");
-        (void)model->engine();
-        std::printf("不应到达\n");
-        return 0;
-    }
-    if (argc >= 2 && std::string(argv[1]) == "--expect-tensor-abort")
-    {
-        nn::Tensor t;
-        {
-            nn::CpuEngine engine;
-            t = engine.create_tensor(2, 2, nn::Precision::F32);
-        }
-        std::printf("子进程：引擎已销毁，调用 Tensor::engine()\n");
-        (void)t.engine();
-        std::printf("不应到达\n");
-        return 0;
-    }
-
-    std::printf("── EngineLease / Layer / Model / Tensor 生命周期 ──\n");
-    test_lease_basics();
-    test_layer_state_machine();
+    std::printf("── EngineId / Layer / Model / Optimizer / Tensor 生命周期 ──\n");
+    test_engine_id();
+    test_tensor_survives_engine();
+    test_layer_keeps_engine_alive();
+    test_model_keeps_engine_alive();
     test_cross_engine_reinit_rejected();
-    test_engine_destroyed_before_layer();
-    test_normal_order();
-    test_model_engine_destroyed();
-    test_tensor_engine_destroyed();
+    test_optimizer_keeps_engine_alive();
+    test_gpu_buffer_outlives_engine();
+    test_layer_init_failure_rollback();
 
     if (g_fail == 0)
         std::printf("layer_lifetime_test: ALL PASS\n");

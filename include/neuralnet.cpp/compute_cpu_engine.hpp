@@ -37,7 +37,16 @@ inline constexpr std::size_t kExprParallelThreshold = 65536;
 
 class CpuEngine final : public ComputeEngine
 {
+private:
+    CpuEngine() = default;
+
 public:
+    // 引擎必须由 shared_ptr 管理：Layer / Model / Optimizer 会保存强引用。
+    [[nodiscard]] static std::shared_ptr<CpuEngine> create()
+    {
+        return std::shared_ptr<CpuEngine>(new CpuEngine());
+    }
+
     [[nodiscard]] Device device() const noexcept override { return Device::CPU; }
 
     // ── 批处理：CPU 为 no-op（同步执行） ──────────────────────────────────
@@ -58,7 +67,7 @@ public:
         if (owner)
             NN_FAIL("begin_expr: 嵌套录制（已有未结束的 begin_expr）");
         owner = std::make_unique<ExprGraph>();
-        owner->owner = lease();
+        owner->owner = weak_from_this().lock();
 #endif
         return {};
     }

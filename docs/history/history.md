@@ -693,6 +693,23 @@ GPU 后端 / GPU 引擎头文件「历史状态类注释」摘录。整改原则
 
 # 引擎接口 / CPU 引擎 / 精度 / 张量 / 损失 / 优化器
 
+- **2026-10-18 引擎所有权 v2（EngineId + shared_ptr 强引用）**（原位置：
+  `core_engine_lease.hpp` / `compute_tensor.hpp` / `compute_engine.hpp` /
+  `compute_vk_backend.hpp`）：旧方案用进程级只增不减的 `EngineLiveness` 令牌池 +
+  8B `EngineLease`，`require()` 仍是 check-then-use；`GpuBackend::instance()`
+  故意泄漏 Vulkan 资源，`GpuBuffer` 析构还依赖全局单例存活。v2 改为：
+  ① `Tensor` 只保存 8B `EngineId`（进程内单调递增、永不复用，无指针/无原子
+  拷贝）；② `Layer` / `Model` / `Optimizer` / `ExprGraph` / `ExprBlock` 持有
+  `shared_ptr<ComputeEngine>`；③ `CpuEngine` / `GpuEngine` 私有构造 +
+  `create()`，禁止栈上引擎；④ `GpuBackend` 改 `shared()` / `create()` +
+  `enable_shared_from_this`，`GpuBuffer` 持 backend keepalive，`reduce_partial_`
+  改 backend 自有裸 `VkBuffer` 以切断引用环；⑤ 修复 `~GpuBackend` 中
+  `reduce_partial_` 晚于 memory pool 析构的顺序隐患。验收：CPU ctest 53/53；
+  GPU ctest 55/55（`NN_VULKAN_DEVICE=850M`）；`layer_lifetime_test` 覆盖
+  EngineId 8B、Tensor 晚于引擎析构、Layer/Model/Optimizer 保活、跨引擎拒绝；
+  `NN_GPU_LIFETIME_FULL=1` 额外验证 GpuBuffer 晚于 GpuEngine/backend 析构。
+  设计与迁移清单见 `docs/development/09-engine-ownership.md`。
+
 ## P2-12：复合 kernel 的运行期精度签名在 scan 侧无登记入口（2026-10-14；原位置 include/neuralnet.cpp/compute_cpu_engine.hpp:71）
 - 类型：覆盖缺口 → 修复（构建期扫描补记）
 - 内容：`scan_exprs` 模式下的 CPU `end_expr` 只做了 `global_registry().add(k.spec)`（登记**结构** V0），没有登记**融合 kernel 的运行期精度签名**——单节点结构的签名由 `dsl::compute` 的 `scan_register` 与引擎 `eval_expr*` 入口按真实张量精度登记，而**融合结构只在 GPU 的 `end_expr` 执行时才算出签名**。后果：`--f16` 下复合结构只有 V0/`#s`/`#x` 三种载体 ⇒ ① 拿不到 `key#xxxx` 静态特化（回落带 `prec` 三元的 `#x`）；② 拿不到 `key#xxxx#b` 批量变体（即便 `#b` 已对每个静态签名变体发射）。修法 = 在 scan 的 `end_expr` 里对 `members.size() > 1` 的 kernel 用**与运行期同源**的口径补记 `add_variant(k.spec, expr_prec_sig_make(输入张量 f16 位图, k.prec == F16))`（等价于运行期 `expr_prec_sig_of(d.ins, out.precision())`；内部依赖输入未绑定张量 → 该槽按 f32 记，纯逐元素复合的成员引用经寄存器直替、不进 views，故正常构图下每槽都是外部输入）。生效后 Adam 复合结构拿到 `#10004` + `#10004#b`；实测（40HX/f16/b64/20 步，配对 `329f8f1` vs `5bb6a51`）：`[ir-c][degrade]` 70 → 0/步、优化器派发 138.7 → 8.55 calls/步（−94%）、优化器 host 阶段 −34%，但端到端墙钟在 GPU-bound（忙率 95.5%）下无可见收益。**边界**：只覆盖 scan 真跑过的 profile（f32 + `--f16`），其它显式组合仍按设计回落降级（构建期 2^4 精度枚举不可取）。
@@ -5115,3 +5132,47 @@ P0-4 的 `install()/find_package` 与 P2-9）；剩 13 项 = 部分完成 5（P0
   `cli_controllers.py` 的 `DEFAULT_SYSTEM_PROMPT`（GUI 字段默认）。`chat_prompt_test` 的
   CLI 端到端显式传 `--system SYS`，避免把这份字面量复制进测试；两份默认值若漂移，GUI 与 CLI
   的默认行为差异只在"用户没改系统提示"时可见（GUI 总是显式发 `--system`）。
+
+---
+
+# P1-5：CI 扩 MSVC Debug + 权重变化断言（2026-10-18）
+
+- 类型：演进记录 / 门禁补强
+- **原状**：CI 的两个平台矩阵都显式用 `clang++` + Release，Debug 专有路径（STL 断言、
+  迭代器调试、未初始化读、assert 分支）没有自动覆盖。权重变化断言只存在于
+  `f16_writeback_probe`，而它在无 Vulkan 的树里整例返回 77（skip）⇒ CPU-only Debug
+  job 覆盖不到。
+- **改动**：
+  ① `.github/workflows/cmake-single-platform.yml` 新增 `msvc-debug` job：
+  `windows-latest` + **Visual Studio 17 2022 生成器**（直接得到 cl.exe，无需 vcvars 脚本），
+  `NN_ENABLE_NATIVE=OFF` / `NN_ENABLE_GPU=OFF`（纯 CPU，避开 Vulkan/glslc 变量）/
+  `NN_ENABLE_TESTS=ON`；`cmake --build`（Debug 配置）后 `ctest -C Debug`（除 C11 外全跑）。
+  ② `src/optimizer_test.cpp` 新增 [4] 训练冒烟：小 MLP + Adam 跑 8 步，断言 loss 有限且下降、
+  **全参数 L1 位移 > 1e-3**；同一个 `detect_movement()` 的负例（同一快照自比）必须判为
+  "无移动"，证明断言不是恒真。该段纯 CPU f32，因此 MSVC Debug CPU-only job 会真实执行。
+- **验收**：本机 `build/cpu`（Release + CPU-only）`optimizer_test` ALL PASS，
+  实测 `loss 3.016254 → 0.155520（8 步），参数 L1 位移 41824.5`；workflow YAML 解析通过。
+  另用本机 `build/p1-5-debug`（clang 24 / Debug / `NN_ENABLE_NATIVE=OFF` / CPU-only）
+  跑通全量构建（**98 个 ninja 步骤**），`optimizer_test` 同样 ALL PASS（`3.016255 → 0.155522`）。
+  Debug 全量 ctest **51/52**：唯一失败是既有 **C11**（`rapt_test_f16` 第 9 步 NaN）；
+  按 CI 同款排除后 **51/51 通过**（165.28 s，18 条 GPU 用例按 77 skip）。
+  该问题用户已排查，**怀疑是设备/后端自身问题；Release 下不触发只是概率**，不是"Debug 专有"，
+  因此本轮不把它算作 P1-5 回归。已在 18 §3.1 登记，CI 的 Debug 测试步暂以
+  `-E "^rapt_test_f16$"` 排除（根因定位后删除该排除项）。
+  **MSVC 102 实机验证（2026-10-18，`ethan@192.168.1.102`，全新目录 `nn-p1-5-msvc`）**：
+  VS 2026 18.10.4 / **cl 19.51.36260.0** / CMake 4.3.3，Debug + CPU-only。首次全量构建
+  `text_train.cpp` 触发 **C1128**（节数超对象文件格式限制）⇒ 加 `/bigobj`（MSVC 目录级 +
+  接口选项，消费方大 TU 同样受益）；随后 ctest 有 **9 个用例 0xC00000FD 栈溢出**
+  （`t1_58` / `bitnet_struct` / `model_roles` / `batchnorm` / `model_spec_validation` /
+  `text_train_modules` / `train_state` + `t1_58_test_gpu` / `bitnet_struct_test_gpu`）——
+  MSVC 默认栈 1 MB，Linux 是 8 MB ⇒ 加 `/STACK:8388608` 后全部恢复（7 个直接运行 EXIT=0）。
+  CI 口径（C11 排除）**51/51 通过 / 0 失败 / 180.00 s**（20 条 GPU/app 依赖用例 skip；
+  `rapt_test_f16` 在该 MSVC Debug 树单独跑 **3/3 通过**，排除只是为了避免概率性红）；
+  **另跑不排除的完整 ctest：52/52 通过 / 181.61 s**（`rapt_test_f16` 2.33 s 通过）；
+  `optimizer_test` MSVC 实测 `loss 2.773293 → 0.170448（8 步），参数 L1 位移 41965.2`。
+- **口径**：`/bigobj` 与 `/STACK:8388608` 已在 102 实测触发后加入，不是预先猜测；两者均写入
+  `CMakeLists.txt` 的 MSVC 分支（`/bigobj` 同时随接口传给消费方）。
+- **顺带清理**：`t1_58_test` 的 `--expect-post-init-abort` 与 `assert_always_test` 的四个
+  crash 负例都是**故意 abort** 的子进程；原先每次 ctest 都会让 systemd-coredump 留下
+  多条 SIGABRT 记录（容易误判为真故障）。现在子进程入口先 `setrlimit(RLIMIT_CORE, 0)`
+  （POSIX；Windows 不适用），父进程的"非零退出 + stderr 断言"语义不变。

@@ -47,6 +47,90 @@
         pending_destroys_.clear();
     }
 
+    // ── reduce scratch 的生命周期 ────────────────────────────────────────
+    // scratch 由 backend 直接持有（不是 GpuBuffer），避免
+    // backend → GpuTensor → GpuBuffer(shared_ptr<GpuBackend>) 的引用环。
+
+    // 析构期：device 已 idle，直接销毁并归还 pool。
+    void destroy_reduce_partial_now_()
+    {
+        if (reduce_partial_.buffer == VK_NULL_HANDLE)
+            return;
+        vkDestroyBuffer(device_.device(), reduce_partial_.buffer, nullptr);
+        if (reduce_partial_.pool && reduce_partial_.alloc.valid())
+            reduce_partial_.pool->free(reduce_partial_.alloc);
+        reduce_partial_ = {};
+    }
+
+    // 运行期形状变化：batch 录制中 / 帧在飞时走延迟队列，其余立即释放。
+    void retire_reduce_partial_()
+    {
+        if (reduce_partial_.buffer == VK_NULL_HANDLE)
+            return;
+        if (needs_deferred_destroy())
+        {
+            defer_buffer_destroy(device_.device(), reduce_partial_.buffer,
+                                 reduce_partial_.alloc,
+                                 observer_ptr<MemoryPool>(reduce_partial_.pool));
+        }
+        else
+        {
+            vkDestroyBuffer(device_.device(), reduce_partial_.buffer, nullptr);
+            if (reduce_partial_.pool && reduce_partial_.alloc.valid())
+                reduce_partial_.pool->free(reduce_partial_.alloc);
+        }
+        reduce_partial_ = {};
+    }
+
+    [[nodiscard]] Result<void> ensure_reduce_partial_(std::uint32_t rows,
+                                                       std::uint32_t cols)
+    {
+        if (reduce_partial_.buffer != VK_NULL_HANDLE &&
+            reduce_partial_.rows == rows && reduce_partial_.cols == cols)
+            return {};
+
+        retire_reduce_partial_();
+
+        MemoryPool& pool = alloc_pool();
+        VkBufferCreateInfo info{};
+        info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        info.size = static_cast<VkDeviceSize>(rows) * cols * sizeof(float);
+        info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                     VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                     VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        if (pool.device_address_alloc())
+            info.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+        info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+        VkBuffer buffer = VK_NULL_HANDLE;
+        const VkResult cr =
+            vkCreateBuffer(device_.device(), &info, nullptr, &buffer);
+        if (cr != VK_SUCCESS)
+            NN_FAIL("reduce scratch vkCreateBuffer failed: " +
+                    std::to_string(static_cast<int>(cr)));
+
+        VkMemoryRequirements req{};
+        vkGetBufferMemoryRequirements(device_.device(), buffer, &req);
+        auto alloc_r = pool.allocate(req, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (!alloc_r)
+        {
+            vkDestroyBuffer(device_.device(), buffer, nullptr);
+            NN_TRY_CHECK(alloc_r);
+        }
+        const VkResult br = vkBindBufferMemory(
+            device_.device(), buffer, alloc_r->memory, alloc_r->offset);
+        if (br != VK_SUCCESS)
+        {
+            pool.free(*alloc_r);
+            vkDestroyBuffer(device_.device(), buffer, nullptr);
+            NN_FAIL("reduce scratch vkBindBufferMemory failed: " +
+                    std::to_string(static_cast<int>(br)));
+        }
+
+        reduce_partial_ = ReduceScratch{buffer, *alloc_r, &pool, rows, cols};
+        return {};
+    }
+
     // ── reap 单帧（多帧流水线）──────────────────────────────────
     // 等待该帧 fence（wait=true；wait=false 要求调用方已用零超时
     // vkWaitForFences 确认 VK_SUCCESS）→ 销毁该帧的延迟 buffer 并归还

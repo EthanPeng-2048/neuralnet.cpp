@@ -33,7 +33,8 @@ float abs_diff(float a, float b) { return a > b ? a - b : b - a; }
 int main()
 {
     // ── CPU 参考 ─────────────────────────────────────────────────────────
-    nn::CpuEngine cpu;
+    auto cpu_owner = nn::CpuEngine::create();
+    nn::CpuEngine& cpu = *cpu_owner;
     nn::Tensor x = cpu.create_tensor(4, 3, nn::Precision::F32,
                                      nn::InitSpec::constant(0.5f));
     nn::Tensor y = cpu.create_tensor(4, 3, nn::Precision::F32,
@@ -70,7 +71,8 @@ int main()
                      ir.error().message.c_str());
         return 77;   // ctest 约定：77 = skip
     }
-    nn::GpuEngine gpu(backend);
+    auto gpu_owner = nn::GpuEngine::create(backend);
+    nn::GpuEngine& gpu = *gpu_owner;
 
     // ③ f32 路径（注册表命中 V0）
     {

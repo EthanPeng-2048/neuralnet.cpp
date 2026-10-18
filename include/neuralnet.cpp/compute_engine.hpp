@@ -46,6 +46,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <limits>   // RV-02：create_tensor 的形状溢出检查
+#include <memory>
 #include <random>
 #include <source_location>
 #include <span>
@@ -58,7 +59,7 @@
 #include "core_config.hpp"
 #include "core_errors.hpp"
 #include "core_env.hpp"       // RV-09：环境变量读取唯一入口
-#include "core_engine_lease.hpp"
+#include "core_engine_id.hpp"
 #include "core_profile.hpp"   // 训练 step 剖析（NN_PROFILE=1 门控；默认零开销）
 #include "compute_tensor.hpp"
 #include "expr_opt.hpp"   // canonicalize_expr_spec（trace 归因用，与 gen_fused 同源 key）
@@ -231,24 +232,31 @@ struct EngineInfo
 //           **不做能力分支**（精度策略下沉到各引擎的 `*_impl`）。
 //   protected 虚 `*_impl` = 引擎实现：既管算，也管自己的精度边界策略。
 //   能力：各引擎私有事实（`*_` 私有成员 / 编译期常量）；对外只经 `describe()`。
-class ComputeEngine
+class ComputeEngine : public std::enable_shared_from_this<ComputeEngine>
 {
 public:
-    // ── 生命周期令牌（core_engine_lease.hpp）──────────────────────────────
-    // 令牌与引擎对象分开分配：引擎析构时只把令牌置为 dead，借用方
-    // （Layer / Model / Tensor / ExprGraph）据此 fail-fast，而不是解引用悬垂
-    // 指针。引擎不可拷贝：复制会让两个对象共享同一身份，破坏"一个引擎一个令牌"。
-    ComputeEngine() : liveness_(detail::engine_token_pool().create(this)) {}
-    virtual ~ComputeEngine() { liveness_->retire(); }
+    // ── 身份与所有权（docs/development/09-engine-ownership.md）────────────
+    // 引擎必须由 shared_ptr 管理（CpuEngine::create / GpuEngine::create）。
+    // Tensor 只保存 id()；会解引用引擎的 Layer / Model / Optimizer /
+    // ExprGraph 保存 keepalive()，因此不依赖析构顺序约定。
+    virtual ~ComputeEngine() = default;
 
     ComputeEngine(const ComputeEngine&) = delete;
     ComputeEngine& operator=(const ComputeEngine&) = delete;
 
-    [[nodiscard]] EngineLease lease() const noexcept { return EngineLease(liveness_); }
-    [[nodiscard]] bool alive() const noexcept
+    [[nodiscard]] EngineId id() const noexcept { return id_; }
+
+    // 取得本引擎的强引用。未由 shared_ptr 管理时返回空指针（调用方必须
+    // 把它当错误处理，不能继续解引用 this 之外的任何生命周期假设）。
+    [[nodiscard]] std::shared_ptr<ComputeEngine> keepalive() noexcept
     {
-        return liveness_ != nullptr && liveness_->alive();
+        return weak_from_this().lock();
     }
+
+protected:
+    ComputeEngine() : id_(detail::next_engine_id()) {}
+
+public:
 
     // ── 设备查询 ──────────────────────────────────────────────────────────
     [[nodiscard]] virtual Device device() const noexcept = 0;
@@ -473,9 +481,9 @@ public:
         // 原样返回共享句柄。optimizer 每 step 会对每个 DSL leaf 反复走
         // 此入口（profile 约 3.4 万次/20 steps）；在这里提前返回可跳过
         // bind_check_ 与 virtual dispatch，同时保留跨引擎/跨精度的完整路径。
-        // 引擎已销毁时 engine_.get() 为 nullptr → 走完整 bind_check_，不会
-        // 形成悬垂引用（旧写法 &src.engine() 会在引擎死后构造悬垂引用）。
-        if (src.valid() && src.bound() && src.engine_.get() == this &&
+        // 身份比较只读 8 字节 EngineId，不解引用引擎；不同引擎永远不相等
+        // （ID 进程内单调递增、永不复用）。
+        if (src.valid() && src.bound() && src.engine_id() == id() &&
             src.precision() == P)
             return src;
         NN_TRY(ec, bind_check_({&src}));
@@ -1700,22 +1708,21 @@ protected:
 
     // ══════════════════════════════════════════════════════════════════════
     // P1 出生 stamp（docs/history/history.md「15 号归档」 §3.1）：未绑定的产物补上 this；
-    // 已绑定且引擎仍存活 → 原样（cast 同精度返回 src 等传播场景沿用 src 绑定，
-    // 不改写）。绑定存在但引擎已销毁 → 视同未绑定，改 stamp 到当前引擎：
-    // 陈旧的死绑定没有任何身份价值，留着只会让后续 import 反复走慢路径。
-    // 只 stamp 有效张量：失败路径返回的 Tensor() 空槽保持不绑定
-    // （§3.1：库内非绑定态仅剩空槽；库外直构不受本函数管辖）。
+    // 只给"尚未记录出生身份"的有效张量打上当前引擎 ID。已绑定张量保持
+    // 原 ID（cast/reshape 等传播场景沿用来源身份）；跨引擎消费由
+    // bind_check_ 明确拒绝。
+    // 只 stamp 有效张量：失败路径返回的 Tensor() 空槽保持未绑定。
     // ══════════════════════════════════════════════════════════════════════
     [[nodiscard]] Tensor stamp_(Tensor t)
     {
-        if (t.valid() && !t.engine_.alive())
-            t.engine_ = lease();
+        if (t.valid() && !t.bound())
+            t.engine_id_ = id();
         return t;
     }
     [[nodiscard]] Result<Tensor> stamp_(Result<Tensor>&& r)
     {
-        if (r && r->valid() && !r->engine_.alive())
-            r->engine_ = lease();
+        if (r && r->valid() && !r->bound())
+            r->engine_id_ = id();
         return std::move(r);
     }
 
@@ -1731,15 +1738,13 @@ protected:
 
     // ── IR-C 录制拦截──────────────────────────────────
     // 录制图归属校验（唯一入口）：同一录制段内的表达式必须经**同一**引擎求值。
-    // 用 EngineLease 判定而不是裸指针比较：引擎先销毁时能给出明确错误，而不是
-    // 在 g.owner 上形成悬垂引用。
+    // owner 是 shared_ptr：录制图存在期间引擎必然存活。
     [[nodiscard]] Result<void> check_graph_owner_(const ExprGraph& g,
                                                   const char* what) const
     {
-        if (g.owner.expired())
-            NN_FAIL(std::string(what) +
-                    ": 录制图所属引擎已销毁（begin_expr/end_expr 必须与引擎同生命周期）");
-        if (g.owner.bound() && g.owner.get() != this)
+        if (!g.owner)
+            NN_FAIL(std::string(what) + ": 录制图未绑定引擎");
+        if (g.owner.get() != this)
             NN_FAIL(std::string(what) +
                     ": 录制段内跨引擎求值（段内表达式必须经开启录制的引擎）");
         return {};
@@ -1869,9 +1874,8 @@ protected:
             ref = t;
             return {};
         }
-        // 身份比较用令牌地址（引擎死后仍稳定、永不跨引擎相等）；不用
-        // get()（引擎已销毁时它返回 nullptr，两个不同引擎会误判相等）。
-        if (t->engine_.identity() != ref->engine_.identity())
+        // 身份比较只读 EngineId（无指针、永不复用）。
+        if (t->engine_id() != ref->engine_id())
             NN_FAIL(bind_error_("mixed engines (both bound, identities differ)", ref, t, loc));
         return {};
     }
@@ -2160,8 +2164,8 @@ protected:
     std::uint64_t init_seq_ = 0;
 
 private:
-    // 存活令牌（见文件头的生命周期契约）；不随引擎拷贝/移动。
-    EngineLiveness* liveness_ = nullptr;
+    // 进程内单调递增、永不复用的身份。Tensor 只保存这个值。
+    EngineId id_;
 };
 
 namespace detail {

@@ -111,7 +111,8 @@ int run_test()
     // ── 2. round-trip：匹配 spec 加载成功 ─────────────────────────────
     std::cout << "\n── round-trip（匹配 spec 加载成功） ──\n";
     {
-        nn::CpuEngine eng;
+        auto eng_owner = nn::CpuEngine::create();
+        nn::CpuEngine& eng = *eng_owner;
         const std::string file = "arch_check_matching.bin";
         const ModelSpec spec = nn::make_gpt_spec(100, 64, 32, 4, 128, 2);
 
@@ -134,7 +135,8 @@ int run_test()
     // ── 3. 不匹配 spec：加载同一文件应报错 ────────────────────────────
     std::cout << "\n── 不匹配 spec（应报错） ──\n";
     {
-        nn::CpuEngine eng;
+        auto eng_owner = nn::CpuEngine::create();
+        nn::CpuEngine& eng = *eng_owner;
         const std::string file = "arch_check_mismatch.bin";
         const ModelSpec spec = nn::make_gpt_spec(100, 64, 32, 4, 128, 2);
 
@@ -162,7 +164,8 @@ int run_test()
     // ── 4. 无 spec 模型（build_gpt_model 直接构建）：跳过校验 ─────────
     std::cout << "\n── 无 spec 模型（跳过校验，向后兼容） ──\n";
     {
-        nn::CpuEngine eng;
+        auto eng_owner = nn::CpuEngine::create();
+        nn::CpuEngine& eng = *eng_owner;
         const std::string file = "arch_check_nospec.bin";
         const ModelSpec spec = nn::make_gpt_spec(100, 64, 32, 4, 128, 2);
 
@@ -270,7 +273,8 @@ int run_test()
     // 显式挂载时 norm 必须真的在模型里，且 save→load 往返成功、错配被拦截。
     std::cout << "\n── 归一化挂载（NormPlace） ──\n";
     {
-        nn::CpuEngine eng;
+        auto eng_owner = nn::CpuEngine::create();
+        nn::CpuEngine& eng = *eng_owner;
 
         // 7.0 旧文件兼容：缺 norm_place / norm_type 键 → 架构无关的 None / LayerNorm
         //（**不**回落到新默认 CNN=BatchNorm@Conv、ViT=LayerNorm@Final——

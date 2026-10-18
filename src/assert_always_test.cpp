@@ -7,7 +7,7 @@
 //
 // 覆盖（每个负例经子进程断言，本进程不终止；子进程 stderr 重定向到文件后校验）：
 //   ① `MatrixT::at` 越界            → NN_FATAL（algebra_matrix.hpp）
-//   ② 未绑定张量的 `Tensor::engine()`→ NN_ASSERT_ALWAYS（compute_tensor.hpp）
+//   ② 未绑定引擎的 `Model::engine()` → NN_FATAL（model_container.hpp）
 //   ③ `sample_next_token_` 空 logits → NN_ASSERT_ALWAYS（compute_layer_base.hpp）
 //   ④ 未 init 的层调 forward（→ engine_ref）→ NN_FATAL（compute_layer_base.hpp）
 //
@@ -16,7 +16,7 @@
 // `NN_ASSERT_ALWAYS` / `NN_FATAL`（而不是旧的 NN_ASSERT 路径）——后者在 NDEBUG
 // 下根本不打印，本断言因此**在 Release 与 Debug 两种构建下都有效**。
 //
-// 子进程模式：--crash-matrix-at / --crash-tensor-engine / --crash-empty-logits
+// 子进程模式：--crash-matrix-at / --crash-model-unbound / --crash-empty-logits
 //             / --crash-layer-uninit
 // （父进程 std::system 自举）。退出码：0 = 通过，1 = 失败。
 // ───────────────────────────────────────────────────────────────────────────
@@ -29,6 +29,7 @@
 #include <vector>
 
 #ifndef _WIN32
+#include <sys/resource.h>
 #include <sys/wait.h>
 #endif
 
@@ -138,6 +139,12 @@ int main(int argc, char* argv[])
     // ── 子进程模式：只在父进程经 std::system 自举时进入（走到终止即成功）────
     if (argc >= 2)
     {
+        // 这些子进程是**故意** abort 的负例：关闭 core dump，避免
+        // systemd-coredump 每次 ctest 记录多条 SIGABRT（父进程只看退出码/stderr）。
+#ifndef _WIN32
+        const struct rlimit no_core{0, 0};
+        (void)setrlimit(RLIMIT_CORE, &no_core);
+#endif
         const std::string mode = argv[1];
         if (mode == "--crash-matrix-at")
         {
@@ -146,10 +153,10 @@ int main(int argc, char* argv[])
             std::printf("不应到达 v=%g\n", static_cast<double>(v));
             return 0;
         }
-        if (mode == "--crash-tensor-engine")
+        if (mode == "--crash-model-unbound")
         {
-            nn::Tensor t;                      // 未绑定引擎
-            (void)t.engine();                  // 断言后仍 return *engine_
+            nn::Model model;                   // 未绑定引擎
+            (void)model.engine();              // 访问咽喉 fail-fast
             std::printf("不应到达\n");
             return 0;
         }
@@ -167,7 +174,8 @@ int main(int argc, char* argv[])
             // 未 init(engine) 的层 → engine_ref() → NN_FATAL（Release 下旧行为是
             // NN_ASSERT 为空、随后 `return *engine_` 空解引用）
             nn::Linear lin(3, 2);
-            nn::CpuEngine eng;
+            auto eng_owner = nn::CpuEngine::create();
+            nn::CpuEngine& eng = *eng_owner;
             nn::Tensor x = eng.create_tensor(3, 1);
             const auto y = lin.forward(x);   // Result<Tensor>（失败即已终止）
             std::printf("不应到达 %zux%zu\n", y->rows(), y->cols());
@@ -192,9 +200,9 @@ int main(int argc, char* argv[])
     check_crash_case("--crash-matrix-at", kTagFatal,
                      "MatrixT::at index out of range",
                      "MatrixT::at 越界 → 非零退出");
-    check_crash_case("--crash-tensor-engine", kTagFatal,
-                     "未绑定引擎（先调 init(engine)）",
-                     "未绑定 Tensor::engine() → 非零退出");
+    check_crash_case("--crash-model-unbound", kTagFatal,
+                     "未绑定引擎（构造时引擎必须由 shared_ptr 管理）",
+                     "未绑定 Model::engine() → 非零退出");
     check_crash_case("--crash-empty-logits", kTagAssert,
                      "sample_next_token_: empty logits",
                      "sample_next_token_ 空 logits → 非零退出");

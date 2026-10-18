@@ -440,7 +440,8 @@ int main(int argc, char* argv[])
     }
     else
     {
-        nn::CpuEngine eng;
+        auto eng_owner = nn::CpuEngine::create();
+        nn::CpuEngine& eng = *eng_owner;
         test_write_entries(eng, "CPU");
         test_bitlinear_cache(eng, "CPU");
         test_lazy_grads(eng, "CPU");

@@ -91,7 +91,8 @@ int main()
     std::printf("[downstream] neuralnet.cpp 最小消费样例\n");
 
     // ── CPU 路径（始终执行）─────────────────────────────────────────────
-    nn::CpuEngine cpu;
+    auto cpu_owner = nn::CpuEngine::create();
+    nn::CpuEngine& cpu = *cpu_owner;
     float cpu_out = 0.0f;
     if (!run_linear(cpu, "cpu", cpu_out)) return 1;
     std::printf("[downstream] CPU Linear forward OK（y[0]=%.6f）\n",
@@ -107,7 +108,8 @@ int main()
                     ir.error().message.c_str());
         return 77;
     }
-    nn::GpuEngine gpu(backend);
+    auto gpu_owner = nn::GpuEngine::create(backend);
+    nn::GpuEngine& gpu = *gpu_owner;
     float gpu_out = 0.0f;
     if (!run_linear(gpu, "gpu", gpu_out)) return 1;
 

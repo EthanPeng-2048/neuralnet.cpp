@@ -100,7 +100,15 @@ if(MSVC)
     #   MSVC 19.51 / VS18：凡是链接本库的目标全数编译失败，MSVC 配置整体不可用）。
     #   实测（D:\probe.bat）：`/utf-8 /utf-8` 与「同一对开关重复两遍」都合法，
     #   只有"混用两种写法"才报冲突——故统一成 /utf-8，目录级与接口级重复无害。
-    add_compile_options(/W4 /permissive- /Zc:preprocessor /utf-8)
+    # /bigobj：Debug 下 text_train.cpp（header-only 全量展开）实测触发
+    # C1128「节数超过对象文件格式限制」（P1-5，MSVC 19.51 / VS18，2026-10-18）；
+    # Release 未触发，但该限制与优化级别相关，统一打开以避免配置相关失败。
+    add_compile_options(/W4 /permissive- /Zc:preprocessor /utf-8 /bigobj)
+    # /STACK：MSVC 默认 1 MB 栈。Debug 下多个模型/序列化测试实测
+    # STATUS_STACK_OVERFLOW (0xC00000FD)（P1-5，2026-10-18：t1_58 / bitnet_struct /
+    # model_roles / batchnorm / model_spec_validation / text_train_modules /
+    # train_state）；Linux 默认 8 MB。统一抬到 8 MB，与 Linux 口径对齐。
+    add_link_options(/STACK:8388608)
 else()
     add_compile_options(-fno-exceptions -Wall -Wextra -Wpedantic -Werror)
 endif()
@@ -347,7 +355,10 @@ target_compile_options(neuralnet_cpp INTERFACE
     # /Zc:preprocessor 必须随接口传出去（见上方公共标志处的实测说明：
     # 传统预处理器会让 NN_UNWRAP/NN_EXIT 的变参分发错位）。
     $<$<CXX_COMPILER_ID:MSVC>:/utf-8>
-    $<$<CXX_COMPILER_ID:MSVC>:/Zc:preprocessor>)
+    $<$<CXX_COMPILER_ID:MSVC>:/Zc:preprocessor>
+    # /bigobj 也随接口传：消费方在大 TU 里展开 nn.hpp 同样可能触发 C1128
+    # （P1-5 实测 text_train.cpp；对 ABI 无影响）。
+    $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
 
 add_library(neuralnet::nn ALIAS neuralnet_cpp)
 

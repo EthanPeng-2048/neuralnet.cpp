@@ -40,7 +40,8 @@ target_link_libraries(my_app PRIVATE neuralnet::nn)
 
 int main()
 {
-    nn::CpuEngine engine;
+    auto engine_owner = nn::CpuEngine::create();
+    nn::CpuEngine& engine = *engine_owner;
     nn::Model model = NN_UNWRAP(nn::build_mnist_mlp_model(engine));
     (void)model;
     return 0;

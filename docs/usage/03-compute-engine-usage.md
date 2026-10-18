@@ -86,17 +86,20 @@ ComputeEngine              ← op-level 原语，永远不知道 "ReLU" / "Atten
 **CPU**：
 
 ```cpp
-nn::CpuEngine engine;          // 无参，立即可用
+auto engine_owner = nn::CpuEngine::create();   // 无参，立即可用
+nn::CpuEngine& engine = *engine_owner;
 ```
 
 **Vulkan GPU**（`GpuEngine` **不能**无参构造，必须绑定已初始化的 `GpuBackend`）：
 
 ```cpp
 #ifdef NN_HAS_VULKAN
-    nn::GpuBackend& backend = nn::GpuBackend::instance();   // 进程内单例
+    auto backend_owner = nn::GpuBackend::shared();          // 进程共享，RAII 管理
+    nn::GpuBackend& backend = *backend_owner;
     if (auto r = backend.initialize(/*device_selector=*/""); !r)
         return std::unexpected(r.error());                  // 空 = 自动选卡
-    nn::GpuEngine engine(backend);
+    auto engine_owner = nn::GpuEngine::create(backend);
+    nn::GpuEngine& engine = *engine_owner;
     // 设备选择优先级：initialize(sel) > 环境变量 NN_VULKAN_DEVICE > 自动打分
     // sel 可以是索引 "2" 或名称子串 "40HX"/"NVIDIA"
 #else
@@ -104,9 +107,12 @@ nn::CpuEngine engine;          // 无参，立即可用
 #endif
 ```
 
-> ⚠ **常见错误**：写 `nn::GpuEngine engine;`（无参）——编译失败。`docs/usage/01-quickstart-model.md:295` 的 `❌` 反例也用了这一行（那里本意是演示 `cpu_matrix` 私有化，但该行本身同样编译不过）。
+> ⚠ **常见错误**：写 `nn::GpuEngine engine;`（无参）——编译失败；
+> `nn::GpuEngine engine(backend);` 也不再允许。唯一入口是
+> `GpuEngine::create(backend_shared_ptr)`。
 >
-> ⚠ **生命周期**：`engine` 必须晚于任何持有其非拥有指针的对象（`nn::Model`、`Layer`、`Tensor::engine_`）析构。`GpuBackend` 必须比 `GpuEngine` 活得更久。
+> ⚠ **生命周期**：`Model` / `Layer` / `Optimizer` 都持有引擎强引用，
+> 不再要求调用方按声明顺序保证“引擎最后析构”；Tensor 只保存 `EngineId`。
 
 **统一工厂**（CLI 入口用的写法，可直接复用）：
 
@@ -128,7 +134,8 @@ std::unique_ptr<nn::ComputeEngine> engine = std::move(*eng_r);
 
 nn::Result<void> demo()
 {
-    nn::CpuEngine engine;
+    auto engine_owner = nn::CpuEngine::create();
+    nn::CpuEngine& engine = *engine_owner;
 
     // 1) 造输入：Matrix(3,4) → Tensor
     nn::Matrix A(3, 4);
@@ -183,7 +190,7 @@ nn::Result<Tensor> f(nn::ComputeEngine& engine)
 - `nn::Error` 只有 `std::string message` 一个成员。
 - 想让"丢弃 Result"编译期告警：用 `nn::check_result(...)` 包一层。
 - 数值解析用 `nn::parse_number<T>(sv)`（不抛异常），不要用 `std::stoi/stod`。
-- 少数不可恢复点用 `NN_ASSERT` fail-fast（如 `Tensor::engine()` 在未绑定张量上调用）。
+- 少数不可恢复点用 `NN_ASSERT` fail-fast（如 `Layer::engine_ref()` 在未 init 的层上调用）。
 
 ---
 
@@ -286,7 +293,8 @@ struct nn::PrecisionProfile {
 
 ### 3.4 出生绑定与跨引擎检查
 
-张量在**引擎入口产物处自动绑定**创建它的引擎（`Tensor::engine_` 观察者，非拥有）。绑定随拷贝/reshape 传播。
+张量在**引擎入口产物处自动记录**创建它的引擎 `EngineId`（8B，不保存指针）。
+该身份随拷贝/reshape 传播，仅用于跨引擎混用诊断；Tensor 可以安全地晚于引擎析构。
 
 - `engine` 的每个公共入口都做 `bind_check_`：本轮调用的所有操作数中，**双方都绑定且引擎指针不同 → `Result` 硬错误**；单侧未绑定按库外豁免放行。
 - 设置 `NN_BIND_DEBUG=1`（进程启动前）后，**未绑定输入进引擎**也报错，用来抓漏网。错误带 `source_location`（file:line）与张量形状，并同步打到 stderr。
@@ -1638,7 +1646,7 @@ if (nn::dsl::env_flag("NN_PREC_TRACE"))
 
 | 症状 | 原因 | 修法 |
 |---|---|---|
-| `nn::GpuEngine engine;` 编译失败 | `GpuEngine` 必须绑定 `GpuBackend&` | `GpuBackend::instance().initialize(...)` 后 `GpuEngine engine(backend)` |
+| `nn::GpuEngine engine;` 编译失败 | `GpuEngine` 无公开构造函数，必须经工厂创建 | `auto b = GpuBackend::shared(); b->initialize(...); auto e = GpuEngine::create(b);` |
 | `NN_ASSERT: tensor has no P-precision CPU storage` | 用 `Precision::F16` 取了一个 F32 张量的 `cpu_matrix<F16>()` | 检查 `precision()`；库外不要用存储访问器 |
 | `NN_ASSERT: tensor has no P-precision GPU storage`（`[gpu_tensor-fail]`） | GPU 上对 f16 张量传了 `to_matrix(t, Precision::F16)` | 用默认 `P=F32` 或 `read` |
 | `read/write: span 元素类型与张量精度不匹配` | `span<float>` 配了 f16 张量（或反之） | U2 精确匹配：f16 张量用 `std::span<nn::f16>` |
@@ -1662,7 +1670,7 @@ if (nn::dsl::env_flag("NN_PREC_TRACE"))
 
 | 不存在的写法 | 事实 |
 |---|---|
-| `nn::GpuEngine engine;`（无参） | `GpuEngine(GpuBackend&)` 是唯一构造 |
+| `nn::GpuEngine engine;`（无参） | 不存在公开构造；唯一入口是 `GpuEngine::create(shared_ptr<GpuBackend>)` |
 | `engine.ensure_gpu(...)` | 已改名 `import`（符号清零，命名即防线） |
 | `engine.set_offload_enabled(...)` | 不存在；开关在 `GPTModel`/`RAPTModel` 的 `set_activation_offload(bool)`，底层 `ActivationOffloader` |
 | `dsl::begin_expr` / `dsl::record_expr` | 不存在；跨表达式录制走**引擎**入口 `engine.begin_expr()` / `engine.end_expr()`（IR-C，见 §8.9）。`dsl::start_expr` / `dsl::end_expr` **存在**，但只是"单表达式跨行书写"的语法糖（`ExprBlock`） |

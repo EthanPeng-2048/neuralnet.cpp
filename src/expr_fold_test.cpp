@@ -53,7 +53,8 @@ int test_expr_fold()
     { return std::isfinite(diff) ? std::fmax(err, diff)
                                  : std::numeric_limits<Scalar>::infinity(); };
 
-    nn::CpuEngine engine;
+    auto engine_owner = nn::CpuEngine::create();
+    nn::CpuEngine& engine = *engine_owner;
     std::mt19937 rng(20260923);
     std::uniform_real_distribution<Scalar> dist(-2.0f, 2.0f);
     constexpr Scalar kTol = Scalar{1e-4};

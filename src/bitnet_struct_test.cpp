@@ -69,7 +69,8 @@ void test_subln_param_count()
 {
     std::puts("[1] SubLN 参数条数：on − off = layers × (d_model + d_ff)（RMSNorm）");
 
-    nn::CpuEngine eng;
+    auto eng_owner = nn::CpuEngine::create();
+    nn::CpuEngine& eng = *eng_owner;
     const std::size_t V = 64, D = 32, S = 8, H = 4, FF = 64, L = 3;
     const auto P = nn::PosEncodingType::Learned;
     const auto A = nn::ActivationType::SwiGLU;
@@ -108,7 +109,8 @@ void test_subln_grad_wiring()
 {
     std::puts("[2] SubLN 在计算图里：子层 norm 参数拿到非零梯度");
 
-    nn::CpuEngine eng;
+    auto eng_owner = nn::CpuEngine::create();
+    nn::CpuEngine& eng = *eng_owner;
     const std::size_t D = 16, FF = 32, H = 4, S = 4, B = 2;
 
     // FeedForward：参数序 = [fc1.w, fc1.b, fc2.w, fc2.b, sub_norm.gamma]
@@ -169,7 +171,8 @@ void test_subln_changes_forward()
 {
     std::puts("[3] SubLN 影响前向：同权重下 on ≠ off");
 
-    nn::CpuEngine eng;
+    auto eng_owner = nn::CpuEngine::create();
+    nn::CpuEngine& eng = *eng_owner;
     const std::size_t D = 16, FF = 32, B = 3;
 
     nn::FeedForward off(D, FF, nn::ActivationType::GeLU, /*subln=*/false);
@@ -216,7 +219,8 @@ void test_subln_spec_roundtrip()
     const std::string file = "bitnet_struct_subln_roundtrip.bin";
 
     const std::size_t V = 64, D = 32, S = 8, H = 4, FF = 64, L = 2, B = 2;
-    nn::CpuEngine eng;
+    auto eng_owner = nn::CpuEngine::create();
+    nn::CpuEngine& eng = *eng_owner;
 
     nn::GptConfig cfg;
     cfg.vocab_size = V; cfg.d_model = D; cfg.seq_len = S;
@@ -437,7 +441,8 @@ void test_gqa_spec()
 
     const std::string file = "bitnet_struct_gqa_roundtrip.bin";
     const std::size_t V = 64, D = 32, S = 8, H = 4, FF = 64, L = 2, B = 2;
-    nn::CpuEngine eng;
+    auto eng_owner = nn::CpuEngine::create();
+    nn::CpuEngine& eng = *eng_owner;
     nn::GptConfig cfg;
     cfg.vocab_size = V; cfg.d_model = D; cfg.seq_len = S;
     cfg.num_heads = H;  cfg.d_ff = FF;   cfg.num_layers = L;
@@ -482,7 +487,8 @@ void test_gqa_spec()
 void test_tied_embedding()
 {
     std::puts("[10] tied embedding：参数条数 / 数值等价 / 梯度累加");
-    nn::CpuEngine eng;
+    auto eng_owner = nn::CpuEngine::create();
+    nn::CpuEngine& eng = *eng_owner;
     const std::size_t V = 64, D = 32, S = 8, H = 4, FF = 64, L = 2, B = 2, N = S * B;
 
     auto mk = [&](bool tie) {
@@ -572,7 +578,8 @@ void test_tied_spec()
 
     const std::string file = "bitnet_struct_tied_roundtrip.bin";
     const std::size_t V = 64, D = 32, S = 8, H = 4, FF = 64, L = 2, B = 2;
-    nn::CpuEngine eng;
+    auto eng_owner = nn::CpuEngine::create();
+    nn::CpuEngine& eng = *eng_owner;
     nn::GptConfig cfg;
     cfg.vocab_size = V; cfg.d_model = D; cfg.seq_len = S;
     cfg.num_heads = H;  cfg.d_ff = FF;   cfg.num_layers = L;
@@ -618,7 +625,8 @@ void test_tied_spec()
 void test_relu2_activation()
 {
     std::puts("[12] ReLU2GLU：门控平方 ReLU 前向/反向 vs 宿主参考");
-    nn::CpuEngine eng;
+    auto eng_owner = nn::CpuEngine::create();
+    nn::CpuEngine& eng = *eng_owner;
     const std::size_t FF = 6, B = 3, R = 2 * FF;
 
     nn::ReLU2GLU gl(FF);
@@ -675,7 +683,8 @@ void test_relu2_activation()
 void test_relu2_gpt()
 {
     std::puts("[13] ReLU² 进 GPT：前向/反向 + 规格往返");
-    nn::CpuEngine eng;
+    auto eng_owner = nn::CpuEngine::create();
+    nn::CpuEngine& eng = *eng_owner;
     const std::size_t V = 48, D = 32, S = 8, H = 4, FF = 64, L = 2, B = 2, N = S * B;
 
     nn::GptConfig cfg;
@@ -830,7 +839,8 @@ struct BitnetData
 void test_gpt_ternary_wiring()
 {
     std::puts("[14] 三值 GPT：BitLinear 接线（形状一致 + 梯度非零）");
-    nn::CpuEngine eng;
+    auto eng_owner = nn::CpuEngine::create();
+    nn::CpuEngine& eng = *eng_owner;
     const std::size_t V = 32, D = 32, S = 8, H = 4, KV = 2, FF = 64, L = 2, B = 2;
 
     const nn::PrecisionProfile f32p;
@@ -985,7 +995,8 @@ int main(int argc, char* argv[])
     test_subln_spec_matches();
     {   // GQA 对拍：CPU 必跑；--gpu 时**再在真实 GPU 上跑一遍**（P2 的
         // in-kernel 头映射（HeadGroup 视图 + vp 槽）只有 GPU 才真正生效）
-        nn::CpuEngine cpu_eng;
+        auto cpu_eng_owner = nn::CpuEngine::create();
+        nn::CpuEngine& cpu_eng = *cpu_eng_owner;
         test_gqa_mha_equivalence(cpu_eng, "CPU");
         test_gqa_head_mapping(cpu_eng, "CPU");
     }
@@ -999,7 +1010,8 @@ int main(int argc, char* argv[])
     // 真实 BitNet（2B4T 形状）训练：CPU 必跑；--gpu 时在真实 GPU 上再跑一遍比对
     double cpu_bitnet_loss = -1.0;
     {
-        nn::CpuEngine eng;
+        auto eng_owner = nn::CpuEngine::create();
+        nn::CpuEngine& eng = *eng_owner;
         cpu_bitnet_loss = test_bitnet_training(eng, "CPU");
         if (cpu_bitnet_loss < 0.0) ++g_failures;
     }
@@ -1033,7 +1045,8 @@ int main(int argc, char* argv[])
     }
     else
     {
-        nn::CpuEngine eng;
+        auto eng_owner = nn::CpuEngine::create();
+        nn::CpuEngine& eng = *eng_owner;
         if (!test_training(eng, "CPU")) g_failures++;
     }
 

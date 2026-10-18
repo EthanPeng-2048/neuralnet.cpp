@@ -46,19 +46,19 @@ namespace nn::cli
     // 根据 use_gpu 选择 GpuEngine/CpuEngine。
     // 返回 Result：显式请求的后端不可用（初始化失败/未编译）时返回错误，
     // **不回退 CPU**；成功返回引擎并打印选择信息到 log。
-    [[nodiscard]] inline nn::Result<std::unique_ptr<nn::ComputeEngine>> create_engine(
+    [[nodiscard]] inline nn::Result<std::shared_ptr<nn::ComputeEngine>> create_engine(
         const EngineConfig &cfg, [[maybe_unused]] std::ostream &log = std::cerr)
     {
         if (cfg.use_gpu)
         {
 #ifdef NN_HAS_VULKAN
-            auto &backend = nn::GpuBackend::instance();
-            auto init_r = backend.initialize(cfg.gpu_device);
+            auto backend = nn::GpuBackend::shared();
+            auto init_r = backend->initialize(cfg.gpu_device);
             if (init_r)
             {
                 log << "GPU 加速已启用 (Vulkan GpuEngine, GPU: "
-                    << backend.device().device_name() << ")\n\n";
-                return std::make_unique<nn::GpuEngine>(backend);
+                    << backend->device().device_name() << ")\n\n";
+                return nn::GpuEngine::create(std::move(backend));
             }
             NN_FAIL("请求 --gpu 但 GPU 初始化失败: " + init_r.error().message                 + "（不回退 CPU；请移除 --gpu 或改用 CPU 模式）");
 #else
@@ -66,6 +66,6 @@ namespace nn::cli
 #endif
         }
 
-        return std::make_unique<nn::CpuEngine>();
+        return nn::CpuEngine::create();
     }
 } // namespace nn::cli

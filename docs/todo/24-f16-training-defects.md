@@ -3,10 +3,14 @@
 > **读者**：项目开发者（本仓内部工作文档）。本分册定位见 [`README.md`](README.md)；
 > 历史归档在 [`../history/history.md`](../history/history.md)。
 
-> 状态（2026-10-13 更新）：**A 全 f16 NaN 的「`stable=f16` 直接生产者」已修 / B1 GPU
-> `stable=f16` loss 冻结已修（根因订正为「CE 的 (1,1) loss 归约按 `stable=f16` 落盘溢出」，
-> [`14`](14-f16-stable-gpu-loss-frozen.md) 原「回读链」定位**并非**真因）/ B2 数值性冻结与
-> `optimizer=f16` 爆炸仍按已知数值限制保留（见 F5）/ f16 降速兑现（F4）未做（需 40HX）。**
+> 状态（2026-10-18 更新）：**F1–F4 已完成；F5 的「可训练性」已完成**（optimizer state scaling，
+> 2026-10-14）。后续拆成两套计划：**F7 = 标准 `--f16`（Plan A，参考 PyTorch AMP）**；
+> **F6 = 全流程真 f16（Plan B）**，二者均于 2026-10-18 立项/恢复（细则见
+> [`26-f16-speedup-plan.md`](26-f16-speedup-plan.md) §8）。本文中「全 f16 不可训练 / 必崩」的
+> 表述均指 **F5 之前**；F5 之后应读作「可训练，但尚未达到真 f16（零转换 / native16 全覆盖）」。
+> A/B1 的 `stable=f16` 根因订正与修复仍有效：**A 全 f16 NaN 的「`stable=f16` 直接生产者」已修 /
+> B1 GPU `stable=f16` loss 冻结已修（根因 = CE 的 (1,1) loss 归约按 `stable=f16` 落盘溢出，
+> [`14`](14-f16-stable-gpu-loss-frozen.md) 原「回读链」定位并非真因）。**
 > 落地改动：`include/neuralnet.cpp/compute_loss.hpp`（CE 稀疏/稠密两条链的 (1,1) 归约输出恒
 > F32）+ `src/f16_precision_test.cpp` 回归用例 + `src/cli_precision_warning_test.cpp` 门禁。
 > 来源：核对用户提供的《全 f16 训练 NaN 问题定位报告》，并按追加要求定位「f16 训练冻结」
@@ -20,14 +24,14 @@
 
 「全 f16」= `profile_all_f16()` = **四字段全 F16**（`--f16 --precision-stable f16 --precision-optimizer f16`），
 区别于健康推荐路径 `--f16` = `profile_f16()` = {param:F16, compute:F16, stable:F32, optimizer:F32}。
-本档把用户报告的「全 f16 不可训练」与追加定位的「冻结」「降速」并列立项。
+本档把用户报告的「全 f16 不可训练」（F5 前的历史现象）与追加定位的「冻结」「降速」并列立项。
 
 | 缺陷 | 现象 | 定位结论 | 坐标 | 状态 |
 |---|---|---|---|---|
-| **A 全 f16 NaN** | ① epoch2 起 loss `-nan`；② `stable=f16` CE 链 ~200 步 NaN | **NaN 直接生产者 = `stable=F16`**（CE 归约的 (1,1) 输出溢出 f16 上限 65504 → ±inf；见 §2.1 订正）；**前导放大器 = `optimizer=F16`**（Adam 二阶矩下溢 → 更新爆炸 → logits 出 f16 范围） | `compute_loss.hpp`（`softmax_cols_` / `fused_forward_sparse_`）、`compute_optimizer.hpp`（`Adam::adam_update_`） | **`stable=F16` 部分已修**（2026-10-13：(1,1) 归约输出恒 F32）；`optimizer=F16` 放大器留 F5 |
+| **A 全 f16 NaN** | ① epoch2 起 loss `-nan`；② `stable=f16` CE 链 ~200 步 NaN | **NaN 直接生产者 = `stable=F16`**（CE 归约的 (1,1) 输出溢出 f16 上限 65504 → ±inf；见 §2.1 订正）；**前导放大器 = `optimizer=F16`**（Adam 二阶矩下溢 → 更新爆炸 → logits 出 f16 范围） | `compute_loss.hpp`（`softmax_cols_` / `fused_forward_sparse_`）、`compute_optimizer.hpp`（`Adam::adam_update_`） | **`stable=F16` 部分已修**（2026-10-13：(1,1) 归约输出恒 F32）；`optimizer=F16` 放大器 **F5 已修可训练性**；长跑质量/覆盖见 F6 |
 | **B1 冻结（GPU）** | GPU + `stable=f16` 时 loss 打印恒 `4.0137`，权重照常更新 | **订正**：冻结 = **CE 的 (1,1) loss 归约按 `stable=f16` 落盘溢出**（大 token 数下 Σ≈ -log(vocab)·N 超 65504）；`4.0137 ≈ 65504/num_valid` = 该溢出在部分硬件上饱和为 f16 上限的表现。**并非**回读链问题（原结论） | `compute_loss.hpp`（`softmax_cols_` / `fused_forward_sparse_` 的 (1,1) reduce 输出精度） | **已修**（2026-10-13；[`14`](14-f16-stable-gpu-loss-frozen.md) 已同步订正根因） |
-| **B2 冻结（数值）** | 四字段全 f16 时 loss 恒定（更新被 f16 舍入吃光） | 数值性冻结：`upd_prec=F16` 下 `p += delta` 的 `|delta|` 小于参数所在 f16 网格步长 → 原地写回无变化 | `compute_optimizer.hpp` `Adam::adam_update_` K3（`delta` + `compute_into(p + delta)`） | 已定位（机制清楚，与 `precision.hpp` 注记一致；未修 = F5） |
-| **C 降速** | `--f16`（健康路径）比 f32 **慢 11–17%**，与「f16 应省带宽/更快」的预期相反 | **部分定位**：step 时间 ~30% 卡在 **wgrad 工作组饥饿**（细 tile 变体 2026-10-07 已落地，f32 e2e −7.8%），**f16 提速兑现（P3）未做**；另有边界 cast 的 f32 临时量与 CPU 无 f16 ISA 两个已知来源 | `backend/compute_vk_backend_ops.inc`（matmul dispatch 网格）、`shaders/matmul_tiled.comp`；`docs/development/05-mixed-precision.md` §12.11 | 未兑现（P3） |
+| **B2 冻结（数值）** | 四字段全 f16 时 loss 恒定（更新被 f16 舍入吃光） | 数值性冻结：`upd_prec=F16` 下 `p += delta` 的 `|delta|` 小于参数所在 f16 网格步长 → 原地写回无变化 | `compute_optimizer.hpp` `Adam::adam_update_` K3（`delta` + `compute_into(p + delta)`） | **F5 已修可训练性**（状态缩放后 m/v 回到 f16 正常区）；长跑/质量见 F6 |
+| **C 降速** | `--f16`（健康路径）比 f32 **慢 11–17%**，与「f16 应省带宽/更快」的预期相反 | **已兑现（F4）**：运行期精度分派三元税为主，S1s/S1t + 网格粒度变体修掉；边界 cast 的 f32 临时量与 CPU 无 f16 ISA 两个来源也已分别处理/评估 | `backend/compute_vk_backend_ops.inc`、`shaders/matmul_tiled.comp`、`compute_gpu_engine.hpp`；`docs/development/05-mixed-precision.md` §12.11 | ✅ **2026-10-14 已完成**；真 f16 的零转换/native16 覆盖见 [`26`](26-f16-speedup-plan.md) §8 R4 |
 
 ## 1. 报告核对（逐条）
 
@@ -44,7 +48,7 @@
 | 根因②代码位置 `Adam::adam_update_` K2（v 用 `p_.optimizer`）与 K3（`sqrt(v)+eps`） | ✅ 证实 | `compute_optimizer.hpp` `adam_update_`（K2 L330–333、K3 L345–353） |
 | 根因②：`v ≈ g²` ~ 1e-10 低于 f16 次正规最小 6e-8 → 下溢 0；`eps=1e-8 → 0` | ✅ 证实（f16 最小正规数 2⁻¹⁴≈6.1e-5、次正规最小 2⁻²⁴≈5.96e-8；默认 `eps=1e-8`） | `precision.hpp` §5.2 数值事实；`compute_optimizer.hpp` `Adam` 默认 `eps=1e-8`（L396） |
 | 根因②实测「loss 7.9→3.6e4」 | ✅ 与既有实测一致（另一次配制实测 1.8e7，同为爆炸形态） | `precision.hpp` L539–541 注记；[`14`](14-f16-stable-gpu-loss-frozen.md) §2.1 case c |
-| 根因③「四字段全 f16 → loss 恒定」 | ✅ 机制证实；**常数口径已订正**：原 `precision.hpp` 注记的「32.1」无 bench 背书、且已在 2026-10-13 随修复移除（该注记现只描述「不可训练」）。GPU [`14`](14-f16-stable-gpu-loss-frozen.md) 的 `4.0137` **另有根因**：= CE 的 (1,1) loss 归约按 `stable=f16` 落盘**饱和到 f16 上限**（`≈ 65504/num_valid`，见 §3.1）——与「更新被舍入吃光」的数值性冻结是两回事，报告把二者并陈需分开看 | `precision.hpp` `profile_f16()` 注；[`14`](14-f16-stable-gpu-loss-frozen.md) §2 与 §3.1 |
+| 根因③「四字段全 f16 → loss 恒定」 | ✅ 机制证实；**常数口径已订正**：原 `precision.hpp` 注记的「32.1」无 bench 背书、且已在 2026-10-13 随修复移除（该注记仍停留在 F5 前的「不可训练」口径，R0 待同步）。GPU [`14`](14-f16-stable-gpu-loss-frozen.md) 的 `4.0137` **另有根因**：= CE 的 (1,1) loss 归约按 `stable=f16` 落盘**饱和到 f16 上限**（`≈ 65504/num_valid`，见 §3.1）——与「更新被舍入吃光」的数值性冻结是两回事，报告把二者并陈需分开看 | `precision.hpp` `profile_f16()` 注；[`14`](14-f16-stable-gpu-loss-frozen.md) §2 与 §3.1 |
 | 报告「14 号报告 Open / GPU 特有」 | ✅ 证实 | [`14-f16-stable-gpu-loss-frozen.md`](14-f16-stable-gpu-loss-frozen.md)（状态 Open） |
 | 报告 §三.2「`debug_profile_matrix` 矩阵**没有**四槽全 f16 这一行」 | ✅ 证实（cases = f32 / param / compute / stable / opt / f16(CLI)，无 all=f16） | `src/f16_precision_test.cpp` `debug_profile_matrix`（cases L639–646） |
 | 报告 §三.2「预期 `[dbg stable=f16]` 与 `[dbg opt=f16]` 出现非有限/爆炸」 | ⚠️ **部分更正**（本档已实测复现，见 §2.4）：`opt=f16` ✅ 爆炸（`3.4772 → 3.50e6 → … → nan`）；`stable=f16` 在该 CPU 小 GPT（vocab 32、20 步）下**健康**（`3.4785 → 3.1797`）。~200 步 NaN 需大词表 + 更多步，报告对小矩阵的预期与实测矛盾 | [`14`](14-f16-stable-gpu-loss-frozen.md) §2.3；§2.4 复现输出 |
@@ -88,7 +92,8 @@ inf → CE 链 `inf-inf = NaN`。这与 `precision.hpp` L539–541、§12.5 的�
 ### 2.3 CLI 语义与危险组合口径（本轮裁定：**仅警告，不拒绝**）
 
 `src/text_train.cpp` / `src/mnist_train.cpp` 的 `--precision-param/-compute/-stable/-optimizer`
-只赋值、**不校验**——用户可无告警地组合出 `optimizer=f16` / 四字段全 f16 这类「必崩」配置
+只赋值、**不校验**——用户可无告警地组合出 `optimizer=f16` / 四字段全 f16 这类高风险配置
+（F5 前是必崩；F5 后已可训练，但仍有 `|g|` 溢出与长跑质量边界）
 （[`18-roadmap.md`](18-roadmap.md) P1-3 已立项）。
 
 **裁定（本轮，取代原「fail-fast / 显式确认」口径）**：危险精度组合**不 fail-fast、不加确认开关**，
@@ -163,7 +168,10 @@ harvest_loss`）本身无误**——`ce_fusion_test` 的「异步标量回读 vs
 
 > 判别口诀：B1 权重在动、只有打印冻结（设备链路）；B2 权重真的不动（精度吃光更新）。
 
-## 4. 缺陷 C：f16 训练降速（未兑现）
+> **后续（2026-10-14）**：F5 的 Adam 状态缩放让 m/v 回到 f16 正常区，B2 的「更新被舍入吃光」
+> 在 tiny GPT / 500 步记录中不再出现；但「长跑是否始终不动」仍归 F6 的健康断言（§4.6 / 26 §8）。
+
+## 4. 缺陷 C：f16 训练降速（历史归因；已由 F4 兑现）
 
 ### 4.1 复现数据（40HX，GPT d64/h4/L4/ff256/seq256/B64/adam lr1e-3）
 
@@ -316,6 +324,10 @@ K1 `#0002#b` / K2 `#0002#b` / 复合 `#10004#b`，各 32+32+6 实例）；优化
 
 **残留边界**：`|g|·S` 逼近 f16 上限 65504（即 |g| ≳ 0.0625）时 v 会溢出 ⇒ 实践配 `--max-norm`；F1 的启动期告警保持有效（`optimizer=f16` 仍属"显式实验"档）。
 
+> **与真 f16 的差距（2026-10-18）**：本节只证明“四字段全 f16 可训练”。当前 `S` / `eps` 仍以
+> f32 rparam 传入，CE loss 标量仍恒 F32，matmul/归约仍有 f32 累加，native16 也未全覆盖——这些
+> 都不满足 [`26`](26-f16-speedup-plan.md) §8 的真 f16 零转换门禁，归 F6/R2–R4。
+
 ## 5. 立项（todo）
 
 | 立项 | 事项 | 验收口径 | 依赖 | 优先级 | 状态 |
@@ -324,13 +336,18 @@ K1 `#0002#b` / K2 `#0002#b` / 复合 `#10004#b`，各 32+32+6 实例）；优化
 | **F2** 补 GPU + 全 f16 覆盖缺口 | profile 组合矩阵补 `{F16,F16,F16,F16}` 行（CPU、廉价）；把 stable=f16 / 全 f16 形态搬到 GPU 分支做数值断言。**端到端全 f16 模型训练不进 ctest**（太费时，见下注），改挂到大版本发布清单 [`25`](25-release-requirements.md) 第 1 项「端到端模型训练测试」 | 单字段 / 全 f16 组合有**廉价**断言进默认门禁；端到端全 f16 轨迹在大版本发布时实跑通过 | F1（或与 F1 同批） | 高（关 [`14`](14-f16-stable-gpu-loss-frozen.md) §3 缺口） | ✅ **已完成（组合矩阵 + GPU 分支 + CE 溢出回归，2026-10-13）**；端到端全 f16 仍归发布清单 |
 | **F3** 修 GPU `stable=f16` loss 冻结 | 最小复现 → 定位并修。**实际结论**：不是回读链（`cast`/槽位）问题，而是 **CE 的 (1,1) loss 归约按 `stable=f16` 落盘溢出**（见 §3.1 订正） | 冻结/`inf` 消失；GPU + stable=f16 loss 曲线可观测；回归用例 | 无 | 高（既有 Open 故障，[`14`](14-f16-stable-gpu-loss-frozen.md)） | ✅ **已完成 2026-10-13**（详见 §3.1） |
 | **F4** f16 提速兑现 | 归因「f16 比 f32 慢」的时间去向；方案见 [`26`](26-f16-speedup-plan.md)（**存储路径**带宽优先、**原生 f16 用足**；口径「任意设备」） | ① 存储路径在任意设备（40HX / 850M / CPU）上 `--f16` step ≤ f32 且峰值显存更低、**不依赖** `shaderFloat16`；② capable 设备额外：原生 f16 已启用（`NN_VULKAN_NO_16BIT_ALU` A/B 显示原生开更快） | F3 等 | 中 | ✅ **已完成 2026-10-14**。根因订正 = 「运行期精度分派 `#x` 的三元税」为主（非"固定开销掩盖"、非"logits 仍 f32"）→ 用 **S1s/S1t 编译期特化** + **网格粒度变体（P2-13）** 修掉。**跨设备结果**（各 15 步 ×3 轮）：**850M**（无 `shaderFloat16`）`--f16` **2005 vs f32 2038 ms（−1.6%）**、峰值显存 **606 vs 818 MiB（−26%）**；**40HX**（有原生 f16 ALU）`--f16` **1013 vs f32 1046 ms（−3.2%）**；**CPU** f16 不再慢于 f32（3.6→1.9 s，见 P2-8）。另外 **F5 全 f16 已可训练**（§4.6）。S0/S1/S2/S5 的评估见 [`26`](26-f16-speedup-plan.md)（0/1/2 为实测后不做、5 为资格不再扩张） |
-| **F5** 全 f16 可用性 | ✅ **已完成 2026-10-14**。落地形态与原方案不同：不用训练循环里的 loss scaling，而是**在优化器状态更新处缩放**（`Adam::optimizer_state_scale_`）——进入 m/v 的梯度放大 **S=4096**（2 的幂 → f16 下无损）、`(1-β1)·S` / `(1-β2)·S²` / `eps·S` 同步换算。**为什么有效**：Adam 的更新是尺度不变的 `lr·(S·m̂)/(√(S²·v̂)+S·eps) = lr·m̂/(√v̂+eps)` ⇒ **更新量数学不变**，但 m~g·S、v~g²·S² 都回到 f16 正常区（根因 = v ≈ (1-β2)·g² ~ 1e-10 在 f16 下**下溢为 0** 而 m 仍在次正规区 ⇒ `m/(√v+eps)` 退化、更新暴涨 → 第 1 步即 NaN）。比 loss scaling 更内聚：不改 CLI / 不改梯度与裁剪语义、无"是否反缩放"分支；rparam 恒 f32 传递 ⇒ 原方案里的"eps flush-to-0"不成问题（eps 的**相对**比例由 `eps·S` 保持）。**边界**：|g| ≳ 0.0625 时 v 会溢出 f16 ⇒ 实践配 `--max-norm` 裁剪；启动期精度告警（F1）保持有效 | 四字段全 f16 在 CPU/GPU 上健康收敛 | F1/F2/F3 | 中 | ✅ **已完成**（见 §4.6） |
+| **F5** 全 f16 可用性 | ✅ **可训练性完成 2026-10-14**（产品化转 F6）。落地形态与原方案不同：不用训练循环里的 loss scaling，而是**在优化器状态更新处缩放**（`Adam::optimizer_state_scale_`）——进入 m/v 的梯度放大 **S=4096**（2 的幂 → f16 下无损）、`(1-β1)·S` / `(1-β2)·S²` / `eps·S` 同步换算。**为什么有效**：Adam 的更新是尺度不变的 `lr·(S·m̂)/(√(S²·v̂)+S·eps) = lr·m̂/(√v̂+eps)` ⇒ **更新量数学不变**，但 m~g·S、v~g²·S² 都回到 f16 正常区（根因 = v ≈ (1-β2)·g² ~ 1e-10 在 f16 下**下溢为 0** 而 m 仍在次正规区 ⇒ `m/(√v+eps)` 退化、更新暴涨 → 第 1 步即 NaN）。比 loss scaling 更内聚：不改 CLI / 不改梯度与裁剪语义、无"是否反缩放"分支；rparam 恒 f32 传递 ⇒ 原方案里的"eps flush-to-0"不成问题（eps 的**相对**比例由 `eps·S` 保持）。**边界**：|g| ≳ 0.0625 时 v 会溢出 f16 ⇒ 实践配 `--max-norm` 裁剪；启动期精度告警（F1）保持有效 | 四字段全 f16 在 CPU/GPU 上健康收敛 | F1/F2/F3 | 中 | ✅ **可训练性已完成**（见 §4.6）；但 CE 标量仍是 F32 补丁、native16 未全覆盖 ⇒ **不等于真 f16**；🟡 **全流程真 f16 产品化 = F6** |
+| **F6** 全流程真 f16 产品化（**2026-10-18 恢复立项**） | 把 F5 的「可训练性」推进到「真 f16、可长期、全模型、可发布」：**B-Mem = 无 f32 持久态**；capable 设备另追 **B-Arith = 零 f16↔f32 转换**；不支持时只由计算引擎在算子内部隐式转换（Layer/DSL/CLI 零手写 cast）。包含一键 `--f16-all`、native16 全覆盖、f16 累加/归约与 CE 标量改造、logits/CE 融合、**R2.5 数值鲁棒性技术栈**（SR / GradientStabilizer / ECO / attention δ 修复）、全模型/全设备长跑与质量基线。**原 F5 的 loss scaling 不作为前置**（F5 已用 optimizer state scaling 解决下溢）；F5 的 F32 CE 标量补丁与 f32 累加器必须在 R2 消除 | [`26`](26-f16-speedup-plan.md) §8.3 R0–R6、§8.B.7 全部门禁；B-Mem 必达；B-Arith = capable 设备 `cast`/`cast_into` = 0、f32 临时量 = 0（补偿 kernel 豁免表）、native16 全覆盖；incapable 设备转换只在引擎内；至少 GPT/MLP/CNN/RAPT × CPU/850M/40HX 的长跑无 NaN、loss 下降、权重移动；`gui_cli_audit` 退出码 0 | F5 | 中–大 | 🟡 **活跃（2026-10-18）**，细则见 [`26`](26-f16-speedup-plan.md) §8 |
+| **F7** 标准 `--f16` 训练（Plan A，**2026-10-18 立项**） | 参考 PyTorch AMP：`profile_f16()` 为默认（f16 参数/激活 + f32 stable/optimizer），`profile_master_weights()` 为可选 master-weights 形态；补动态 loss scaling（GradScaler 语义）、敏感链 f32 与 PyTorch AMP 对照。**不要求零转换/native16 全覆盖** | 同数据/同 seeds：`--f16` 与 f32 轨迹在冻结容差内、无 NaN/冻结、权重移动；与 PyTorch AMP 同量级；loss scaling 的 growth/inf-skip/恢复用例通过；峰值显存低于 f32，step 不慢于 f32 | F5 | 中 | 🟡 **活跃（2026-10-18）**，细则见 [`26`](26-f16-speedup-plan.md) §8.A |
 
-> **纪律**：F1–F4 属「先止血再提速」；F5 是「让全 f16 真正可用」的长期项。在 F5 落地前，
-> CLI 保持 `--f16` = 安全配方，全 f16 仅作显式实验（**F1 落实后必须带启动期告警**）。
-> 进度（2026-10-13）：**F1/F2/F3 已完成**（告警 + 覆盖缺口 + `stable=f16` 溢出修复）；
-> F4 未做（需 40HX）；F5 未做。**注意**：F3 的修复顺带让 `stable=f16` 的 CE loss 链条健康，
-> 但 `optimizer=f16` / 四字段全 f16 仍不可训练 → F1 的告警继续有效。
+> 注：26 号已把两套计划拆为 **§8.A（Plan A / F7）** 与 **§8.B（Plan B / F6）**；此前文档里的
+> “§8.3 / §8.4”现分别指 §8.B.3 / §8.B.4。
+
+> **纪律**：F1–F4 属「先止血再提速」；F5 解决「全 f16 能不能训练」；**F7（Plan A）**解决「标准
+> `--f16` 能不能按 PyTorch AMP 口径稳定训练」；**F6（Plan B）**解决「真 f16 能不能零转换、全模型、
+> 可发布地训练」。**当前**：F1–F5 已完成；F6/F7 于 2026-10-18 立项。CLI 仍保持
+> `--f16` = 推荐安全配方，`--f16-all` 在 R5 通过前是显式实验档；启动期告警保留，但文案必须从
+> 「必崩/不可训练」改为「数值边界与质量权衡」（R0）。
 >
 > **训练为何不进 ctest**：ctest 要能在 CI runner 上分钟级跑完，而模型端到端训练（含全 f16 形态）
 > 太费时——故默认门禁只放**廉价**断言，端到端训练归口大版本发布清单

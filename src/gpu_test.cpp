@@ -134,7 +134,7 @@ int main(int argc, char* argv[])
 
     // ── 1. 初始化引擎 ──────────────────────────────────────────────
     std::cout << "[1/6] 初始化引擎..." << std::flush;
-    auto cpu_engine = std::make_unique<CpuEngine>();
+    auto cpu_engine = CpuEngine::create();
 
     auto& backend = GpuBackend::instance();
     auto init_result = backend.initialize(gpu_device);
@@ -147,7 +147,7 @@ int main(int argc, char* argv[])
         std::cerr << "GPU 初始化失败: " << init_result.error().message << "\n";
         return 77;
     }
-    auto gpu_engine = std::make_unique<GpuEngine>(backend);
+    auto gpu_engine = GpuEngine::create(backend);
     // 打印所选物理设备：选错卡（例如把独显老卡当目标）会直接表现为
     // 能力不足 / 驱动死锁，先让"跑在哪块卡上"可见。
     std::cout << " 成功 (CpuEngine + GpuEngine, GPU: "

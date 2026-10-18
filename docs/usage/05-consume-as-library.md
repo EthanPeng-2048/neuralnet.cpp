@@ -25,7 +25,8 @@ target_link_libraries(my_app PRIVATE neuralnet::nn)
 #include <neuralnet.cpp/nn.hpp>
 
 int main() {
-    nn::CpuEngine engine;
+    auto engine_owner = nn::CpuEngine::create();
+    nn::CpuEngine& engine = *engine_owner;
     // ... 构建模型、训练/推理，见 docs/usage/01、02
 }
 ```

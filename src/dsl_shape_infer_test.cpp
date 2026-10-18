@@ -97,7 +97,8 @@ void check_infer_error(R&& r, const char* what)
 // ── [1][2] 表达式族：推导 == 显式（形状 + 逐位值）─────────────────────────
 void test_infer_matches_explicit()
 {
-    nn::CpuEngine eng;
+    auto eng_owner = nn::CpuEngine::create();
+    nn::CpuEngine& eng = *eng_owner;
 
     auto t = [&](std::size_t r, std::size_t c, float base) {
         return make_tensor(eng, r, c, base, 0.01f);
@@ -229,7 +230,8 @@ void test_infer_matches_explicit()
 // ── [3] 显式 P 的 3 参重载 ────────────────────────────────────────────────
 void test_explicit_precision()
 {
-    nn::CpuEngine eng;
+    auto eng_owner = nn::CpuEngine::create();
+    nn::CpuEngine& eng = *eng_owner;
     nn::Tensor a = make_tensor(eng, 4, 3, 0.25f, 0.01f);
     nn::Tensor b = make_tensor(eng, 4, 3, 0.5f, 0.02f);
     auto e = nn::dsl::leaf(a) + nn::dsl::leaf(b);
@@ -249,7 +251,8 @@ void test_explicit_precision()
 // ── [4] compute_reduce 的无形状重载 ───────────────────────────────────────
 void test_compute_reduce_infer()
 {
-    nn::CpuEngine eng;
+    auto eng_owner = nn::CpuEngine::create();
+    nn::CpuEngine& eng = *eng_owner;
     nn::Tensor x = make_tensor(eng, 4, 3, 0.2f, 0.01f);
     auto e = nn::dsl::row_reduce_sum(x);            // 归约视图根
     nn::Tensor inf = must(nn::dsl::compute_reduce(eng, e), "reduce inferred");
@@ -265,7 +268,8 @@ void test_compute_reduce_infer()
 // ── [5] 负例：不猜形状 ────────────────────────────────────────────────────
 void test_negative_cases()
 {
-    nn::CpuEngine eng;
+    auto eng_owner = nn::CpuEngine::create();
+    nn::CpuEngine& eng = *eng_owner;
     // 形状冲突（4x3 与 2x3：行维既不等、又都不为 1）
     {
         nn::Tensor a = make_tensor(eng, 4, 3, 0.1f, 0.01f);

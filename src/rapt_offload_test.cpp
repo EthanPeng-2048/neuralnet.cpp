@@ -68,7 +68,8 @@ int off_run_test()
         std::cout << "[SKIP] GPU 初始化失败: " << init_r.error().message << "\n";
         return 77;
     }
-    GpuEngine eng(backend);
+    auto eng_owner = GpuEngine::create(backend);
+    GpuEngine& eng = *eng_owner;
 
     std::cout << "========================================\n"
               << "  RAPT activation offload 一致性测试\n"

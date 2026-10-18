@@ -159,7 +159,8 @@ public:
 ### 接入与训练（与内置层逐字一致）
 
 ```cpp
-nn::CpuEngine engine;
+auto engine_owner = nn::CpuEngine::create();
+nn::CpuEngine& engine = *engine_owner;
 nn::Model model(engine);
 NN_UNWRAP(model.add<nn::Linear>(28, 3));
 NN_UNWRAP(model.add<demo::LowRankAdapter>(3, 2));   // dim=3, rank=2
@@ -221,7 +222,8 @@ auto opt = nn::create_optimizer("adam", engine, model.parameters(),
 对每个参数抽样若干元素做中心差分：
 
 ```cpp
-nn::CpuEngine engine;
+auto engine_owner = nn::CpuEngine::create();
+nn::CpuEngine& engine = *engine_owner;
 nn::Model model(engine);
 NN_UNWRAP(model.add<nn::Linear>(4, 3));
 NN_UNWRAP(model.add<demo::LowRankAdapter>(3, 2));   // 换成你的层

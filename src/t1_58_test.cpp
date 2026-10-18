@@ -29,6 +29,7 @@
 
 #ifndef _WIN32
 #include <sys/wait.h>
+#include <sys/resource.h>
 #endif
 
 #include "neuralnet.cpp/cli/cli_engine_factory.hpp"
@@ -71,7 +72,8 @@ void test_precision_set()
     CHECK(t.to_string() == "t1_58", "t1_58 集合名");
 
     // 默认能力 = 现状（既有层零改动）
-    nn::CpuEngine eng;
+    auto eng_owner = nn::CpuEngine::create();
+    nn::CpuEngine& eng = *eng_owner;
     nn::Linear probe(4, 3);
     const nn::PrecisionSupport sup = probe.precision_support();
     CHECK(sup.param.mask == r.mask && sup.compute.mask == r.mask &&
@@ -92,7 +94,8 @@ nn::Result<void> add_linear_with_profile(nn::ComputeEngine& eng, const nn::Preci
 void test_capability_reject()
 {
     std::puts("[2] 能力校验反例：普通 Linear 不支持 param=T1_58");
-    nn::CpuEngine eng;
+    auto eng_owner = nn::CpuEngine::create();
+    nn::CpuEngine& eng = *eng_owner;
 
     nn::PrecisionProfile t1;
     t1.param = nn::Precision::T1_58;
@@ -134,7 +137,8 @@ void test_capability_reject()
 void test_capability_accept()
 {
     std::puts("[3] 能力校验正例：既有配置全部照常通过");
-    nn::CpuEngine eng;
+    auto eng_owner = nn::CpuEngine::create();
+    nn::CpuEngine& eng = *eng_owner;
 
     const nn::PrecisionProfile cases[] = {
         nn::profile_f32(),
@@ -160,7 +164,8 @@ void test_capability_accept()
 void test_post_init_immutable()
 {
     std::puts("[4] D3(b)：init 之后 set_precision_profile → fail-fast");
-    nn::CpuEngine eng;
+    auto eng_owner = nn::CpuEngine::create();
+    nn::CpuEngine& eng = *eng_owner;
     nn::Linear ln(4, 3);
     auto r = ln.init(eng);
     CHECK(r.has_value(), "init 成功");
@@ -232,7 +237,8 @@ void ref_quant(double (&tau_ref)[kOUT], double (&wq_ref)[kOUT][kIN])
 void test_bitlinear_rules()
 {
     std::puts("[5] BitLinear：τ = 逐行 absmean，wq 逐位符合 RoundClip(W/τ,-1,1)");
-    nn::CpuEngine eng;
+    auto eng_owner = nn::CpuEngine::create();
+    nn::CpuEngine& eng = *eng_owner;
     constexpr std::size_t IN = kIN, OUT = kOUT, B = kB;
 
     nn::BitLinear bl(IN, OUT);
@@ -389,7 +395,8 @@ void test_bitlinear_rules()
 void test_bitlinear_f16_compute()
 {
     std::puts("[7a] BitLinear：compute=F16（param 三值 + 激活 f16）与 f32 一致");
-    nn::CpuEngine eng;
+    auto eng_owner = nn::CpuEngine::create();
+    nn::CpuEngine& eng = *eng_owner;
     constexpr std::size_t IN = kIN, OUT = kOUT, B = kB;
 
     nn::PrecisionProfile prof;
@@ -457,7 +464,8 @@ void test_spec_roundtrip()
 
     nn::Matrix Y_ref;
     {   // 建模型（from_spec：与 mnist_train 生产路径一致）→ 写已知权重 → 保存
-        nn::CpuEngine eng;
+        auto eng_owner = nn::CpuEngine::create();
+        nn::CpuEngine& eng = *eng_owner;
         auto m = nn::build_mnist_model_from_spec(eng, spec, t1);
         CHECK(m.has_value(), "from_spec 构建 T1_58 单层模型");
         if (!m.has_value())
@@ -505,7 +513,8 @@ void test_spec_roundtrip()
                   "spec_summary 披露 wq=t1_58");
         }
         // 反例：把同一文件加载进"普通 MLP"（weight_quant=None）必须被拒
-        nn::CpuEngine eng;
+        auto eng_owner = nn::CpuEngine::create();
+        nn::CpuEngine& eng = *eng_owner;
         nn::ModelSpec plain = spec;
         plain.weight_quant = nn::WeightQuant::None;
         auto plain_model = nn::build_mnist_model_from_spec(eng, plain, nn::profile_f32());
@@ -518,7 +527,8 @@ void test_spec_roundtrip()
     }
 
     {   // 重建 + 加载：同一输入 → 与前向参考一致
-        nn::CpuEngine eng;
+        auto eng_owner = nn::CpuEngine::create();
+        nn::CpuEngine& eng = *eng_owner;
         auto m2 = nn::build_mnist_model_from_spec(eng, spec, t1);
         CHECK(m2.has_value(), "按规格重建成功");
         if (!m2.has_value()) return;
@@ -717,7 +727,14 @@ int main(int argc, char* argv[])
     // ── 子进程自举：init 后注入 profile → 期望终止 ────────────────────────
     if (argc >= 2 && std::string(argv[1]) == "--expect-post-init-abort")
     {
-        nn::CpuEngine eng;
+        // 这是**故意** abort 的子进程：关闭 core dump，避免 systemd-coredump
+        // 每次 ctest 都记录一条 SIGABRT（父进程只断言非零退出，不依赖 core）。
+#ifndef _WIN32
+        const struct rlimit no_core{0, 0};
+        (void)setrlimit(RLIMIT_CORE, &no_core);
+#endif
+        auto eng_owner = nn::CpuEngine::create();
+        nn::CpuEngine& eng = *eng_owner;
         nn::Linear ln(4, 3);
         (void)ln.init(eng);
         ln.set_precision_profile(nn::profile_f16());   // 必须 fail-fast
@@ -745,7 +762,8 @@ int main(int argc, char* argv[])
     }
     else
     {
-        nn::CpuEngine eng;
+        auto eng_owner = nn::CpuEngine::create();
+        nn::CpuEngine& eng = *eng_owner;
         if (!test_training(eng, "CPU")) g_failures++;
         if (!test_preset_t1_58(eng, "CPU")) g_failures++;
     }

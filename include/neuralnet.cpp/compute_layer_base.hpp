@@ -287,11 +287,9 @@ protected:
     // 层在 `init(engine)` 时绑定（公共 init 是 NVI 包装，绑定后转 init_impl），
     // forward/backward/zero_grad/forward_recompute 不再收 engine 形参。
     //
-    // **生命周期契约（core_engine_lease.hpp）**：engine_ 不是裸指针，而是
-    // "非拥有 + 可失效"的 EngineLease。引擎先于层析构时，engine_ref() 能判定
-    // expired 并终止并打印层名 + 调用点——不会解引用悬垂指针（此前实测
-    // pure virtual call / 挂死 / 静默错值三种 UB 表现）。
-    EngineLease engine_;
+    // **生命周期契约（09-engine-ownership.md）**：engine_ 是强引用。层存活
+    // 期间引擎不会析构；init 时从 ComputeEngine& 的 weak_from_this() 提升。
+    std::shared_ptr<ComputeEngine> engine_;
     BindingState binding_state_ = BindingState::unbound;
 
     // 绑定读取：未 init / init 失败 / 引擎已销毁都是调用方错误 → fail-fast，
@@ -306,7 +304,14 @@ protected:
             detail::fatal_at("NN_FATAL", loc.file_name(),
                              static_cast<int>(loc.line()), msg.c_str());
         }
-        return engine_.require(layer_name(), loc);
+        if (!engine_)
+        {
+            const std::string msg = std::string("[layer-lifetime] ") + layer_name() +
+                ": 未绑定引擎（先调 init(engine)）";
+            detail::fatal_at("NN_FATAL", loc.file_name(),
+                             static_cast<int>(loc.line()), msg.c_str());
+        }
+        return *engine_;
     }
 
 public:
@@ -314,8 +319,8 @@ public:
 
     // ── 绑定状态（诊断/测试可查询；不需要触发 abort）─────────────────────
     [[nodiscard]] BindingState binding_state() const noexcept { return binding_state_; }
-    // 绑定过且引擎仍存活；未绑定 / 已销毁 → false
-    [[nodiscard]] bool engine_alive() const noexcept { return engine_.alive(); }
+    // 是否持有引擎强引用（init 成功后恒 true）
+    [[nodiscard]] bool engine_alive() const noexcept { return engine_ != nullptr; }
 
     // ── 层名（诊断设施）─────────────────────────────────────────────────
     // 能力校验的错误信息必须能定位到"哪一层"（此前 Layer 无任何名称设施，
@@ -592,19 +597,23 @@ public:
         // 的半初始化状态（旧实现会把它误判成"已 init"，后续改 profile 直接 abort）。
         NN_TRY_CHECK(check_precision_support_());
 
+        // 强引用提升：引擎必须由 shared_ptr 管理。栈上引擎无法保证"层存活
+        // 期间引擎不析构"，因此在入口明确拒绝，而不是留下悬垂引用。
+        auto keepalive = engine.weak_from_this().lock();
+        if (!keepalive)
+            NN_FAIL(std::string("Layer::init: 引擎必须由 shared_ptr 管理"
+                                "（使用 CpuEngine::create() / GpuEngine::create()）；层=")
+                    + layer_name());
+
         if (binding_state_ == BindingState::ready)
         {
-            if (engine_.expired())
-                NN_FAIL(std::string("Layer 绑定的引擎已销毁，不能在同一层上重新绑定"
-                                    "（旧权重仍留在已销毁的引擎上）；请构造新层（层=")
-                        + layer_name() + "）");
             if (engine_.get() != &engine)
                 NN_FAIL(std::string("Layer 已绑定到另一个引擎（层=") + layer_name() +
                         "）：跨引擎重绑会让旧权重留在原引擎、新引擎读到未初始化存储；"
                         "请构造新层");
         }
 
-        engine_ = engine.lease();
+        engine_ = std::move(keepalive);
         binding_state_ = BindingState::ready;   // init_impl 内的 engine_ref() 可用
 
         if (auto r = init_impl(engine); !r)
@@ -618,6 +627,14 @@ public:
             return r;
         }
         return {};
+    }
+
+    // 便捷重载：引擎工厂返回 shared_ptr，调用方不必手写 *engine。
+    [[nodiscard]] Result<void> init(const std::shared_ptr<ComputeEngine>& engine)
+    {
+        if (!engine)
+            NN_FAIL("Layer::init: engine 为空");
+        return init(*engine);
     }
 
     // ── P1-6 R2：参数存储精度自检（2026-10-14）────────────────────────────

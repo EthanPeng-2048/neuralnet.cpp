@@ -267,7 +267,8 @@ V4 及以上格式的模型文件会自动嵌入分词器，推理时无需单�
 #include <neuralnet.cpp/domain_mnist.hpp>
 
 int main() {
-    nn::CpuEngine engine;
+    auto engine_owner = nn::CpuEngine::create();
+    nn::CpuEngine& engine = *engine_owner;
 
     // 1. 构建模型（使用工厂函数，自动创建同设备权重）
     auto model_result = nn::build_mnist_mlp_model(engine);
@@ -340,7 +341,8 @@ int main() {
 #include <neuralnet.cpp/domain_gpt.hpp>
 
 int main() {
-    nn::CpuEngine engine;
+    auto engine_owner = nn::CpuEngine::create();
+    nn::CpuEngine& engine = *engine_owner;
 
     // 1. 加载分词器
     auto tokenizer = nn::load_tokenizer_from_file("gpt_bpe.nnvocab");
@@ -416,7 +418,8 @@ int main() {
 #include <neuralnet.cpp/domain_gpt.hpp>
 
 int main() {
-    nn::CpuEngine engine;
+    auto engine_owner = nn::CpuEngine::create();
+    nn::CpuEngine& engine = *engine_owner;
 
     // 1. 加载模型（v4+ 自描述格式：文件头部含 spec + tokenizer；Model 需预先构建以提供 spec 用于校验）
     auto load_result = nn::load_model("gpt_model.bin", model);

@@ -48,6 +48,9 @@ namespace
 {
 
 int g_fail = 0;
+// Tensor 不再保存引擎指针；测试里的 matrix_of 按张量设备选择对应引擎。
+nn::CpuEngine* g_cpu_engine = nullptr;
+nn::GpuEngine* g_gpu_engine = nullptr;
 #define CHECK(cond, msg)                                                     \
     do {                                                                     \
         if (!(cond)) {                                                       \
@@ -92,7 +95,10 @@ nn::Matrix matrix_of(const nn::Tensor& t)
         ++g_fail;
         return nn::Matrix(0, 0);
     }
-    auto m = t.engine().to_matrix(t);
+    nn::ComputeEngine& engine = t.is_gpu()
+        ? static_cast<nn::ComputeEngine&>(*g_gpu_engine)
+        : static_cast<nn::ComputeEngine&>(*g_cpu_engine);
+    auto m = engine.to_matrix(t);
     if (!m)
     {
         std::printf("[FAIL] to_matrix 失败: %s\n", m.error().message.c_str());
@@ -569,7 +575,7 @@ int main()
     std::printf("  IR-C 图 IR 融合 GPU 端到端验证\n");
     std::printf("========================================\n");
 
-    auto cpu_engine = std::make_unique<nn::CpuEngine>();
+    auto cpu_engine = nn::CpuEngine::create();
     auto& backend = nn::GpuBackend::instance();
     auto init_r = backend.initialize();
     if (!init_r)
@@ -577,7 +583,9 @@ int main()
         std::printf("GPU 初始化失败: %s\n", init_r.error().message.c_str());
         return 77;
     }
-    auto gpu_engine = std::make_unique<nn::GpuEngine>(backend);
+    auto gpu_engine = nn::GpuEngine::create(backend);
+    g_cpu_engine = cpu_engine.get();
+    g_gpu_engine = gpu_engine.get();
     std::printf("[init] CpuEngine + GpuEngine 就绪\n");
 
     int fail = 0;

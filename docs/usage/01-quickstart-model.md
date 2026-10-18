@@ -53,10 +53,12 @@ auto result = model.forward(input);   // engine 在 Model 内部自动传递
 #include <neuralnet.cpp/nn.hpp>
 
 // CPU 引擎（默认，无需额外依赖）
-nn::CpuEngine engine;
+auto engine_owner = nn::CpuEngine::create();
+nn::CpuEngine& engine = *engine_owner;
 
 // GPU 引擎（需要 Vulkan SDK，条件编译 NN_HAS_VULKAN）
-// nn::GpuEngine gpu_engine;
+// auto gpu_backend = nn::GpuBackend::shared();
+// auto gpu_engine = nn::GpuEngine::create(gpu_backend);
 ```
 
 ---
@@ -173,7 +175,8 @@ Matrix/Tensor 行主序:  (rows, cols)
 #include <neuralnet.cpp/nn.hpp>
 
 int main() {
-    nn::CpuEngine engine;
+    auto engine_owner = nn::CpuEngine::create();
+    nn::CpuEngine& engine = *engine_owner;
 
     // 1. 构建模型（add 返回 Result<void>，[[nodiscard]] 不能直接丢弃；
     //    NN_UNWRAP = 失败时打印 message + file:line 后终止）
@@ -318,7 +321,8 @@ nn::Model model;                    // 默认构造
 model.add<nn::Linear>(784, 10);     // NN_ASSERT(engine_, "Model: engine not bound") 断言失败
 
 // ✅ 正确
-nn::CpuEngine engine;
+auto engine_owner = nn::CpuEngine::create();
+nn::CpuEngine& engine = *engine_owner;
 nn::Model model(engine);
 model.add<nn::Linear>(784, 10);
 ```
@@ -327,12 +331,13 @@ model.add<nn::Linear>(784, 10);
 
 ```cpp
 // ❌ 错误：直接摸 GPU 张量的 CPU 存储（M1 起存储访问器已私有 → 这行编译不过）
-nn::GpuEngine engine;                       // 需 NN_HAS_VULKAN
-nn::Tensor t = engine.create_tensor(10, 10);
+auto gpu_backend = nn::GpuBackend::shared();             // 需 NN_HAS_VULKAN
+auto gpu_engine = nn::GpuEngine::create(gpu_backend);
+nn::Tensor t = gpu_engine->create_tensor(10, 10);
 auto& m = t.cpu_matrix();                   // 编译错误：cpu_matrix 是私有成员
 
 // ✅ 正确：跨设备读写统一走 engine（to_matrix 下载，GPU 会等待在飞命令完成）
-auto m_result = engine.to_matrix(t);
+auto m_result = gpu_engine->to_matrix(t);
 ```
 
 ### 4. 梯度清零遗漏

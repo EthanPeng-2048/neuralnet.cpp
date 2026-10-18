@@ -27,7 +27,7 @@ inline Result<GpuTensorT<P>> GpuTensorT<P>::from_matrix(const MatrixT<P>& cpu_ma
     auto buf_res = GpuBuffer::create_device_local(
         backend.device().device(), backend.alloc_pool(),
         byte_count,
-        TENSOR_BUFFER_USAGE);
+        TENSOR_BUFFER_USAGE, backend.keepalive());
     NN_TRY_CHECK(buf_res);
     auto tensor = GpuTensorT<P>(
         std::make_shared<GpuBuffer>(std::move(*buf_res)),
@@ -50,7 +50,7 @@ inline Result<GpuTensorT<P>> GpuTensorT<P>::create_empty(
     auto buf_res = GpuBuffer::create_device_local(
         backend.device().device(), backend.alloc_pool(),
         byte_count,
-        TENSOR_BUFFER_USAGE);
+        TENSOR_BUFFER_USAGE, backend.keepalive());
     NN_TRY_CHECK(buf_res);
     return GpuTensorT<P>(std::make_shared<GpuBuffer>(std::move(*buf_res)), rows, cols);
 }
@@ -65,7 +65,7 @@ inline Result<GpuTensorT<P>> GpuTensorT<P>::create_host_visible_empty(
     auto buf_res = GpuBuffer::create_host_visible(
         backend.device().device(), backend.alloc_pool(),
         byte_count,
-        TENSOR_BUFFER_USAGE);
+        TENSOR_BUFFER_USAGE, backend.keepalive());
     NN_TRY_CHECK(buf_res);
     return GpuTensorT<P>(std::make_shared<GpuBuffer>(std::move(*buf_res)), rows, cols);
 }

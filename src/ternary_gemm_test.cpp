@@ -720,7 +720,8 @@ int main(int argc, char* argv[])
     }
     else
     {
-        nn::CpuEngine eng;
+        auto eng_owner = nn::CpuEngine::create();
+        nn::CpuEngine& eng = *eng_owner;
         test_primitives(eng, "CPU");
         test_bitlinear_paths(eng, "CPU");
         test_shapes(eng, "CPU", /*gpu=*/false);

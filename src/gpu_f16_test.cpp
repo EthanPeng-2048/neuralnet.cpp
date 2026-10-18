@@ -22,7 +22,8 @@ int main() {
     printf("shaderFloat16: %s\n", backend.has_shader_float16() ? "YES" : "NO");
 
     // Test GPU f16 operations
-    nn::GpuEngine engine(backend);
+    auto engine_owner = nn::GpuEngine::create(backend);
+    nn::GpuEngine& engine = *engine_owner;
 
     // Create f32 matrix
     nn::Matrix m(2, 2);
@@ -72,7 +73,8 @@ int main() {
     // 的 f16 存储变体（f16 变体的类型/索引一旦出错是静默错值——对拍是
     // 唯一护栏）。
     printf("\n=== Op-level f16 variants vs CPU f32 reference ===\n");
-    nn::CpuEngine cpu;
+    auto cpu_owner = nn::CpuEngine::create();
+    nn::CpuEngine& cpu = *cpu_owner;
     int fails = 0;
     const auto check = [&](const char* name, const nn::Matrix& got,
                            const nn::Matrix& ref, float tol)

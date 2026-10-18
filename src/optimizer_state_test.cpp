@@ -36,7 +36,8 @@ constexpr std::size_t kParams = 2;   // 两个参数张量（含一个 (n,1)，�
 // ── 固定夹具：参数/梯度张量 + 确定性梯度序列 ─────────────────────────────
 struct Fixture
 {
-    nn::CpuEngine engine;
+    std::shared_ptr<nn::CpuEngine> engine_owner = nn::CpuEngine::create();
+    nn::CpuEngine& engine = *engine_owner;
     std::vector<nn::Tensor> params;
     std::vector<nn::Tensor> grads;
     std::vector<nn::TensorRef> pref;

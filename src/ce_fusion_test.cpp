@@ -556,7 +556,8 @@ int main()
               << "  列式 softmax 融合 + 稀疏交叉熵验证\n"
               << "========================================\n";
 
-    nn::CpuEngine cpu_engine;
+    auto cpu_engine_owner = nn::CpuEngine::create();
+    nn::CpuEngine& cpu_engine = *cpu_engine_owner;
     int fail = run_case(cpu_engine, "CPU");
     std::cout << "\n── 新旧 CE 逐用例对拍（online-softmax fold vs 旧数学，容差 1e-6） ──\n";
     fail += run_old_new_parity(cpu_engine, "CPU");
@@ -574,7 +575,8 @@ int main()
         std::cout << "[SKIP] GPU 不可用: " << init_r.error().message << "\n";
         return 77;
     }
-    nn::GpuEngine gpu_engine(backend);
+    auto gpu_engine_owner = nn::GpuEngine::create(backend);
+    nn::GpuEngine& gpu_engine = *gpu_engine_owner;
     fail += run_case(gpu_engine, "GPU");
     fail += run_old_new_parity(gpu_engine, "GPU");
 

@@ -26,7 +26,8 @@ int g_failures = 0;
 void test_f16_matmul_vs_f32()
 {
     std::printf("  [1] f16 matmul vs f32 reference...");
-    nn::CpuEngine engine;
+    auto engine_owner = nn::CpuEngine::create();
+    nn::CpuEngine& engine = *engine_owner;
 
     // 创建 f32 矩阵 A(4,8) B(8,3)，用已知值
     nn::Matrix a32(4, 8);
@@ -80,7 +81,8 @@ void test_f16_matmul_vs_f32()
 void test_cast_roundtrip()
 {
     std::printf("  [2] cast roundtrip precision...");
-    nn::CpuEngine engine;
+    auto engine_owner = nn::CpuEngine::create();
+    nn::CpuEngine& engine = *engine_owner;
 
     nn::Matrix m32(3, 4);
     std::mt19937 rng(123);
@@ -115,7 +117,8 @@ void test_cast_roundtrip()
 void test_f16_linear_training()
 {
     std::printf("  [3] f16 linear training (loss decrease)...");
-    nn::CpuEngine engine;
+    auto engine_owner = nn::CpuEngine::create();
+    nn::CpuEngine& engine = *engine_owner;
 
     // 简单线性回归：y = 2*x + 1，用 f16 matmul 训练
     const std::size_t N = 32;  // batch size
@@ -217,7 +220,8 @@ void test_f16_linear_training()
 void test_f16_batched_matmul()
 {
     std::printf("  [4] f16 batched_matmul...");
-    nn::CpuEngine engine;
+    auto engine_owner = nn::CpuEngine::create();
+    nn::CpuEngine& engine = *engine_owner;
 
     const std::size_t batch = 2;
     const std::size_t M = 3, K = 4, N = 2;

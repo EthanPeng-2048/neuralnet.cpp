@@ -787,7 +787,8 @@ int main()
 
     // CPU（始终运行；任意 DSL 表达式不受 AOT 闭合世界约束）
     {
-        nn::CpuEngine cpu;
+        auto cpu_owner = nn::CpuEngine::create();
+        nn::CpuEngine& cpu = *cpu_owner;
         nn::ComputeEngine& adapter = cpu;   // P-1：原 PrecisionEngine 已下沉
         run_suite("cpu", cpu, adapter, /*allow_arbitrary_expr=*/true);
         if (env_flag("NN_F16_DEBUG"))
@@ -803,7 +804,8 @@ int main()
         auto& backend = nn::GpuBackend::instance();
         if (backend.initialize())
         {
-            nn::GpuEngine gpu(backend);
+            auto gpu_owner = nn::GpuEngine::create(backend);
+            nn::GpuEngine& gpu = *gpu_owner;
             nn::ComputeEngine& adapter = gpu;   // P-1：原 PrecisionEngine 已下沉
             run_suite("gpu", gpu, adapter, /*allow_arbitrary_expr=*/false);
         }

@@ -10,8 +10,8 @@
 //   - 访问器按 P 模板化（P 默认 F32）
 //   - precision_ 与 device_ 共同唯一确定存储的有效类型
 //   - 使用 shared_ptr 内部持有存储，拷贝廉价（零拷贝传递）
-//   - 出生绑定（P1）：engine_ 观察创建本张量的引擎；库内产物出生即绑定，
-//     绑定随拷贝/reshape 传播（docs/history/history.md「15 号归档」 §3.1）
+//   - 出生身份（v2）：engine_id_ 只记录创建本张量的引擎 ID；不保存指针，
+//     拷贝/reshape 传播该整数。详见 docs/development/09-engine-ownership.md
 // ─────────────────────────────────────────────────────────────────────────
 
 #include <algorithm>
@@ -20,21 +20,20 @@
 #include <cstdio>
 #include <functional>
 #include <memory>
-#include <source_location>
 #include <string>
 #include <variant>
 
 #include "core_config.hpp"
 #include "core_errors.hpp"
-#include "core_engine_lease.hpp"
+#include "core_engine_id.hpp"
 #include "precision.hpp"
 #include "algebra_matrix.hpp"
 
 namespace nn
 {
 
-// ComputeEngine 前置声明：Tensor 持有非拥有、可失效的绑定（EngineLease，P1
-// 出生绑定，docs/history/history.md「15 号归档」 §3.1），不能反向 include。
+// ComputeEngine 前置声明：Tensor 只保存 EngineId（8B），不保存引擎指针；
+// 详见 docs/development/09-engine-ownership.md。
 class ComputeEngine;
 class CpuEngine;
 class GpuEngine;
@@ -72,15 +71,10 @@ private:
     std::size_t rows_ = 0;
     std::size_t cols_ = 0;
 
-    // ── 出生绑定（P1，docs/history/history.md「15 号归档」 §3.1）──────────────────────────
-    // 创建本张量的引擎（非拥有、可失效的 EngineLease；与旧 observer_ptr 同为 8B）。
-    // 未绑定 = 空 lease（非绑定态仅剩
-    // 库外直构：Tensor{} 空槽、src/ 测试的 Tensor::from_matrix/from_host 之前
-    // 的宿主直构）。库内产物出生即绑定——由引擎工厂/算子出口 stamp 或
-    // ComputeEngine::adopt 内部通道补绑定。
-    // **契约**：engine 必须长于 Tensor；违反时 engine_alive() 变 false，
-    // engine() 在访问点终止并打印调用点（不会解引用悬垂指针）。
-    EngineLease engine_;
+    // ── 出生身份（v2）──────────────────────────────────────────────────
+    // 只保存 8 字节 EngineId：无指针、无控制块、拷贝零原子操作。Tensor 可以
+    // 晚于引擎析构；它只用于 bind_check_ 的跨引擎诊断，从不据此解引用引擎。
+    EngineId engine_id_;
 
     // ── IR-C 录制占位标记（图节点输出识别，expr_graph.hpp）──────────────
     // begin_expr/end_expr 录制期内，eval 出口给占位 Tensor 打上节点标号
@@ -265,20 +259,12 @@ public:
 #endif
     }
 
-    // ── 出生绑定（P1，§3.1）──────────────────────────────────────────────
-    // bound()：是否已 stamp 到某个引擎（未绑定输入在 P1 检查中按库外豁免放行，
-    //   仅 NN_BIND_DEBUG=1 时报错——见 ComputeEngine::bind_check_）。
-    // engine_alive()：绑定存在且引擎仍存活。
-    // engine()：取绑定引擎；未绑定 / 引擎已销毁 → 在访问点终止并打印调用点
-    //   （EngineLease::require，不会解引用悬垂指针）。
-    [[nodiscard]] bool bound() const noexcept { return engine_.bound(); }
-    // 绑定过且引擎仍存活（Tensor 跨引擎复用/导入前的判据）
-    [[nodiscard]] bool engine_alive() const noexcept { return engine_.alive(); }
-    [[nodiscard]] ComputeEngine& engine(
-        std::source_location loc = std::source_location::current()) const
-    {
-        return engine_.require("Tensor", loc);
-    }
+    // ── 出生身份（v2）──────────────────────────────────────────────────
+    // bound()：是否记录过出生引擎。engine_id()：该身份（0 = 未绑定）。
+    // Tensor 不提供 engine()/engine_alive()：它不是引擎句柄，也不会反向
+    // 延长/查询引擎生命周期。
+    [[nodiscard]] bool bound() const noexcept { return engine_id_.bound(); }
+    [[nodiscard]] EngineId engine_id() const noexcept { return engine_id_; }
 
     // ── valid：存储匹配 precision_ 且非空 ────────────────────────────────
     [[nodiscard]] bool valid() const noexcept
@@ -418,7 +404,7 @@ private:
         t.precision_ = precision_;
         t.rows_ = new_rows;
         t.cols_ = new_cols;
-        t.engine_ = engine_;  // 传播：reshape 沿用 src 绑定（§3.1）
+        t.engine_id_ = engine_id_;  // 传播：reshape 沿用 src 身份
 #ifdef NN_HAS_VULKAN
         t.gpu_data_ = gpu_data_;
 #endif

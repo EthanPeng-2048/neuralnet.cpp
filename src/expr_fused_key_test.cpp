@@ -45,7 +45,8 @@ void fk_eq(const char* name, const std::string& a, const std::string& b,
 
 int main()
 {
-    nn::CpuEngine eng;
+    auto eng_owner = nn::CpuEngine::create();
+    nn::CpuEngine& eng = *eng_owner;
     // 真实实例的操作数（形状/精度都真实）
     const nn::Tensor x  = eng.create_tensor(8, 4, nn::Precision::F32);
     const nn::Tensor w  = eng.create_tensor(5, 8, nn::Precision::F32);

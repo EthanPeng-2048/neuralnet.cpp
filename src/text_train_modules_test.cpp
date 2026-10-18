@@ -114,7 +114,8 @@ void test_ckpt_path()
 // ── [2] 角色门禁 + [3] 断点往返 ────────────────────────────────────────
 void test_role_gate_and_roundtrip(const std::filesystem::path& dir)
 {
-    nn::CpuEngine eng;
+    auto eng_owner = nn::CpuEngine::create();
+    nn::CpuEngine& eng = *eng_owner;
     const nn::ModelSpec spec = tiny_spec();
     auto built = nn::build_gpt_model_from_spec(eng, spec);
     NN_ASSERT_ALWAYS(built, "text_train_modules_test: 构建小 GPT 失败");
@@ -390,7 +391,8 @@ void test_role_gate_and_roundtrip(const std::filesystem::path& dir)
 // ── [4] 断点记账与退出码语义（P1-1 第一刀回归锁）────────────────────────
 void test_ckpt_accounting(const std::filesystem::path& dir)
 {
-    nn::CpuEngine eng;
+    auto eng_owner = nn::CpuEngine::create();
+    nn::CpuEngine& eng = *eng_owner;
     const nn::ModelSpec spec = tiny_spec();
     auto built = nn::build_gpt_model_from_spec(eng, spec);
     NN_ASSERT_ALWAYS(built, "text_train_modules_test: 构建小 GPT 失败");
@@ -426,7 +428,8 @@ void test_ckpt_accounting(const std::filesystem::path& dir)
 // ── [6] P1-2 断点状态接线：save_ckpt_with_state → peek → load_optimizer_state ──
 void test_train_state_wiring(const std::filesystem::path& dir)
 {
-    nn::CpuEngine eng;
+    auto eng_owner = nn::CpuEngine::create();
+    nn::CpuEngine& eng = *eng_owner;
     const nn::ModelSpec spec = tiny_spec();
     auto built = nn::build_gpt_model_from_spec(eng, spec, nn::PrecisionProfile{});
     NN_ASSERT_ALWAYS(built, "test_train_state_wiring: 构建小 GPT 失败");
@@ -503,7 +506,8 @@ void test_train_state_wiring(const std::filesystem::path& dir)
 // ── [5] 推理模型角色（text_infer 侧前提）───────────────────────────────
 void test_inference_model_role(const std::filesystem::path& dir)
 {
-    nn::CpuEngine eng;
+    auto eng_owner = nn::CpuEngine::create();
+    nn::CpuEngine& eng = *eng_owner;
     const nn::ModelSpec spec = tiny_spec();
     auto built = nn::build_gpt_model_from_spec(eng, spec);
     NN_ASSERT_ALWAYS(built, "text_train_modules_test: 构建小 GPT 失败");

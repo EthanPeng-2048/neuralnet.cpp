@@ -73,7 +73,8 @@ nn::Tensor ref_matmul_bias_relu(nn::ComputeEngine& e, const nn::Tensor& A,
 void test_pure_matmul()
 {
     const std::size_t M = 4, K = 5, N = 3;
-    nn::CpuEngine eng;
+    auto eng_owner = nn::CpuEngine::create();
+    nn::CpuEngine& eng = *eng_owner;
     const nn::Tensor A = make_tensor(eng, M, K, 0.5f, 0.03f);
     const nn::Tensor B = make_tensor(eng, K, N, -0.5f, 0.02f);
 
@@ -95,7 +96,8 @@ void test_pure_matmul()
 void test_matmul_bias()
 {
     const std::size_t M = 4, K = 5, N = 3;
-    nn::CpuEngine eng;
+    auto eng_owner = nn::CpuEngine::create();
+    nn::CpuEngine& eng = *eng_owner;
     const nn::Tensor A = make_tensor(eng, M, K, 0.5f, 0.03f);
     const nn::Tensor B = make_tensor(eng, K, N, -0.5f, 0.02f);
     const nn::Tensor bias = make_tensor(eng, M, N, 0.2f, 0.01f);
@@ -125,7 +127,8 @@ void test_matmul_bias()
 void test_matmul_bias_relu()
 {
     const std::size_t M = 3, K = 4, N = 5;
-    nn::CpuEngine eng;
+    auto eng_owner = nn::CpuEngine::create();
+    nn::CpuEngine& eng = *eng_owner;
     const nn::Tensor A = make_tensor(eng, M, K, -0.3f, 0.05f);
     const nn::Tensor B = make_tensor(eng, K, N, 0.1f, -0.02f);
     const nn::Tensor bias = make_tensor(eng, M, N, -0.4f, 0.03f);
@@ -149,7 +152,8 @@ void test_matmul_bias_relu()
 void test_transpose_variants()
 {
     const std::size_t M = 4, K = 5, N = 3;
-    nn::CpuEngine eng;
+    auto eng_owner = nn::CpuEngine::create();
+    nn::CpuEngine& eng = *eng_owner;
     // A0: (M,K)；At: A^T 存储 (K,M)；B0: (K,N)；Bt: B^T 存储 (N,K)
     const nn::Tensor A0 = make_tensor(eng, M, K, 0.2f, 0.04f);
     const nn::Tensor At = make_tensor(eng, K, M, 0.2f, 0.04f);   // A^T
@@ -233,7 +237,8 @@ void test_key_shape_invariance()
     CHECK(knomm != k8, "有/无 matmul 段的 spec key 必须不同");
 
     // 不同 k 的实际求值正确（用 k=8 的 spec 在 K=8 输入上求值）
-    nn::CpuEngine eng;
+    auto eng_owner = nn::CpuEngine::create();
+    nn::CpuEngine& eng = *eng_owner;
     const std::size_t M = 3, K = 8, N = 2;
     const nn::Tensor A = make_tensor(eng, M, K, 0.4f, 0.02f);
     const nn::Tensor B = make_tensor(eng, K, N, 0.3f, -0.01f);
@@ -249,7 +254,8 @@ void test_key_shape_invariance()
 void test_matmul_reduce_instr()
 {
     const std::size_t M = 3, K = 4, N = 5;
-    nn::CpuEngine eng;
+    auto eng_owner = nn::CpuEngine::create();
+    nn::CpuEngine& eng = *eng_owner;
     const nn::Tensor A = make_tensor(eng, M, K, 0.2f, 0.03f);
     const nn::Tensor B = make_tensor(eng, K, N, -0.2f, 0.04f);
 
@@ -295,7 +301,8 @@ void test_col_matmul_reduce_instr()
 {
     const std::size_t K = 4, N = 5, batch = 2, M = 3;
     const std::size_t rows = batch * M;   // 6：覆盖 rows != M 的 batch 分解
-    nn::CpuEngine eng;
+    auto eng_owner = nn::CpuEngine::create();
+    nn::CpuEngine& eng = *eng_owner;
     const nn::Tensor A = make_tensor(eng, rows, K, 0.2f, 0.03f);   // transA=0 → (rows, K)
     const nn::Tensor B = make_tensor(eng, batch * K, N, -0.2f, 0.04f); // transB=0 → (batch*K, N)
 
@@ -383,7 +390,8 @@ void test_validation()
 void test_dsl_pure_matmul()
 {
     const std::size_t M = 4, K = 6, N = 2;
-    nn::CpuEngine eng;
+    auto eng_owner = nn::CpuEngine::create();
+    nn::CpuEngine& eng = *eng_owner;
     const nn::Tensor A = make_tensor(eng, M, K, 0.3f, 0.02f);
     const nn::Tensor B = make_tensor(eng, K, N, 0.1f, 0.03f);
     auto r = nn::dsl::compute(eng, dsl::matmul(A, B), M, N);

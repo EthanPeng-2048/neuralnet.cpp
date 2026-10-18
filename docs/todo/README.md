@@ -25,7 +25,7 @@
 | [`00-code-review-remediation.md`](00-code-review-remediation.md) | **2026-10-11 代码审查整改立项台账**：审查发现的问题逐条立项（现象/证据/根因/方案/验收/优先级） |
 | [`18-roadmap.md`](18-roadmap.md) | **"某件事该不该做"的唯一入口**：未来 6–12 个月方向 + 未完成项**裁定**台账（做 / 条件触发 / 不做）+ 验收口径 + 现状实测；**§4.5 P4 = 持续优化方向**（性能利用率 / 算子性能 / 显存开销 + API 易用性与 Fold 自动化扫描）。**不含执行计划**（见下一行） |
 | [`27-execution-plan.md`](27-execution-plan.md) | **执行计划（优先级象限）**：把 18 号 §3/§4/§6 与 00 号 RV 台账里当前可动手的项排成"先做哪个"（重要×简单四象限 + 第一步动作 + 三条硬依赖）——**想知道"下一个先做哪个"读它** |
-| [`26-f16-speedup-plan.md`](26-f16-speedup-plan.md) | **f16 提速方案（台账 24 · F4）**：带宽优先、ALU 可选——先决 S0（去 step 内固定开销）→ S1（主导张量 f16 + 融合消费者）→ S2（f16x2 打包）→ S3（f16 GEMM）→ S4（CPU F16C）；验收锚 = **任意设备** `--f16` ≤ f32（不依赖 `shaderFloat16`） |
+| [`26-f16-speedup-plan.md`](26-f16-speedup-plan.md) | **f16 提速 + 两套 f16 计划**：F4 存储路径提速已收口；§8 分 A/B 两条路线——**A = 标准 `--f16`（参考 PyTorch AMP，补动态 loss scaling/master weights）**；**B = 全流程真 f16（B-Mem 无 f32 持久态；capable 设备的 B-Arith 零转换）**。**§8.B.7 汇总 SR / GradientStabilizer / ECO / Unit Scaling / Peri-LN / attention δ 修复的外部证据与 R2.5 落地顺序**。A 是推荐默认，B 是实验/性能目标 |
 | [`04-memory-optimization.md`](04-memory-optimization.md) | 显存优化计划：L1 激活重计算（已实施）/ L2 内存池归还（已实施）/ L3 远期 |
 
 ### 现行设计 / 总纲（改对应模块前读）
@@ -47,8 +47,8 @@
 | [`12-compute-engine-inventory.md`](12-compute-engine-inventory.md) | 引擎接口现状盘点（复现：`bench/doc_inventory.ps1`）：virtual 方法数、Layer 直调分类、两套 CPU 求值机制、ctest 计数 |
 | [`10-development-standards.md`](10-development-standards.md) | C++ 编码规范全文（内存管理 / 模块隔离 / 高性能 / 错误处理 / 注释） |
 | [`08-pitfalls-and-lessons.md`](08-pitfalls-and-lessons.md) | **踩坑警示录，改代码前读**：分级 bug 与跨领域根因模式 |
-| [`14-f16-stable-gpu-loss-frozen.md`](14-f16-stable-gpu-loss-frozen.md) | **未修故障报告**：GPU `--precision-stable f16` 训练 loss 打印冻结（权重不冻结）——触发矩阵、覆盖缺口、证据 |
-| [`24-f16-training-defects.md`](24-f16-training-defects.md) | **f16 训练缺陷台账**：全 f16 NaN（`stable=f16` CE 溢出 + `optimizer=f16` 二阶矩下溢）、loss 冻结（GPU 回读 `14` + 数值泛化）、`--f16` 降速——含报告核对与立项 F1–F5 |
+| [`14-f16-stable-gpu-loss-frozen.md`](14-f16-stable-gpu-loss-frozen.md) | **已修故障报告（根因已订正）**：GPU `--precision-stable f16` 训练 loss 打印冻结——真因 = CE 的 `(1,1)` 归约输出按 f16 落盘溢出（不是回读链） |
+| [`24-f16-training-defects.md`](24-f16-training-defects.md) | **f16 训练缺陷台账**：全 f16 NaN / loss 冻结 / `--f16` 降速——含报告核对与立项 F1–F7（F5 = 可训练性已完成；**F6 = 真 f16（Plan B）**；**F7 = 标准 `--f16`（Plan A）**） |
 | [`25-release-requirements.md`](25-release-requirements.md) | **大版本发布要求**（`1.x.y → 1.(x+1).0`）：端到端模型训练测试 / 发布文档 / 完整 ctest + Debug 构建 / 多编译器 × 标准库矩阵 |
 
 ## 相关（相邻分册 / 总档）

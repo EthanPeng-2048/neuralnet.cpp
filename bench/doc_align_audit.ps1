@@ -173,6 +173,9 @@ $removedFlags  = @('--cuda','--tdr-retry','--max-tdr-retries',
                    #   （docs/todo/23，2026-10-11）删除 → 文件角色
                    #   .nnmodel/.nnckpt 取代
                    '--export-deploy')
+# 已在 26 §8.B.7 明确标注“计划中、默认关闭、尚未实现”的参数。它们不得出现在
+# 当前 --help / 解析分支里；实现后应移出本表（届时代码侧会自然命中）。
+$plannedFlags  = @('--stochastic-rounding','--unit-scaling')
 
 # ── [D] 文档里的 CLI 参数是否存在 ────────────────────────────────────────
 Write-Host '=== [D] 文档引用但代码中不存在的 CLI 参数（--flag）==='
@@ -193,12 +196,13 @@ $missFlags = 0
 $skippedFlags = 0
 foreach ($f in ($flags.Keys | Sort-Object)) {
     if ($codeText -notmatch [regex]::Escape($f)) {
-        if ($externalFlags -contains $f -or $removedFlags -contains $f) { $skippedFlags++; continue }
+        if ($externalFlags -contains $f -or $removedFlags -contains $f -or
+            $plannedFlags -contains $f) { $skippedFlags++; continue }
         $missFlags++
         Write-Host ("  -- {0}   出现于: {1}" -f $f, ($flags[$f] -join ', '))
     }
 }
-Write-Host ("  [D] 找不到的 {0} 个；白名单跳过 {1} 个（外部工具参数/文档已标注移除）" -f $missFlags, $skippedFlags)
+Write-Host ("  [D] 找不到的 {0} 个；白名单跳过 {1} 个（外部工具参数/文档已标注移除/计划中）" -f $missFlags, $skippedFlags)
 Write-Host ''
 
 # ── [E] 文档里的 nn::Xxx 符号是否存在 ────────────────────────────────────

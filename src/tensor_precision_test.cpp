@@ -237,7 +237,8 @@ void test_f16_data_roundtrip(nn::ComputeEngine& eng)
 int main()
 {
     std::printf("tensor_precision_test (D3: Tensor precision + engine I/O roundtrip, M1)\n");
-    nn::CpuEngine eng;
+    auto eng_owner = nn::CpuEngine::create();
+    nn::CpuEngine& eng = *eng_owner;
     test_default_tensor();
     test_f32_cpu_tensor(eng);
     test_f16_cpu_tensor(eng);

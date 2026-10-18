@@ -65,7 +65,8 @@ int run_test()
         std::cout << "[SKIP] GPU 不可用: " << init_r.error().message << "\n";
         return 77;
     }
-    GpuEngine eng(backend);
+    auto eng_owner = GpuEngine::create(backend);
+    GpuEngine& eng = *eng_owner;
 
     std::cout << "========================================\n"
               << "  GPT activation offload 一致性测试\n"

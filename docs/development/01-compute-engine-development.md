@@ -661,7 +661,8 @@ void main() {
 
 ```cpp
 TEST_CASE("elementwise_abs_diff") {
-    CpuEngine engine;
+    auto engine_owner = CpuEngine::create();
+    CpuEngine& engine = *engine_owner;
 
     Matrix a(2, 2);
     Matrix b(2, 2);
@@ -756,7 +757,8 @@ for (std::size_t r = 0; r < rows; ++r) {
 
 ```cpp
 TEST_CASE("matmul") {
-    CpuEngine engine;
+    auto engine_owner = CpuEngine::create();
+    CpuEngine& engine = *engine_owner;
 
     Matrix a(2, 3);
     Matrix b(3, 2);
@@ -779,7 +781,8 @@ TEST_CASE("matmul") {
 
 ```cpp
 TEST_CASE("linear_gradcheck") {
-    CpuEngine engine;
+    auto engine_owner = CpuEngine::create();
+    CpuEngine& engine = *engine_owner;
     Linear layer(10, 5);
 
     Matrix input(10, 1);

@@ -9,7 +9,7 @@
 //       `ModelSpec`（架构规格）、`save_model` / `load_model` / `peek_model_spec`。
 // 用法：
 //     #include <neuralnet.cpp/model.hpp>
-//     nn::Model model(engine);
+//     nn::Model model(*engine);
 //     NN_UNWRAP(model.add<nn::Linear>(784, 256));
 //     NN_UNWRAP(nn::save_model("model.bin", model, spec));
 //

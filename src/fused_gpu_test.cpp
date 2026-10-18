@@ -849,7 +849,7 @@ int main()
     std::cout << "========================================\n"
               << "  AOT 融合 shader GPU 数值验证（端到端）\n"
               << "========================================\n";
-    auto cpu_engine = std::make_unique<CpuEngine>();
+    auto cpu_engine = CpuEngine::create();
     auto& backend = GpuBackend::instance();
     auto init_r = backend.initialize();
     if (!init_r)
@@ -860,7 +860,7 @@ int main()
         std::cout << "[SKIP] GPU 不可用: " << init_r.error().message << "\n";
         return 77;
     }
-    auto gpu_engine = std::make_unique<GpuEngine>(backend);
+    auto gpu_engine = GpuEngine::create(backend);
     std::cout << "[init] CpuEngine + GpuEngine 就绪\n";
 
     int fail = 0;

@@ -49,6 +49,9 @@ private:
     VkBuffer buffer_ = VK_NULL_HANDLE;
     MemoryPool::Allocation alloc_;
     observer_ptr<MemoryPool> pool_;
+    // backend keepalive：GpuBuffer 可能晚于 GpuEngine 析构。持有强引用后，
+    // 析构时可以安全访问 backend（延迟销毁队列 / memory pool）。
+    std::shared_ptr<GpuBackend> backend_keepalive_;
 
     // ── 写版本（write epoch）──────────────────────────────────────────────
     // 与 MatrixT 的 write_epoch_ 同义（见 algebra_matrix.hpp 的说明）：内容
@@ -64,8 +67,10 @@ public:
 
     GpuBuffer() = default;
 
-    GpuBuffer(VkDevice device, VkBuffer buffer, const MemoryPool::Allocation& alloc, MemoryPool& pool)
-        : device_(device), buffer_(buffer), alloc_(alloc), pool_(pool) {}
+    GpuBuffer(VkDevice device, VkBuffer buffer, const MemoryPool::Allocation& alloc,
+              MemoryPool& pool, std::shared_ptr<GpuBackend> backend_keepalive)
+        : device_(device), buffer_(buffer), alloc_(alloc), pool_(pool),
+          backend_keepalive_(std::move(backend_keepalive)) {}
 
     // 析构定义在 GpuBackend 之后：batch 录制期间已录制的 descriptor 仍引用
     // 本 buffer，需延迟到 end_batch 提交完成后再销毁（见 defer_buffer_destroy）。
@@ -73,12 +78,14 @@ public:
 
     GpuBuffer(GpuBuffer&& o) noexcept
         : device_(o.device_), buffer_(o.buffer_), alloc_(o.alloc_), pool_(o.pool_),
+          backend_keepalive_(std::move(o.backend_keepalive_)),
           write_epoch_(o.write_epoch_)
     {
         o.device_ = VK_NULL_HANDLE;
         o.buffer_ = VK_NULL_HANDLE;
         o.alloc_ = {};
         o.pool_.reset();
+        o.backend_keepalive_.reset();
     }
 
     GpuBuffer& operator=(GpuBuffer&& o) noexcept
@@ -89,6 +96,7 @@ public:
             std::swap(buffer_, o.buffer_);
             std::swap(alloc_, o.alloc_);
             pool_.swap(o.pool_);
+            std::swap(backend_keepalive_, o.backend_keepalive_);
             std::swap(write_epoch_, o.write_epoch_);
         }
         return *this;
@@ -102,7 +110,8 @@ public:
     // 与 MemoryPool 分配侧的 DEVICE_ADDRESS 标志成对（都随 bda_available 门控）。
     [[nodiscard]] static Result<GpuBuffer> create_device_local(
         VkDevice device, MemoryPool& pool,
-        std::size_t byte_count, VkBufferUsageFlags usage)
+        std::size_t byte_count, VkBufferUsageFlags usage,
+        std::shared_ptr<GpuBackend> backend_keepalive)
     {
         VkBufferCreateInfo buf_info{};
         buf_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
@@ -135,13 +144,15 @@ public:
             NN_FAIL("vkBindBufferMemory failed: " + std::to_string(res));
         }
 
-        return GpuBuffer(device, buffer, *alloc_r, pool);
+        return GpuBuffer(device, buffer, *alloc_r, pool,
+                         std::move(backend_keepalive));
     }
 
     // 创建 Host Visible 缓冲区（尺寸语义 = 字节数，§6.3）
     [[nodiscard]] static Result<GpuBuffer> create_host_visible(
         VkDevice device, MemoryPool& pool,
-        std::size_t byte_count, VkBufferUsageFlags usage)
+        std::size_t byte_count, VkBufferUsageFlags usage,
+        std::shared_ptr<GpuBackend> backend_keepalive)
     {
         VkBufferCreateInfo buf_info{};
         buf_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
@@ -193,7 +204,8 @@ public:
             NN_FAIL("vkBindBufferMemory failed: " + std::to_string(res));
         }
 
-        return GpuBuffer(device, buffer, *alloc_r, pool);
+        return GpuBuffer(device, buffer, *alloc_r, pool,
+                         std::move(backend_keepalive));
     }
 
     [[nodiscard]] VkBuffer impl() const noexcept { return buffer_; }

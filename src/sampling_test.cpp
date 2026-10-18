@@ -218,7 +218,8 @@ void test_greedy_consumes_no_rng()
 
 void test_gpt_model_generate()
 {
-    nn::CpuEngine eng;
+    auto eng_owner = nn::CpuEngine::create();
+    nn::CpuEngine& eng = *eng_owner;
     const std::size_t vocab = 32, d_model = 16, seq = 8, heads = 2, d_ff = 32;
     nn::GPTModel model(vocab, d_model, seq, heads, d_ff, /*layers=*/1,
                        nn::PosEncodingType::Learned,

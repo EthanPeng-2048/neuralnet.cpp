@@ -214,7 +214,8 @@ void test_kvrec_roundtrip()
 void test_checkpoint_roundtrip(const std::filesystem::path &dir)
 {
     std::cout << "\n── [2] Checkpoint 往返（状态段 + 优化器张量）──\n";
-    nn::CpuEngine engine;
+    auto engine_owner = nn::CpuEngine::create();
+    nn::CpuEngine& engine = *engine_owner;
     auto model_r = make_model(engine);
     CHECK(model_r.has_value(), "建模型");
     if (!model_r) return;
@@ -368,7 +369,8 @@ void test_checkpoint_roundtrip(const std::filesystem::path &dir)
 void test_integrity(const std::filesystem::path &dir)
 {
     std::cout << "\n── [5] 整文件校验和 / 尾部完整性标记 ──\n";
-    nn::CpuEngine engine;
+    auto engine_owner = nn::CpuEngine::create();
+    nn::CpuEngine& engine = *engine_owner;
     auto model_r = make_model(engine);
     if (!model_r) { CHECK(false, "建模型"); return; }
     const auto path = dir / "integrity.nnmodel";
@@ -422,7 +424,8 @@ void test_integrity(const std::filesystem::path &dir)
 void test_resave_byte_identity(const std::filesystem::path &dir)
 {
     std::cout << "\n── [9] save → load → save 逐字节一致（f32 状态）──\n";
-    nn::CpuEngine engine;
+    auto engine_owner = nn::CpuEngine::create();
+    nn::CpuEngine& engine = *engine_owner;
     auto model_r = make_model(engine);
     CHECK(model_r.has_value(), "建模型");
     if (!model_r) return;

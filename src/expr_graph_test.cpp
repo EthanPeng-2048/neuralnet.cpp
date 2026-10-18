@@ -148,7 +148,8 @@ nn::ExprSpec make_row_sum()
 // A: y = x * 2；B: z = y + 1 → 融合后 z = x*2 + 1，单 kernel
 void test_chain_fuse()
 {
-    nn::CpuEngine eng;
+    auto eng_owner = nn::CpuEngine::create();
+    nn::CpuEngine& eng = *eng_owner;
     const std::size_t rows = 3, cols = 4;
     nn::ExprGraph g;
     nn::Tensor x = make_tensor(eng, rows, cols, 0.0f, 0.5f);
@@ -211,7 +212,8 @@ void test_chain_fuse()
 // A: y=x*2；B: z=y+3；C: w=z-1 → 融合成单 kernel
 void test_chain3_fuse()
 {
-    nn::CpuEngine eng;
+    auto eng_owner = nn::CpuEngine::create();
+    nn::CpuEngine& eng = *eng_owner;
     const std::size_t rows = 2, cols = 5;
     nn::ExprGraph g;
     nn::Tensor x = make_tensor(eng, rows, cols, 1.0f, 0.3f);
@@ -290,7 +292,8 @@ void test_chain3_fuse()
 // A: y = x*2（无消费者）；B: z = w+1（外部输入 w，不依赖 A）→ 2 个 kernel
 void test_independent()
 {
-    nn::CpuEngine eng;
+    auto eng_owner = nn::CpuEngine::create();
+    nn::CpuEngine& eng = *eng_owner;
     const std::size_t rows = 3, cols = 3;
     nn::ExprGraph g;
     nn::Tensor x = make_tensor(eng, rows, cols, 0.0f, 0.1f);
@@ -321,7 +324,8 @@ void test_independent()
 // ── 测试 4：多消费者写穿融合（P2：A 被 B、C 同时消费 → 单 kernel 3 输出）──
 void test_multi_consumer()
 {
-    nn::CpuEngine eng;
+    auto eng_owner = nn::CpuEngine::create();
+    nn::CpuEngine& eng = *eng_owner;
     const std::size_t rows = 2, cols = 4;
     nn::ExprGraph g;
     nn::Tensor x = make_tensor(eng, rows, cols, 0.0f, 0.1f);
@@ -373,7 +377,8 @@ void test_multi_consumer()
 // ── 测试 5：归约节点作为融合边界 ───────────────────────────────────────
 void test_reduce_boundary()
 {
-    nn::CpuEngine eng;
+    auto eng_owner = nn::CpuEngine::create();
+    nn::CpuEngine& eng = *eng_owner;
     const std::size_t rows = 3, cols = 4;
     nn::ExprGraph g;
     nn::Tensor x = make_tensor(eng, rows, cols, 0.0f, 0.1f);
@@ -423,7 +428,8 @@ nn::ExprSpec make_abs_chain(std::uint8_t n)
 
 void test_limit_pressure()
 {
-    nn::CpuEngine eng;
+    auto eng_owner = nn::CpuEngine::create();
+    nn::CpuEngine& eng = *eng_owner;
     const std::size_t rows = 1, cols = 4;
     nn::ExprGraph g;
     nn::Tensor x = make_tensor(eng, rows, cols, 0.0f, 0.1f);
@@ -458,7 +464,8 @@ void test_limit_pressure()
 // ── 测试 7：确定性（同一图多次融合结果一致） ───────────────────────────
 void test_determinism()
 {
-    nn::CpuEngine eng;
+    auto eng_owner = nn::CpuEngine::create();
+    nn::CpuEngine& eng = *eng_owner;
     const std::size_t rows = 2, cols = 4;
     nn::Tensor x = make_tensor(eng, rows, cols, 0.0f, 0.1f);
 
@@ -489,7 +496,8 @@ void test_determinism()
 // ── 测试 8：录制图 add_node 依赖识别 ───────────────────────────────────
 void test_dep_recognition()
 {
-    nn::CpuEngine eng;
+    auto eng_owner = nn::CpuEngine::create();
+    nn::CpuEngine& eng = *eng_owner;
     const std::size_t rows = 2, cols = 4;
     nn::ExprGraph g;
     nn::Tensor x = make_tensor(eng, rows, cols, 0.0f, 0.1f);
@@ -521,7 +529,8 @@ void test_dep_recognition()
 // A: y = x1 * x2（两个输入）；B: z = y + x3 → 融合后 inputs = [x1, x2, x3]
 void test_input_order()
 {
-    nn::CpuEngine eng;
+    auto eng_owner = nn::CpuEngine::create();
+    nn::CpuEngine& eng = *eng_owner;
     const std::size_t rows = 2, cols = 4;
     nn::ExprGraph g;
     nn::Tensor x1 = make_tensor(eng, rows, cols, 0.0f, 0.1f);
@@ -594,7 +603,8 @@ void test_input_order()
 //      instrs = A 尾链 + B 指令（matmul 输出经"虚拟寄存器"流入 relu）。
 void test_matmul_chain_fuse()
 {
-    nn::CpuEngine eng;
+    auto eng_owner = nn::CpuEngine::create();
+    nn::CpuEngine& eng = *eng_owner;
     const std::size_t M = 3, K = 4, N = 2;
     nn::ExprGraph g;
     nn::Tensor A0 = make_tensor(eng, M, K, 0.5f, 0.03f);
@@ -648,7 +658,8 @@ void test_matmul_chain_fuse()
 //   B: z = y + bias 消费 A → 融合为单 kernel（B 对 A 的引用替换为 Matmul 操作数）
 void test_matmul_pure_chain_fuse()
 {
-    nn::CpuEngine eng;
+    auto eng_owner = nn::CpuEngine::create();
+    nn::CpuEngine& eng = *eng_owner;
     const std::size_t M = 2, K = 3, N = 4;
     nn::ExprGraph g;
     nn::Tensor A0 = make_tensor(eng, M, K, 0.4f, 0.05f);

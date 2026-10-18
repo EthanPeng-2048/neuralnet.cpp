@@ -13,7 +13,7 @@
 // 提供：`ComputeEngine`（原语接口）、`CpuEngine`，以及 GPU 构建下的 `GpuEngine`。
 // 用法：
 //     #include <neuralnet.cpp/engine.hpp>
-//     nn::CpuEngine engine;
+//     auto engine = nn::CpuEngine::create();   // shared_ptr，RAII 管理
 
 #include "compute_engine.hpp"
 #include "compute_cpu_engine.hpp"
