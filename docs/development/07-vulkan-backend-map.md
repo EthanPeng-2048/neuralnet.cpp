@@ -8,15 +8,21 @@
 
 后端拆分过一轮（RV-08），但那是**物理拆分**：四个 `.inc` 片段被
 `class GpuBackend { ... }` 在类体内按序 `#include`。文件数变多了，读者面对的
-仍然是"一个类、四段成员定义、彼此共享全部私有状态"：
+仍然是"一个类、四段成员定义、彼此共享全部私有状态"。
+
+P2-7 的前几刀先把**数据与表**从类里移出去（存储层、pipeline 目录、融合
+kernel 记录、描述符绑定），当前规模：
 
 | 位置 | 行数 | 读者实际看到的内容 |
 |---|---:|---|
-| `backend/compute_vk_backend.hpp` | 1073 | 设备/张量声明 + 44 个 pipeline 成员 + 帧环/池/计时状态 |
-| `backend/compute_vk_backend_destroy.inc` | 994 | 延迟销毁 + `initialize()`（约 750 行，内含 40 处 pipeline 创建样板） |
-| `backend/compute_vk_backend_frame.inc` | 785 | 帧环、batch、上传下载、matmul |
-| `backend/compute_vk_backend_pipelines.inc` | 673 | 扫描原语 + 描述符/屏障/solo fence 辅助 |
-| `backend/compute_vk_backend_ops.inc` | 2688 | 15 个原语 dispatch + 融合执行 |
+| `backend/compute_gpu_storage.hpp` | 255 | `GpuBuffer` / `GpuTensorT<P>`（只依赖 Vulkan 句柄 + MemoryPool） |
+| `backend/compute_vk_pipeline_catalog.hpp` | 176 | `PipelineId` / `PipelineSpec` / `PipelineCatalog` |
+| `backend/compute_vk_pipeline_specs.hpp` | 146 | 44 行 pipeline 布局表（唯一真源） |
+| `backend/compute_vk_backend.hpp` | 814 | 设备 + 目录 + 帧环/池/计时状态 |
+| `backend/compute_vk_backend_destroy.inc` | 550 | 延迟销毁 + `initialize()`（一条创建序列） |
+| `backend/compute_vk_backend_frame.inc` | 772 | 帧环、batch、上传下载、matmul |
+| `backend/compute_vk_backend_pipelines.inc` | 721 | 扫描原语 + 描述符/屏障/solo fence 辅助 |
+| `backend/compute_vk_backend_ops.inc` | 2415 | 15 个原语 dispatch + 融合执行 |
 | `compute_gpu_engine.hpp` | 2610 | 引擎适配、cast 回退、融合图执行 |
 
 `.inc` **不可单独编译、不可单独索引**：IDE 的 "go to definition" 与
@@ -32,7 +38,7 @@ Layer / DSL
   │         │  形状选择 / 精度回退 / K-split 决策
   │         └─ GpuBackend::matmul_gpu()      (compute_vk_backend_frame.inc)
   │              ├─ acquire_cmd()            → 帧环 or solo fence
-  │              ├─ alloc_desc_set() + vkUpdateDescriptorSets
+  │              ├─ alloc_desc_set_for(layout, buffers)
   │              ├─ record_input_barriers()
   │              ├─ ts_dispatch()            → vkCmdDispatch（+ 可选 timestamp）
   │              ├─ record_output_barrier()
@@ -49,9 +55,9 @@ Layer / DSL
 - **引擎层（`GpuEngine`）**回答"用哪个原语、什么精度、要不要回退"；
 - **后端层（`GpuBackend`）**回答"Vulkan 怎么录、怎么交、什么时候等"。
 
-当前这两件事在 `GpuEngine::*_impl` 里仍混有 `cast_if_f16` / `has_*_pipeline`
-之类的后端能力判断；重构方向是把"能力查询"收进一个显式的 capability 对象，
-引擎只读事实、不读 pipeline 句柄。
+当前这两件事在 `GpuEngine::*_impl` 里仍混有 `cast_if_f16` /
+`has(PipelineId)` 之类的后端能力判断；重构方向是把"能力查询"收进一个显式的
+capability 对象，引擎只读事实、不读 pipeline 句柄。
 
 ## 3. 所有权与生命周期
 
@@ -102,24 +108,25 @@ L3+ model / domain / cli / app
 |---|---|---|
 | 设备与能力 | `compute_vk_device.hpp` | `vk::Device`（已有 `VulkanDevice`） |
 | Pipeline 创建/查找 | `destroy.inc` 的 `initialize()` | `vk::PipelineCatalog` + `PipelineId` |
-| 描述符分配/绑定 | `pipelines.inc` + 各算子 | `vk::DescriptorAllocator` + `vk::DescriptorWriter` |
+| 描述符分配/绑定 | `pipelines.inc` 的 `alloc_desc_set_for` | `vk::DescriptorAllocator` + `vk::DescriptorWriter` |
 | 命令录制/提交 | `frame.inc` + `pipelines.inc` | `vk::CommandRecorder` + `vk::FrameRing` |
 | 算子语义 | `ops.inc` + `frame.inc` 的 matmul | `gpu::ops::*`（接收 `OpContext`） |
 
 ### 5.1 已收敛与待收敛
 
-已完成（P2-7 第 2–3 刀）：
+已完成（P2-7 第 2–5 刀）：
 
 - 44 个 pipeline 成员 + 40 个 `has_*_pipeline()` 手工转发 → `PipelineCatalog`
   + 一个 `has(PipelineId)` 查询入口；
 - `initialize()` 中 40 段"取 SPIR-V → 判空 → 创建 → 移动" → 一张
   `PipelineSpec` 表 + 一个循环（`compute_vk_pipeline_specs.hpp`）；
 - 融合 kernel 的 9 张并行 map → 一个 `FusedKernel` 记录（注册时一次写定）。
+- 15 处算子各自重复的描述符写入样板 → `alloc_desc_set_for(layout, buffers)`。
 
 仍待收敛：
 
-- 每个算子重复"分配描述符 → 写 4 个 binding → bind → push → dispatch →
-  barrier → submit" → 目标是一个 `DispatchRequest` + `CommandRecorder`；
+- 每个算子仍在重复"取 cmd → bind → push → dispatch → barrier → submit"
+  → 目标是一个 `DispatchRequest` + `CommandRecorder`；
 - `GpuBackend` 仍同时承担设备、存储、帧环、描述符、剖析、算子六件事 →
   目标是 `vk::` 协作者 + `gpu::ops::*` 薄算子。
 
@@ -130,16 +137,15 @@ L3+ model / domain / cli / app
    注册表）。
 2. `compute_engine.hpp` 加 op-level 接口（NVI 入口 + 默认 "unsupported"）。
 3. `GpuEngine` 加 `*_impl`：只做形状/精度决策，把"怎么录"交给后端。
-4. 后端加一个 `*_gpu`：绑定 → push constants → dispatch → barrier。
+4. 后端加一个 `*_gpu`：`alloc_desc_set_for` → push constants → dispatch →
+   barrier（不再手写 `VkWriteDescriptorSet`）。
 5. `shaders/scan_exprs` 不需要登记（op-level 原语不进 AOT 闭合世界）。
 
 ## 7. 怎么加一个 pipeline 变体
 
-当前：在 44 个成员里加一个、在 `initialize()` 里抄一段创建、在 `has_*` 区抄
-一个转发、在算子里加一个三元选择——**四处**。
-
-目标：在 `PipelineSpec` 表加一行（id / 名字 / SPIR-V getter / binding 数 /
-push 字节数 / 能力要求），算子侧用 `PipelineId` 选路——**两处**。
+当前：`PipelineId` 加一个名字，`pipeline_specs()` 加一行（SPIR-V getter /
+binding 数 / push 字节数 / 能力要求），算子侧用 `PipelineId` 选路——**两处**。
+`has()`、`get()`、创建循环都不需要改。
 
 ## 8. 验收口径
 
@@ -152,6 +158,30 @@ push 字节数 / 能力要求），算子侧用 `PipelineId` 选路——**两�
   `rapt_test --gpu` / `--f16 --gpu`、`scan_bitwise_test`；
 - 融合产物不变：`expr_fuse_test`、`fusion_custom_layer_example`；
 - 默认构建**不引入 LTO**；头文件布局不因"想少编译几个 TU"而妥协。
+
+### 8.1 为什么不用 LTO 换结构
+
+本次重构的收益必须**在默认构建（无 LTO）下成立**。LTO 是单线程串行的
+链接期优化，成本远高于并行编译；把它当作"跨文件内联的补偿"会让库外消费者
+被迫接受一次不可并行的长尾。
+
+因此：
+
+- 头文件内的小访问器、转发函数保持 `inline` 定义（不产生跨 TU 调用）；
+- 算子边界（per-dispatch）允许一次普通调用——GPU 提交本身就是微秒级，
+  多一层函数调用不改变可观测性能；
+- 任何"必须 LTO 才能回到原性能"的拆分方案直接否决。
+
+### 8.2 当前会话的落地顺序
+
+1. 本文件（结构地图）；
+2. `compute_gpu_storage.hpp`：存储层下沉，切断 L1 → L2 反向依赖；
+3. `PipelineCatalog` + `PipelineSpec`：44 个 pipeline 收敛为目录 + 一张表；
+4. `FusedKernel`：9 张并行元数据表合并为一条记录；
+5. `alloc_desc_set_for`：15 处描述符写入样板收敛。
+
+每一步都是独立提交，且以 `gpu_test` / `expr_fuse_test` /
+`scan_bitwise_test` 的通过为界。
 
 ## 9. 阅读顺序建议
 
