@@ -48,6 +48,7 @@
 - [matmul K 切分二次归约（`#ks`/`#kr`）](#matmul K 切分二次归约（`#ks`/`#kr`）：wgrad 派发饥饿第二刀（2026-10-07）)（1 条）
 - [录制窗口排空隐藏 + SpecBuilder 输入槽去重（项目 4/5）](#录制窗口排空隐藏 + SpecBuilder 输入槽去重（项目 4/5，2026-10-08）)（1 条）
 - [代码审查整改 批 A/B（RV-01..RV-04，2026-10-11）](#代码审查整改 批 A/B（RV-01..RV-04，2026-10-11）)（1 条）
+- [仓库历史整理（legacy 接入 + 大文件剔除，2026-10-18）](#仓库历史整理（legacy 接入 + 大文件剔除，2026-10-18）)（1 条）
 
 ---
 
@@ -5176,3 +5177,33 @@ P0-4 的 `install()/find_package` 与 P2-9）；剩 13 项 = 部分完成 5（P0
   crash 负例都是**故意 abort** 的子进程；原先每次 ctest 都会让 systemd-coredump 留下
   多条 SIGABRT 记录（容易误判为真故障）。现在子进程入口先 `setrlimit(RLIMIT_CORE, 0)`
   （POSIX；Windows 不适用），父进程的"非零退出 + stderr 断言"语义不变。
+
+---
+
+# 仓库历史整理（legacy 接入 + 大文件剔除，2026-10-18）
+
+- 类型：演进记录 / 仓库维护（**所有提交哈希已变化**）
+- **原状**：仓库存在两条互不相干的历史——`legacy`（2026-05-15 `Init` … 2026-08-31
+  `clang++ & libstdc++`，209 个提交）与 `main`（2026-09-11 `Release v0.0.1` 起重起，
+  开头 7 个提交是把 legacy 各阶段压成的快照）。两条线没有共同祖先；`main` 上的
+  `v0.0.1` … `v1.1.0` 与 legacy 的历史内容重复。
+- **整理目标**：把 legacy 的真实提交接回主线，去掉重复快照与错误提交的模型 / 词表 /
+  数据集 / 构建产物，同时保留原始提交时间。
+- **做法**：
+  ① 以 `v1.2.0` 快照作为**内容桥接提交**（它的树 = 旧 v1.2.0 的树），父提交改为
+  legacy 末端；`v0.0.1` … `v1.1.0` 六个快照不再位于 `main` 的祖先链，但仍以 tag
+  形式保留为归档（tag 指向的提交也一并清除了大文件）。
+  ② 全历史剔除：`gpt_model.bin` / `gpt_model.nnmodel` / `mnist_model.bin`、
+  根目录各版 BPE / CharBPE 词表 JSON 与 `vocab_*.txt` / `dataset.txt`、
+  `compare_with_torch/gpt_bpe_torch.json`，以及 `build2/` `build_fused/` `build_review/`
+  `build_test/` `build_verify/` 下的 PDB、可执行文件、Ninja/CMake 生成物。
+  ③ `--prune-empty` 移除剔除后变空的 2 个 legacy 提交（提交信息均为 `1`）。
+  ④ 所有保留提交的 author date / committer date 原样保留（含 8 个 author≠committer
+  的提交）；`v1.2.0` 及之后的 tag 随祖先改写重新指向，tag 日期不变。
+- **结果**：`legacy` 仍是独立分支（207 个提交），并成为 `main` 的祖先；`main` 与
+  `dev/api_opti` 的最终树与整理前**逐文件一致**，仅少了上述被剔除的产物。
+  `dev/api_opti` 在 `main` 之后保留原有 41 个提交，随后合并进 `main`。
+- **协作影响**：这是**不可快进的历史改写**，远端 `main` / `dev/api_opti` /
+  `legacy/compiler-compat` 与全部版本 tag 均已 force 更新。旧克隆不要再向这些分支
+  合并或推送，按 `git fetch --all --prune --force` + `git reset --hard origin/<branch>`
+  重新对齐；改写前的完整备份 bundle 保存在维护者本机（不进入仓库）。

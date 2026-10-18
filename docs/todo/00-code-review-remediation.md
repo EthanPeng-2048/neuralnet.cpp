@@ -29,7 +29,7 @@
 |---|---|---|
 | **P2**：`NN_ASSERT` 在 Release 为空展开 → 断言后继续解引用 = UB | ✅ **成立**（且本仓已有"修法先例"，见 RV-01） | `core_assert.hpp` 的 `NDEBUG` 分支 = `((void)0)`；8 类"断言后继续用"点，见 RV-01 |
 | **P1**：`create_tensor` 失败返回**空 Tensor + stderr**，不是 `Result<Tensor>` | ✅ **成立**（代码注释自陈这是契约；同族 `from_matrix` 已是 `Result`） | `compute_engine.hpp::ComputeEngine::create_tensor`；调用面 **115** 处 |
-| **P3**：`GpuBackend` 故意泄漏单例、缺显式 `shutdown()` | ✅ **成立**，且 **代码里已写 `TODO(1.1, L1)`** 并给了恢复方案 | `backend/compute_vk_backend.hpp::GpuBackend::instance` |
+| **P3**：`GpuBackend` 故意泄漏单例、缺显式 `shutdown()` | ✅ **已修复（2026-10-18，引擎所有权 v2）**：`shared_ptr` keepalive 取代故意泄漏；`GpuBuffer` 持 backend 强引用，`reduce_partial_` 改裸 `VkBuffer` 切断环；进程退出时静态 `shared_ptr` 正常析构并执行 `vkDestroy*` | `backend/compute_vk_backend.hpp`、`backend/compute_gpu_storage.hpp`、`src/layer_lifetime_test.cpp`；history「引擎所有权 v2」 |
 | **P3**：`Tensor` 析构不探测引擎存活 → 悬垂观察者 | ⚠ **部分成立**：当前应用栈安全（引擎严于 Tensor 析构），嵌入场景是风险；`observer_ptr` 无 Debug 校验 | `core_observer_ptr.hpp`（明确"不提供 RAII"） |
 | **P4**：绑定不变量靠人肉维护、`NN_BIND_DEBUG` 默认关不可靠 | ✅ 作为"不变量强度"问题**成立**；但**"`NN_BIND_DEBUG` 未走统一探针门 = 违例"标签不当**——AGENTS §2 明确把它列入探针门的**例外**（初始化期读一次并缓存的**行为开关**） | AGENTS §2；`compute_engine.hpp::bind_check_` |
 | AdamW 的 decay / update **顺序依赖**（无数据依赖边） | ✅ **成立**（代码注释自陈"同目标两次 `compute_into`、无数据依赖边"） | `compute_optimizer.hpp::AdamW::step` |
@@ -226,7 +226,7 @@ display / beta / state_bufs / half_state）+ `optimizer_table()` / `find_optimiz
 
 ### RV-05 — GPU 后端生命周期：显式 `shutdown()` / 引用计数
 
-- **优先级**：中 · **状态**：`Open` · **来源**：审查 P3 · **依赖**：GPU 提权环境（AGENTS §2）
+- **优先级**：中 · **状态**：`Fixed`（2026-10-18，引擎所有权 v2） · **来源**：审查 P3 · **依赖**：GPU 提权环境（AGENTS §2）
 
 **现象与证据**：`backend/compute_vk_backend.hpp::GpuBackend::instance` 注释 + **`TODO(1.1, L1)`**：
 「故意泄漏（进程退出时由 OS 回收）：避免静态析构顺序问题……**若作为库被长驻进程 embed，此泄漏会持续累积**
@@ -238,6 +238,15 @@ display / beta / state_bufs / half_state）+ `optimizer_table()` / `find_optimiz
 
 **验收**：`--gpu` 冒烟后显式 shutdown → 无 VVL 报错、无未销毁对象（VVL leak 检查或 `vkDestroy*` 计数）；
 `examples/downstream/` 跑通"创建引擎 → 销毁 → 再创建"（作为库嵌入的长驻场景）。
+
+**落地（2026-10-18）**：没有引入单独的 `nn::vulkan::shutdown()`，改用**共享所有权**直接消除故意泄漏：
+`GpuBackend::shared()` 返回 `shared_ptr`，`GpuEngine` 与 `GpuBuffer` 都持 backend keepalive，
+`GpuBackend` 析构时正常执行 `vkDestroy*`；`reduce_partial_` 改为 backend 自有裸 `VkBuffer`，
+切断 `backend → GpuTensor → GpuBuffer(shared_ptr<GpuBackend>)` 的引用环；`Tensor` 只保留 8B
+`EngineId`（不复用、无指针），Tensor 晚于引擎析构也安全。验收：CPU ctest **53/53**、GPU ctest
+**55/55**（850M）；`layer_lifetime_test` 覆盖 Tensor/Layer/Model/Optimizer 保活与跨引擎拒绝，
+`NN_GPU_LIFETIME_FULL=1` 额外验证 `GpuBuffer` 晚于 `GpuEngine`/backend 析构；设计与迁移清单见
+[`../development/09-engine-ownership.md`](../development/09-engine-ownership.md)。
 
 ### RV-06 — 绑定不变量与 `NN_BIND_DEBUG`：把调试门升为 CI 门禁
 
@@ -591,7 +600,9 @@ helper 自身 1 处 + `submit_and_wait` 5 处 + `reap_frame` 1 处 + `owns_cmd` 
 **只审计**：27 个释放点逐点分类 ⇒ **闭环，无 use-after-free、无泄漏**；唯一窗口是 batch 模式下
 "错后仍继续运行"的调用方，另立 **RV-15**（Open，收敛成 1 个 helper 即可）。RV-14 结论为
 代码级生命周期分析，不再需要 GPU 提权环境（本机无校验层的口径已在卡内注明）。
-**仍然 Open**：RV-05、RV-07、RV-08、RV-12、RV-15。
+**2026-10-18 进度**：**RV-05** 已 **Fixed**——引擎所有权 v2 用 `EngineId` + `shared_ptr`
+keepalive 取代 `GpuBackend` 的故意泄漏，Vulkan 资源随最后一个强引用析构；GPU ctest 55/55。
+**当前仍然 Open**：RV-07、RV-08、RV-12、RV-15。
 
 门禁：`bench/doc_inventory.ps1` → `L2-VIOLATIONS: 0`、`HANDWRITTEN-RESIDUE: 0`、
 `virtual methods: 52 declarations / 52 unique`（与本文 §4.3 口径一致）；

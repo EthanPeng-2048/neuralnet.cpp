@@ -23,6 +23,8 @@ CMakeUserPresets.json
 
 # ==================== Model binaries (训练产物) ====================
 *.bin
+*.nnmodel
+*.nnckpt
 pretrained/
 
 # ==================== Tokenizer / 词表 (训练产物) ====================
