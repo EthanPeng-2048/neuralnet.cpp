@@ -585,7 +585,7 @@ helper 自身 1 处 + `submit_and_wait` 5 处 + `reap_frame` 1 处 + `owns_cmd` 
 **2026-10-12 进度**：批 D 的小改三条 **RV-10 / RV-11 / RV-13** 已 Fixed（注释精确化 / 编译期护栏 /
 概念移到 L1），批 C 的 **RV-09**（`core_env.hpp` 环境变量单一入口）与 **RV-06**（绑定不变量 CI 门禁）
 已 Fixed——RV-06 的前置是修掉 `matmul_q_impl`（CPU/GPU）"impl 产物进公共 `cast` 前未 stamp"的库内漏网
-（三个三值用例在 `NN_BIND_DEBUG=1` 下原为红）。**仍 Open**：RV-05、RV-07、RV-08、RV-12、RV-14
+（三个三值用例在 `NN_BIND_DEBUG=1` 下原为红）。**当时仍 Open**：RV-05、RV-07、RV-08、RV-12、RV-14
 （RV-05/RV-14 需 GPU 提权环境；RV-07/RV-08 是需单独提交并逐步过三件套的重构；RV-12 只做设计评估）。
 **四组「编译器 × 标准库」实测（`ethan@192.168.1.102`，全部全新构建 + ctest + 审计门禁）**：
 
@@ -632,8 +632,8 @@ keepalive 取代 `GpuBackend` 的故意泄漏，Vulkan 资源随最后一个强�
 
 - **训练数值正确性**：审查给的正面结论（softmax/LayerNorm 数值稳定、CE 梯度缩放、Adam 偏差修正时机、AdamWQuant 尺度上界自洽、
   Muon Newton-Schulz 系数）与本仓既有验收一致（`precision_test` / `t1_58_test` / `ternary_gemm_test` / 各 `*_gradcheck` / `ce_fusion_test` 等）。**不立项**。
-- **"无结构性内存泄漏" vs RV-05 的"单例故意泄漏"**：二者不矛盾——训练/推理路径无泄漏；`GpuBackend` 单例是**已知设计取舍**，
-  且代码里已有 `TODO(1.1, L1)` 与恢复方案，RV-05 只是把它落地。
+- **"无结构性内存泄漏" vs RV-05 的"单例故意泄漏"**：二者不矛盾——训练/推理路径无泄漏；`GpuBackend` 单例曾是**已知设计取舍**，
+  且代码里已有 `TODO(1.1, L1)` 与恢复方案；RV-05 已于 2026-10-18 由引擎所有权 v2 落地（`EngineId` + `shared_ptr` keepalive）。
 - **CUDA**：本仓**不支持 CUDA**（后端只有 CPU / Vulkan，AGENTS §2）——整改中**不得**引入任何 CUDA 相关改动或文档表述。
 - **审查建议"旧签名保留为转发"**：采纳，已进 RV-02 方案 2。
 

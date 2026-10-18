@@ -36,3 +36,65 @@ ctest 是 CI **每次 push 都跑**的默认门禁，要求**分钟级**跑完�
 - 常规 PR 门禁（构建 + `ctest` + `NN_BIND_DEBUG=1 ctest` + 文档审计）见
   [`../../CONTRIBUTING.md`](../../CONTRIBUTING.md) §6 与 [`18-roadmap.md`](18-roadmap.md) §8。
 - 本清单是**超集**：大版本在常规门禁之上，再要求第 1 项（端到端训练）与第 4 项（多编译器矩阵）。
+
+## 4. 2026-10-18 发布前实跑记录（v1.8.2 发布态复验）
+
+> 口径：`NN_ENABLE_NATIVE=OFF`（可移植基线）；Windows 102 = VS 2026 / cl 19.51 /
+Vulkan SDK 1.4.350 / NVIDIA CMP 40HX；Linux 本机 = clang 24 + libstdc++ / GTX 850M。
+
+### 4.1 第 1 项：真实数据集端到端训练
+
+数据集 `datasets/tinystories_200mb.nndataset`（584,568 docs / 124,715,061 tokens），
+GPT `d_model=64 / heads=4 / layers=2 / d_ff=128 / seq_len=128 / batch=8`，850M GPU，
+每种配方 20 step：
+
+| 配方 | loss 起 → 止 | 结果 |
+|---|---|---|
+| f32 | 8.7601 → 7.6061 | 健康下降，无 NaN |
+| `--f16` | 8.7734 → 7.5770 | 健康下降，无 NaN；`param/compute=f16` |
+| `--t1_58` | 8.8839 → 8.0488 | 健康下降，无 NaN；BitLinear 三值权重 |
+
+复现（以 f32 为例）：
+
+```bash
+./build/text_train datasets/tinystories_200mb.nndataset --model gpt \
+  --d-model 64 --num-heads 4 --num-layers 2 --d-ff 128 \
+  --seq-len 128 --batch-size 8 --max-steps 20 --log-interval 5 \
+  --gpu=850M --save /tmp/nn_e2e_f32.nnmodel
+```
+
+### 4.2 第 2 项：发布文档
+
+- `docs/release-notes/` 已覆盖 **v1.5.0 → v1.8.2 的全部 tag**；`v1.5.1` / `v1.6.1` /
+  `v1.7.1` / `v1.8.0` 的独立说明于 2026-10-18 补齐。
+- `bench/doc_align_audit.ps1` / `bench/doc_inventory.ps1` / `bench/gui_cli_audit.py`
+  可行动项均为 **0**，三脚本 exit 0。
+
+### 4.3 第 3 项：Release / Debug ctest
+
+| 树 | 结果 |
+|---|---|
+| Linux Release + Vulkan（850M） | **55/55 通过**（含 `scan_bitwise_test` / `rapt_test_f16`） |
+| Linux Debug + Vulkan | 54/54（`scan_bitwise_test` 因 Debug 非优化构建按 77 skip；`rapt_test_f16` 按既有 C11 口径 `-E` 排除） |
+| Windows clang 23.1 + MSVC STL Release（40HX） | **55/55 通过**（`scan_bitwise_test` 按 Windows 口径 skip） |
+| Windows cl.exe 19.51 Debug CPU-only | **52/52 通过**（GPU 用例 77 skip；`rapt_test_f16` 按 CI 口径排除） |
+
+### 4.4 第 4 项：四组「编译器 × 标准库」
+
+| 配置 | 结果 |
+|---|---|
+| WSL clang++ 24 + **libc++**（CPU-only） | **53/53**（18 条 GPU 用例 77 skip） |
+| WSL g++ 15.2 + **libstdc++**（CPU-only） | **53/53**（18 条 GPU 用例 77 skip） |
+| Windows clang 23.1 + **MSVC STL**（Vulkan / 40HX） | **55/55**（1 条 Windows 口径 skip） |
+| Windows cl.exe 19.51 + **MSVC STL**（Debug / CPU-only） | **52/52**（C11 排除 / GPU skip） |
+
+### 4.5 同批收口的缺陷
+
+- **RV-05 / `GpuBackend` 故意泄漏**：已由引擎所有权 v2 修复（`EngineId` + `shared_ptr`
+  keepalive，`GpuBuffer` 持 backend 强引用，`reduce_partial_` 改裸 `VkBuffer` 切断环）；
+  GPU ctest 55/55，`layer_lifetime_test` 与 `NN_GPU_LIFETIME_FULL=1` 均通过。
+- **Windows 可移植性**：clang++ 补 `-Wl,/STACK:8388608`；`layer_lifetime_test` 改用
+  `nn::detail::env_flag_raw`；CLI 子进程测试使用绝对路径与 cmd 安全引号；三值/模型测试
+  不再因 1 MB 默认栈 SegFault。
+- **`scan_bitwise_test` 平台口径**：逐位锚以 Linux Release + 850M 为权威；Windows 与
+  Debug 构建按 77 skip（数值正确性仍由 `gpu_test` 的容差用例覆盖）。
