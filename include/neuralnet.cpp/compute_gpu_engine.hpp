@@ -594,7 +594,7 @@ public:
             auto r = backend_->gather_gpu(t32->gpu_tensor(), idx_ref.gpu_tensor());
             NN_TRY_CHECK(r);
             Tensor out32 = Tensor::from_gpu(std::move(*r));
-            return cast(out32, Precision::F16);
+            return cast(adopt(std::move(out32)), Precision::F16);
         }
         auto r = backend_->gather_gpu(tbl_gpu->gpu_tensor(), idx_gpu->gpu_tensor());
         NN_TRY_CHECK(r);
@@ -682,7 +682,7 @@ public:
                 inverse ? 1u : 0u);
             NN_TRY_CHECK(r);
             Tensor out32 = Tensor::from_gpu(std::move(*r));
-            return cast(out32, Precision::F16);
+            return cast(adopt(std::move(out32)), Precision::F16);
         }
         auto r = backend_->rearrange_3d_gpu(
             x_gpu->gpu_tensor(),
@@ -716,7 +716,7 @@ public:
             auto r32 = backend_->transpose_gpu(a32->gpu_tensor());
             NN_TRY_CHECK(r32);
             Tensor out32 = Tensor::from_gpu(std::move(*r32));
-            return cast(out32, Precision::F16);
+            return cast(adopt(std::move(out32)), Precision::F16);
         }
         auto r = backend_->transpose_gpu(a_gpu->gpu_tensor());
         NN_TRY_CHECK(r);
@@ -752,7 +752,7 @@ public:
                                          C, H, W, k, stride, pad, OH, OW);
             NN_TRY_CHECK(r);
             Tensor out32 = Tensor::from_gpu(std::move(*r));
-            return cast(out32, Precision::F16);
+            return cast(adopt(std::move(out32)), Precision::F16);
         }
         auto r = backend_->im2col_gpu(x_gpu->gpu_tensor(),
                                      C, H, W, k, stride, pad, OH, OW);
@@ -786,7 +786,7 @@ public:
                                          C, H, W, k, stride, pad, OH, OW);
             NN_TRY_CHECK(r);
             Tensor out32 = Tensor::from_gpu(std::move(*r));
-            return cast(out32, Precision::F16);
+            return cast(adopt(std::move(out32)), Precision::F16);
         }
         auto r = backend_->col2im_gpu(c_gpu->gpu_tensor(),
                                      C, H, W, k, stride, pad, OH, OW);
@@ -993,7 +993,7 @@ public:
             NN_TRY_CHECK(r);
             // cast 回 f16
             Tensor result_f32 = Tensor::from_gpu(std::move(*r));
-            return cast(result_f32, Precision::F16);
+            return cast(adopt(std::move(result_f32)), Precision::F16);
         }
 
         NN_FAIL("matmul: unsupported precision");
@@ -1089,7 +1089,7 @@ public:
                 static_cast<float>(alpha));
             NN_TRY_CHECK(r);
             Tensor result_f32 = Tensor::from_gpu(std::move(*r));
-            return cast(result_f32, Precision::F16);
+            return cast(adopt(std::move(result_f32)), Precision::F16);
         }
 
         NN_FAIL("batched_matmul: unsupported precision");
