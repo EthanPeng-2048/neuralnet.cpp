@@ -7,7 +7,7 @@
 > **取代**：本文件替代早先的 `23-model-format-v7-and-engine-capability.md`（那版的"NNQT 独立
 > 格式 + 部署标签"已被裁决取消）。
 
-> **增补（2026-10-16）**：§2.1.1 = P1-2 的**训练状态段（v8）**与 role 语义细化（**已立项、未实施**）——
+> **增补（2026-10-16，2026-10-18 收口）**：§2.1.1 = P1-2 的**训练状态段（v8）**与 role 语义（**已实施**）——
 > 状态段是**唯一权威**（A/B 类参数禁止再由 CLI 给出）、数据集身份硬错、`.nnmodel` 恢复放开以支持 SFT。
 > 裁定正文与验收口径在 [`18-roadmap.md`](18-roadmap.md) §4.2 P1-2 行 / §3.4 M6 / §8.2 门禁 7。
 
@@ -111,7 +111,7 @@ matmul / matmul_with_bias / add_inplace / accumulate / row_reduce_sum / col_redu
 | 角色 | 文件 | 内容 | 谁写 | 谁读 |
 |---|---|---|---|---|
 | **模型**（推理） | `*.nnmodel`（`.bin` 的接替者） | 推理所需的**全部**参数：Dense 层参数 + 三值层的**打包形态** + τ。**不含**"训练才需要"的参数 | `text_train`/`mnist_train` 收尾的 `--save`（默认 `gpt_model.nnmodel`） | `text_infer` / `mnist_infer` / 任何人 |
-| **训练断点** | `*.nnckpt` | 模型 + **训练参数**：三值层 latent（f32）+ 训练状态段（v8；见 §2.1.1；**格式与读写已落地，训练路径接线待续**） | `--save-interval`（周期性）、需要续训时 | `--resume`（Checkpoint 角色；v8 起状态段为唯一权威） |
+| **训练断点** | `*.nnckpt` | 模型 + **训练参数**：三值层 latent（f32）+ 训练状态段（v8；见 §2.1.1；格式、读写与训练路径接线均已落地） | `--save-interval`（周期性）、需要续训时 | `--resume`（Checkpoint 角色；v8 起状态段为唯一权威） |
 
 **v7 文件头**：`magic "NNNN" | version=7 | Scalar precision | role u8 | spec_len + spec kvrec`
 —— `role`（Model / Checkpoint）是**文件属性**，不是"模型状态"：它只回答"这份文件是什么"，
@@ -144,7 +144,7 @@ matmul / matmul_with_bias / add_inplace / accumulate / row_reduce_sum / col_redu
 **旧文件**：v5/v6 的 `*.bin` 仍可读（零破坏，`role` 缺失按 Model 处理）；**写一律 v7 + 新扩展名**；
 CLI/GUI 的默认保存名同步改为 `.nnmodel`（`.bin` 不再被写入）。
 
-### 2.1.1 训练状态段（v8；**P1-2 立项，未实施**，2026-10-16 裁定）
+### 2.1.1 训练状态段（v8；**P1-2 已实施**，2026-10-16 裁定）
 
 **一句话**：断点是**训练的可续点**，不是"更大的模型文件"——状态段里的一切都是**断点权威**，
 CLI 不再有发言权。

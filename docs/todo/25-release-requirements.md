@@ -37,7 +37,7 @@ ctest 是 CI **每次 push 都跑**的默认门禁，要求**分钟级**跑完�
   [`../../CONTRIBUTING.md`](../../CONTRIBUTING.md) §6 与 [`18-roadmap.md`](18-roadmap.md) §8。
 - 本清单是**超集**：大版本在常规门禁之上，再要求第 1 项（端到端训练）与第 4 项（多编译器矩阵）。
 
-## 4. 2026-10-18 发布前实跑记录（v1.8.2 发布态复验）
+## 4. 2026-10-18 发布前实跑记录（v1.9.0 发布态复验）
 
 > 口径：`NN_ENABLE_NATIVE=OFF`（可移植基线）；Windows 102 = VS 2026 / cl 19.51 /
 Vulkan SDK 1.4.350 / NVIDIA CMP 40HX；Linux 本机 = clang 24 + libstdc++ / GTX 850M。
@@ -65,8 +65,8 @@ GPT `d_model=64 / heads=4 / layers=2 / d_ff=128 / seq_len=128 / batch=8`，850M 
 
 ### 4.2 第 2 项：发布文档
 
-- `docs/release-notes/` 已覆盖 **v1.5.0 → v1.8.2 的全部 tag**；`v1.5.1` / `v1.6.1` /
-  `v1.7.1` / `v1.8.0` 的独立说明于 2026-10-18 补齐。
+- `docs/release-notes/` 已覆盖 **v1.5.0 → v1.9.0 的全部 tag**；`v1.5.1` / `v1.6.1` /
+  `v1.7.1` / `v1.8.0` 的独立说明于 2026-10-18 补齐，`v1.9.0` 随本次发布新增。
 - `bench/doc_align_audit.ps1` / `bench/doc_inventory.ps1` / `bench/gui_cli_audit.py`
   可行动项均为 **0**，三脚本 exit 0。
 
@@ -93,6 +93,10 @@ GPT `d_model=64 / heads=4 / layers=2 / d_ff=128 / seq_len=128 / batch=8`，850M 
 - **RV-05 / `GpuBackend` 故意泄漏**：已由引擎所有权 v2 修复（`EngineId` + `shared_ptr`
   keepalive，`GpuBuffer` 持 backend 强引用，`reduce_partial_` 改裸 `VkBuffer` 切断环）；
   GPU ctest 55/55，`layer_lifetime_test` 与 `NN_GPU_LIFETIME_FULL=1` 均通过。
+- **GPU f16 回退边界 cast 的身份漏 stamp**：`gather` / `rearrange_3d` / `transpose` /
+  `im2col` / `col2im` / `matmul` / `batched_matmul` 的“f32 计算 → cast 回 f16”出口在
+  `NN_BIND_DEBUG=1` 下暴露未绑定输入；7 处统一改为 `cast(adopt(...), F16)`。修复后
+  Release+GPU 的 `NN_BIND_DEBUG=1` ctest **55/55**，CPU-only 同口径 **53/53**。
 - **Windows 可移植性**：clang++ 补 `-Wl,/STACK:8388608`；`layer_lifetime_test` 改用
   `nn::detail::env_flag_raw`；CLI 子进程测试使用绝对路径与 cmd 安全引号；三值/模型测试
   不再因 1 MB 默认栈 SegFault。

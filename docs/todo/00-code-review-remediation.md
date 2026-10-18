@@ -602,7 +602,7 @@ helper 自身 1 处 + `submit_and_wait` 5 处 + `reap_frame` 1 处 + `owns_cmd` 
 代码级生命周期分析，不再需要 GPU 提权环境（本机无校验层的口径已在卡内注明）。
 **2026-10-18 进度**：**RV-05** 已 **Fixed**——引擎所有权 v2 用 `EngineId` + `shared_ptr`
 keepalive 取代 `GpuBackend` 的故意泄漏，Vulkan 资源随最后一个强引用析构；GPU ctest 55/55。
-**当前仍然 Open**：RV-07、RV-08、RV-12、RV-15。
+**当前仍然 Open**：RV-12（RV-07 / RV-08 / RV-15 均已 Fixed，证据见各自卡片）。
 
 门禁：`bench/doc_inventory.ps1` → `L2-VIOLATIONS: 0`、`HANDWRITTEN-RESIDUE: 0`、
 `virtual methods: 52 declarations / 52 unique`（与本文 §4.3 口径一致）；

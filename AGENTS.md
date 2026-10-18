@@ -339,7 +339,7 @@ optimizer.step();
 |------|--------|
 | `README.md` | **文档总索引与分册定位**（含 2026-10-11 整理记录） |
 | `history/history.md` | **全仓唯一的历史状态归档**：演进记录 / 已修复勘误 / 被否决方案 / 性能 A/B 过程。代码注释与其他文档只记录当前状态；查"为什么当初这么改、旧数字是多少"只来这里。**原 `development/15`（ComputeEngine Refresh 设计）与 `16`（P0 盘点）、已删的 `13`（重构清单）均归档在本文** |
-| `release-notes/v*.md` | 面向使用者的版本变更说明（破坏性 API 变更 + 迁移指南 + 验收基线）。当前为 `release-notes/v1.8.2.md`（v1.8.1 → **f16 训练缺陷修复（F1–F5，含"全 f16 可训练"）+ f16 提速（编译期精度特化 / 批量派发 / 网格粒度变体 / F16C / f16 GEMM）+ RAPT/CNN f16 接线 + `Layer::init` 参数精度自检**，无破坏性 API；上一版 v1.8.1.md = v1.8.0 → **代码审查整改 RV-06…RV-13**：算子分派单一表 + VK 后端拆分 + 环境变量单一入口 + 精度映射护栏 + CI 真跑测试与 `NN_BIND_DEBUG` 门禁 + ccache×PCH 提速，无破坏性 API；再上一版 v1.7.0.md = v1.6.1 → **统一数据集**：`.nndataset`/`.nnvocab`/KVRecord v2 + `nn::Dataset` + 模型 v6 + 错误处理宏族） |
+| `release-notes/v*.md` | 面向使用者的版本变更说明（破坏性 API 变更 + 迁移指南 + 验收基线）。当前为 `release-notes/v1.9.0.md`（v1.8.2 → **可续训模型文件 v8 + 引擎所有权 v2（含 `GpuBackend` 泄漏修复）+ 推理采样与多轮对话 + Vulkan 后端结构重整 / `scan_prefix` 提速 + GUI、CLI 与 Windows 工程化收口**；有模型格式与引擎创建 API 迁移。上一版 v1.8.2.md = v1.8.1 → f16 训练缺陷修复与提速；再上一版 v1.8.1.md = v1.8.0 → 代码审查整改 RV-06…RV-13） |
 
 ### 介绍类（docs/introduction/）
 

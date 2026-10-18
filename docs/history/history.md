@@ -710,6 +710,13 @@ GPU 后端 / GPU 引擎头文件「历史状态类注释」摘录。整改原则
   EngineId 8B、Tensor 晚于引擎析构、Layer/Model/Optimizer 保活、跨引擎拒绝；
   `NN_GPU_LIFETIME_FULL=1` 额外验证 GpuBuffer 晚于 GpuEngine/backend 析构。
   设计与迁移清单见 `docs/development/09-engine-ownership.md`。
+- **2026-10-18 发布前补漏：GPU f16 回退边界 cast 的 EngineId stamp**：`NN_BIND_DEBUG=1`
+  全量 GPU ctest 暴露 `f16_writeback_probe` / `f16_precision_test` / `rapt_test_f16_gpu`
+  三例失败，首个点位是 `ComputeEngine::cast` 的未绑定输入。根因是 GPU 引擎在无原生 f16
+  pipeline 时的 `gather` / `rearrange_3d` / `transpose` / `im2col` / `col2im` /
+  `matmul` / `batched_matmul` 回退路径用静态工厂造出 f32 产物后，直接进公共 `cast`，
+  此时尚未走到外层入口的 `stamp_`。7 处统一改为 `cast(adopt(std::move(out)), F16)`；
+  修复后 Release+GPU 的 `NN_BIND_DEBUG=1` ctest **55/55**、CPU-only **53/53**。
 
 ## P2-12：复合 kernel 的运行期精度签名在 scan 侧无登记入口（2026-10-14；原位置 include/neuralnet.cpp/compute_cpu_engine.hpp:71）
 - 类型：覆盖缺口 → 修复（构建期扫描补记）
