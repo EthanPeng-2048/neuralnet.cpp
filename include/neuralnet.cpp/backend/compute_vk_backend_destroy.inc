@@ -386,7 +386,7 @@
             //   mm_trans）/ 归约 4（…, rows, vector_out）/ 归约+matmul 7 /
             //   fold 5（…, vector_out, fold_k）/ fold+mm 7（…, fold_k, mm_k,
             //   mm_batch）+ 分派变体 1 个 `prec`。
-            // ⚠ 该值**只在此处计算一次**并存进 fused_pc_base_fixed_，写入侧
+            // ⚠ 该值**只在此处计算一次**并存进 FusedKernel::pc_base_fixed，写入侧
             //   (run_fused_gpu) 只读：此前两侧各推导一遍，漂移会让
             //   vkCmdPushConstants 超 range 而被驱动丢弃 → shader 读到未定义
             //   残留（随前序 op 漂移，表现为时对时错的假 PASS，"全绿"验不出）。
@@ -410,29 +410,28 @@
                 num_bindings, pc_size);
             if (fp_r)
             {
-                fused_pipelines_.emplace(fs.key, std::move(*fp_r));
-                fused_reduce_axis_.emplace(fs.key, fs.reduce_axis);
-                fused_has_matmul_.emplace(fs.key, fs.has_matmul != 0);
-                fused_fold_meta_.emplace(fs.key, FoldMeta{
+                FusedKernel kernel;
+                kernel.pipeline = std::move(*fp_r);
+                kernel.reduce_axis = fs.reduce_axis;
+                kernel.has_matmul = fs.has_matmul != 0;
+                kernel.fold = FoldMeta{
                     fs.spec.fold
                         ? (fs.spec.fold->vec_state_len > 0 ? fs.spec.fold->vec_state_len : 1u)
                         : 0u,
                     // per_thread_row 判据与 generate_glsl 分派同源（v2 = 有
                     // vec 态或 mm 段；v1 = 纯标量）
                     static_cast<std::uint8_t>(fs.spec.fold &&
-                        !(fs.spec.fold->vec_state_len > 0 || fs.spec.fold->matmul))});
-                fused_view_param_counts_.emplace(fs.key, fs.view_param_count);
-                fused_rparam_counts_.emplace(fs.key, fs.rparam_count);
-                fused_vec_width_.emplace(fs.key, fs.vec_width);
-                fused_pc_base_fixed_.emplace(fs.key, pc_base_fixed);
+                        !(fs.spec.fold->vec_state_len > 0 || fs.spec.fold->matmul))};
+                kernel.view_param_count = fs.view_param_count;
+                kernel.rparam_count = fs.rparam_count;
+                kernel.vec_width = fs.vec_width;
+                kernel.pc_base_fixed = pc_base_fixed;
                 // P3 批量变体：实例表 stride（uvec2 槽数），run_fused_gpu_batch
                 // 据此校验实例布局（生成器 S = 输入+主输出+extras+尾槽，同源）
                 if (is_batch)
-                    fused_batch_stride_.emplace(
-                        fs.key,
-                        n_in + 1u
-                            + static_cast<std::uint32_t>(fs.spec.extras.size())
-                            + 1u);
+                    kernel.batch_stride = static_cast<std::uint32_t>(
+                        n_in + 1u + fs.spec.extras.size() + 1u);
+                fused_kernels_.emplace(fs.key, std::move(kernel));
             }
         }
 #endif

@@ -170,39 +170,30 @@
         if (!initialized_)
             NN_FAIL("GPU backend not initialized");
         const auto prof_t0 = std::chrono::steady_clock::now();
-        const auto it = fused_pipelines_.find(shader_name);
-        if (it == fused_pipelines_.end())
+        const auto it = fused_kernels_.find(shader_name);
+        if (it == fused_kernels_.end())
             NN_FAIL("fused shader not registered: " + shader_name);
+        const FusedKernel& kernel = it->second;
         // （pipeline 绑定推迟到细 tile 选择之后——基础键必须存在，细变体可选）
         // 运行期精度分派变体（键后缀 "#x"）：描述符 = 2N 输入视图 + 2 输出视图，
         // 且 PC 固定头末尾多一个 `prec` 槽。
         const bool is_disp =
             std::string_view(shader_name).ends_with(nn::EXPR_PREC_DISPATCH_SUFFIX);
         // PC 固定头槽数：**注册时算定，此处只读**（唯一来源 =
-        // register_fused_shaders 的 pc_base_fixed；本地重推会让两侧漂移 →
+        // FusedKernel::pc_base_fixed；本地重推会让两侧漂移 →
         // push constant 超 range 被驱动丢弃 → 静默读未定义残留）。
-        const auto pcbase_it = fused_pc_base_fixed_.find(shader_name);
-        if (pcbase_it == fused_pc_base_fixed_.end())
-            NN_FAIL("run_fused_gpu: shader 元数据缺失（pc_base_fixed）：" + shader_name);
-        const std::uint32_t pc_base_fixed = pcbase_it->second;
+        const std::uint32_t pc_base_fixed = kernel.pc_base_fixed;
         // 归约轴：-1=逐元素, 0=行归约, 1=列归约
-        const int raxis = fused_reduce_axis_.count(shader_name)
-            ? fused_reduce_axis_.at(shader_name) : -1;
+        const int raxis = kernel.reduce_axis;
         // 是否含前置 matmul 段（push constants 多 rows + mm_k）
-        const bool has_mm = fused_has_matmul_.count(shader_name)
-            ? fused_has_matmul_.at(shader_name) : false;
+        const bool has_mm = kernel.has_matmul;
         // fold 形态（注册时从 FusedShader.spec.fold 取，与生成器同源）
-        const bool has_fold_meta = fused_fold_meta_.count(shader_name) > 0;
-        const FoldMeta fmeta = has_fold_meta
-            ? fused_fold_meta_.at(shader_name) : FoldMeta{0u, 0u};
-        const std::uint32_t fold_out = fmeta.out;
-        const bool is_fold = has_fold_meta && fold_out > 0;
+        const FoldMeta fmeta = kernel.fold;
+        const bool is_fold = kernel.is_fold();
         // 运行时视图参数个数（RowMod/RotateHalf 的 vp 槽）
-        const std::uint32_t n_vp = fused_view_param_counts_.count(shader_name)
-            ? fused_view_param_counts_.at(shader_name) : 0u;
+        const std::uint32_t n_vp = kernel.view_param_count;
         // 运行时标量参数个数（优化器 lr/eps/β 的 rp 槽）
-        const std::uint32_t n_rp = fused_rparam_counts_.count(shader_name)
-            ? fused_rparam_counts_.at(shader_name) : 0u;
+        const std::uint32_t n_rp = kernel.rparam_count;
 
         // ── P0 细 tile 选择（wgrad 网格饥饿）────────────────────────────────
         // 纯 matmul 形态（与下方 dispatch 分支同一判据）且 64-tile 网格的
@@ -237,14 +228,14 @@
                     (static_cast<std::uint32_t>(cols) + B64 - 1u) / B64) *
                 ((m_per + B64 - 1u) / B64) * matmul_batch;
             if (wg64 < nn::EXPR_MATMUL_FINE_MIN_WGS &&
-                fused_pipelines_.count(shader_name + nn::EXPR_MM_FINE_SUFFIX) != 0)
+                fused_kernels_.count(shader_name + nn::EXPR_MM_FINE_SUFFIX) != 0)
                 use_fine = true;
             if (wg64 < nn::EXPR_MATMUL_FINE_MIN_WGS && !is_disp &&
                 !mm_ksplit_disabled() && extra_outs.empty() &&
                 matmul_k && *matmul_k > 0 &&
-                fused_pipelines_.count(
+                fused_kernels_.count(
                     shader_name + nn::EXPR_MM_KSPLIT_SUFFIX) != 0 &&
-                fused_pipelines_.count(
+                fused_kernels_.count(
                     shader_name + nn::EXPR_MM_KSPLIT_REDUCE_SUFFIX) != 0)
             {
                 constexpr std::uint32_t Bf = nn::EXPR_MATMUL_BLOCK_FINE;
@@ -284,8 +275,8 @@
             }
         }
         const VulkanPipeline& pipeline =
-            use_fine ? fused_pipelines_.at(shader_name + nn::EXPR_MM_FINE_SUFFIX)
-                     : it->second;
+            use_fine ? fused_kernels_.at(shader_name + nn::EXPR_MM_FINE_SUFFIX).pipeline
+                     : kernel.pipeline;
 
         if (inputs.size() + 1 > EXPR_MAX_INPUTS + 1)
             NN_FAIL("run_fused_gpu: too many inputs");
@@ -380,10 +371,10 @@
         if (use_ks)
         {
             const VulkanPipeline& ks_pipe =
-                fused_pipelines_.at(shader_name + nn::EXPR_MM_KSPLIT_SUFFIX);
+                fused_kernels_.at(shader_name + nn::EXPR_MM_KSPLIT_SUFFIX).pipeline;
             const VulkanPipeline& kr_pipe =
-                fused_pipelines_.at(shader_name
-                                    + nn::EXPR_MM_KSPLIT_REDUCE_SUFFIX);
+                fused_kernels_.at(shader_name
+                                  + nn::EXPR_MM_KSPLIT_REDUCE_SUFFIX).pipeline;
             const std::uint32_t rows32 = static_cast<std::uint32_t>(rows);
             const std::uint32_t cols32 = static_cast<std::uint32_t>(cols);
             const std::uint32_t k32 = *matmul_k;
@@ -733,8 +724,7 @@
         // BLOCK 与 glsl_gen 生成的输出块一致（EXPR_MATMUL_BLOCK=64：每工作组
         // 64×64 输出块、16×16 线程、每线程 4×4 寄存器分块；网格饥饿时的
         // 细 tile 变体 BLOCK=EXPR_MATMUL_BLOCK_FINE=16，见上方 use_fine）
-        const std::uint32_t vec_width = fused_vec_width_.count(shader_name)
-            ? fused_vec_width_.at(shader_name) : 1u;
+        const std::uint32_t vec_width = kernel.vec_width;
         if (has_mm && raxis < 0 && !is_fold)
         {
             // P0 细 tile：use_fine 时输出块 64 → 16（同一 struct 的两个变体，
@@ -834,31 +824,28 @@
                     "（应先逐 kernel 降级，不该到此）");
         if (!std::string_view(shader_name).ends_with(nn::EXPR_BATCH_SUFFIX))
             NN_FAIL("run_fused_gpu_batch: 非批量变体键（应以 #b 结尾）：" + shader_name);
-        const auto it = fused_pipelines_.find(shader_name);
-        if (it == fused_pipelines_.end())
+        const auto it = fused_kernels_.find(shader_name);
+        if (it == fused_kernels_.end())
             NN_FAIL("fused shader not registered: " + shader_name);
-        const VulkanPipeline& pipeline = it->second;
+        const FusedKernel& kernel = it->second;
+        const VulkanPipeline& pipeline = kernel.pipeline;
         if (instances.empty())
             return {};
         // PC 槽位校验（与 run_fused_gpu 同源：vp/rp 计数来自注册表元数据）
-        const std::uint32_t n_vp = fused_view_param_counts_.count(shader_name)
-            ? fused_view_param_counts_.at(shader_name) : 0u;
-        const std::uint32_t n_rp = fused_rparam_counts_.count(shader_name)
-            ? fused_rparam_counts_.at(shader_name) : 0u;
+        const std::uint32_t n_vp = kernel.view_param_count;
+        const std::uint32_t n_rp = kernel.rparam_count;
         if (view_params.size() != n_vp)
             NN_FAIL("run_fused_gpu_batch: view_params count mismatch for " + shader_name);
         if (rparams.size() != n_rp)
             NN_FAIL("run_fused_gpu_batch: rparams count mismatch for " + shader_name);
-        const std::uint32_t pc_base_fixed = fused_pc_base_fixed_.count(shader_name)
-            ? fused_pc_base_fixed_.at(shader_name) : 2u;
+        const std::uint32_t pc_base_fixed = kernel.pc_base_fixed;
 
         // 实例表布局：stride S = 输入 + 主输出 + extras + (count,cols) 尾槽
         const std::size_t n_in = instances[0].inputs.size();
         const std::size_t n_ex = instances[0].extra_outs.size();
         const std::size_t stride = n_in + 1 + n_ex + 1;
-        const auto stride_it = fused_batch_stride_.find(shader_name);
-        if (stride_it != fused_batch_stride_.end() &&
-            stride_it->second != static_cast<std::uint32_t>(stride))
+        if (kernel.batch_stride != 0 &&
+            kernel.batch_stride != static_cast<std::uint32_t>(stride))
             NN_FAIL("run_fused_gpu_batch: 实例槽数与注册结构不一致：" + shader_name);
         for (const FusedBatchInst& inst : instances)
         {
@@ -1039,7 +1026,7 @@
     // 查询融合 shader 是否已注册（GpuEngine AOT 匹配前置判断）
     [[nodiscard]] bool has_fused_shader(const std::string& shader_name) const noexcept
     {
-        return fused_pipelines_.find(shader_name) != fused_pipelines_.end();
+        return fused_kernels_.find(shader_name) != fused_kernels_.end();
     }
 
     // P3 批量派发计数（测试/诊断：确认批量路径真的被走到，而非静默降级）

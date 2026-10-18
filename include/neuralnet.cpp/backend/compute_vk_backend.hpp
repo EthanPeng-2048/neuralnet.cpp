@@ -477,40 +477,46 @@ private:
     // 局部销毁会踩铁律 6；形状变化时旧缓冲走 pending_destroys_ 延迟销毁，
     // 对在飞录制安全。同一 batch 内多次使用由 cmd 内屏障串行化）
     std::optional<GpuTensor> reduce_partial_;
-    // AOT 融合 shader pipelines（key = expr_spec_key → pipeline；由构建期
-    // fused_registry.hpp 注册，运行时按 key 匹配后直接 dispatch）
-    std::unordered_map<std::string, VulkanPipeline> fused_pipelines_;
-    // 归约轴：-1=逐元素, 0=行归约, 1=列归约（决定 push constants 与 dispatch）
-    std::unordered_map<std::string, int> fused_reduce_axis_;
-    // 是否含前置 matmul 段（push constants 多 rows + mm_k 两个 uint）
-    std::unordered_map<std::string, bool> fused_has_matmul_;
-    // fold 形态元数据（与生成器分派同源判定）：
-    //   out       = 输出列数（vec_state_len 或 1）——调用约定 cols==out 校验
-    //   per_thread_row = 1 → v1 标量 fold：每线程一行（local 256，wg=ceil(rows/256)）；
-    //               0 → v2 双域 fold：每 WG EXPR_FOLD_ROWS_PER_WG 行
-    //               （row = wg*NR + ri，wg = ceil(rows/NR)，行循环同生成器）
-    //               ——dispatch 公式两者不同（v2 若按 ceil(count/256) 会丢行！）
-    struct FoldMeta { std::uint32_t out; std::uint8_t per_thread_row; };
-    std::unordered_map<std::string, FoldMeta> fused_fold_meta_;
-    // 运行时视图参数个数（RowMod/RotateHalf 的 vp push constant 槽数）
-    std::unordered_map<std::string, std::uint32_t> fused_view_param_counts_;
-    // 运行时标量参数个数（优化器 lr/eps/β 等的 rp push constant 槽数）
-    std::unordered_map<std::string, std::uint32_t> fused_rparam_counts_;
-    // 每线程处理元素数（1=标量, 4=vec4；决定 dispatch 宽度缩放）
-    std::unordered_map<std::string, std::uint32_t> fused_vec_width_;
-    // push constant **固定头**长度（uint 槽数，不含 vp/常量池）：**注册时算一次**
-    // 并在此存下，run_fused_gpu 只读不算 —— 该值此前在创建侧与写入侧各推导一遍
-    // （两侧入参来源不同：fs.spec.fold/has_matmul/reduce_axis 对
-    //  is_fold/matmul_k/has_mm/raxis），任一侧漂移就是"vkCmdPushConstants 超
-    //  range 被驱动丢弃 → shader 读到未定义残留 → 假 PASS"（见注册处注释）。
-    // 运行期精度分派变体（键后缀 "#x"）的额外 `prec` 槽也含在此值内。
-    std::unordered_map<std::string, std::uint32_t> fused_pc_base_fixed_;
+    // ── AOT 融合 kernel 目录 ────────────────────────────────────────────
+    // 一个 key（expr_spec_key）对应一个 FusedKernel：pipeline + 该结构在
+    // 运行期需要的全部形状/布局元数据。**注册时一次写定，运行期只读**。
+    //
+    // 旧实现是 9 张并行 map（pipeline/reduce_axis/has_matmul/fold_meta/
+    // view_param/rparam/vec_width/pc_base_fixed/batch_stride），每次派发要
+    // 9 次查找且必须手工保持 key 同步；漏写一张表 = 静默读默认值。
+    struct FoldMeta
+    {
+        // 输出列数（vec_state_len 或 1）；0 = 非 fold 形态
+        std::uint32_t out = 0;
+        // 1 → v1 标量 fold：每线程一行（wg = ceil(rows/256)）
+        // 0 → v2 双域 fold：每 WG EXPR_FOLD_ROWS_PER_WG 行（wg = ceil(rows/NR)）
+        // ——dispatch 公式两者不同（v2 若按 ceil(count/256) 会丢行）
+        std::uint8_t per_thread_row = 0;
+    };
+
+    struct FusedKernel
+    {
+        VulkanPipeline pipeline;
+        int reduce_axis = -1;          // -1=逐元素, 0=行归约, 1=列归约
+        bool has_matmul = false;       // 含前置 matmul 段（PC 多 rows + mm_k）
+        FoldMeta fold;
+        std::uint32_t view_param_count = 0;   // vp push constant 槽数
+        std::uint32_t rparam_count = 0;       // rp push constant 槽数
+        std::uint32_t vec_width = 1;          // 每线程元素数（1 / 4）
+        // push constant 固定头长度（uint 槽数，不含 vp/常量池）。
+        // 生成器与写入侧共用这一个值：重复推导一旦漂移，vkCmdPushConstants
+        // 会超 range 被驱动丢弃 → shader 读未定义残留（假 PASS）。
+        std::uint32_t pc_base_fixed = 2;
+        // `#b` 批量变体的实例表 stride（uvec2 槽数）；0 = 非批量变体
+        std::uint32_t batch_stride = 0;
+
+        [[nodiscard]] bool is_fold() const noexcept { return fold.out > 0; }
+    };
+
+    std::unordered_map<std::string, FusedKernel> fused_kernels_;
     // P3 批量派发观测计数（测试/诊断用：确认批量路径真的走到、而非静默降级
     // 为逐 kernel 后 A/B 自比恒真）
     std::uint64_t fused_batch_dispatches_ = 0;
-    // `#b` 批量变体的实例表 stride（uvec2 槽数 = 输入+主输出+extras+尾槽）：
-    // 注册时算定，run_fused_gpu_batch 校验实例布局与之一致（防槽位错位错值）。
-    std::unordered_map<std::string, std::uint32_t> fused_batch_stride_;
 
     std::unique_ptr<MemoryPool> memory_pool_;
     // 第二阶段：瞬态/持久分池。batch 录制期（batch_mode_=true）创建的

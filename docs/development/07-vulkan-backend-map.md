@@ -41,7 +41,7 @@ Layer / DSL
   └─ dsl::compute()                          (expr_dsl.hpp)
        └─ GpuEngine::eval_expr*_impl()
             └─ GpuBackend::run_fused_gpu()  (AOT 融合 kernel)
-                 └─ fused_pipelines_[key] + 9 张并行元数据表
+                 └─ fused_kernels_[key]     （一个 FusedKernel 记录）
 ```
 
 读代码时的关键分界：
@@ -106,16 +106,22 @@ L3+ model / domain / cli / app
 | 命令录制/提交 | `frame.inc` + `pipelines.inc` | `vk::CommandRecorder` + `vk::FrameRing` |
 | 算子语义 | `ops.inc` + `frame.inc` 的 matmul | `gpu::ops::*`（接收 `OpContext`） |
 
-### 5.1 重复样板（重构的量化依据）
+### 5.1 已收敛与待收敛
 
-- 40 个 `has_*_pipeline()` 手工转发 → 应为 `catalog.has(PipelineId::x)`；
-- `initialize()` 中 40 段"取 SPIR-V → 判空 → 创建 → 移动" → 应为一张
-  `PipelineSpec` 表 + 一个循环；
+已完成（P2-7 第 2–3 刀）：
+
+- 44 个 pipeline 成员 + 40 个 `has_*_pipeline()` 手工转发 → `PipelineCatalog`
+  + 一个 `has(PipelineId)` 查询入口；
+- `initialize()` 中 40 段"取 SPIR-V → 判空 → 创建 → 移动" → 一张
+  `PipelineSpec` 表 + 一个循环（`compute_vk_pipeline_specs.hpp`）；
+- 融合 kernel 的 9 张并行 map → 一个 `FusedKernel` 记录（注册时一次写定）。
+
+仍待收敛：
+
 - 每个算子重复"分配描述符 → 写 4 个 binding → bind → push → dispatch →
-  barrier → submit" → 应为一个 `dispatch(...)` 请求对象；
-- 融合 kernel 的 9 张并行 map（pipeline / reduce_axis / has_matmul / fold_meta /
-  view_param_counts / rparam_counts / vec_width / pc_base_fixed / batch_stride）
-  → 应为一个 `FusedKernel` 记录的 9 个字段。
+  barrier → submit" → 目标是一个 `DispatchRequest` + `CommandRecorder`；
+- `GpuBackend` 仍同时承担设备、存储、帧环、描述符、剖析、算子六件事 →
+  目标是 `vk::` 协作者 + `gpu::ops::*` 薄算子。
 
 ## 6. 怎么加一个原语算子
 
