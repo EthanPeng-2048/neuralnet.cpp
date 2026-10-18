@@ -962,4 +962,3 @@ namespace nn
     using MatrixF16 = MatrixT<Precision::F16>;
 
 } // namespace nn
-
