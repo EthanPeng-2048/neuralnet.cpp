@@ -5152,9 +5152,11 @@ P0-4 的 `install()/find_package` 与 P2-9）；剩 13 项 = 部分完成 5（P0
   job 覆盖不到。
 - **改动**：
   ① `.github/workflows/cmake-single-platform.yml` 新增 `msvc-debug` job：
-  `windows-latest` + **Visual Studio 17 2022 生成器**（直接得到 cl.exe，无需 vcvars 脚本），
+  `windows-latest` + **Visual Studio 2026 生成器**（直接得到 cl.exe，无需 vcvars 脚本），
   `NN_ENABLE_NATIVE=OFF` / `NN_ENABLE_GPU=OFF`（纯 CPU，避开 Vulkan/glslc 变量）/
   `NN_ENABLE_TESTS=ON`；`cmake --build`（Debug 配置）后 `ctest -C Debug`（除 C11 外全跑）。
+  **2026-10-18 补正**：GitHub 的 `windows-latest` 已切到 VS 2026 镜像，
+  `Visual Studio 17 2022` 生成器找不到实例；工作流改为 `Visual Studio 18 2026`。
   ② `src/optimizer_test.cpp` 新增 [4] 训练冒烟：小 MLP + Adam 跑 8 步，断言 loss 有限且下降、
   **全参数 L1 位移 > 1e-3**；同一个 `detect_movement()` 的负例（同一快照自比）必须判为
   "无移动"，证明断言不是恒真。该段纯 CPU f32，因此 MSVC Debug CPU-only job 会真实执行。
