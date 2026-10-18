@@ -171,7 +171,7 @@ void test_gpu_buffer_outlives_engine()
     // 独立 backend 的完整初始化在部分老卡上要几十秒；默认只跑 CPU 生命周期。
     // 需要验证"最后一个 GpuBuffer 释放 → backend 正常析构"时手动设
     // NN_GPU_LIFETIME_FULL=1。
-    if (std::getenv("NN_GPU_LIFETIME_FULL") == nullptr)
+    if (!nn::detail::env_flag_raw("NN_GPU_LIFETIME_FULL"))
         return;
 
     nn::Tensor t;

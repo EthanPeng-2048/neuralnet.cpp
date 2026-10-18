@@ -113,6 +113,14 @@ else()
     add_compile_options(-fno-exceptions -Wall -Wextra -Wpedantic -Werror)
 endif()
 
+# Windows 上的 clang++（GNU-like 驱动）不是 CMake 的 MSVC 分支，但链接仍走
+# link.exe，默认栈同样是 1 MB。实测（102 / clang 23.1 + MSVC STL / Release）
+# t1_58_test、bitnet_struct_test、model_roles_test 在 ctest 中 SegFault；
+# 与 cl.exe 的 0xC00000FD 同源。用 -Wl, 把 /STACK 透传给 link.exe。
+if(WIN32 AND CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND NOT MSVC)
+    add_link_options(-Wl,/STACK:8388608)
+endif()
+
 # ── 编译器特有选项 ───────────────────────────────────────────────────────
 # -fexperimental-library 仅 Clang 识别；GCC 不识别会产生警告
 if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
