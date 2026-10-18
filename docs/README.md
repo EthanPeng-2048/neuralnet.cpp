@@ -68,6 +68,7 @@
 | [`01-compute-engine-development.md`](development/01-compute-engine-development.md) | 扩展引擎原语：接口全解 + CPU/GPU 实现模式 + 加新原语的完整步骤 |
 | [`05-mixed-precision.md`](development/05-mixed-precision.md) | 多精度语义契约（写层/选 profile 必读）+ 实测限制 |
 | [`06-rapt-algorithm.md`](development/06-rapt-algorithm.md) | 线性注意力（RLA → RAPT → RLA-2）算法 + 扫描原语落地 |
+| [`07-vulkan-backend-map.md`](development/07-vulkan-backend-map.md) | Vulkan 后端结构地图（维护者）：调用链 / 所有权 / 依赖方向 / 扩展步骤 |
 | [`20-custom-layer-ergonomics.md`](development/20-custom-layer-ergonomics.md) | 写自定义层的**实测报告**：接入契约与 7 个摩擦点（库外使用者视角） |
 
 ### todo/（给项目开发者）
