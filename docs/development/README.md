@@ -30,6 +30,7 @@
 | [`05-mixed-precision.md`](05-mixed-precision.md) | 多精度**语义契约**（f16 的 P 精度算术、`PrecisionProfile{param/compute/stable/optimizer}`）+ 当前实测结论与已知数值限制（§12） |
 | [`06-rapt-algorithm.md`](06-rapt-algorithm.md) | 线性注意力家族（RLA / RAPT / RLA-2）：直观理解 + 数学定义 + 扫描原语工程落地 |
 | [`07-vulkan-backend-map.md`](07-vulkan-backend-map.md) | **维护者视角**：Vulkan 后端的调用链、所有权、依赖方向，以及"加一个算子/pipeline 要改哪几处" |
+| [`08-object-lifetimes.md`](08-object-lifetimes.md) | **维护者视角**：引擎与 Layer/Model/Tensor/Expr 的借用生命周期契约（EngineLease 状态机、失败语义、令牌池取舍） |
 | [`20-custom-layer-ergonomics.md`](20-custom-layer-ergonomics.md) | 自定义层的**实测报告**（库外使用者视角）：7 个摩擦点、逐条坐标。写层前读 [`write-a-custom-layer.md`](write-a-custom-layer.md)，本文是它的背景证据 |
 
 > **命名约定**：带数字前缀的文件沿用历史设计稿编号（`01` / `05` / `06` / `20`）；
