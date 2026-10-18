@@ -29,10 +29,6 @@
 #include "precision.hpp"
 #include "algebra_matrix.hpp"
 
-#ifdef NN_HAS_VULKAN
-#include "backend/compute_vk_backend.hpp"
-#endif
-
 namespace nn
 {
 

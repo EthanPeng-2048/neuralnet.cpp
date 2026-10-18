@@ -55,6 +55,7 @@
 // 收集器 TU）时编译断裂（clang 与 MSVC 同批报错，实测）。
 #include "../expr_spec.hpp"
 #include "compute_memory_pool.hpp"
+#include "compute_gpu_storage.hpp"
 #include "compute_staging_ring.hpp"
 
 // SPIR-V 嵌入头文件（由 CMake 生成）
@@ -432,12 +433,6 @@ namespace nn
 template <Precision P> class MatrixT;
 using Matrix = MatrixT<Precision::F32>;
 
-// 前向声明（模板 + 别名，匹配本文件末尾的 GpuTensorT<P> 定义，§6.3）
-template <Precision P> class GpuTensorT;
-using GpuTensor = GpuTensorT<Precision::F32>;
-using GpuTensorF32 = GpuTensorT<Precision::F32>;
-using GpuTensorF16 = GpuTensorT<Precision::F16>;
-
 namespace detail
 {
 // 纯 CPU 构建（无嵌入 SPIR-V）时 get_*_spirv() 的占位返回（RV-08 单一注册表）
@@ -447,227 +442,6 @@ namespace detail
     return empty;
 }
 }  // namespace detail
-
-// ══════════════════════════════════════════════════════════════════════════
-// GpuBuffer — GPU 缓冲区 RAII 封装
-// ══════════════════════════════════════════════════════════════════════════
-
-class GpuBuffer
-{
-private:
-    VkDevice device_ = VK_NULL_HANDLE;
-    VkBuffer buffer_ = VK_NULL_HANDLE;
-    MemoryPool::Allocation alloc_;
-    observer_ptr<MemoryPool> pool_;
-
-    // ── 写版本（write epoch）──────────────────────────────────────────────
-    // 与 MatrixT 的 write_epoch_ 同义（见 algebra_matrix.hpp 的说明）：内容
-    // "可能已经变了"的单调计数，唯一推进入口 = ComputeEngine 的写入口护栏。
-    // 放在 GpuBuffer（而不是 GpuTensorT）上：GpuTensorT 存在零拷贝重贴标签
-    // （with_shape）与 import 别名，同一块显存可能有多个 GpuTensorT 句柄 ——
-    // 版本必须随真正存放数据的 buffer 走。
-    std::uint64_t write_epoch_{0};
-
-public:
-    [[nodiscard]] std::uint64_t write_epoch() const noexcept { return write_epoch_; }
-    void mark_content_changed() noexcept { ++write_epoch_; }
-
-    GpuBuffer() = default;
-
-    GpuBuffer(VkDevice device, VkBuffer buffer, const MemoryPool::Allocation& alloc, MemoryPool& pool)
-        : device_(device), buffer_(buffer), alloc_(alloc), pool_(pool) {}
-
-    // 析构定义在 GpuBackend 之后：batch 录制期间已录制的 descriptor 仍引用
-    // 本 buffer，需延迟到 end_batch 提交完成后再销毁（见 defer_buffer_destroy）。
-    ~GpuBuffer();
-
-    // 移动语义
-    GpuBuffer(GpuBuffer&& o) noexcept
-        : device_(o.device_), buffer_(o.buffer_), alloc_(o.alloc_), pool_(o.pool_),
-          write_epoch_(o.write_epoch_)
-    {
-        o.device_ = VK_NULL_HANDLE;
-        o.buffer_ = VK_NULL_HANDLE;
-        o.alloc_ = {};
-        o.pool_.reset();
-    }
-
-    GpuBuffer& operator=(GpuBuffer&& o) noexcept
-    {
-        if (this != &o)
-        {
-            std::swap(device_, o.device_);
-            std::swap(buffer_, o.buffer_);
-            std::swap(alloc_, o.alloc_);
-            pool_.swap(o.pool_);
-            std::swap(write_epoch_, o.write_epoch_);
-        }
-        return *this;
-    }
-
-    // 禁止拷贝
-    GpuBuffer(const GpuBuffer&) = delete;
-    GpuBuffer& operator=(const GpuBuffer&) = delete;
-
-    // 创建 Device Local 缓冲区（尺寸语义 = 字节数，§6.3）
-    // usage 恒补 SHADER_DEVICE_ADDRESS（P3 实例表按设备地址引用张量缓冲）：
-    // 与 MemoryPool 分配侧的 DEVICE_ADDRESS 标志成对（都随 bda_available 门控）。
-    [[nodiscard]] static Result<GpuBuffer> create_device_local(
-        VkDevice device, MemoryPool& pool,
-        std::size_t byte_count, VkBufferUsageFlags usage)
-    {
-        VkBufferCreateInfo buf_info{};
-        buf_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-        buf_info.size = byte_count;
-        buf_info.usage = usage;
-        if (pool.device_address_alloc())
-            buf_info.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
-        buf_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-
-        VkBuffer buffer = VK_NULL_HANDLE;
-        VkResult res = vkCreateBuffer(device, &buf_info, nullptr, &buffer);
-        if (res != VK_SUCCESS)
-            NN_FAIL("vkCreateBuffer failed: " + std::to_string(res));
-        VkMemoryRequirements mem_reqs;
-        vkGetBufferMemoryRequirements(device, buffer, &mem_reqs);
-
-        auto alloc_r = pool.allocate(
-            mem_reqs, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        if (!alloc_r)
-        {
-            vkDestroyBuffer(device, buffer, nullptr);
-            NN_TRY_CHECK(alloc_r);
-        }
-
-        res = vkBindBufferMemory(device, buffer, alloc_r->memory, alloc_r->offset);
-        if (res != VK_SUCCESS)
-        {
-            pool.free(*alloc_r);
-            vkDestroyBuffer(device, buffer, nullptr);
-            NN_FAIL("vkBindBufferMemory failed: " + std::to_string(res));
-        }
-
-        return GpuBuffer(device, buffer, *alloc_r, pool);
-    }
-
-    // 创建 Host Visible 缓冲区（尺寸语义 = 字节数，§6.3）
-    [[nodiscard]] static Result<GpuBuffer> create_host_visible(
-        VkDevice device, MemoryPool& pool,
-        std::size_t byte_count, VkBufferUsageFlags usage)
-    {
-        VkBufferCreateInfo buf_info{};
-        buf_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-        buf_info.size = byte_count;
-        buf_info.usage = usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-        // P3：与 create_device_local 同款补 SHADER_DEVICE_ADDRESS（池分配侧
-        // 已配对 DEVICE_ADDRESS 标志，见 MemoryPool::create_block）
-        if (pool.device_address_alloc())
-            buf_info.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
-        buf_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-
-        VkBuffer buffer = VK_NULL_HANDLE;
-        VkResult res = vkCreateBuffer(device, &buf_info, nullptr, &buffer);
-        if (res != VK_SUCCESS)
-            NN_FAIL("vkCreateBuffer failed: " + std::to_string(res));
-        VkMemoryRequirements mem_reqs;
-        vkGetBufferMemoryRequirements(device, buffer, &mem_reqs);
-
-        VkMemoryPropertyFlags preferred, fallback;
-        if (pool.is_uma())
-        {
-            // 真 UMA/共享显存：slab 落在统一内存池（device-local 即 host-visible）
-            preferred = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
-                      | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
-                      | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-            fallback  = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
-                      | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-        }
-        else
-        {
-            // 独显：纯 HOST_VISIBLE（系统 RAM），避免 slab 落在 GPU 可驻留内存
-            preferred = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
-                      | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-            fallback  = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
-        }
-
-        auto alloc_r = pool.allocate(mem_reqs, preferred, fallback);
-        if (!alloc_r)
-        {
-            vkDestroyBuffer(device, buffer, nullptr);
-            NN_TRY_CHECK(alloc_r);
-        }
-
-        res = vkBindBufferMemory(device, buffer, alloc_r->memory, alloc_r->offset);
-        if (res != VK_SUCCESS)
-        {
-            pool.free(*alloc_r);
-            vkDestroyBuffer(device, buffer, nullptr);
-            NN_FAIL("vkBindBufferMemory failed: " + std::to_string(res));
-        }
-
-        return GpuBuffer(device, buffer, *alloc_r, pool);
-    }
-
-    [[nodiscard]] VkBuffer impl() const noexcept { return buffer_; }
-    [[nodiscard]] bool valid() const noexcept { return buffer_ != VK_NULL_HANDLE; }
-};
-
-// ══════════════════════════════════════════════════════════════════════════
-// GpuTensorT<P> — GPU 矩阵抽象（多精度，docs/development/05-mixed-precision.md §6.3）
-// buffer 字节数 = rows * cols * sizeof(elem<P>)（f32=4B / f16=2B）
-// 别名：GpuTensor = GpuTensorT<F32>（现有调用点零改动）
-// ══════════════════════════════════════════════════════════════════════════
-
-template <Precision P>
-class GpuTensorT
-{
-private:
-    std::shared_ptr<GpuBuffer> buffer_;
-    std::size_t rows_ = 0;
-    std::size_t cols_ = 0;
-
-public:
-    GpuTensorT() = default;
-
-    GpuTensorT(std::shared_ptr<GpuBuffer> buffer, std::size_t rows, std::size_t cols)
-        : buffer_(std::move(buffer)), rows_(rows), cols_(cols) {}
-
-    // 从 CPU Matrix 创建（上传数据；同精度跨设备 = 原始字节拷贝，§6.5）
-    [[nodiscard]] static Result<GpuTensorT<P>> from_matrix(
-        const MatrixT<P>& cpu_mat, class GpuBackend& backend);
-
-    // 创建空的 GPU Tensor（用于输出）
-    [[nodiscard]] static Result<GpuTensorT<P>> create_empty(
-        std::size_t rows, std::size_t cols, class GpuBackend& backend);
-
-    // 创建空的 Host Visible Tensor（activation offload 存储，§6.6）
-    [[nodiscard]] static Result<GpuTensorT<P>> create_host_visible_empty(
-        std::size_t rows, std::size_t cols, class GpuBackend& backend);
-
-    // 转换为 CPU Matrix（下载数据）
-    [[nodiscard]] Result<MatrixT<P>> to_matrix(class GpuBackend& backend) const;
-
-    // 访问器
-    [[nodiscard]] std::size_t rows() const noexcept { return rows_; }
-    [[nodiscard]] std::size_t cols() const noexcept { return cols_; }
-    [[nodiscard]] bool valid() const noexcept { return buffer_ && buffer_->valid(); }
-    [[nodiscard]] const GpuBuffer& buffer() const noexcept { return *buffer_; }
-    // 底层 buffer 的共享句柄（把同一 buffer 以另一种元素类型重贴标签用，
-    // 见 run_fused_gpu 的 out_f16：in-kernel f16 的输出是 f16 字节布局）
-    [[nodiscard]] std::shared_ptr<GpuBuffer> shared_buffer() const noexcept
-    { return buffer_; }
-
-    // 零拷贝 reshape：共享底层 buffer，只改变形状元数据
-    [[nodiscard]] GpuTensorT<P> with_shape(std::size_t new_rows, std::size_t new_cols) const
-    {
-        return GpuTensorT<P>(buffer_, new_rows, new_cols);
-    }
-};
-
-// 别名（现有调用点零改动；f16 显式使用 GpuTensorF16）
-using GpuTensor = GpuTensorT<Precision::F32>;
-using GpuTensorF32 = GpuTensorT<Precision::F32>;
-using GpuTensorF16 = GpuTensorT<Precision::F16>;
 
 // ── P3 跨链批量派发：单实例描述（run_fused_gpu_batch 的输入）──────────────
 // 与 run_fused_gpu 的单 kernel 调用同一组形参的实例化：每实例自带输入/输出
@@ -1069,5 +843,11 @@ inline GpuBuffer::~GpuBuffer()
 }
 
 } // namespace nn
+
+// GpuTensorT<P> 的 backend 依赖实现（from_matrix / to_matrix / create_*）：
+// 放在 GpuBackend 与 GpuBuffer 析构之后——存储层（compute_gpu_storage.hpp）
+// 本身不认识后端，只有这些"经后端上传/下载"的动作需要完整定义。
+// algebra_matrix.hpp 不再包含它，从而只依赖存储层。
+#include "compute_gpu_tensor_impl.hpp"
 
 #endif // NN_HAS_VULKAN
