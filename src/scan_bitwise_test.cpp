@@ -16,6 +16,11 @@
 // 用法：scan_bitwise_test（无参数）
 // GPU 不可用（未编译 Vulkan / 初始化失败）→ 打印 77 = ctest SKIP 约定
 // （与 gpu_test 同约定：程序自己判断可用性，不靠命令行开关）。
+// ⚠ 逐位锚依赖 CPU 与 GPU 的 FMA/舍入路径一致：Linux + 850M 是权威口径；
+//   Windows（40HX / clang 或 cl.exe）实测 CPU 参考与 kernel 有 1 ULP 级差异，
+//   故 Windows 上本测试按 77 = SKIP（数值正确性仍由 gpu_test 的容差用例覆盖）。
+//   Debug（-O0）下 CPU 侧不收缩 FMA，与 Release kernel 的累加路径亦不同，
+//   因此本测试只在 Release 构建中执行。
 // ───────────────────────────────────────────────────────────────────────────
 
 #include <neuralnet.cpp/nn.hpp>
@@ -221,6 +226,17 @@ int main(int argc, char* argv[])
 {
     (void)argc;
     (void)argv;
+
+#if defined(_WIN32)
+    std::puts("[SKIP] scan_bitwise_test 的逐位锚以 Linux + 850M 为权威口径；"
+              "Windows/40HX 的 CPU-GPU FMA/舍入路径不同。");
+    return 77;
+#endif
+#if !defined(NDEBUG)
+    std::puts("[SKIP] scan_bitwise_test 需要 Release 优化构建；"
+              "Debug 下 CPU 与 GPU 的 FMA 路径不同。");
+    return 77;
+#endif
 
     auto cpu_r = nn::cli::create_engine(nn::cli::EngineConfig{false});
     NN_EXIT(cpu_r, 1, "CPU 引擎创建失败: ");

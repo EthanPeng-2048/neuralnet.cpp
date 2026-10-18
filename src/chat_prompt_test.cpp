@@ -48,6 +48,16 @@ constexpr int kSkip = 77;   // ctest 约定：跳过（CLI 缺失时不阻塞门
 
 std::string g_self;         // argv[0]：定位同构建的 app 二进制
 
+#ifdef _WIN32
+// cmd.exe 把正斜杠当开关分隔符：argv[0] 是 D:/... 时直接拼进 system() 会报
+// "The filename, directory name, or volume label syntax is incorrect"。
+std::string native_path(std::string p)
+{
+    std::replace(p.begin(), p.end(), '/', '\\');
+    return p;
+}
+#endif
+
 // ── 小工具 ───────────────────────────────────────────────────────────────
 std::string dirname_of(const std::string &path)
 {
@@ -80,10 +90,17 @@ std::string find_app(const std::string &name)
     const std::string dir = dirname_of(g_self);
     const std::string candidates[] = {dir + "/../" + name, dir + "/" + name, name};
     for (const auto &c : candidates)
-        if (file_exists(c)) return c;
+        if (file_exists(c))
+        {
+#ifdef _WIN32
+            return native_path(c);
+#else
+            return c;
+#endif
+        }
 #ifdef _WIN32
     for (const auto &c : candidates)
-        if (file_exists(c + ".exe")) return c + ".exe";
+        if (file_exists(c + ".exe")) return native_path(c + ".exe");
 #endif
     return {};
 }
@@ -435,6 +452,10 @@ struct CliFixture
 
 std::string shell_quote(const std::string &s)
 {
+#ifdef _WIN32
+    // cmd 会剥掉"整条命令以引号开头"时的首尾引号；无空格路径直接裸写。
+    if (s.find_first_of(" \t") == std::string::npos) return s;
+#endif
     std::string out = "\"";
     for (const char c : s)
     {
@@ -501,7 +522,18 @@ void test_cli_multi_turn(const std::string &exe, const std::filesystem::path &di
     CHECK(!reply1_text.empty(), "单轮回复文件非空（--reply-out）");
 
     // ── 三轮（带历史；历史里的 assistant 文本 = 上一轮的回复）──
-    const std::string r1 = rstrip_newline(reply1_text);
+    // Windows cmd 不能用换行/控制字符/非 ASCII 字节做参数；把助手回复规范成
+    // 可打印 ASCII 单行文本。三轮用例只验证"历史确实进入 prompt"，库侧比较
+    // 使用同一份文本，故不会削弱前缀不变式。
+    std::string r1 = rstrip_newline(reply1_text);
+    for (char& c : r1)
+    {
+        const auto u = static_cast<unsigned char>(c);
+        if (u < 0x20 || u >= 0x7F || c == '"' || c == '&' || c == '|' ||
+            c == '<' || c == '>')
+            c = ' ';
+    }
+    if (r1.find_first_not_of(' ') == std::string::npos) r1 = "ok";
     const int rc3 = exit_code_of(std::system(
         (base + " --turn user:\"hi there\" --turn assistant:" + shell_quote(r1) +
          " --turn user:\"bye now\" --reply-out " + shell_quote(reply3) +
@@ -580,7 +612,9 @@ void test_cli_rejections(const std::string &exe, const std::filesystem::path &di
 
 int main(int argc, char **argv)
 {
-    g_self = (argc > 0 && argv[0] != nullptr) ? argv[0] : "";
+    g_self = (argc > 0 && argv[0] != nullptr)
+        ? std::filesystem::absolute(argv[0]).string()
+        : "";
     std::printf("chat_prompt_test（P0-5 尾项：多轮对话闭环）\n");
 
     test_dialogue_structure();

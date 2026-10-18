@@ -12,8 +12,10 @@
 // 退出码：0 = 通过，1 = 失败，77 = 跳过。
 // ─────────────────────────────────────────────────────────────────────────
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <string>
@@ -33,6 +35,26 @@ namespace
 constexpr int kSkip = 77;   // ctest 约定：跳过（二进制缺失时不阻塞门禁）
 
 std::string g_self;   // argv[0]：定位同构建的 app 二进制
+
+#ifdef _WIN32
+// cmd.exe 把正斜杠当开关分隔符：argv[0] 是 D:/... 时直接拼进 system() 会报
+// "The system cannot find the path specified"。返回给 shell 的路径统一用反斜杠。
+std::string native_path(std::string p)
+{
+    std::replace(p.begin(), p.end(), '/', '\\');
+    return p;
+}
+#endif
+
+// Windows cmd 在命令**以引号开头**时会剥掉首尾引号（即使路径无空格）；
+// 这里对无空格的路径不加引号，避免 "The system cannot find the path specified"。
+std::string quote_exe(const std::string& p)
+{
+#ifdef _WIN32
+    if (p.find_first_of(" \t") == std::string::npos) return p;
+#endif
+    return "\"" + p + "\"";
+}
 
 std::string dirname_of(const std::string& path)
 {
@@ -76,10 +98,17 @@ std::string find_app(const std::string& name)
         name,
     };
     for (const auto& c : candidates)
-        if (file_exists(c)) return c;
+        if (file_exists(c))
+        {
+#ifdef _WIN32
+            return native_path(c);
+#else
+            return c;
+#endif
+        }
 #ifdef _WIN32
     for (const auto& c : candidates)
-        if (file_exists(c + ".exe")) return c + ".exe";
+        if (file_exists(c + ".exe")) return native_path(c + ".exe");
 #endif
     return {};
 }
@@ -145,14 +174,14 @@ void test_cli_stderr(const std::string& exe, const std::string& label,
     const std::string err_all = "nn_precwarn_all.err";
 
     const int rc_plain = run_capture_stderr(
-        "\"" + exe + "\" " + dataset_arg, err_plain);
+        quote_exe(exe) + " " + dataset_arg, err_plain);
     const int rc_f16 = run_capture_stderr(
-        "\"" + exe + "\" --f16 " + dataset_arg, err_f16);
+        quote_exe(exe) + " --f16 " + dataset_arg, err_f16);
     const int rc_opt = run_capture_stderr(
-        "\"" + exe + "\" --precision-stable f16 --precision-optimizer f16 " + dataset_arg,
+        quote_exe(exe) + " --precision-stable f16 --precision-optimizer f16 " + dataset_arg,
         err_opt);
     const int rc_all = run_capture_stderr(
-        "\"" + exe + "\" --f16 --precision-stable f16 --precision-optimizer f16 " + dataset_arg,
+        quote_exe(exe) + " --f16 --precision-stable f16 --precision-optimizer f16 " + dataset_arg,
         err_all);
 
     if (rc_plain == -1)
@@ -189,7 +218,9 @@ void test_cli_stderr(const std::string& exe, const std::string& label,
 
 int main(int argc, char** argv)
 {
-    g_self = (argc > 0 && argv[0] != nullptr) ? argv[0] : "";
+    g_self = (argc > 0 && argv[0] != nullptr)
+        ? std::filesystem::absolute(argv[0]).string()
+        : "";
     std::printf("cli_precision_warning_test（F1：危险精度组合启动期告警）\n");
 
     test_helper_matrix();
