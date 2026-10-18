@@ -556,7 +556,7 @@ public:
         // 精度要求）。无 f16 pipeline → 引擎内边界 cast 回退。
         if (tbl_gpu->precision() == Precision::F16)
         {
-            if (backend_.has_gather_f16_pipeline() &&
+            if (backend_.has(PipelineId::gather_f16) &&
                 idx_gpu->precision() == Precision::F32)
             {
                 auto r = backend_.gather_gpu(f16_view(*tbl_gpu),
@@ -603,7 +603,7 @@ public:
         NN_TRY_CHECK(grad_gpu);
         const bool f16_io = dst.precision() == Precision::F16 &&
                             grad_gpu->precision() == Precision::F16 &&
-                            backend_.has_scatter_add_f16_pipeline();
+                            backend_.has(PipelineId::scatter_add_f16);
         if (f16_io)
         {
             GpuTensor dst_ref = f16_view(dst);       // 局部保活（禁 &临时）
@@ -649,7 +649,7 @@ public:
         // Phase C1 f16 直读直写；无 f16 pipeline → 引擎内边界 cast 回退
         if (x_gpu->precision() == Precision::F16)
         {
-            if (backend_.has_rearrange_3d_f16_pipeline())
+            if (backend_.has(PipelineId::rearrange_3d_f16))
             {
                 auto r = backend_.rearrange_3d_gpu(
                     f16_view(*x_gpu), static_cast<uint32_t>(M),
@@ -689,7 +689,7 @@ public:
         // 绑到 f32 pipeline（静默错值）。
         if (a_gpu->precision() == Precision::F16)
         {
-            if (backend_.has_transpose_f16_pipeline())
+            if (backend_.has(PipelineId::transpose_f16))
             {
                 auto r = backend_.transpose_gpu(f16_view(*a_gpu), /*f16_io=*/true);
                 NN_TRY_CHECK(r);
@@ -722,7 +722,7 @@ public:
         //（绝不把 f16 buffer 绑到 f32 pipeline；CNN 路径与 move_ 直通保障）
         if (x_gpu->precision() == Precision::F16)
         {
-            if (backend_.has_im2col_f16_pipeline())
+            if (backend_.has(PipelineId::im2col_f16))
             {
                 auto r = backend_.im2col_gpu(f16_view(*x_gpu),
                                              C, H, W, k, stride, pad, OH, OW,
@@ -756,7 +756,7 @@ public:
         // Phase C2d：同 im2col——f16 窗口变体优先，无 pipeline 引擎内回退
         if (c_gpu->precision() == Precision::F16)
         {
-            if (backend_.has_col2im_f16_pipeline())
+            if (backend_.has(PipelineId::col2im_f16))
             {
                 auto r = backend_.col2im_gpu(f16_view(*c_gpu),
                                              C, H, W, k, stride, pad, OH, OW,
@@ -789,7 +789,7 @@ public:
         NN_TRY_CHECK(x_gpu);
         if (x_gpu->precision() == Precision::F16)
         {
-            if (backend_.has_group_reduce_f16_pipeline())
+            if (backend_.has(PipelineId::group_reduce_f16))
             {
                 auto r = backend_.grouped_reduce_gpu(
                     f16_view(*x_gpu), G, R, is_max, /*f16_in=*/true);
@@ -833,7 +833,7 @@ public:
     [[nodiscard]] Result<Tensor> trit_pack_impl(const Tensor& w,
                                                 const Tensor& scale) override
     {
-        if (!(backend_.has_trit_pack_pipeline() && backend_.has_matmul_q_pipeline()))
+        if (!(backend_.has(PipelineId::trit_pack) && backend_.has(PipelineId::matmul_q)))
             NN_FAIL("trit_pack: 该设备未创建三值打包 pipeline（docs 21 §5 P2）");
         if (!w.is_gpu() || !scale.is_gpu())
             NN_FAIL("trit_pack: GPU 张量必需");
@@ -857,7 +857,7 @@ public:
                                                bool transA, std::size_t out_rows,
                                                Precision P) override
     {
-        if (!(backend_.has_trit_pack_pipeline() && backend_.has_matmul_q_pipeline()))
+        if (!(backend_.has(PipelineId::trit_pack) && backend_.has(PipelineId::matmul_q)))
             NN_FAIL("matmul_q: 该设备未创建三值 GEMM pipeline（docs 21 §5 P2）");
         if (!packed.is_gpu() || !scale.is_gpu() || !B.is_gpu())
             NN_FAIL("matmul_q: GPU 张量必需（跨设备请先 import）");
@@ -878,7 +878,7 @@ public:
         // in-kernel f16 变体（B 与输出均 f16）：f16 profile 下的主路径 ——
         // 否则每个 BitLinear 层每步要多付两份 (·,batch) 的 f32 边界 cast 临时量。
         if (P == Precision::F16 && B.precision() == Precision::F16 &&
-            backend_.has_matmul_q_f16_pipeline())
+            backend_.has(PipelineId::matmul_q_f16))
         {
             auto out16 = GpuTensorF16::create_empty(M, N, backend_);
             NN_TRY_CHECK(out16);
@@ -945,8 +945,8 @@ public:
             const bool f16_ok =
                 a_gpu->precision() == Precision::F16 &&
                 b_gpu->precision() == Precision::F16 &&
-                ((n_out > 8 && backend_.has_matmul_tiled_f16_pipeline()) ||
-                 (n_out <= 8 && backend_.has_gemv_f16_pipeline()));
+                ((n_out > 8 && backend_.has(PipelineId::matmul_tiled_f16)) ||
+                 (n_out <= 8 && backend_.has(PipelineId::matmul_gemv_f16)));
             if (f16_ok)
             {
                 auto r = backend_.matmul_gpu(
@@ -1045,7 +1045,7 @@ public:
         // 同 matmul：两个操作数都 f16 → f16 存储版 batch GEMM（零 f32 副本）。
         if (P == Precision::F16 && a_gpu->precision() == Precision::F16 &&
             b_gpu->precision() == Precision::F16 &&
-            backend_.has_batched_matmul_f16_pipeline())
+            backend_.has(PipelineId::batched_matmul_f16))
         {
             auto r = backend_.batched_matmul_gpu(
                 f16_view(*a_gpu), f16_view(*b_gpu),
@@ -1097,7 +1097,7 @@ public:
         //   · B 是 f32（梯度混合精度）→ 只物化 B 的 f16 小副本再加；
         //   · 无 f16 pipeline → 引擎内回退（A 抬 f32 加完写回，正确性不变）。
         if (a_gpu->precision() == Precision::F16 &&
-            backend_.has_elementwise_v2_f16_pipeline())
+            backend_.has(PipelineId::elementwise_v2_f16))
         {
             std::optional<Tensor> b16;
             if (b_gpu->precision() != Precision::F16)
@@ -1178,7 +1178,7 @@ public:
         if (a_gpu->precision() == Precision::F16)
         {
             const uint32_t cnt = static_cast<uint32_t>(A.rows() * A.cols());
-            if (backend_.has_elementwise_v2_f16_pipeline())
+            if (backend_.has(PipelineId::elementwise_v2_f16))
             {
                 const GpuTensor a_ref = f16_view(*a_gpu);   // 局部保活（禁 &临时）
                 auto r = backend_.elementwise_v2_gpu(
@@ -1346,7 +1346,7 @@ public:
         const bool all_f16 = p->precision() == Precision::F16 &&
             r->precision() == Precision::F16 && s->precision() == Precision::F16;
         if (prec == Precision::F16 && all_f16 &&
-            backend_.has_outer_col_f16_pipeline())
+            backend_.has(PipelineId::outer_col_f16))
         {
             auto res = backend_.outer_col_gpu(
                 f16_view(*p), f16_view(*r), f16_view(*s),
@@ -1381,7 +1381,7 @@ public:
         {
             // f16 张量必须经 f16_view（gpu_tensor() 默认 P=F32 → 读 f16 buffer
             // 的 f32 view = 断言失败 [gpu_tensor-fail]）
-            if (backend_.has_reduce_f16_pipeline())
+            if (backend_.has(PipelineId::reduce_f16))
                 return backend_.reduce_gpu(f16_view(*a_gpu), mode, reduce_op,
                                            /*f16_in=*/true);
             // 引擎内边界 cast（无 f16 pipeline 的设备）
@@ -1660,10 +1660,10 @@ public:
         i.engine = "vulkan";
         i.device = backend_.device().device_name();
         i.native_f16_move = true;      // 字节级搬运 + 引擎内 cast 回退
-        i.native_f16_reduce = backend_.has_reduce_f16_pipeline();
+        i.native_f16_reduce = backend_.has(PipelineId::reduce_f16);
         i.fused_prec_variant = true;   // 有带类型融合 shader 机制（AOT 闭合世界）
-        i.ternary_gemm = backend_.has_trit_pack_pipeline() &&
-                         backend_.has_matmul_q_pipeline();
+        i.ternary_gemm = backend_.has(PipelineId::trit_pack) &&
+                         backend_.has(PipelineId::matmul_q);
         i.int8_dot = backend_.device().has_int8_dot();
         i.int8_dot_accelerated = backend_.device().int8_dot_accelerated();
         return i;

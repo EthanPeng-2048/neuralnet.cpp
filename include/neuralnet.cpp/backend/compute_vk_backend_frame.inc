@@ -597,12 +597,12 @@
         //    batched_matmul_gpu 的同款做法）
         const bool use_f16 = f16_io;
         // f16 可用性：N≤8 走 GEMV（C2e，仅需 gemv_f16），否则 tiled_f16
-        if (use_f16 && N <= 8u && !has_matmul_tiled_f16_pipeline() &&
-            has_gemv_f16_pipeline())
+        if (use_f16 && N <= 8u && !has(PipelineId::matmul_tiled_f16) &&
+            has(PipelineId::matmul_gemv_f16))
         {
             // gemv_f16 可用 → 下方分派走 GEMV，无需 tiled_f16
         }
-        else if (use_f16 && !has_matmul_tiled_f16_pipeline())
+        else if (use_f16 && !has(PipelineId::matmul_tiled_f16))
             NN_FAIL("matmul_gpu: f16 pipeline 不可用（设备无 SSBO 16 位存储？）");
         std::optional<GpuTensor> owned;
         if (use_f16)
@@ -632,10 +632,10 @@
         // Phase C2e：f16 也可走 GEMV（f16 变体 pipeline 存在时）——小 N
         //   （n_out≤8）f16 GEMM 直读直写；变体 pipeline 缺失时引擎回退
         //   边界 cast。
-        const bool use_gemv = has_gemv_pipeline() && N <= GEMV_MAX_N
+        const bool use_gemv = has(PipelineId::matmul_gemv) && N <= GEMV_MAX_N
                               && device_.subgroup_size() >= 4u
-                              && (!use_f16 || has_gemv_f16_pipeline());
-        const bool use_tiled = (use_f16 || has_tiled_pipeline()) && !use_gemv;
+                              && (!use_f16 || has(PipelineId::matmul_gemv_f16));
+        const bool use_tiled = (use_f16 || has(PipelineId::matmul_tiled)) && !use_gemv;
         // P0 细 tile（wgrad 网格饥饿）：64-tile 网格只有
         // ceil(N/64)×ceil(M/64) 个工作组——反传 wgrad 形状（M,N=64..256 ×
         // K=16384）只派 1~4 个，40HX（34 SM）大面积空转（实测 208~278
@@ -654,17 +654,17 @@
                 // NN_MM_FINE_NAIVE=1 → naive（每线程 1 输出：线程数 = M×N，
                 // 是细 tiled 的 16×；无 shared/barrier，靠 warp 切换吃延迟）
                 use_naive_fine = mm_fine_naive() &&
-                                 matmul_pipeline_.handle() != VK_NULL_HANDLE;
-                use_fine = !use_naive_fine && has_tiled_fine_pipeline();
+                                 pipelines_.get(PipelineId::matmul).handle() != VK_NULL_HANDLE;
+                use_fine = !use_naive_fine && has(PipelineId::matmul_tiled_fine);
             }
         }
-        auto& pipeline = use_gemv ? (use_f16 ? matmul_gemv_f16_pipeline_
-                                             : matmul_gemv_pipeline_)
-                       : use_f16 ? matmul_tiled_f16_pipeline_
-                       : use_naive_fine ? matmul_pipeline_
-                       : use_fine ? matmul_tiled_fine_pipeline_
-                       : use_tiled ? matmul_tiled_pipeline_
-                                   : matmul_pipeline_;
+        const auto& pipeline = use_gemv ? (use_f16 ? pipelines_.get(PipelineId::matmul_gemv_f16)
+                                             : pipelines_.get(PipelineId::matmul_gemv))
+                       : use_f16 ? pipelines_.get(PipelineId::matmul_tiled_f16)
+                       : use_naive_fine ? pipelines_.get(PipelineId::matmul)
+                       : use_fine ? pipelines_.get(PipelineId::matmul_tiled_fine)
+                       : use_tiled ? pipelines_.get(PipelineId::matmul_tiled)
+                                   : pipelines_.get(PipelineId::matmul);
 
         // 3. 复用通用 dispatch：2 输入 + 1 输出，push {M,N,K,transA,transB}
         //   Dispatch：按 shader 输出块尺寸计算工作组数
@@ -725,10 +725,10 @@
             NN_FAIL("GPU backend not initialized");
         if (batch == 0)
             NN_FAIL("batched_matmul_gpu: batch must be > 0");
-        const bool use_f16 = f16_io && has_batched_matmul_f16_pipeline();
+        const bool use_f16 = f16_io && has(PipelineId::batched_matmul_f16);
         if (f16_io && !use_f16)
             NN_FAIL("batched_matmul_gpu: f16 pipeline 不可用（设备无 SSBO 16 位存储？）");
-        if (!use_f16 && !has_batched_matmul_pipeline())
+        if (!use_f16 && !has(PipelineId::batched_matmul))
             NN_FAIL("batched_matmul_gpu: pipeline not available");
         // 校验：A.rows() 必须能被 batch 整除
         if (A.rows() % batch != 0 || B.rows() % batch != 0)
@@ -776,7 +776,7 @@
         constexpr uint32_t BM = 64, BN = 64;
         std::vector<GpuTensor> inputs{A, B};
         auto r = dispatch_compute(
-            use_f16 ? batched_matmul_f16_pipeline_ : batched_matmul_pipeline_,
+            use_f16 ? pipelines_.get(PipelineId::batched_matmul_f16) : pipelines_.get(PipelineId::batched_matmul),
             inputs, C, pc, (N + BN - 1) / BN, (M + BM - 1) / BM, batch,
             "batched_matmul", use_f16 ? "f16" : "f32");
         NN_TRY_CHECK(r);

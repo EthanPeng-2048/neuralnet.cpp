@@ -25,14 +25,14 @@
     {
         if (!initialized_)
             NN_FAIL("GPU backend not initialized");
-        if (!has_elementwise_v2_pipeline())
+        if (!has(PipelineId::elementwise_v2))
             NN_FAIL("elementwise_v2 pipeline not available");
         // Phase C1b f16 变体（仅需 16 位存储门控）；请求但无 pipeline →
         // 报错由引擎层回退边界 cast
-        if (f16_io && !has_elementwise_v2_f16_pipeline())
+        if (f16_io && !has(PipelineId::elementwise_v2_f16))
             NN_FAIL("elementwise_v2_gpu: f16 pipeline 不可用（设备无16位存储）");
-        auto& pipeline = f16_io ? elementwise_v2_f16_pipeline_
-                                : elementwise_v2_pipeline_;
+        const auto& pipeline = f16_io ? pipelines_.get(PipelineId::elementwise_v2_f16)
+                                : pipelines_.get(PipelineId::elementwise_v2);
 
         // 1. 输出 Tensor：原地模式直接复用 out 的 buffer，否则新分配
         //    （f16_io：按 2B/元素分配 + 纯绑定视图，同 matmul_gpu）
@@ -1054,10 +1054,10 @@
     // mode: 0=row_reduce → out(rows,1), 1=col_reduce → out(1,cols)
     // reduce_op: 0=sum, 1=max
     // 列归约大行数走两段式 partials（同 cmd 双 dispatch 单次提交，见分支内注释）
-    // f16_in（Phase C2）：输入缓冲按 float16_t 读（reduce_f16_pipeline_）；
+    // f16_in（Phase C2）：输入缓冲按 float16_t 读（PipelineId::reduce_f16）；
     // 输出/ partials 恒 f32 → 两段式 pass2 输入是 f32 partials，恒用 f32
     // pipeline（ds/layout 各随所属 pipeline）。f16 pipeline 未创建时硬报错，
-    // 由调用方（GpuEngine）提前查 has_reduce_f16_pipeline 走引擎内 cast 回退。
+    // 由调用方（GpuEngine）提前查 has(PipelineId::reduce_f16) 走引擎内 cast 回退。
     // ══════════════════════════════════════════════════════════════════
     [[nodiscard]] Result<GpuTensor> reduce_gpu(
         const GpuTensor& input, uint32_t mode, uint32_t reduce_op,
@@ -1065,12 +1065,12 @@
     {
         if (!initialized_)
             NN_FAIL("GPU backend not initialized");
-        if (!has_reduce_pipeline())
+        if (!has(PipelineId::reduce))
             NN_FAIL("reduce pipeline not available");
-        if (f16_in && !has_reduce_f16_pipeline())
+        if (f16_in && !has(PipelineId::reduce_f16))
             NN_FAIL("reduce f16 pipeline not available");
         // 输入侧 pipeline（pass1 / 单段）；输出侧与 pass2 恒 f32 pipeline
-        VulkanPipeline& in_pipe = f16_in ? reduce_f16_pipeline_ : reduce_pipeline_;
+        const VulkanPipeline& in_pipe = f16_in ? pipelines_.get(PipelineId::reduce_f16) : pipelines_.get(PipelineId::reduce);
 
         const uint32_t rows = static_cast<uint32_t>(input.rows());
         const uint32_t cols = static_cast<uint32_t>(input.cols());
@@ -1129,7 +1129,7 @@
             auto ds1_r = alloc_desc_set(in_pipe.descriptor_layout());
             NN_TRY_CHECK(ds1_r);
             VkDescriptorSet ds1 = *ds1_r;
-            auto ds2_r = alloc_desc_set(reduce_pipeline_.descriptor_layout());
+            auto ds2_r = alloc_desc_set(pipelines_.get(PipelineId::reduce).descriptor_layout());
             NN_TRY_CHECK(ds2_r);
             VkDescriptorSet ds2 = *ds2_r;
 
@@ -1182,11 +1182,11 @@
             // pass2：合并 partials（rows = nchunk ≤ 8，复用 mode1 整表路径；
             // 输入 = f32 partials → 恒 f32 pipeline）
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                reduce_pipeline_.handle());
+                pipelines_.get(PipelineId::reduce).handle());
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                reduce_pipeline_.pipeline_layout(), 0, 1, &ds2, 0, nullptr);
+                pipelines_.get(PipelineId::reduce).pipeline_layout(), 0, 1, &ds2, 0, nullptr);
             const uint32_t push2[5] = {nchunk, cols, 1u, reduce_op, 0u};
-            vkCmdPushConstants(cmd, reduce_pipeline_.pipeline_layout(),
+            vkCmdPushConstants(cmd, pipelines_.get(PipelineId::reduce).pipeline_layout(),
                 VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push2), push2);
             ts_dispatch(cmd, "reduce", (cols + 31u) / 32u, 1, 1);
             record_output_barrier(cmd, output.buffer().impl());
@@ -1273,12 +1273,12 @@
     {
         if (!initialized_)
             NN_FAIL("GPU backend not initialized");
-        if (!has_rearrange_3d_pipeline())
+        if (!has(PipelineId::rearrange_3d))
             NN_FAIL("rearrange_3d pipeline not available");
-        if (f16_io && !has_rearrange_3d_f16_pipeline())
+        if (f16_io && !has(PipelineId::rearrange_3d_f16))
             NN_FAIL("rearrange_3d_gpu: f16 pipeline 不可用（设备无16位存储）");
-        auto& pipeline = f16_io ? rearrange_3d_f16_pipeline_
-                                : rearrange_3d_pipeline_;
+        const auto& pipeline = f16_io ? pipelines_.get(PipelineId::rearrange_3d_f16)
+                                : pipelines_.get(PipelineId::rearrange_3d);
 
         const uint32_t total = M * B * N;
         if (total != input.rows() * input.cols())
@@ -1656,9 +1656,9 @@
     {
         if (!initialized_)
             NN_FAIL("GPU backend not initialized");
-        if (!has_cast_pipeline())
+        if (!has(PipelineId::cast))
             NN_FAIL("cast_gpu: cast pipeline not available");
-        auto ds_r = alloc_desc_set(cast_pipeline_.descriptor_layout());
+        auto ds_r = alloc_desc_set(pipelines_.get(PipelineId::cast).descriptor_layout());
         NN_TRY_CHECK(ds_r);
         VkDescriptorSet desc_set = *ds_r;
 
@@ -1693,15 +1693,15 @@
         std::vector<VkBuffer> in_bufs{src.impl()};
         record_input_barriers(cmd, in_bufs);
 
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cast_pipeline_.handle());
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelines_.get(PipelineId::cast).handle());
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-            cast_pipeline_.pipeline_layout(), 0, 1, &desc_set, 0, nullptr);
+            pipelines_.get(PipelineId::cast).pipeline_layout(), 0, 1, &desc_set, 0, nullptr);
 
         struct Push { std::uint32_t count; std::uint32_t kind; };
         Push push{static_cast<std::uint32_t>(count), kind};
         std::vector<std::uint8_t> pc(sizeof(push));
         std::memcpy(pc.data(), &push, sizeof(push));
-        vkCmdPushConstants(cmd, cast_pipeline_.pipeline_layout(),
+        vkCmdPushConstants(cmd, pipelines_.get(PipelineId::cast).pipeline_layout(),
             VK_SHADER_STAGE_COMPUTE_BIT, 0,
             static_cast<uint32_t>(pc.size()), pc.data());
 
@@ -1726,9 +1726,9 @@
     {
         if (!initialized_)
             NN_FAIL("GPU backend not initialized");
-        if (!has_trit_pack_pipeline())
+        if (!has(PipelineId::trit_pack))
             NN_FAIL("trit_pack_gpu: trit_pack pipeline not available");
-        auto ds_r = alloc_desc_set(trit_pack_pipeline_.descriptor_layout());
+        auto ds_r = alloc_desc_set(pipelines_.get(PipelineId::trit_pack).descriptor_layout());
         NN_TRY_CHECK(ds_r);
         VkDescriptorSet desc_set = *ds_r;
 
@@ -1764,15 +1764,15 @@
         std::vector<VkBuffer> in_bufs{w.impl(), tau.impl()};
         record_input_barriers(cmd, in_bufs);
 
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, trit_pack_pipeline_.handle());
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelines_.get(PipelineId::trit_pack).handle());
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-            trit_pack_pipeline_.pipeline_layout(), 0, 1, &desc_set, 0, nullptr);
+            pipelines_.get(PipelineId::trit_pack).pipeline_layout(), 0, 1, &desc_set, 0, nullptr);
 
         struct Push { std::uint32_t rows; std::uint32_t k; std::uint32_t wpr; };
         Push push{rows, k, wpr};
         std::vector<std::uint8_t> pc(sizeof(push));
         std::memcpy(pc.data(), &push, sizeof(push));
-        vkCmdPushConstants(cmd, trit_pack_pipeline_.pipeline_layout(),
+        vkCmdPushConstants(cmd, pipelines_.get(PipelineId::trit_pack).pipeline_layout(),
             VK_SHADER_STAGE_COMPUTE_BIT, 0,
             static_cast<uint32_t>(pc.size()), pc.data());
 
@@ -1817,22 +1817,22 @@
         const std::uint32_t qgemv_rows =
             qgemv_layout_ok ? (QGEMV_THREADS / sgs) * QGEMV_RPS : 0u;
         const bool use_gemv = (transA == 0u) && N <= QGEMV_MAX_N && qgemv_layout_ok
-                              && has_matmul_q_gemv_pipeline()
-                              && (!f16 || has_matmul_q_gemv_f16_pipeline());
+                              && has(PipelineId::matmul_q_gemv)
+                              && (!f16 || has(PipelineId::matmul_q_gemv_f16));
         const VulkanPipeline* pipe = nullptr;
         if (use_gemv)
-            pipe = f16 ? &matmul_q_gemv_f16_pipeline_ : &matmul_q_gemv_pipeline_;
+            pipe = f16 ? &pipelines_.get(PipelineId::matmul_q_gemv_f16) : &pipelines_.get(PipelineId::matmul_q_gemv);
         else if (f16)
         {
-            if (!has_matmul_q_f16_pipeline())
+            if (!has(PipelineId::matmul_q_f16))
                 NN_FAIL("matmul_q_gpu: f16 pipeline not available（设备缺 16 位存储？）");
-            pipe = &matmul_q_f16_pipeline_;
+            pipe = &pipelines_.get(PipelineId::matmul_q_f16);
         }
         else
         {
-            if (!has_matmul_q_pipeline())
+            if (!has(PipelineId::matmul_q))
                 NN_FAIL("matmul_q_gpu: matmul_q pipeline not available");
-            pipe = &matmul_q_pipeline_;
+            pipe = &pipelines_.get(PipelineId::matmul_q);
         }
         auto ds_r = alloc_desc_set(pipe->descriptor_layout());
         NN_TRY_CHECK(ds_r);
@@ -2089,13 +2089,13 @@
     {
         if (!initialized_)
             NN_FAIL("GPU backend not initialized");
-        if (!has_transpose_pipeline())
+        if (!has(PipelineId::transpose))
             NN_FAIL("transpose pipeline not available");
         // Phase C1 f16 变体：f16_io 请求但设备无 f16 pipeline（能力门控未过）
         // → 显式报错，引擎层回退边界 cast（不静默绑错类型）
-        if (f16_io && !has_transpose_f16_pipeline())
+        if (f16_io && !has(PipelineId::transpose_f16))
             NN_FAIL("transpose_gpu: f16 pipeline 不可用（需16位存储 + shaderFloat16）");
-        auto& pipeline = f16_io ? transpose_f16_pipeline_ : transpose_pipeline_;
+        const auto& pipeline = f16_io ? pipelines_.get(PipelineId::transpose_f16) : pipelines_.get(PipelineId::transpose);
 
         const uint32_t R = static_cast<uint32_t>(A.rows());
         const uint32_t C = static_cast<uint32_t>(A.cols());
@@ -2195,15 +2195,15 @@
     {
         if (!initialized_)
             NN_FAIL("GPU backend not initialized");
-        if (!has_im2col_pipeline())
+        if (!has(PipelineId::im2col))
             NN_FAIL("im2col pipeline not available");
-        if (f16_io && !has_im2col_f16_pipeline())
+        if (f16_io && !has(PipelineId::im2col_f16))
             NN_FAIL("im2col f16 pipeline not available");
         if (C == 0 || H == 0 || W == 0 || k == 0 || stride == 0 || OH == 0 || OW == 0)
             NN_FAIL("im2col_gpu: C/H/W/k/stride/OH/OW must be > 0");
         if (x.rows() != C * H * W)
             NN_FAIL("im2col_gpu: x must be (C*H*W, B)");
-        VulkanPipeline& pipe = f16_io ? im2col_f16_pipeline_ : im2col_pipeline_;
+        const VulkanPipeline& pipe = f16_io ? pipelines_.get(PipelineId::im2col_f16) : pipelines_.get(PipelineId::im2col);
 
         const std::size_t B    = x.cols();
         const std::size_t rows = C * k * k;
@@ -2289,16 +2289,16 @@
     {
         if (!initialized_)
             NN_FAIL("GPU backend not initialized");
-        if (!has_col2im_pipeline())
+        if (!has(PipelineId::col2im))
             NN_FAIL("col2im pipeline not available");
-        if (f16_io && !has_col2im_f16_pipeline())
+        if (f16_io && !has(PipelineId::col2im_f16))
             NN_FAIL("col2im f16 pipeline not available");
         if (C == 0 || H == 0 || W == 0 || k == 0 || stride == 0 || OH == 0 || OW == 0)
             NN_FAIL("col2im_gpu: C/H/W/k/stride/OH/OW must be > 0");
         const std::size_t P = OH * OW;
         if (col.rows() != C * k * k || col.cols() == 0 || col.cols() % P != 0)
             NN_FAIL("col2im_gpu: col must be (C*k*k, B*OH*OW)");
-        VulkanPipeline& pipe = f16_io ? col2im_f16_pipeline_ : col2im_pipeline_;
+        const VulkanPipeline& pipe = f16_io ? pipelines_.get(PipelineId::col2im_f16) : pipelines_.get(PipelineId::col2im);
 
         const std::size_t B    = col.cols() / P;
         const std::size_t rows = C * H * W;
@@ -2380,7 +2380,7 @@
     //   Push Constants (16 bytes): G, R, N, reduce_op
     //   Bindings: In(0), Out(1)；Dispatch: ceil(G*N / 256)
     //   f16_in（Phase C2c）：x 按 half 读、输出恒 f32（CNN 调用 P=F32）；
-    //   pipeline 未创建时硬报错，调用方提前查 has_group_reduce_f16_pipeline
+    //   pipeline 未创建时硬报错，调用方提前查 has(PipelineId::group_reduce_f16)
     //   走引擎内 cast 回退。
     // ══════════════════════════════════════════════════════════════════
     [[nodiscard]] Result<GpuTensor> grouped_reduce_gpu(
@@ -2389,9 +2389,9 @@
     {
         if (!initialized_)
             NN_FAIL("GPU backend not initialized");
-        if (!has_group_reduce_pipeline())
+        if (!has(PipelineId::group_reduce))
             NN_FAIL("group_reduce pipeline not available");
-        if (f16_in && !has_group_reduce_f16_pipeline())
+        if (f16_in && !has(PipelineId::group_reduce_f16))
             NN_FAIL("group_reduce f16 pipeline not available");
         if (G == 0 || R == 0)
             NN_FAIL("grouped_reduce_gpu: G/R must be > 0");
@@ -2400,8 +2400,8 @@
         const std::size_t N = x.cols();
         if (N == 0)
             NN_FAIL("grouped_reduce_gpu: N must be > 0");
-        VulkanPipeline& pipe = f16_in ? group_reduce_f16_pipeline_
-                                       : group_reduce_pipeline_;
+        const VulkanPipeline& pipe = f16_in ? pipelines_.get(PipelineId::group_reduce_f16)
+                                       : pipelines_.get(PipelineId::group_reduce);
 
         auto out_res = GpuTensor::create_empty(G, N, *this);
         NN_TRY_CHECK(out_res);
@@ -2474,13 +2474,13 @@
     {
         if (!initialized_)
             NN_FAIL("GPU backend not initialized");
-        if (!has_gather_pipeline())
+        if (!has(PipelineId::gather))
             NN_FAIL("gather pipeline not available");
         // Phase C1 f16 变体：table/out f16；**indices 恒 f32**（行号整数值
         // 精度要求，shader 内 float indices 槽不变）
-        if (f16_io && !has_gather_f16_pipeline())
+        if (f16_io && !has(PipelineId::gather_f16))
             NN_FAIL("gather_gpu: f16 pipeline 不可用（设备无16位存储）");
-        auto& pipeline = f16_io ? gather_f16_pipeline_ : gather_pipeline_;
+        const auto& pipeline = f16_io ? pipelines_.get(PipelineId::gather_f16) : pipelines_.get(PipelineId::gather);
 
         const uint32_t vocab = static_cast<uint32_t>(table.rows());
         const uint32_t D = static_cast<uint32_t>(table.cols());
@@ -2574,7 +2574,7 @@
     // f16_io（Phase C2b）：dst/grad 为 f16 存储——f16 shader 里 dst 每 uint
     // word 打包 2 个 half（CAS 覆盖整 word）、grad half 直读；indices 恒
     // float（行号 >2048 禁 f16）。pipeline 未创建时硬报错，调用方提前查
-    // has_scatter_add_f16_pipeline 走引擎内 cast 回退。
+    // has(PipelineId::scatter_add_f16) 走引擎内 cast 回退。
     // ══════════════════════════════════════════════════════════════════
     [[nodiscard]] Result<void> scatter_add_gpu(
         GpuTensor& dst, const GpuTensor& indices, const GpuTensor& grad,
@@ -2582,11 +2582,11 @@
     {
         if (!initialized_)
             NN_FAIL("GPU backend not initialized");
-        if (!has_scatter_add_pipeline())
+        if (!has(PipelineId::scatter_add))
             NN_FAIL("scatter_add pipeline not available");
-        VulkanPipeline& pipe = f16_io ? scatter_add_f16_pipeline_
-                                       : scatter_add_pipeline_;
-        if (f16_io && !has_scatter_add_f16_pipeline())
+        const VulkanPipeline& pipe = f16_io ? pipelines_.get(PipelineId::scatter_add_f16)
+                                       : pipelines_.get(PipelineId::scatter_add);
+        if (f16_io && !has(PipelineId::scatter_add_f16))
             NN_FAIL("scatter_add f16 pipeline not available");
         const uint32_t vocab = static_cast<uint32_t>(dst.rows());
         const uint32_t D = static_cast<uint32_t>(dst.cols());

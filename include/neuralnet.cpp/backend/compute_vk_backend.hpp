@@ -56,6 +56,7 @@
 #include "../expr_spec.hpp"
 #include "compute_memory_pool.hpp"
 #include "compute_gpu_storage.hpp"
+#include "compute_vk_pipeline_catalog.hpp"
 #include "compute_staging_ring.hpp"
 
 // SPIR-V 嵌入头文件（由 CMake 生成）
@@ -468,66 +469,14 @@ class GpuBackend
 {
 private:
     VulkanDevice device_;
-    VulkanPipeline matmul_pipeline_;
-    VulkanPipeline matmul_tiled_pipeline_;
-    VulkanPipeline matmul_gemv_pipeline_;
-    VulkanPipeline matmul_gemv_f16_pipeline_;   // Phase C2e 小 N GEMV f16
-    VulkanPipeline batched_matmul_pipeline_;
-    // 精度变体（f16 存储；设备无 storageBuffer16BitAccess 时保持空句柄）
-    VulkanPipeline batched_matmul_f16_pipeline_;
-    VulkanPipeline matmul_tiled_f16_pipeline_;
-    // P0 细 tile 变体（16×16 输出块，wgrad 网格饥饿；f32 only，恒创建）
-    VulkanPipeline matmul_tiled_fine_pipeline_;
-    VulkanPipeline elementwise_v2_pipeline_;
-    VulkanPipeline elementwise_v2_f16_pipeline_;   // Phase C1b f16 存储变体
-    VulkanPipeline reduce_pipeline_;
-    VulkanPipeline reduce_f16_pipeline_;           // Phase C2 f16 归约变体
+    // ── 原语 pipeline 目录 ──────────────────────────────────────────────
+    // 44 个原语/变体的"身份 + 布局 + 设备能力要求"是 pipeline_specs() 的
+    // 一行表格；这里只保留目录句柄。缺失的变体 = 空句柄 = 上层回退。
+    PipelineCatalog pipelines_;
     // 列归约两段式 partials scratch（成员复用：batch 录制期被 cmd 引用，
     // 局部销毁会踩铁律 6；形状变化时旧缓冲走 pending_destroys_ 延迟销毁，
     // 对在飞录制安全。同一 batch 内多次使用由 cmd 内屏障串行化）
     std::optional<GpuTensor> reduce_partial_;
-    VulkanPipeline rearrange_3d_pipeline_;
-    VulkanPipeline transpose_pipeline_;
-    VulkanPipeline gather_pipeline_;
-    // Phase C1 op-level f16 变体（纯位拷贝搬运；设备能力不足时保持空句柄
-    // → 引擎回退边界 cast）。门控分层：gather/rearrange 只需 16 位存储；
-    // transpose 的 shared float16_t 需 SPIR-V Float16 → 还需 shaderFloat16。
-    VulkanPipeline rearrange_3d_f16_pipeline_;
-    VulkanPipeline transpose_f16_pipeline_;
-    VulkanPipeline gather_f16_pipeline_;
-    VulkanPipeline scatter_add_pipeline_;
-    VulkanPipeline scatter_add_f16_pipeline_;   // Phase C2b f16 打包 half CAS
-    // 卷积/池化窗口展开（纯数据搬运；Conv2D/MaxPool2D 的 im2col/col2im）
-    VulkanPipeline im2col_pipeline_;
-    VulkanPipeline col2im_pipeline_;
-    VulkanPipeline im2col_f16_pipeline_;   // Phase C2d f16 窗口变体
-    VulkanPipeline col2im_f16_pipeline_;
-    // 分组归约（沿行方向按固定长度 R 分组求和/求最大）
-    VulkanPipeline group_reduce_pipeline_;
-    VulkanPipeline group_reduce_f16_pipeline_;   // Phase C2c f16 输入变体
-    // RLA 扫描原语（手写原语，不进 AOT 融合注册表；铁律 3：shader 不含算法）
-    VulkanPipeline scan_prefix_outer_pipeline_;
-    VulkanPipeline scan_prefix_outer_d32_pipeline_;   // P4-2b 窄共享（dk ≤ 32）
-    VulkanPipeline scan_suffix_outer_pipeline_;
-    VulkanPipeline scan_prefix_outer_gen_pipeline_;  // 通用 d_k（>64）前缀扫描
-    VulkanPipeline scan_suffix_outer_gen_pipeline_;  // 通用 d_k（>64）后缀扫描
-    VulkanPipeline outer_col_pipeline_;
-    // Phase C2f f16 扫描变体（输入输出均 half；St scratch 仍 f32）
-    VulkanPipeline scan_prefix_outer_f16_pipeline_;
-    VulkanPipeline scan_prefix_outer_d32_f16_pipeline_;   // P4-2b 窄共享 f16
-    VulkanPipeline scan_suffix_outer_f16_pipeline_;
-    VulkanPipeline scan_prefix_outer_gen_f16_pipeline_;
-    VulkanPipeline scan_suffix_outer_gen_f16_pipeline_;
-    VulkanPipeline outer_col_f16_pipeline_;
-    // 通用精度转换原语（engine.cast 的 GPU 实现；f16↔f32，kind 分派精度对）
-    VulkanPipeline cast_pipeline_;
-    // 三值打包原语（P2/F3）：打包字容器 + 量化 GEMM（f32 / f16 存储两版）
-    VulkanPipeline trit_pack_pipeline_;
-    VulkanPipeline matmul_q_pipeline_;
-    VulkanPipeline matmul_q_f16_pipeline_;
-    // 窄 N（N ≤ 8）打包 GEMV（解码主路径；同 matmul_gemv 的 subgroup 归约）
-    VulkanPipeline matmul_q_gemv_pipeline_;
-    VulkanPipeline matmul_q_gemv_f16_pipeline_;
     // AOT 融合 shader pipelines（key = expr_spec_key → pipeline；由构建期
     // fused_registry.hpp 注册，运行时按 key 匹配后直接 dispatch）
     std::unordered_map<std::string, VulkanPipeline> fused_pipelines_;
@@ -712,6 +661,9 @@ private:
 
     GpuBackend() = default;
 
+    // ── 原语 pipeline 布局表（单一真源；定义见 compute_vk_pipeline_specs.hpp）
+    [[nodiscard]] static std::span<const PipelineSpec> pipeline_specs();
+
     // ── SPIR-V 字节码 getter（由文件头的单一注册表展开；RV-08）────────────
     // 每个 shader 的字节码访问函数在文件头绑定为 NN_SPV_FN_<name>（有嵌入头 = 真实
     // 函数；纯 CPU 构建 = 占位空向量）；此处由列表统一展开为 get_<name>_spirv()。
@@ -843,6 +795,9 @@ inline GpuBuffer::~GpuBuffer()
 }
 
 } // namespace nn
+
+// 原语 pipeline 布局表（GpuBackend::pipeline_specs 的定义）
+#include "compute_vk_pipeline_specs.hpp"
 
 // GpuTensorT<P> 的 backend 依赖实现（from_matrix / to_matrix / create_*）：
 // 放在 GpuBackend 与 GpuBuffer 析构之后——存储层（compute_gpu_storage.hpp）
