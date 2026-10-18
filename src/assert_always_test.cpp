@@ -192,14 +192,14 @@ int main(int argc, char* argv[])
     check_crash_case("--crash-matrix-at", kTagFatal,
                      "MatrixT::at index out of range",
                      "MatrixT::at 越界 → 非零退出");
-    check_crash_case("--crash-tensor-engine", kTagAssert,
-                     "tensor is not bound to any engine",
+    check_crash_case("--crash-tensor-engine", kTagFatal,
+                     "未绑定引擎（先调 init(engine)）",
                      "未绑定 Tensor::engine() → 非零退出");
     check_crash_case("--crash-empty-logits", kTagAssert,
                      "sample_next_token_: empty logits",
                      "sample_next_token_ 空 logits → 非零退出");
     check_crash_case("--crash-layer-uninit", kTagFatal,
-                     "engine 未绑定",
+                     "未绑定引擎（先调 init(engine)）",
                      "未 init 的层 forward → 非零退出");
 
     std::remove(kLogPath);

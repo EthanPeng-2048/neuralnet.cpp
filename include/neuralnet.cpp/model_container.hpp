@@ -3,7 +3,7 @@
 // ── model_container.hpp — 引擎化模型容器 ───────────────────────────────────
 //
 // 架构铁律：
-//   1. Model 持有 observer_ptr<ComputeEngine>（非拥有），所有 forward/backward 委托给
+//   1. Model 持有 EngineLease（非拥有、可失效），所有 forward/backward 委托给
 //      Layer::forward(Tensor) / Layer::backward(Tensor)（M6 段 C 起 engine 由 init 绑定，不再作形参）。
 //   2. Model 不包含任何 GPU-resident 中间结果缓存或 forward_gpu/backward_gpu
 //      路径 —— 设备分发完全由 ComputeEngine 实现负责。
@@ -20,10 +20,11 @@
 #include <cstddef>
 #include <memory>
 #include <optional>
+#include <source_location>
 #include <vector>
 
 #include "core_assert.hpp"
-#include "core_observer_ptr.hpp"
+#include "core_engine_lease.hpp"
 #include "compute_layer.hpp"
 #include "model_spec.hpp"
 
@@ -33,7 +34,7 @@ namespace nn
 class Model
 {
 private:
-    observer_ptr<ComputeEngine> engine_;
+    EngineLease engine_;
     std::vector<std::unique_ptr<Layer>> layers_;
     // 可选架构规格：由 build_*_from_spec 工厂在构建时设置，供 load_model
     // 校验文件头部与模型架构是否一致。为空表示未记录（跳过校验，向后兼容）。
@@ -47,7 +48,7 @@ private:
 
 public:
     Model() = default;
-    explicit Model(ComputeEngine& engine) : engine_(engine) {}
+    explicit Model(ComputeEngine& engine) : engine_(engine.lease()) {}
 
     // 不可拷贝（unique_ptr 语义），可移动
     Model(const Model&) = delete;
@@ -59,11 +60,11 @@ public:
     // D7（15 §4.7，M6 裁定=删除死码）：原 `set_engine(ComputeEngine&)` 全仓
     // 零调用方，且"绑定后换引擎"与"层已在 add() 时 init 绑定"冲突——绑定只经
     // 构造函数 `Model(ComputeEngine&)`（或移动后沿用既有绑定）。
-    [[nodiscard]] ComputeEngine& engine() const noexcept
+    [[nodiscard]] ComputeEngine& engine(
+        std::source_location loc = std::source_location::current()) const
     {
-        // RV-01：失败后紧跟 `return *engine_` → Release 下必须终止（空解引用 = UB）
-        NN_ASSERT_ALWAYS(engine_, "Model: engine not bound");
-        return *engine_;
+        // 未绑定 / 引擎已销毁 → 终止并打印调用点（不会解引用悬垂指针）。
+        return engine_.require("Model", loc);
     }
 
     // ── 构建网络（通用模板接口） ────────────────────────────────────────
@@ -199,8 +200,8 @@ public:
     {
         if (layers_.empty())
             NN_FAIL("Model::forward: no layers");
-        if (engine_ == nullptr)
-            NN_FAIL("Model::forward: engine not bound");
+        if (!engine_.alive())
+            NN_FAIL("Model::forward: engine 未绑定或已销毁（engine 必须比 Model 活得久）");
         Tensor x = input;
         for (std::size_t li = 0; li < layers_.size(); ++li)
         {
@@ -217,8 +218,8 @@ public:
     {
         if (layers_.empty())
             NN_FAIL("Model::backward: no layers");
-        if (engine_ == nullptr)
-            NN_FAIL("Model::backward: engine not bound");
+        if (!engine_.alive())
+            NN_FAIL("Model::backward: engine 未绑定或已销毁（engine 必须比 Model 活得久）");
         Tensor g = grad_output;
         for (std::size_t i = layers_.size(); i-- > 0;)
         {

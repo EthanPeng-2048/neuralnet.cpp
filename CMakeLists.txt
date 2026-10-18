@@ -619,6 +619,12 @@ if(NN_BUILD_APPS OR NN_ENABLE_TESTS)
     nn_add_executable(assert_always_test src/assert_always_test.cpp)
     list(APPEND NN_TEST_TARGETS assert_always_test)
 
+    # ── 引擎借用生命周期（EngineLease / Layer 状态机 / 引擎先析构路径）──
+    # 覆盖：令牌三态、init 失败回滚、跨引擎重绑拒绝、Layer/Model/Tensor 在
+    # 引擎销毁后的 fail-fast（子进程断言）与正常顺序回归。
+    nn_add_executable(layer_lifetime_test src/layer_lifetime_test.cpp)
+    list(APPEND NN_TEST_TARGETS layer_lifetime_test)
+
     # ── F1：危险精度组合启动期告警（仅警告，不拒绝；docs/todo/24 §2.3）────
     # [1][2] 头文件函数组合矩阵（含 all=f16）单测；[3] 子进程跑 text_train/
     # mnist_train，捕获 stderr 断言告警出现 + 退出码不变；二进制缺失 → 77 = SKIP

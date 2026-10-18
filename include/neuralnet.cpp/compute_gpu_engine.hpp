@@ -95,7 +95,7 @@ public:
         if (owner)
             NN_FAIL("begin_expr: 嵌套录制（已有未结束的 begin_expr）");
         owner = std::make_unique<ExprGraph>();
-        owner->owner = this;
+        owner->owner = lease();
         return {};
     }
 

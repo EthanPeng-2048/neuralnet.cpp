@@ -34,6 +34,7 @@
 #include <ranges>
 
 #include "core_config.hpp"   // NN_PROBES_ENABLED（探针编译门）
+#include "core_engine_lease.hpp"
 #include "core_env.hpp"      // RV-09：环境变量读取唯一入口
 
 namespace nn::dsl
@@ -1956,7 +1957,9 @@ template <typename E>
 template <typename E>
 struct ExprBlock
 {
-    ComputeEngine* eng;
+    // 非拥有、可失效的借用（与 Layer/Model/Tensor 同一套生命周期契约）。
+    // ExprBlock 是作用域内值对象；end_expr 在引擎已销毁时给出明确错误。
+    EngineLease    eng;
     std::size_t    rows, cols;
     E              expr;
 };
@@ -1964,10 +1967,10 @@ struct ExprBlock
 template <typename E>
 [[nodiscard]] ExprBlock<E> start_expr(ComputeEngine& eng, std::size_t rows,
                                       std::size_t cols, const E& e)
-{ return {&eng, rows, cols, e}; }
+{ return {eng.lease(), rows, cols, e}; }
 
 template <typename E>
 [[nodiscard]] Result<Tensor> end_expr(const ExprBlock<E>& b)
-{ return compute(*b.eng, b.expr, b.rows, b.cols); }
+{ return compute(b.eng.require("dsl::end_expr"), b.expr, b.rows, b.cols); }
 
 } // namespace nn::dsl

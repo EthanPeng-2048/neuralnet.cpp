@@ -42,6 +42,7 @@
 #include <vector>
 
 #include "compute_tensor.hpp"
+#include "core_engine_lease.hpp"
 #include "precision.hpp"
 #include "expr_spec.hpp"
 #include "expr_opt.hpp"
@@ -93,10 +94,11 @@ struct ExprGraph
     // 节点下标 → 本图分配的唯一占位标记（调用方 stamp 到占位 Tensor；
     // 与 node_by_tag 同源，杜绝跨图撞车——见 next_virtual_tag）
     std::vector<std::uint64_t> tag_of_node;
-    // 录制发起引擎（非拥有观察者；恢复时新增）：录制段内的表达式必须经
+    // 录制发起引擎（非拥有、可失效的 EngineLease）：录制段内的表达式必须经
     // **同一**引擎求值——占位 buffer 是该引擎的存储，混引擎消费会静默读到
-    // 未写入数据。NVI 录制拦截据此做跨引擎 fail-fast。
-    ComputeEngine* owner = nullptr;
+    // 未写入数据。NVI 录制拦截据此做跨引擎 fail-fast；引擎先销毁时
+    // expired() 可判定（旧裸指针会悬垂）。
+    EngineLease owner;
 
     // 录制：把一个表达式加入图，返回节点下标。
     // inputs 中带 virtual_tag 的占位 Tensor 会被识别为前序节点输出（依赖边）。

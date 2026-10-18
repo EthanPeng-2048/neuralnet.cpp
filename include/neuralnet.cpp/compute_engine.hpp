@@ -58,6 +58,7 @@
 #include "core_config.hpp"
 #include "core_errors.hpp"
 #include "core_env.hpp"       // RV-09：环境变量读取唯一入口
+#include "core_engine_lease.hpp"
 #include "core_profile.hpp"   // 训练 step 剖析（NN_PROFILE=1 门控；默认零开销）
 #include "compute_tensor.hpp"
 #include "expr_opt.hpp"   // canonicalize_expr_spec（trace 归因用，与 gen_fused 同源 key）
@@ -233,7 +234,21 @@ struct EngineInfo
 class ComputeEngine
 {
 public:
-    virtual ~ComputeEngine() = default;
+    // ── 生命周期令牌（core_engine_lease.hpp）──────────────────────────────
+    // 令牌与引擎对象分开分配：引擎析构时只把令牌置为 dead，借用方
+    // （Layer / Model / Tensor / ExprGraph）据此 fail-fast，而不是解引用悬垂
+    // 指针。引擎不可拷贝：复制会让两个对象共享同一身份，破坏"一个引擎一个令牌"。
+    ComputeEngine() : liveness_(detail::engine_token_pool().create(this)) {}
+    virtual ~ComputeEngine() { liveness_->retire(); }
+
+    ComputeEngine(const ComputeEngine&) = delete;
+    ComputeEngine& operator=(const ComputeEngine&) = delete;
+
+    [[nodiscard]] EngineLease lease() const noexcept { return EngineLease(liveness_); }
+    [[nodiscard]] bool alive() const noexcept
+    {
+        return liveness_ != nullptr && liveness_->alive();
+    }
 
     // ── 设备查询 ──────────────────────────────────────────────────────────
     [[nodiscard]] virtual Device device() const noexcept = 0;
@@ -458,7 +473,10 @@ public:
         // 原样返回共享句柄。optimizer 每 step 会对每个 DSL leaf 反复走
         // 此入口（profile 约 3.4 万次/20 steps）；在这里提前返回可跳过
         // bind_check_ 与 virtual dispatch，同时保留跨引擎/跨精度的完整路径。
-        if (src.valid() && src.bound() && &src.engine() == this && src.precision() == P)
+        // 引擎已销毁时 engine_.get() 为 nullptr → 走完整 bind_check_，不会
+        // 形成悬垂引用（旧写法 &src.engine() 会在引擎死后构造悬垂引用）。
+        if (src.valid() && src.bound() && src.engine_.get() == this &&
+            src.precision() == P)
             return src;
         NN_TRY(ec, bind_check_({&src}));
         if (!src.valid())
@@ -1682,20 +1700,22 @@ protected:
 
     // ══════════════════════════════════════════════════════════════════════
     // P1 出生 stamp（docs/history/history.md「15 号归档」 §3.1）：未绑定的产物补上 this；
-    // 已绑定 → 原样（cast 同精度返回 src 等传播场景沿用 src 绑定，不改写）。
+    // 已绑定且引擎仍存活 → 原样（cast 同精度返回 src 等传播场景沿用 src 绑定，
+    // 不改写）。绑定存在但引擎已销毁 → 视同未绑定，改 stamp 到当前引擎：
+    // 陈旧的死绑定没有任何身份价值，留着只会让后续 import 反复走慢路径。
     // 只 stamp 有效张量：失败路径返回的 Tensor() 空槽保持不绑定
     // （§3.1：库内非绑定态仅剩空槽；库外直构不受本函数管辖）。
     // ══════════════════════════════════════════════════════════════════════
     [[nodiscard]] Tensor stamp_(Tensor t)
     {
-        if (t.valid() && !t.engine_)
-            t.engine_ = make_observer(*this);
+        if (t.valid() && !t.engine_.alive())
+            t.engine_ = lease();
         return t;
     }
     [[nodiscard]] Result<Tensor> stamp_(Result<Tensor>&& r)
     {
-        if (r && r->valid() && !r->engine_)
-            r->engine_ = make_observer(*this);
+        if (r && r->valid() && !r->engine_.alive())
+            r->engine_ = lease();
         return std::move(r);
     }
 
@@ -1710,6 +1730,21 @@ protected:
     }
 
     // ── IR-C 录制拦截──────────────────────────────────
+    // 录制图归属校验（唯一入口）：同一录制段内的表达式必须经**同一**引擎求值。
+    // 用 EngineLease 判定而不是裸指针比较：引擎先销毁时能给出明确错误，而不是
+    // 在 g.owner 上形成悬垂引用。
+    [[nodiscard]] Result<void> check_graph_owner_(const ExprGraph& g,
+                                                  const char* what) const
+    {
+        if (g.owner.expired())
+            NN_FAIL(std::string(what) +
+                    ": 录制图所属引擎已销毁（begin_expr/end_expr 必须与引擎同生命周期）");
+        if (g.owner.bound() && g.owner.get() != this)
+            NN_FAIL(std::string(what) +
+                    ": 录制段内跨引擎求值（段内表达式必须经开启录制的引擎）");
+        return {};
+    }
+
     // begin_expr/end_expr 录制段内，eval_expr/eval_expr_reduce 不求值：表达式
     // 入图（add_node 建依赖边），返回带 virtual_tag 的占位 Tensor（真实存储、
     // 出生即绑定——end_expr 的复合 kernel 经 output_override 直接写回该存储，
@@ -1718,8 +1753,7 @@ protected:
         ExprGraph& g, const ExprSpec& spec, std::span<const Tensor> inputs,
         std::size_t rows, std::size_t cols, bool vector_out, Precision P)
     {
-        if (g.owner != nullptr && g.owner != this)
-            NN_FAIL("eval_expr: 录制段内跨引擎求值（段内表达式必须经开启录制的引擎）");
+        NN_TRY_CHECK(check_graph_owner_(g, "eval_expr"));
         const int node = g.add_node(spec, inputs, rows, cols, vector_out, P);
         std::size_t orows = rows, ocols = cols;
         if (vector_out)
@@ -1741,8 +1775,7 @@ protected:
         ExprGraph& g, const ExprSpec& spec, std::span<const Tensor> inputs,
         std::size_t rows, std::size_t cols, Tensor& out)
     {
-        if (g.owner != nullptr && g.owner != this)
-            NN_FAIL("eval_expr_into: 录制段内跨引擎求值（段内表达式必须经开启录制的引擎）");
+        NN_TRY_CHECK(check_graph_owner_(g, "eval_expr_into"));
         const int node = g.add_node(spec, inputs, rows, cols,
                                     /*vector_out=*/false, out.precision(),
                                     // RV-03：记录写目标存储 —— 同目标的多次写
@@ -1836,8 +1869,10 @@ protected:
             ref = t;
             return {};
         }
-        if (t->engine_.get() != ref->engine_.get())
-            NN_FAIL(bind_error_("mixed engines (both bound, pointers differ)", ref, t, loc));
+        // 身份比较用令牌地址（引擎死后仍稳定、永不跨引擎相等）；不用
+        // get()（引擎已销毁时它返回 nullptr，两个不同引擎会误判相等）。
+        if (t->engine_.identity() != ref->engine_.identity())
+            NN_FAIL(bind_error_("mixed engines (both bound, identities differ)", ref, t, loc));
         return {};
     }
 
@@ -2123,6 +2158,10 @@ protected:
 
     // InitSpec 分布创建序号（M2）：每个引擎独立从 0 起，host 填数时混流用。
     std::uint64_t init_seq_ = 0;
+
+private:
+    // 存活令牌（见文件头的生命周期契约）；不随引擎拷贝/移动。
+    EngineLiveness* liveness_ = nullptr;
 };
 
 namespace detail {

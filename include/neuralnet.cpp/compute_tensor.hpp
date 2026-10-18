@@ -20,20 +20,21 @@
 #include <cstdio>
 #include <functional>
 #include <memory>
+#include <source_location>
 #include <string>
 #include <variant>
 
 #include "core_config.hpp"
 #include "core_errors.hpp"
-#include "core_observer_ptr.hpp"
+#include "core_engine_lease.hpp"
 #include "precision.hpp"
 #include "algebra_matrix.hpp"
 
 namespace nn
 {
 
-// ComputeEngine 前置声明：Tensor 持有非拥有绑定（observer_ptr，P1 出生绑定，
-// docs/history/history.md「15 号归档」 §3.1），不能反向 include。
+// ComputeEngine 前置声明：Tensor 持有非拥有、可失效的绑定（EngineLease，P1
+// 出生绑定，docs/history/history.md「15 号归档」 §3.1），不能反向 include。
 class ComputeEngine;
 class CpuEngine;
 class GpuEngine;
@@ -72,12 +73,14 @@ private:
     std::size_t cols_ = 0;
 
     // ── 出生绑定（P1，docs/history/history.md「15 号归档」 §3.1）──────────────────────────
-    // 创建本张量的引擎（非拥有观察者；+8B）。未绑定 = nullptr（非绑定态仅剩
+    // 创建本张量的引擎（非拥有、可失效的 EngineLease；与旧 observer_ptr 同为 8B）。
+    // 未绑定 = 空 lease（非绑定态仅剩
     // 库外直构：Tensor{} 空槽、src/ 测试的 Tensor::from_matrix/from_host 之前
     // 的宿主直构）。库内产物出生即绑定——由引擎工厂/算子出口 stamp 或
-    // ComputeEngine::adopt 内部通道补绑定。engine 生命周期必须长于其创建的
-    // Tensor（一期不加析构探测，13 §10.3 第 3 条）。
-    observer_ptr<ComputeEngine> engine_ = nullptr;
+    // ComputeEngine::adopt 内部通道补绑定。
+    // **契约**：engine 必须长于 Tensor；违反时 engine_alive() 变 false，
+    // engine() 在访问点终止并打印调用点（不会解引用悬垂指针）。
+    EngineLease engine_;
 
     // ── IR-C 录制占位标记（图节点输出识别，expr_graph.hpp）──────────────
     // begin_expr/end_expr 录制期内，eval 出口给占位 Tensor 打上节点标号
@@ -265,13 +268,16 @@ public:
     // ── 出生绑定（P1，§3.1）──────────────────────────────────────────────
     // bound()：是否已 stamp 到某个引擎（未绑定输入在 P1 检查中按库外豁免放行，
     //   仅 NN_BIND_DEBUG=1 时报错——见 ComputeEngine::bind_check_）。
-    // engine()：取绑定引擎；未绑定 → NN_ASSERT_ALWAYS 硬失败（勿在未绑定张量上调用）。
-    // Release 也必须终止：失败后紧跟 `return *engine_` 解引用空指针 = UB（RV-01）。
-    [[nodiscard]] bool bound() const noexcept { return static_cast<bool>(engine_); }
-    [[nodiscard]] ComputeEngine& engine() const
+    // engine_alive()：绑定存在且引擎仍存活。
+    // engine()：取绑定引擎；未绑定 / 引擎已销毁 → 在访问点终止并打印调用点
+    //   （EngineLease::require，不会解引用悬垂指针）。
+    [[nodiscard]] bool bound() const noexcept { return engine_.bound(); }
+    // 绑定过且引擎仍存活（Tensor 跨引擎复用/导入前的判据）
+    [[nodiscard]] bool engine_alive() const noexcept { return engine_.alive(); }
+    [[nodiscard]] ComputeEngine& engine(
+        std::source_location loc = std::source_location::current()) const
     {
-        NN_ASSERT_ALWAYS(engine_, "Tensor::engine(): tensor is not bound to any engine");
-        return *engine_;
+        return engine_.require("Tensor", loc);
     }
 
     // ── valid：存储匹配 precision_ 且非空 ────────────────────────────────
