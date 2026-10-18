@@ -76,7 +76,7 @@ GPT `d_model=64 / heads=4 / layers=2 / d_ff=128 / seq_len=128 / batch=8`，850M 
 |---|---|
 | Linux Release + Vulkan（850M） | **55/55 通过**（含 `scan_bitwise_test` / `rapt_test_f16`） |
 | Linux Debug + Vulkan | 54/54（`scan_bitwise_test` 因 Debug 非优化构建按 77 skip；`rapt_test_f16` 按既有 C11 口径 `-E` 排除） |
-| Windows clang 23.1 + MSVC STL Release（40HX） | **55/55 通过**（`scan_bitwise_test` 按 Windows 口径 skip） |
+| Windows clang 23.1 + MSVC STL Release（40HX） | **55/55 通过**；`NN_BIND_DEBUG=1` 同为 **55/55**（`scan_bitwise_test` 按 Windows 口径 skip） |
 | Windows cl.exe 19.51 Debug CPU-only | **52/52 通过**（GPU 用例 77 skip；`rapt_test_f16` 按 CI 口径排除） |
 
 ### 4.4 第 4 项：四组「编译器 × 标准库」
