@@ -391,6 +391,13 @@ option(NN_ENABLE_PCH "Precompile nn.hpp once and reuse it across targets" ON)
 function(nn_add_executable name)
     add_executable(${name} ${ARGN})
     target_link_libraries(${name} PRIVATE nn_core)
+    # GPU 块按这份名单统一挂 NN_HAS_VULKAN / Vulkan::Vulkan。名单与创建点
+    # 同源，避免"测试目标只在 NN_ENABLE_TESTS=ON 时才进 GPU 名单"这类漏配：
+    # 编译门是 NN_BUILD_APPS OR NN_ENABLE_TESTS（默认 Release 也会编出全部
+    # 测试程序），漏挂时共享 PCH 里的 NN_HAS_VULKAN 会泄漏进 TU，表现为
+    # 链接期整屏 `undefined reference to vk*`。
+    list(APPEND NN_EXECUTABLE_TARGETS ${name})
+    set(NN_EXECUTABLE_TARGETS ${NN_EXECUTABLE_TARGETS} PARENT_SCOPE)
     if(NN_ENABLE_PCH)
         set(NN_PCH_CANDIDATES ${NN_PCH_CANDIDATES} ${name} PARENT_SCOPE)
     endif()
@@ -419,6 +426,7 @@ option(NN_ENABLE_PROBES "Compile diagnostic probes (hot-path trace hooks + probe
 # 收集实际构建的目标，供 GPU 统一启用（避免引用未定义目标）
 set(NN_APP_TARGETS "")
 set(NN_TEST_TARGETS "")
+set(NN_EXECUTABLE_TARGETS "")   # 所有经 nn_add_executable 创建的可执行目标
 set(NN_BENCH_TARGETS "")   # 性能基准已移除（bench 工具不注册 ctest 且无法在 -Werror 下编译）
 
 # ── 应用 / 探针 / 基准目标（NN_BUILD_APPS，默认 = 是否顶层工程）───────────
@@ -1127,14 +1135,12 @@ if(Vulkan_FOUND)
         target_link_libraries(neuralnet_cpp INTERFACE Vulkan::Vulkan)
         add_dependencies(neuralnet_cpp compile_gpu_shaders)
 
-        # 为所有实际构建的目标启用 Vulkan（含测试目标：它们由上方
-        # NN_BUILD_APPS OR NN_ENABLE_TESTS 门创建）
-        set(NN_GPU_TARGETS ${NN_APP_TARGETS})
-        if(NN_ENABLE_TESTS)
-            list(APPEND NN_GPU_TARGETS ${NN_TEST_TARGETS})
-        endif()
-
-        foreach(TARGET ${NN_GPU_TARGETS})
+        # 为所有实际构建的目标启用 Vulkan。名单来自 nn_add_executable 的
+        # 创建点本身（应用 + 探针 + 测试），**不按 NN_ENABLE_TESTS 拼**：
+        # 测试目标在默认 Release（NN_BUILD_APPS=ON / NN_ENABLE_TESTS=OFF）
+        # 下同样会被编译，漏挂宏/链接会让 gpu_f16_test 等目标在链接期报
+        # `undefined reference to vk*`（详见 nn_add_executable 处注释）。
+        foreach(TARGET ${NN_EXECUTABLE_TARGETS})
             target_compile_definitions(${TARGET} PRIVATE NN_HAS_VULKAN)
             target_include_directories(${TARGET} PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
             target_link_libraries(${TARGET} PRIVATE Vulkan::Vulkan)
