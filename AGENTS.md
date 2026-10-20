@@ -52,11 +52,12 @@ cmake -B build -G Ninja -DNN_ENABLE_TESTS=ON && cmake --build build && ctest --t
 | 表达式 DSL / 融合 IR | `expr_dsl.hpp` / `expr_spec.hpp` / `expr_opt.hpp` / `expr_registry.hpp` / `expr_graph.hpp`（IR-C 图融合 = **现行能力**：`expr_graph.hpp` + `begin_expr/end_expr` + `dsl::start_expr/end_expr` + GPU 图执行；P1 链/P2 写穿多输出，已接入 Adam/AdamW step） |
 | 后端代码生成（IR-D emitter 抽象） | `expr_emitter.hpp`（注册表）+ `expr_glsl_gen.hpp`（GlslEmitter） |
 | 模型容器/规格/序列化 | `model_container.hpp` / `model_spec.hpp` / `model_serialization.hpp` / `model_keyvalue_record.hpp` |
-| 训练生命周期容器（推荐入口） | `training_session.hpp`：`TrainingSession` 同时拥有 `Model` + `Optimizer`（成员声明顺序保证 optimizer 先析构），提供 `zero_grad/clip_grads/step/set_lr/step_count`；Loss/数据集/CLI 仍留调用方（docs/todo/29） |
+| 训练生命周期容器（推荐入口） | `training_session.hpp`：`TrainingSession` 同时拥有 `Model` + `Optimizer` + `TrainState`（成员声明顺序保证 optimizer 先析构），提供 `zero_grad/clip_grads/step/set_lr/step_count/train_state`；Loss/数据集/循环归训练工厂 `text_trainer.hpp`（docs/todo/29） |
+| 训练工厂（数据集 → 样本 → 循环） | `text_trainer.hpp`：`nn::TextTrainer`（`create(session, dataset, TextTrainConfig)` → `fit()`；epoch×step/shuffle/累积/裁剪/lr 调度/非阻塞 loss 回读/测试评估/断点状态装配；`TextTrainerHooks` 装输出/断点/探针）+ `text_train_config.hpp`（`nn::TextTrainConfig` = 训练配方唯一真源）+ `lr_scheduler.hpp`（epoch/step 级 lr） |
 | MNIST / GPT / CNN / RLA / 分词器 模型工厂 | `domain_mnist.hpp` / `domain_gpt.hpp` / `domain_cnn.hpp` / `domain_rla.hpp` / `domain_tokenizer{,_base,_bpe,_charbpe}.hpp` |
-| 训练/推理 CLI 入口 | `src/mnist_train.cpp` 等；公共 CLI 逻辑在 `include/neuralnet.cpp/cli/`（**`cli_help.hpp` = 各 `--help` 的统一排版器**：宽度感知对齐、统一版式；改帮助/加选项前先读其文件头的审计约定）。**`text_train` 已模块化（P1-1）**：`cli/text_train_config.hpp`（`TrainConfig` + `--help` + argv 解析 = CLI 参数解析层，**唯一允许 `std::exit`**）、`cli/text_train_loop.hpp`（epoch × step 训练循环 + 探针）、`cli/text_train_recovery.hpp`（`--resume`）、`cli/text_train_checkpoint.hpp`（`.nnckpt`/`.nnmodel` 产出 + 退出码语义）；`src/text_train.cpp` 只留接线与唯一出口 `main`，三个模块**不得终止进程**（经 `Result` 上抛；门禁 `bench/doc_inventory.ps1` 第 [6] 节） |
+| 训练/推理 CLI 入口 | `src/mnist_train.cpp` 等；公共 CLI 逻辑在 `include/neuralnet.cpp/cli/`（**`cli_help.hpp` = 各 `--help` 的统一排版器**：宽度感知对齐、统一版式；改帮助/加选项前先读其文件头的审计约定）。**`text_train` 已模块化（P1-1）且训练循环已上收库层（P2b）**：`cli/text_train_config.hpp`（`TrainConfig : nn::TextTrainConfig` + `--help` + argv 解析 = CLI 参数解析层，**唯一允许 `std::exit`**）、`cli/text_train_loop.hpp`（只装 CLI hooks：梯度日志/探针/`.nnckpt` 写盘 → 调 `TextTrainer::fit()`）、`cli/text_train_recovery.hpp`（`--resume`）、`cli/text_train_checkpoint.hpp`（`.nnckpt`/`.nnmodel` 产出 + 退出码语义）；`src/text_train.cpp` 只留接线与唯一出口 `main`，三个模块**不得终止进程**（经 `Result` 上抛；门禁 `bench/doc_inventory.ps1` 第 [6] 节） |
 | 推理采样（top-k / top-p / 重复惩罚 / 种子）+ 多轮对话（`--turn`/`--reply-out`/`--system`） | 采样：`compute_layer_base.hpp`（`SamplingConfig` + 共用 `sample_next_token_`，**host 侧采样、不进 AOT 闭合世界**）+ `compute_layer_{gpt,rapt}.hpp` 的 `generate`（配置重载；旧 temperature 重载 = 全默认语义）+ `src/text_infer.cpp` 的 `--top-k`/`--top-p`/`--repeat-penalty`/`--repeat-window`/`--seed`。多轮：prompt 构建唯一真源 = `domain_tokenizer_base.hpp` 的 `Tokenizer::chat_prompt`（`ChatTurn` + 对话标记模板 + 按整轮截断到 `seq_len`）；CLI 侧 `--interactive`（进程内累积）与 `--turn`（历史由调用方自带，一次一问）+ `--reply-out`（回复落盘，GUI 取回复不解析日志）；GUI 侧 `cli_controllers.py` 的 `ChatSession` + `gui.py` 的「GPT 推理」页多轮面板；门禁 `chat_prompt_test` + `bench/gui_cli_audit.py` 第 [7] 节 |
-| 统一数据集（`.nndataset`/`.nnvocab`/KVRecord v2） | `dataset.hpp`（`nn::Dataset` 只读类 + 生成期公共件）/ `dataset_format.hpp`（文件标签/词表 blob/`.nnvocab` 编解码）/ `model_keyvalue_record.hpp`（KVRecord v1+v2）；生成/转换 CLI 在 `src/dataset_gen.cpp` / `src/dataset_convert.cpp`（设计与裁决见 `docs/todo/19-unified-dataset.md`） |
+| 统一数据集（`.nndataset`/`.nnvocab`/KVRecord v2） | `dataset.hpp`（`nn::Dataset` 只读类 + 生成期公共件；存储单位 = **doc**，`DatasetSubset{Train,Test}`）/ `dataset_samples.hpp`（训练单位 = **样本**：`TextSample`/`TextSampleSet`——切窗 + batch 装配，`sample_count()`、`steps_per_epoch(batch)` 是派生量）/ `dataset_format.hpp`（文件标签/词表 blob/`.nnvocab` 编解码）/ `model_keyvalue_record.hpp`（KVRecord v1+v2）；生成/转换 CLI 在 `src/dataset_gen.cpp` / `src/dataset_convert.cpp`（设计与裁决见 `docs/todo/19-unified-dataset.md`） |
 | 训练 step 剖析器（`NN_PROFILE=1` 门控） | `core_profile.hpp`（聚合器：帧栈 inclusive/exclusive 双口径、`stage::op` 聚合、`NN_PROFILE_TRACE` Chrome trace、`device_add` 设备侧回填（含 per-key 归因表）、`interned`/`interned_detail` 动态名驻留）；插桩点：`compute_engine.hpp` 42 个 NVI 入口 + `expr_dsl.hpp` 三入口（CPU 模板路径不经引擎，须单独计时）+ 两引擎 public-virtual override + `text_train` phase + Model/GPT/RAPT/Transformer 逐层逐块 scope + `compute_vk_backend.hpp` timestamp query（设备侧 kernel 表 / per-key 归因 / GPU busy%） |
 | 构建期工具（AOT 融合） | `tools/scan_exprs.cpp`（**单步** = 收集 + 生成）/ `tools/fused_generate.hpp`（生成阶段，原独立工具 `gen_fused`；另有 `tools/decode_fused.py` 调试用）。**库外使用者**：CMake 函数 `nn_enable_gpu_fusion(<target> MAIN <含 main 的源>)`（定义在 `CMakeLists.txt`，样例 `examples/fusion_custom_layer*`） |
 | 批量改写 / 一致性审计（改多处时用，均带 `-DryRun`） | `tools/edit_ranges.ps1`（行区间删除：四重断言 + **花括号平衡护栏**）/ `tools/test_refactor.ps1`（删定义块 / 插 include / 正则替换）/ `tools/apply_nn_try.ps1`（`auto X = f(); if (!X) …` → `NN_TRY`/`NN_TRY_CHECK`，L2 层，带 `-DryRun` 计数）/ `tools/doc_rename.ps1`（文档词法改名）/ `bench/doc_align_audit.ps1`（文档↔代码对齐审计：文件/符号/CLI/数字/测试名）/ `bench/doc_inventory.ps1`（引擎接口盘点 + **第 [4] 节 L2+ 分层审计：`Matrix`/Matrix 型 I/O 动词零命中门禁，铁律 #12** + **第 [5] 节手写 `return std::unexpected` 残留门禁，基线 0**） |
@@ -283,31 +284,48 @@ GPT 序列展平: 列序 i = b*seq + t（batch-major，全局唯一约定）
 
 ## 8. 训练循环范式（写新入口时照抄）
 
+**推荐（P2b，数据集直接接入训练工厂）**——训练配方 + 样本切分 + 循环全在库层：
+
 ```cpp
 #include <neuralnet.cpp/nn.hpp>
+#include <neuralnet.cpp/text_trainer.hpp>   // 训练工厂（L5；不在 nn.hpp 聚合头内）
 auto engine = nn::CpuEngine::create();      // 或 nn::GpuEngine::create(gpu_backend)
-auto model_r = nn::build_gpt_model(*engine, vocab, d_model, seq, heads, d_ff, layers);
-nn::Model model = std::move(*model_r);
-// 优化器工厂：sgd / sgd_momentum / adam / adamw / muon
-auto optimizer = nn::create_optimizer("adamw", *engine,
-    model.parameters(), model.param_gradients(), /*lr=*/1e-4, /*wd=*/0.01);
+auto model  = NN_UNWRAP(nn::build_gpt_model(*engine, vocab, d_model, seq, heads, d_ff, layers));
+nn::TrainingConfig scfg; scfg.optimizer = "adamw"; scfg.lr = 1e-4f; scfg.clip_grad_norm = 1.0f;
+auto session = NN_UNWRAP(nn::TrainingSession::create(std::move(model), scfg));
+auto dataset = NN_UNWRAP(nn::Dataset::open("train.nndataset"));
+nn::TextTrainConfig tcfg = nn::make_text_train_config(session);  // 优化器/lr/精度同源
+tcfg.seq_len = seq; tcfg.batch_size = 32; tcfg.epochs = 2;      // 只改数据网格/调度
+auto trainer = NN_UNWRAP(nn::TextTrainer::create(std::move(session), dataset, tcfg));
+auto report  = NN_UNWRAP(trainer.fit());    // epoch×step / 累积 / 裁剪 / 评估
+```
 
-nn::CrossEntropyLoss ce_loss;
+> **配方一致性**：`TextTrainConfig` 与 `TrainingConfig` 的重叠字段（optimizer/lr/
+> weight_decay/beta1/beta2/precision/max_norm）必须相同，`TextTrainer::create` 会逐项
+> 校验并报错；`nn::make_text_train_config(session)` 是从 Session 派生的推荐起步。
+
+`nn::TextTrainer` 内部：`Dataset` → `TextSampleSet`（**样本 = seq_len 窗口**；`step = ceil(样本数/batch)` 是派生量）→ forward/sparse-CE/backward/optimizer；`TrainState` 由工厂装配、`TrainingSession` 持有；诊断/断点走 `TextTrainerHooks`。
+
+**低层手写（自定义任务/推理）**——只需 `Model` + `TrainingSession`：
+
+```cpp
 // 每 step（GPT 用 forward_sparse 稀疏路径，不物化 one-hot）：
-model.zero_grad();
-auto x = engine->from_matrix(batch);        // Matrix → Tensor
-auto logits = model.forward(*x);
-auto loss = ce_loss.forward_sparse(*engine, *logits, labels, loss_mask, vocab);
-auto grad = ce_loss.backward();             // (vocab, total) 梯度
-model.backward(*grad);
-optimizer.step();
+NN_UNWRAP(session.zero_grad());
+auto x = NN_UNWRAP(engine->from_matrix(batch));   // Matrix → Tensor（I/O 层）
+auto logits = NN_UNWRAP(session.model().forward(x));
+auto loss = NN_UNWRAP(ce_loss.forward_sparse(*engine, *logits, labels, loss_mask, vocab));
+auto grad = NN_UNWRAP(ce_loss.backward());        // (vocab, total) 梯度
+NN_UNWRAP(session.model().backward(*grad));
+NN_UNWRAP(session.clip_grads());                  // cfg.clip_grad_norm > 0 时生效
+NN_UNWRAP(session.step());
 ```
 
 > 注意签名细节：**`Layer::forward/backward/zero_grad/forward_recompute` 自 M6 段 C 起不带 engine 参数**（engine 在 `init(engine)` 时绑定到层内 `engine_`；方法体里用函数首行的局部 `ComputeEngine& engine = engine_ref()`，DSL 入口照旧收 engine 形参）。`Model::forward/backward/zero_grad`、`Loss::backward`、`Optimizer::step/zero_grad` 本来就不带 engine；**仍需显式传 engine 的**：`Loss::forward/forward_sparse`、`engine.from_matrix`、以及 `PositionEncoder`/`RotaryEmbedding` 这类辅助对象（`apply/backward`）与层内私有 helper。**手工构造的层必须先 `layer.init(engine)`**（`Model::add` 会自动调）——未绑定即 fail-fast 并打印调用点 file:line。
 
 - 模型工厂：`nn::build_mnist_mlp_model(engine)` / `build_mnist_transformer_model(engine)` / `build_gpt_model(...)` / `build_gpt_model_from_spec(spec)`。
 - 逐层构建：`model.add<nn::Linear>(784,256); model.add<nn::ReLU>(); model.add<nn::Linear>(256,10);`——`add<T>(args...)` 是模板方法（无链式 API），返回 `Result<void>`，须检查错误；层构造后自动 `init(engine)`。
-- **推荐容器**：`nn::TrainingSession`（`training_session.hpp`）同时拥有 `Model` + `Optimizer`（`TrainingSession::create(std::move(model), cfg)`），结构性避免"优化器晚于参数所有者析构"的 UAF；自由工厂 `create_optimizer` 仍可用，但调用方必须保证 optimizer 早于参数所有者销毁。
+- **推荐容器**：`nn::TrainingSession`（`training_session.hpp`）同时拥有 `Model` + `Optimizer` + `TrainState`（`TrainingSession::create(std::move(model), cfg)`），结构性避免"优化器晚于参数所有者析构"的 UAF；自由工厂 `create_optimizer` 仍可用，但调用方必须保证 optimizer 早于参数所有者销毁。
+- **样本/数据集**：存储单位 = **doc**（`Dataset`）；训练单位 = **样本**（`TextSampleSet`，文本 = 滑动窗口）；**step 是派生量**，不在数据集层。`mnist_train` 仍是 CSV 自读 + Session 手写循环（tabular 数据集为阶段四预留）。
 - 序列化：`save_model` / `load_model` / `peek_model_spec`（`model_serialization.hpp`，v4 自描述格式）；`.nnpkg` 训练包见 `docs/usage/04-train-package.md`。
 - GPT/RAPT 高级特性（`GPTModel` / `RAPTModel`，`compute_layer.hpp` 尾部）：梯度检查点（`checkpoint_every_`）、activation offload、文档感知掩码（`set_doc_ids`）、batch flush 粒度。RAPT 与 GPT 同档支持前三者（`RAPTModel::set_checkpoint_every/set_activation_offload/set_flush_interval`），offload 走共用实现 `ActivationOffloader`（`compute_layer_base.hpp`）。
 
@@ -429,7 +447,7 @@ optimizer.step();
 - **注意力单 fold kernel**：`FoldSpec` 分块流式（S 不物化），**掩码 `AttnMaskKind` × 位置偏置** 两正交维度。
 - **CNN 全引擎化**：`im2col`/`col2im` + `rearrange_3d`，无 PCIe 往返。
 - **分词器**：保序并行 `encode`（`set_encode_threads`，任意并行度逐字节一致）+ 零堆分配合并 + `encode_docs_parallel`。
-- **统一数据集**：KVRecord v2 / `.nnvocab`（旧 JSON 不直读，`dataset_convert vocab` 迁移）/ `.nndataset`（`nn::Dataset` 只读类，词表/掩码/test 子集随数据集）。`text_train` 位置参数是 `<dataset.nndataset>`（`--vocab`/`--test-file`/`--loss-scope`/`--no-cache` 已移除）。见 `docs/todo/19`。
+- **统一数据集**：KVRecord v2 / `.nnvocab`（旧 JSON 不直读，`dataset_convert vocab` 迁移）/ `.nndataset`（`nn::Dataset` 只读类，词表/掩码/test 子集随数据集）；**P2b 起样本概念显式**——存储单位 = doc，训练单位 = sample（`dataset_samples.hpp` 的 `TextSampleSet`，文本 = 滑动窗口；`step` 是 `ceil(样本数/batch)` 派生量），数据集可经 `text_trainer.hpp` 直接接入训练工厂。`text_train` 位置参数是 `<dataset.nndataset>`（`--vocab`/`--test-file`/`--loss-scope`/`--no-cache` 已移除）。见 `docs/todo/19`。
 - **模型文件角色（v8）**：一份格式两种角色——`*.nnmodel`（推理，三值层写打包形态 base-3 1.6 bpw）与 `*.nnckpt`（训练断点，写 f32 latent + 训练状态段）；参数级 `kind`（参数形态协议）+ **载入意图** `WeightLoadIntent`（`Inference` 部署只读 / `Trainable` 反量化 warm start，P1-7）；`--resume` 两种角色都收（`.nnckpt` = 断点续训、`.nnmodel` = warm start）。见 `docs/todo/23`。
 - **错误处理宏族**：传播 `NN_TRY`/`NN_TRY_MSG`/`NN_TRY_CHECK`、解包+终止 `NN_UNWRAP(expr[, "语境"])`（**语义 = unwrap，不是 assert**；旧名 `NN_CHECK`/`NN_EASY_CHECK` 保留为等价别名）、解包+退出码 `NN_EXIT(expr, code[, "语境"])`、错误源 `NN_FAIL("msg")`。手写形态已全量迁宏（残留 0，门禁 `doc_inventory.ps1` §5 基线 0）。
 - **CPU 性能**：DSL 模板向量化/并行、`dsl::compute_into` 零分配原地更新、分块 GEMM（`BLOCK_SIZE=64`）。

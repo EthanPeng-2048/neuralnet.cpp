@@ -62,7 +62,7 @@
 | 文档 | 何时读 |
 |------|--------|
 | [`README.md`](development/README.md) | 本分册定位与索引（含入门路径建议） |
-| [`cpp-api-manual.md`](development/cpp-api-manual.md) | **全功能 C++ API 手册**：错误宏 / 引擎 / 张量 / 精度 / DSL / 层与 Model / 工厂 / 损失 / 优化器 / 训练循环 / 模型文件 / 数据集 / 分词器 / 生成 / 剖析（每节带代码片段） |
+| [`cpp-api-manual.md`](development/cpp-api-manual.md) | **全功能 C++ API 手册**：错误宏 / 引擎 / 张量 / 精度 / DSL / 层与 Model / 工厂 / 损失 / 优化器 / 训练循环（含 `TextTrainer`）/ 模型文件 / 数据集（`Dataset` + `TextSampleSet`）/ 分词器 / 生成 / 剖析（每节带代码片段） |
 | [`cmake-integration.md`](development/cmake-integration.md) | 接入与构建：`add_subdirectory`/`FetchContent`、全部构建开关、GPU 语义、`nn_enable_gpu_fusion`、跨平台、故障排查 |
 | [`write-a-custom-layer.md`](development/write-a-custom-layer.md) | 写自己的层：完整示例（实测过梯度检查）+ 接入契约 + 精度槽声明 + 梯度自检 + GPU 清单 |
 | [`01-compute-engine-development.md`](development/01-compute-engine-development.md) | 扩展引擎原语：接口全解 + CPU/GPU 实现模式 + 加新原语的完整步骤 |
@@ -81,7 +81,7 @@
 - `todo/18-roadmap.md` — **"某件事该不该做"的唯一入口**（裁定台账 + 验收口径 + 现状实测；不含执行计划）。
 - `todo/27-execution-plan.md` — **执行计划（优先级象限）**："下一个先做哪个"。
 - `todo/12` / `todo/17` / `todo/19` / `todo/21` / `todo/22` / `todo/23` — 现行设计/盘点。
-- `todo/28` / `todo/29` — **生命周期 v3 / Session 层**（2026-10-20 立项；含 CPU 引擎重构轨道）。
+- `todo/28` / `todo/29` — **生命周期 v3 / Session 层**（2026-10-20 立项；P2a/P2b 已实施，P2b = `v1.10.0-rc0.1`）。
 - `todo/24` / `todo/25` — f16 训练缺陷台账 / **大版本发布要求**（`1.x.y → 1.(x+1).0`）。
 
 ### 总档
@@ -95,7 +95,7 @@
 | [`../CMakePresets.json`](../CMakePresets.json) | 预设构建（`cmake --preset dev` 等）——见 CONTRIBUTING §1 |
 | [`benchmarks/2026-09-25-vulkan-vs-cuda.md`](benchmarks/2026-09-25-vulkan-vs-cuda.md) | Vulkan 后端 vs CUDA（torch）基准 |
 | [`benchmarks/2026-10-06-vulkan-vs-torch.md`](benchmarks/2026-10-06-vulkan-vs-torch.md) | 第二轮复测 |
-| `release-notes/v1.5.0.md` … `v1.10.0-rc0.md` | 版本变更说明，覆盖 v1.5.0 → v1.10.0-rc0 的全部 tag（`v1.5.1` / `v1.6.1` / `v1.7.1` / `v1.8.0` 为 2026-10-18 补写；**大版本发布要求**见 [`todo/25-release-requirements.md`](todo/25-release-requirements.md)） |
+| `release-notes/v1.5.0.md` … `v1.10.0-rc0.1.md` | 版本变更说明，覆盖 v1.5.0 → v1.10.0-rc0.1 的全部 tag（`v1.5.1` / `v1.6.1` / `v1.7.1` / `v1.8.0` 为 2026-10-18 补写；**大版本发布要求**见 [`todo/25-release-requirements.md`](todo/25-release-requirements.md)） |
 
 ## 3. 2026-10-11 文档整理记录
 

@@ -126,7 +126,9 @@ auto gpu = nn::GpuEngine::create(backend_owner);
 3. GPU 引擎不再隐式接收 CPU 张量：显式 `auto t_gpu = NN_UNWRAP(gpu.import(t_cpu));`。
 4. 结果回宿主：`NN_UNWRAP(gpu.to_matrix(t_gpu))`（`to_matrix` 是 GPU→CPU 的正常出口）。
 5. 训练入口优先用 `TrainingSession`（`Model` + `Optimizer` 同生共死）；继续用
-   `create_optimizer` 时保证 optimizer 早于参数所有者销毁。
+   `create_optimizer` 时保证 optimizer 早于参数所有者销毁。文本/GPT 训练再优先用
+   `nn::TextTrainer`（`text_trainer.hpp`：**数据集 + 训练循环**，内部持有
+   `TrainingSession`，并由它装配/持有 `TrainState`）。
 6. 不再需要 `NN_BIND_DEBUG`：域检查是默认行为。
 
 ## 9. 回归

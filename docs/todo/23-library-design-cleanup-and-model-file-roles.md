@@ -179,7 +179,7 @@ CLI 不再有发言权。
 | 计数器 | global_step / epoch / epoch 内步号 / 当前 lr | 续训起点；`--resume-epoch/--resume-step` 从"必填"降级为"禁止再填" |
 | 优化器状态 | Adam m/v **+ `t`**、SGD momentum、Muon、AdamWQuant 的 f16 状态与逐行尺度（经 `Optimizer::save_state/load_state`） | 缺 `t` 会让偏置修正在重启后从 0 重算 ⇒ 前几百步更新量偏小，"loss 轨迹连续"不成立 |
 | 训练配方 | 精度 profile 四槽 + weight_quant、lr 调度配方与**曲线形状**（`total_epochs`/`total_steps`）、batch_size / accum_steps / max_norm / stride | 曲线形状**是配方**（`total_epochs = --epochs`、`total_steps = steps_per_epoch × epochs`），不是"跑多久"；profile 今天完全不进文件 ⇒ `--f16` 断点忘带旗标会被静默重建成 f32 |
-| 数据集身份 | `.nndataset` 文件 sha256 + tokens/docs/windows/`steps_per_epoch`/loss_scope | 身份不匹配 ⇒ **硬报错、无逃生阀**（理由见下） |
+| 数据集身份 | `.nndataset` 文件 sha256 + tokens/docs/**samples**/`steps_per_epoch`/loss_scope | 身份不匹配 ⇒ **硬报错、无逃生阀**（理由见下） |
 
 **role 语义（冻结）**
 
@@ -188,7 +188,12 @@ CLI 不再有发言权。
 | `Checkpoint`（`.nnckpt`） | 状态段是唯一权威：除"完全不改变训练"的参数（保存路径 / 保存间隔 / log 间隔 / `--gpu` / 激活卸载 / `--max-steps` / 探针环境变量 / 数据集**路径**）外，**任何显式给出的训练参数都报错**（按旗标名判定、不看值）。禁列 = 形状与配方（`--d-model`…/`--optimizer`/`--lr`/`--min-lr`/`--weight-decay`/`--beta1`/`--beta2`/`--lr-schedule`/`--warmup-epochs`/`--warmup-steps`/`--batch-size`/`--accum-steps`/`--max-norm`/`--epochs`/`--f16`/`--t1_58`/`--precision-*`）+ 计数器（`--resume-epoch`/`--resume-step`）。 |
 | `Model`（`.nnmodel`） | **CLI 全权**：文件只提供权重与规格（架构仍以文件为准），优化器冷启动、step/lr 从 0 起算——这是 **SFT / 换数据集续训**的入口。三值模型的 `.nnmodel` 载荷是打包形态：载入由**意图**（`WeightLoadIntent`）分流——`Inference`（默认）进 `packed_only_` 部署只读态，`Trainable`（训练侧一律用）= 按文件 τ 反量化成 f32 latent ⇒ **三值 SFT / QAT 同样可续训**（P1-7，2026-10-16 落地，取代了原"唯一拒绝"那条门禁）。 |
 
-**为什么数据集必须硬错、且不需要逃生阀**：数据集变 ⇒ 窗口数变 ⇒ `steps_per_epoch` 变 ⇒
+**数据集身份的字段口径（P2b，2026-10-21 / v1.10.0-rc0.1）**：`DatasetIdentity.num_windows` →
+**`num_samples`**（语义 = **训练样本数** = 文本窗口数；`step` 仍是 `ceil(num_samples / batch_size)`
+的派生量）。状态段落盘键同步改 `dataset_samples`；旧 rc0 断点的 `dataset_windows` **兼容读**
+（缺失新键时回退，同一语义）；写出一律用新键，**v8 文件版本号不变**。
+
+**为什么数据集必须硬错、且不需要逃生阀**：数据集变 ⇒ **样本数**变 ⇒ `steps_per_epoch` 变 ⇒
 ① step_cosine 的 `total_steps`、② `global_step = epoch*steps_per_epoch + step`、③ epoch 边界与
 `--resume-step` 的含义**同时**改变 ⇒ "同一断点 + 不同数据集"**不存在正确的续训语义**，放行等于
 放行一个自欺的续训。合法出口就是上表的 `Model` 行：换数据集 = 新任务 ⇒ 从 `.nnmodel` warm start。

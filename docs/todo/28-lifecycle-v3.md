@@ -2,8 +2,8 @@
 
 > **读者**：项目开发者（本仓内部工作文档）。分册定位见 [`README.md`](README.md)。
 > **状态**：✅ **已实施（2026-10-20，分支 `dev/lifetime_refresh`，发布 `v1.10.0-rc0`）**。
-> P0（安全修复）/ P1（v3 core）/ P3（backend 弱缓存）已完成并全绿；Session 层 P2a 见
-> [`29`](29-session-architecture.md)（P2b 未做）；P4 文档收尾随本分支。决策记录见 §3；Session 层（原第 3 项）拆到
+> P0（安全修复）/ P1（v3 core）/ P3（backend 弱缓存）已完成并全绿；Session 层 P2a/P2b 见
+> [`29`](29-session-architecture.md)（**P2b 已于 2026-10-21 落地，v1.10.0-rc0.1**）；P4 文档收尾随本分支。决策记录见 §3；Session 层（原第 3 项）拆到
 > [`29-session-architecture.md`](29-session-architecture.md)。
 > **替代关系**：本文取代 [`../development/08-object-lifetimes.md`](../development/08-object-lifetimes.md)
 > 与 [`../development/09-engine-ownership.md`](../development/09-engine-ownership.md) 里"Tensor 保存

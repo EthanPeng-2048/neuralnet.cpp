@@ -2,7 +2,9 @@
 
 > **读者**：项目开发者（本仓内部工作文档）。分册定位见 [`README.md`](README.md)。
 > **状态**：✅ **P2a 已实施（2026-10-20，`training_session.hpp` + `training_session_test`）**；
-> P2b（CLI 迁移 + 训练状态收编）未做，计划在正式版前完成（见 §8）。
+> ✅ **P2b 已实施（2026-10-21，v1.10.0-rc0.1）**：`TrainingSession` 持有 `TrainState`；
+> 数据集经 `TextSampleSet`（样本 = 窗口）**直接接入训练工厂 `TextTrainer`**，CLI 退出训练循环
+> 实现（见 §8）。`InferenceSession` / `RLTrainingSession` 仍为占位（§6/§7）。
 > **依赖**：[`28-lifecycle-v3.md`](28-lifecycle-v3.md)（P1 生命周期 v3 先落；本文对应执行计划 P2）。
 > 执行排序见 [`27-execution-plan.md`](27-execution-plan.md)；裁定台账见 [`18-roadmap.md`](18-roadmap.md) §4.2 P1-8。
 
@@ -27,7 +29,9 @@
 |---|---|---|---|
 | L2 | `ComputeEngine`（`CpuEngine`/`GpuEngine`） | 计算原语/设备门面 | 现行，不动 |
 | L3 | `Model` | 网络容器 + forward/backward | 现行，**保持纯值对象** |
-| L4 | **`TrainingSession`** | 拥有 Model + Optimizer + 训练状态；训练生命周期容器 | 本文 P2 |
+| L3 | `TextSampleSet`（`dataset_samples.hpp`） | 数据集子集 → **训练样本**（窗口）与 batch 装配 | 本文 P2b，现行 |
+| L4 | **`TrainingSession`** | 拥有 Model + Optimizer + `TrainState`；训练生命周期容器 | 本文 P2a/P2b |
+| L5 | **`TextTrainer`**（`text_trainer.hpp`） | **训练工厂**：数据集（样本集）→ 循环 → Session；epoch/step、lr、累积、评估、断点状态 | 本文 P2b，现行 |
 | L5 | `InferenceSession`（占位） | 拥有 Model + 推理会话缓存（KV/prompt/命中统计） | 未来 |
 | L5 | `RLTrainingSession`（占位） | 拥有 policy/reference 多模型 + 多优化器 + rollout | 未来 |
 
@@ -115,10 +119,14 @@ private:
 
 **刻意不做的事**（防 god object）：
 
-- 不碰数据集 / epoch / CLI 参数 / 日志排版；
+- Session **不碰**数据集 / epoch / CLI 参数 / 日志排版；这些属于训练工厂 `TextTrainer`（见 P2b 段）；
 - 不替代 `Model::forward/backward`（推理可直接用 Model，不需要 Session）；
-- 不封装 Loss / 多损失 / 自定义 step；
+- 不封装 Loss / 多损失 / 自定义 step（Loss 仍由训练工厂按任务持有）；
 - 不新增计算原语、不改 `ComputeEngine` 虚表。
+
+> P2b 的边界补充：**数据集不归 Session**——`TextTrainer` 接收 `Dataset`（或已切好的
+> `TextSampleSet`）并驱动循环；Session 只持有 Model/Optimizer/TrainState。这样
+> 推理/RL 复用 Session 时不会被文本数据语义污染。
 
 ## 5. 生命周期保证与失败语义
 
@@ -165,30 +173,62 @@ private:
   4. 推理：`session.model()` 可 forward；独立 Model（无 Session）也可 forward；
   5. `--f16` / 三值 profile 透传正确。
 
-### P2b — CLI 迁移 + 训练状态（1–1.5 d）
+### P2b — CLI 迁移 + 训练状态 + 数据集接入训练工厂（✅ 2026-10-21，v1.10.0-rc0.1）
 
-- `text_train` / `mnist_train` / `cli/text_train_loop.hpp` 改用 `TrainingSession`；
-- `TrainState`（计数器 / lr 曲线 / 精度配方）、`.nnckpt` 保存/恢复收进 Session；
-- 删除各入口重复的 "build model → create optimizer → state" 样板；
-- 验收：同 seed/同数据下训练输出与现行**逐字节一致**（loss 序列、`.nnmodel`/`.nnckpt` md5）；
-  `text_train_modules_test` / `model_roles_test` / `optimizer_state_test` 全绿；
-- 文档：`usage/` 训练示例切到 Session；`AGENTS.md` 训练范式更新（P4）。
+已落地（`text_train`；`mnist_train` 同步迁移到 Session）：
+
+- **样本概念显式化**（`dataset_samples.hpp`）：存储单位 = doc，训练单位 = **sample**
+  （一个 `seq_len` 窗口）；`step = ceil(sample_count / batch_size)` 是派生量。
+  `TextSampleSet::create(dataset, subset, TextWindowConfig)` 一次给出切窗 + batch 装配
+  （PAD、目标 = 下一 token、掩码按目标位置、doc_ids PAD=0、batch-major 扁平化）。
+- **数据集直接接入训练工厂**（`text_trainer.hpp`）：
+
+  ```cpp
+  auto dataset = NN_UNWRAP(nn::Dataset::open(path));
+  auto session = NN_UNWRAP(nn::TrainingSession::create(std::move(model), session_cfg));
+  auto trainer = NN_UNWRAP(nn::TextTrainer::create(std::move(session), dataset, recipe));
+  auto report  = NN_UNWRAP(trainer.fit());   // epoch×step / 累积 / 裁剪 / 评估
+  ```
+
+  `TextTrainer` 拥有 Loss 与循环，接受 hooks（进度输出、梯度日志、探针、定期断点）。
+- **`TrainState` 收进 Session**：`train_state()/set_train_state()`；写入方是训练工厂
+  （epoch/step 位置只有循环知道），Session 保证生命周期；断点状态装配唯一实现 =
+  `nn::make_text_train_state`。`fit()` 结束时状态 = **真实下一步位置**（正常跑完
+  `(epochs,0)`；`--max-steps` 提前停为实际停止位置；探针中止不更新 Session 状态）。
+- **配方一致性**：优化器侧字段（optimizer/lr/weight_decay/beta/precision/max_norm）的
+  真源是 `TrainingConfig`；`TextTrainConfig` 同名副本必须一致（`TextTrainer::create`
+  逐项校验），起步用 `nn::make_text_train_config(session)`。
+- **CLI 退出循环实现**：`cli/text_train_loop.hpp` 只留 CLI 侧 hooks（梯度日志、
+  `NN_NAN_TRACE`/`NN_MEM_STATS`、`.nnckpt` 写盘），`text_train.cpp` 不再手工拼 corpus/
+  切窗/填 batch；`mnist_train` 不再用自由工厂 `create_optimizer`。
+- **配方单一真源**：`nn::TextTrainConfig`（库层）；CLI `TrainConfig` 继承它，只额外保留
+  入口字段；`lr_scheduler.hpp` 上收到库层（`cli/cli_lr_scheduler.hpp` 变转发头）。
+- **命名归一**：`DatasetIdentity.num_windows → num_samples`（断点键 `dataset_samples`，
+  旧键 `dataset_windows` 兼容读）；v8 文件格式与版本号不变。
+- 验收：新增 `dataset_samples_test` / `text_trainer_test`；`text_train_modules_test` /
+  `train_state_test` / `training_session_test` 全绿；CPU ctest 57/57。
+- 文档：`usage/` 训练示例、API 手册、AGENTS 训练范式同步（P4 同批完成）。
+- **仍未做（明示）**：`P2-4` 的流式 DataLoader（`TextSampleSet` 仍整段物化
+  `TextCorpus`）；`InferenceSession`/`RLTrainingSession` 仍为占位；`create_optimizer`
+  自由工厂签名未收口（D7）。
 
 ## 9. 验收（P2 整体）
 
 1. ASan 下 Session 生命周期测试全绿；
-2. Session 移动后 TensorRef 有效（测试）；
-3. CLI 端到端逐字节一致（见 P2b）；
+2. Session 移动后 TensorRef / `TrainState` 有效（测试）；
+3. CLI 端到端：循环由 `TextTrainer` 与旧 CLI 循环逐行等价迁移（代码同构 + 正常路径文案/顺序抽查）；CPU/GPU ctest 全绿 + 真实文本冒烟（无 seed API，不承诺"同 seed 轨迹逐位一致"）；
 4. 推理路径不依赖 Session（`Model` 独立可用）；
-5. 文档：29 状态更新；`usage/`/`AGENTS` 训练示例同步。
+5. **样本概念**：数据集样本数 / 派生 step 数 / batch 逐位约定由 `dataset_samples_test` 锁住；
+6. 文档：29 状态更新；`usage/`/`AGENTS` 训练示例同步。
 
 ## 10. 风险与开放问题
 
 | 风险 / 问题 | 处置 |
 |---|---|
-| Session 变成 god object | 明确 §4 "刻意不做"；数据/CLI/Loss 全留在调用方 |
-| Loss 是否归 Session | 暂不归；触发 = 出现第三种训练循环且重复代码显著 |
-| TrainState 范围 | P2b 只搬现有 `TrainState` 字段，不新增语义；不改变 v8 文件格式 |
+| Session 变成 god object | 明确 §4 "刻意不做"；数据/CLI/Loss 全留在训练工厂 |
+| `TextTrainer` 变成 god object | 只做"数据顺序 + 训练循环 + 状态装配"；输出/断点/探针走 hooks；Loss 仍按任务注入（当前内置 CE，后续可泛化） |
+| Loss 是否归 Session | 不归；归训练工厂（P2b），触发 = 出现第三种训练循环且重复代码显著 |
+| TrainState 范围 | P2b 只搬现有 `TrainState` 字段，不新增语义；v8 文件格式不变（仅键 `dataset_windows → dataset_samples`，旧键兼容读） |
 | 自由工厂的 UAF 可能 | 文档前置条件；真实外部调用方出现后再加 weak-token（低成本、可后补） |
 | 命名细节：`RLTrainingSession` 是否太长 | 先用全称，实现时再定简称（`RLSession` 等）；不影响 P2 |
 | 未来推理/RL 的接口是否被现在锁死 | 只冻结"Session 拥有模型 + 引擎共享"这一条模式；具体 API 留到对应立项 |

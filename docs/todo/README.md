@@ -35,12 +35,12 @@
 | [`17-unified-tensor-engine.md`](17-unified-tensor-engine.md) | Tensor / ComputeEngine / MemoryPool 底层总纲（M1–M6 已实施；M7 未立项）：访问不变量、InitSpec、批量读写、Matrix 降级、内存契约、`import`、Layer 删 engine 形参 |
 | [`02-operator-fusion.md`](02-operator-fusion.md) | 算子融合全篇（归约语义 IR → 表达式录制 → matmul 参与融合 → 跨 kernel 自动融合）：改融合/IR 前必读 |
 | [`03-ir-optimization.md`](03-ir-optimization.md) | IR-A/B/C/D 优化链设计（IR-C = 图 IR + `begin_expr/end_expr` 融合分析） |
-| [`19-unified-dataset.md`](19-unified-dataset.md) | 统一数据集（`.nndataset` / `.nnvocab` / KVRecord v2）格式与 `nn::Dataset` |
+| [`19-unified-dataset.md`](19-unified-dataset.md) | 统一数据集（`.nndataset` / `.nnvocab` / KVRecord v2）格式与 `nn::Dataset`；**P2b 起含样本层**（`dataset_samples.hpp`：存储单位 = doc、训练单位 = 样本/窗口，`step` 是派生量） |
 | [`21-quantized-weights.md`](21-quantized-weights.md) | 三值（1.58-bit）量化权重与 `BitLinear`：`Precision::T1_58`、按槽能力声明、打包 GEMM |
 | [`22-bitnet-2b4t-architecture.md`](22-bitnet-2b4t-architecture.md) | BitNet b1.58 2B4T 的结构对齐：SubLN / GQA / tied embedding（与 21 号正交） |
 | [`23-library-design-cleanup-and-model-file-roles.md`](23-library-design-cleanup-and-model-file-roles.md) | 库级违规设计清理：模型文件角色（`.nnmodel` / `.nnckpt`）+ 参数形态协议 + 引擎能力体系 |
 | [`28-lifecycle-v3.md`](28-lifecycle-v3.md) | **生命周期 v3（2026-10-20 立项）**：删 `EngineId`/`stamp_`/`adopt`/`bound`/`NN_BIND_DEBUG`，设备域从存储派生（统一 CPU/GPU 域）；P0/P1/P3/P4 + CPU 独立轨道 P-CPU。改生命周期/Tensor/引擎绑定前读 |
-| [`29-session-architecture.md`](29-session-architecture.md) | **Session 层（2026-10-20 设计）**：`TrainingSession` 拥有 Model + Optimizer（结构性修复非拥有引用 UAF）；`InferenceSession` / `RLTrainingSession` 占位。改 Model/Optimizer/训练入口前读 |
+| [`29-session-architecture.md`](29-session-architecture.md) | **Session 层（P2a/P2b 已实施）**：`TrainingSession` 拥有 Model + Optimizer + `TrainState`（结构性修复非拥有引用 UAF）；数据集经 `TextSampleSet` 接入训练工厂 `TextTrainer`（v1.10.0-rc0.1）；`InferenceSession` / `RLTrainingSession` 占位。改 Model/Optimizer/训练入口前读 |
 
 ### 现状盘点 / 规范 / 教训 / 故障
 

@@ -51,7 +51,7 @@
 | 项 | 坐标 | 为什么重要 | 前置 / 成本 |
 |---|---|---|---|
 | **P1-8 生命周期 v3（core）** ✅ **已完成（2026-10-20）** | [`28`](28-lifecycle-v3.md) §5 P1；18 §4.2 P1-8 | 删除 `EngineId`/`stamp_`/`adopt`/`bound`/`NN_BIND_DEBUG`，统一设备域（D1/D2/D7）；破坏性 API，分支发布 `v1.10.0-rc0` | 先落 28 号设计；P1 完成后 P2/P3 才排；中–大 |
-| **Session 层（P2a/P2b）** ◐ **P2a 已完成（2026-10-20），P2b 待做** | [`29`](29-session-architecture.md) §8；18 §4.2 P1-8 | `TrainingSession` 同时拥有 Model+Optimizer，结构性修复 D3 的 UAF；为推理/RL 留会话模式 | P2a 新增（可与 P1 并行）；P2b 迁 CLI/训练状态，排 P1 后；中 |
+| **Session 层（P2a/P2b）** ✅ **P2a 已完成（2026-10-20）、P2b 已完成（2026-10-21，v1.10.0-rc0.1）** | [`29`](29-session-architecture.md) §8；18 §4.2 P1-8 | `TrainingSession` 同时拥有 Model+Optimizer，结构性修复 D3 的 UAF；为推理/RL 留会话模式。**P2b**：`TrainingSession` 持有 `TrainState`；数据集经 `TextSampleSet`（样本 = 窗口）直接接入训练工厂 `TextTrainer`，算法循环从 CLI 上收库层；`text_train`/`mnist_train` 均迁到 Session（破坏性 API，分支 `v1.10.0-rc0` / `rc0.1`） | P2a 新增（可与 P1 并行）；P2b 已在 P1 后完成；中 |
 | **P3 GPU backend 确定性生命周期** ✅ **已完成（2026-10-20）** | [`28`](28-lifecycle-v3.md) §5 P3 | `shared()` 改 weak 缓存 + 删 `instance()`（D5）；确定性回收，16 处迁移 | 需 GPU 验证（850M/40HX）；中 |
 | **P1-2（+ P2-1 合并）** —— P1-1 ✅ 已完成（2026-10-16） | 18 §4.2 P1-2、§4.3 P2-1；C4/C5，门禁 §8.2 第 7 条 | P1-2 是**真实功能缺陷**：TDR 重启 / `--resume` 后 Adam 动量归零，续训轨迹不连续。**2026-10-16 裁定扩写**为「`.nnckpt` 训练状态段 + role 语义」：状态段 = 计数器 + 优化器状态 + 训练配方 + 数据集身份（role 门控，**v7 → v8**，与 P2-1 同批）；`Checkpoint` **禁止 A/B 类 CLI 输入**（显式即报错），`Model` **CLI 全权**（放开 `.nnmodel` 恢复以支持 SFT） | 前置 **P1-1 已解锁**（`text_train` 已拆为 `cli/text_train_{config,loop,recovery,checkpoint}.hpp` + 396 行入口，恢复路径不再膨胀）；P1-2 与 P2-1 同属版本段改动，**合批做省一次 `MODEL_VERSION` 升版**。细则见 [`23`](23-library-design-cleanup-and-model-file-roles.md) §2.1.1；中–大 |
 | **P1-7 三值模型续训入口（打包 → latent 反量化）** ✅ **已完成（2026-10-16）** | 18 §4.2 P1-7 / §3.4 M6 | 原现象：三值模型的 `.nnmodel` 载入后是 `packed_only_` 部署态 ⇒ `backward()` 明确报错，**三值 SFT / QAT 续训没有入口**。**已修**：载入意图 `WeightLoadIntent::Trainable` 按文件 τ 反量化成 f32 latent（量化器不动点 `L = trit·τ·K/n`）+ 播种量化缓存 ⇒ 首次 forward 与推理文件逐位一致、可续训；训练侧 CLI 一律传该意图，原"三值 `.nnmodel` 必须被拒"门禁删除 | ✅ 已完成：验收 = 反量化后 wq/τ 与文件内打包权重逐位一致（`model_roles_test` [6] 位级比对）+ 8 步 Adam 参数移动 + dense 路径逐位不变；端到端（`.nnmodel` warm start → 训练 → `.nnmodel`/`.nnckpt` → 续训）见 `docs/history/history.md`「P1-7」 |
@@ -64,8 +64,10 @@
 
 > **P1-2 已完成（2026-10-16，四刀）** ⇒ 它的行不再排期：状态写回 18 §4.2（§4.3 前的状态条）与 §8.2 门禁 7，
 > 过程见 `docs/history/history.md` 四条同名条目。**P1-7 也已随之完成（2026-10-16）**；**P1-5 已完成
-> （2026-10-18）** ⇒ 本象限（三）的剩余项 = P2-7（前置已解锁）、P2-14（真 f16）、P2-15（标准 `--f16`）与 P4 系列。P1-7 的验收写回
-> 18 §4.2 与 §8.2 门禁 8，过程见 `docs/history/history.md`「P1-7」条；P1-5 见 18 §4.2 / §8.2 门禁 10。
+> （2026-10-18）**；**P2b（Session 训练工厂）已完成（2026-10-21，v1.10.0-rc0.1）** ⇒ 本象限（三）的剩余项 =
+> P2-7（前置已解锁）、P2-14（真 f16）、P2-15（标准 `--f16`）与 P4 系列。P1-7 的验收写回
+> 18 §4.2 与 §8.2 门禁 8，过程见 `docs/history/history.md`「P1-7」条；P1-5 见 18 §4.2 / §8.2 门禁 10；
+> P2b 见 release note `v1.10.0-rc0.1` 与 29 §8。
 
 ## 5. 象限（四）不重要但复杂——不做 / 等触发
 
@@ -84,7 +86,7 @@
 1. **象限（一）已清空（2026-10-15）**：`gpt_test` flaky（未复现 + 同机完全确定）、C10 归因（主因 = `rms_norm_forward_` 逐头 host 往返 + `scan_prefix` kernel，**归 P4-2**）、P0-5 采样 CLI 半边、RV-14 审计（派生 RV-15）、P2-6 绘制节流半边——五条状态与证据见 18 号对应行。
 2. **P1 已全部收口（2026-10-18）**：P1-1/P1-2/P1-3/P1-4/P1-6/P1-7 已完成，**P1-5（MSVC Debug + 权重变化断言）也已落地**（18 §4.2 / §8.2 门禁 10）。下一步可开 **P2-7**（前置已解锁）；**P2-15（标准 `--f16`，Plan A）** 先做 A1.1 loss scaling + PyTorch AMP 对照；**P2-14（真 f16，Plan B）** 做 R0 口径 + R1 `--f16-all` + P0 探针 + 转换普查/native16 覆盖，随后按 26 §8.B.7 接 R2.5 的 SR/GradientStabilizer → ECO → attention δ 修复。三者可并行。
 3. `P4-1` / `P4-2` 随时可插入（不阻塞任何人的独立 A/B 工作）。
-4. **生命周期 v3 主线（2026-10-20 立项）**：先做 [`28`](28-lifecycle-v3.md) 的 **P0**（安全/文档修复，独立可合），再进 **P1 core**；P1 后并行 **P2 Session**（[`29`](29-session-architecture.md)）与 **P3 backend**；**P-CPU** 只依赖 P1 冻结的域接口，可与 P2/P3 并行，GPU 侧零改动。
+4. **生命周期 v3 主线（2026-10-20 立项）**：先做 [`28`](28-lifecycle-v3.md) 的 **P0**（安全/文档修复，独立可合），再进 **P1 core**；P1 后并行 **P2 Session**（[`29`](29-session-architecture.md)）与 **P3 backend**；**P2 的 P2a/P2b 均已落地（P2b = 2026-10-21 `v1.10.0-rc0.1`）**，P3 也已完成；**P-CPU** 只依赖 P1 冻结的域接口，可与 P2/P3 并行，GPU 侧零改动。
 5. 串行约束（来自 18 §4.0）：**P1-1 ✅ → P1-2 ✅ → P2-1 ✅**；**P0-1 ✅ + P1-5 ✅ → P2-7（已解锁）**；**P0-5 ✅ → P2-6 ✅**；**P1-8（生命周期 v3）→ Session 层 P2b / backend P3**。
 
 ## 7. 维护约定

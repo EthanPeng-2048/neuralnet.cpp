@@ -8,6 +8,12 @@
 > （`MODEL_VERSION 5→6`，v5 及以下仍读内嵌 JSON）；阶段三 = GUI / 控制器 / `train_pkg` /
 > 审计脚本参数同步 + 文档。**阶段四（tabular/csv）未实施**（按裁决预留）。
 > 落地验收与实测数字见 `docs/history/history.md`「统一数据集」条与 AGENTS §12。
+> **增补（2026-10-21，v1.10.0-rc0.1 / P2b）**：窗口化从 `text_train` 上收到库层
+> `include/neuralnet.cpp/dataset_samples.hpp`——**存储单位 = doc**（`.nndataset` 不变），
+> **训练单位 = 样本**（`TextSampleSet` 的 `seq_len` 窗口），`step = ceil(样本数/batch)` 是派生量；
+> 数据集经 `nn::TextTrainer` 直接接入训练（[`29`](29-session-architecture.md) §8）。
+> `.nndataset` 文件格式与"不做预切窗"的裁决（§0 #3）**均未变**；流式仍属 P2-4 后半。
+>
 > **关联**：`docs/todo/18-roadmap.md` X2（无 Dataset 抽象）/ P2-4（Dataset/DataLoader + 流式）——
 > 本文是其前半（格式统一 + 统一类）的详细设计；DataLoader/流式仍留在 P2-4 后半。
 > `.nnpkg` 打包链路**本轮不在范围**（用户裁定），但 §6 标注了它的参数冲突依赖。
@@ -20,7 +26,7 @@
 |---|------|------|
 | 1 | 范围 | 本轮**只写设计文档，不做代码**；`.nnpkg` 先不管 |
 | 2 | 存储单元 | 早期讨论中的 "step" 即**一行文本 = 一篇文档（doc）**；最终**存 docs 不存 steps**（"step" 一词废弃，避免与训练步混淆） |
-| 3 | 窗口化 | **保持原方法**：训练期把全部 doc 拼回全局 token 流再滑窗（`--seq-len`/`--stride` 仍是 text_train 参数）；**不**引入 `Dataset.resize()` 预切窗 |
+| 3 | 窗口化 | **保持原方法（历史裁决）**：训练期把全部 doc 拼回全局 token 流再滑窗；**不**引入 `Dataset.resize()` 预切窗。P2b 起落地位置 = 库层 `TextSampleSet`（`dataset_samples.hpp`），`--seq-len`/`--stride` 归训练配方 `TextTrainConfig`；`Dataset` 仍只读、不做窗口化 |
 | 4 | 文件格式 | 词表 `.nnvocab`、数据集 `.nndataset`（扩展名用户钦定） |
 | 5 | KVRecord v2 | **字段只记录 key、数据类型、值的地址**（"v2 仅支持记录位移"）；版本号内嵌 kvrec 自身：**无版本字段 = v1，有 = 按版本读** |
 | 6 | 嵌套结构 | 整文件 = 标签 + 一个文件级 KVRecord；配套文件、词表、train/test 子集**层层嵌套 KVRecord**（json 套 json，但格式是 kvrec）；**license 不是 kvrec，是纯文本文档** |
@@ -66,7 +72,12 @@
   xxx.nndataset ──► │ nn::Dataset  (统一只读类)      │ ──► tokens / doc_ids / loss_mask
                     └──────────────────────────────┘        │
                                                              ▼
-                                            text_train（只剩：拼流 → 滑窗 → 训练）
+                    ┌─────────────────────────────────────────────────────┐
+                    │ TextSampleSet（dataset_samples.hpp，样本 = 窗口）     │
+                    │ 拼流 → 切窗 → batch 装配（step = ceil(样本数/batch)）│
+                    └─────────────────────────────────────────────────────┘
+                                                             ▼
+                                            TextTrainer（epoch × step 训练循环）
 ```
 
 **组件与职责边界**：
@@ -76,11 +87,15 @@
 | `tokenizer_train` | 文本 → 词表，**输出改为 `.nnvocab`（kvrec）** | 不碰数据集 |
 | `dataset_gen`（新） | 文本 + 词表 → `.nndataset`：编码、算掩码、写配套（来源/license/生成参数） | 不做训练相关任何事 |
 | `dataset_convert`（新） | 旧 `.json` 词表 → `.nnvocab`；未来 csv → nndataset | 不做训练相关任何事 |
-| `nn::Dataset`（新类） | 嗅探 + **只读**打开 `.nndataset`/`.nnvocab`；输出与现 tokcache 同构的 token 流 | 不写文件、不做隐式转换、不做窗口化 |
-| `text_train` | 读数据集 → 拼流 → 滑窗 → 训练 | 不再含 tokenize/缓存/掩码扫描/词表参数 |
+| `nn::Dataset`（新类） | 嗅探 + **只读**打开 `.nndataset`/`.nnvocab`；输出与现 tokcache 同构的 token 流（存储单位 = **doc**） | 不写文件、不做隐式转换、不做窗口化 |
+| `nn::TextSampleSet`（`dataset_samples.hpp`） | 训练单位 = **样本**：把子集 corpus 切成 `seq_len` 窗口，装配 `TextSampleBatch` | 不读文件格式、不跑训练循环 |
+| `nn::TextTrainer`（`text_trainer.hpp`） | 数据集/样本集 → epoch×step 循环（shuffle/累积/裁剪/lr/评估/断点状态） | 不构建模型、不决定产物路径/CLI 文案 |
+| `text_train` | 解析 CLI → `Dataset` → 样本集 → 模型 → `TrainingSession` → `TextTrainer` | 不再含 tokenize/缓存/掩码扫描/词表参数/手工切窗/训练循环 |
 
-**术语**：本文用 **doc** = 语料中的一行（非空、已 trim）= 数据集的存储单元。
-早期讨论中的 "step" 即此物，最终命名统一为 doc。
+**术语**：本文用 **doc** = 语料中的一行（非空、已 trim）= 数据集的**存储单元**；
+**sample** = 一个 `seq_len` 滑动窗口 = 训练的**样本单位**（可跨 doc 边界）；
+**step** = `ceil(sample_count / batch_size)`，是**派生量**。早期讨论中的 "step" 即 doc，
+最终命名统一为 doc；P2b 起"样本"一词只指窗口，不再与 doc / step 混用。
 
 ---
 
@@ -210,9 +225,10 @@ key 不匹配 ⇒ 本记录为 v1（field[0] 已被正确按 v1 消费，继续 
 
 #### 4.3.2 加载输出与现 tokcache 的同构关系
 
-`nn::Dataset::load_text()` 输出 `(token_flow, doc_ids, loss_mask)`，与 `text_train` 现状
-（tokcache + `mark_assistant_spans` 的产物）**逐位同构** ⇒ 下游"拼流 → 滑窗 → 训练"代码
-**一行不改**，训练字节锚得以保持。
+`nn::Dataset::load_text(subset)` 输出 `(token_flow, doc_ids, loss_mask)`，与 `text_train` 旧实现
+（tokcache + `mark_assistant_spans` 的产物）**逐位同构** ⇒ 迁移阶段训练字节锚得以保持。
+P2b 起"拼流 → 切窗 → batch 装配"由 `dataset_samples.hpp` 的 `TextSampleSet` 承担
+（逐位约定不变），训练循环由 `TextTrainer` 承担；`load_text` 自身仍只做子集读取。
 
 **一致性硬约束**（迁移时逐字保留的三段逻辑）：
 
@@ -243,10 +259,11 @@ header-only ⇒ 全部 `inline`；错误一律 `Result<T>`；无隐式随机）�
 namespace nn {
 
 enum class DatasetKind : std::uint64_t { Text = 0, Tabular = 1 };
+enum class DatasetSubset : std::uint8_t { Train = 0, Test = 1 };   // P2b：替代 bool
 
 struct DatasetInfo {
     DatasetKind kind;
-    std::uint64_t num_docs;      // train 子集
+    std::uint64_t num_docs;      // train 子集 doc 数（存储单位）
     std::uint64_t test_docs;     // test 子集 doc 数（0 = 无 test 子集）
     std::string  loss_scope;     // "all" | "assistant"（来自配套 gen）
     std::string  source_sha256;  // 源文本摘要（诊断/复现用）
@@ -267,7 +284,12 @@ public:
 
     [[nodiscard]] const DatasetInfo &info() const noexcept;
 
-    [[nodiscard]] Result<TextCorpus> load_text() const;          // kind=Text
+    [[nodiscard]] Result<TextCorpus> load_text(
+        DatasetSubset subset = DatasetSubset::Train) const;      // kind=Text
+    [[nodiscard]] std::uint64_t doc_count(
+        DatasetSubset subset = DatasetSubset::Train) const noexcept;   // 存储单位 = doc
+    [[nodiscard]] Result<TextDoc> text_doc(
+        DatasetSubset subset, std::size_t index) const;          // 单个 doc（检查/调试）
     // 阶段四:
     // [[nodiscard]] Result<std::pair<Matrix, Matrix>>
     //     load_tabular(std::size_t max_samples = 0) const;       // (features, labels)
@@ -281,10 +303,18 @@ private:
 
 **设计要点**：
 
-- **只读、不转换、不窗口化**——窗口是训练策略，留在 `text_train`（裁决 #3）；
+- **只读、不转换、不窗口化**——数据集给的是 corpus（`tokens/doc_ids/loss_mask`，存储单位 = doc）；
+  窗口化是**训练策略**，P2b 起落在 `dataset_samples.hpp` 的 `TextSampleSet`（`TextWindowConfig{seq_len,stride,pad_id}`）；
 - `load_text` 一次性给出训练所需的全部三样（flow/doc_ids/mask），语料超大时
-  分块迭代接口（`for_each_chunk`）留作 P2-4 流式后半的扩展点，本轮不设计细节；
+  分块迭代接口（`for_each_chunk`）留作 P2-4 流式后半的扩展点，本轮不设计细节
+  （`TextSampleSet` 仍整段物化 `TextCorpus`）；
 - `.nnvocab` 也能 `open`（词表独立加载场景：`text_infer --vocab` 兜底、转换器等）。
+
+**样本层（P2b，`dataset_samples.hpp`）**：`TextSampleSet::create(dataset, subset, TextWindowConfig)`
+把子集切成 `seq_len` 窗口；**样本 = 训练单位**（`sample_count()` / `sample(i)`），
+**step = `steps_per_epoch(batch_size)` = ceil(样本数/batch) 是派生量**；
+`make_batch(indices, TextSampleBatch&)` 产出 `(seq_len,batch)` 输入或 batch-major 扁平
+`flat_targets/flat_mask/doc_ids`。训练工厂 `TextTrainer` 直接消费它（见 [`29`](29-session-architecture.md) §8）。
 
 ---
 
@@ -318,7 +348,7 @@ dataset_convert csv   <train.csv> [<test.csv>] -o <out.nndataset>   # 阶段四�
 | 入口 | 变更 |
 |------|------|
 | `tokenizer_train` | `save()` 写 `.nnvocab`（kvrec）；`--output` 默认 `bpe_vocab.json` → `bpe_vocab.nnvocab`；JSON 写出废弃 |
-| `text_train` | 位置参数 `<text-file>` → `<dataset.nndataset>`；**移除** `--vocab`、`--test-file`、`--loss-scope`、`--no-cache` 四个选项及内联 `read_file_lines` / `parallel_tokenize` / tokcache / `mark_assistant_spans`；**保留** `--seq-len`、`--stride`（窗口化原样）；保存模型时内嵌词表 = 数据集配套词表（kvrec，v6，见 §7） |
+| `text_train` | 位置参数 `<text-file>` → `<dataset.nndataset>`；**移除** `--vocab`、`--test-file`、`--loss-scope`、`--no-cache` 四个选项及内联 `read_file_lines` / `parallel_tokenize` / tokcache / `mark_assistant_spans`；**保留** `--seq-len`、`--stride`（P2b 起归库层 `TextSampleSet`/`TextTrainConfig`，入口不再手工切窗）；保存模型时内嵌词表 = 数据集配套词表（kvrec，v6，见 §7） |
 | `text_infer` | `--vocab` 兜底改读 `.nnvocab`（旧 `.json` 报错指路 `dataset_convert`）；模型内嵌按 `MODEL_VERSION` 分派（§7） |
 | `gui.py` + `cli_controllers.py` | GPT 训练 Tab：`text_file` 字段改指向 `.nndataset`；**删除** vocab / test_file / loss_scope / no_cache 四行（`gui.py:1366,1397,1447` 等）；导出训练包映射随之调整 |
 
@@ -394,6 +424,8 @@ tokcache + `mark_assistant_spans` 输出**逐位一致** ⇒ `text_train` 训练
 
 - 现状读取路径：`include/neuralnet.cpp/cli/cli_mnist_io.hpp`、`src/text_train.cpp`（§ 裁决涉及行：
   `read_file_lines:65`、`tokcache:203-267`、`mark_assistant_spans:179`、帮助行 `293-311`）
+- 现行 Dataset / 样本层 / 训练工厂：`include/neuralnet.cpp/dataset.hpp`、
+  `include/neuralnet.cpp/dataset_samples.hpp`、`include/neuralnet.cpp/text_trainer.hpp`
 - KVRecord v1：`include/neuralnet.cpp/model_keyvalue_record.hpp`
 - 模型格式与内嵌词表：`include/neuralnet.cpp/model_serialization.hpp`（`read_tokenizer:478`）
 - 词表工厂与 JSON 解析：`domain_tokenizer{,_base,_bpe,_charbpe}.hpp`

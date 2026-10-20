@@ -110,8 +110,9 @@ GPT 训练需要一份文本语料（如 `datasets/llm_corpus.txt`，用 `script
 # 使用 Muon 优化器
 ./build/text_train datasets/llm.nndataset --optimizer muon --lr 0.002
 
-# 恢复训练
-./build/text_train datasets/llm.nndataset --resume gpt_model.bin --epochs 5
+# 恢复训练（.nnckpt = 断点续训：形状/配方/计数器由断点决定，禁止再给 --epochs/--lr 等；
+#           .nnmodel = warm start：CLI 全权）
+./build/text_train datasets/llm.nndataset --resume gpt_model.nnckpt
 ```
 
 **完整参数：**
@@ -119,8 +120,8 @@ GPT 训练需要一份文本语料（如 `datasets/llm_corpus.txt`，用 `script
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `<dataset.nndataset>` | 必需 | 数据集文件路径（dataset_gen 生成；词表/loss 掩码/test 子集随数据集） |
-| `--save <path>` | `gpt_model.bin` | 模型保存路径 |
-| `--resume <path>` | 无 | 从已有模型恢复训练 |
+| `--save <path>` | `gpt_model.nnmodel` | 推理模型保存路径（`.nnmodel`，不含训练参数） |
+| `--resume <path>` | 无 | 从模型文件恢复训练：`.nnckpt` = 断点续训（形状/配方/计数器由断点决定）；`.nnmodel` = warm start |
 | `--epochs <n>` | `10` | 训练轮数 |
 | `--lr <lr>` | `0.001` | 学习率 |
 | `--batch-size <n>` | `32` | 批大小 |
@@ -137,7 +138,8 @@ GPT 训练需要一份文本语料（如 `datasets/llm_corpus.txt`，用 `script
 | `--log-interval <n>` | `50` | 日志间隔 |
 
 > 词表、loss 范围（`all`/`assistant`）、test 子集都随数据集（生成期定好），
-> 不再是 `text_train` 的选项；窗口化（`--seq-len`/`--stride`）仍属训练策略。
+> 不再是 `text_train` 的选项；窗口化（`--seq-len`/`--stride`）仍属训练策略，
+> P2b 起由库层 `TextSampleSet` / `TextTrainer` 承担（step = ceil(样本数/batch) 是派生量）。
 
 ### 推理
 
@@ -335,80 +337,71 @@ int main() {
 
 ### GPT 文本生成训练
 
+训练入口用库层训练工厂 `nn::TextTrainer`（P2b）：**Dataset →（内部切样本）→
+TrainingSession → TextTrainer**。`TextTrainConfig` 是训练配方唯一真源，epoch×step 循环、
+shuffle、梯度累积/裁剪、lr 调度、测试评估、断点状态都在库里——不再需要手工切窗/填 batch。
+
 ```cpp
 #include <neuralnet.cpp/nn.hpp>
-#include <neuralnet.cpp/model_serialization.hpp>
-#include <neuralnet.cpp/domain_gpt.hpp>
+#include <neuralnet.cpp/dataset.hpp>
+#include <neuralnet.cpp/text_trainer.hpp>
 
 int main() {
     auto engine_owner = nn::CpuEngine::create();
     nn::CpuEngine& engine = *engine_owner;
 
-    // 1. 加载分词器
-    auto tokenizer = nn::load_tokenizer_from_file("gpt_bpe.nnvocab");
+    // 1. 打开数据集（词表 / loss 掩码 / test 子集都在数据集内）
+    auto dataset_owner = NN_UNWRAP(nn::Dataset::open("llm.nndataset"));
+    const nn::Dataset& dataset = *dataset_owner;
+    auto tokenizer = NN_UNWRAP(nn::load_tokenizer_from_kvrec(dataset.vocab_kvrec()));
 
-    // 2. 构建 GPT 模型
-    auto model_result = nn::build_gpt_model(
+    // 2. 构建 GPT 模型（vocab_size 来自数据集内嵌词表）
+    nn::Model model = NN_UNWRAP(nn::build_gpt_model(
         engine,
-        tokenizer->vocab_size(),  // vocab_size
+        tokenizer->vocab_size(),
         128,    // d_model
         256,    // seq_len
         4,      // num_heads
         512,    // d_ff
         4       // num_layers
-    );
-    nn::Model model = std::move(*model_result);
+    ));
 
-    // 3. 优化器
-    auto optimizer = nn::create_optimizer(
-        "adamw", engine,
-        model.parameters(), model.param_gradients(),
-        0.001, 0.01
-    );
+    // 3. 训练配方（库层唯一真源）+ Session（Model + Optimizer + TrainState）
+    nn::TextTrainConfig recipe;
+    recipe.seq_len      = 256;
+    recipe.batch_size   = 32;
+    recipe.epochs       = 10;
+    recipe.lr           = 0.001f;
+    recipe.lr_schedule  = "cosine";
+    recipe.max_norm     = 1.0f;      // 梯度裁剪（0 = 不裁剪）
 
-    nn::CrossEntropyLoss loss_fn;
+    nn::TrainingConfig scfg;
+    scfg.optimizer      = "adamw";
+    scfg.lr             = recipe.lr;
+    scfg.weight_decay   = recipe.weight_decay;
+    scfg.clip_grad_norm = recipe.max_norm;   // 必须与配方一致（Trainer 前置校验）
+    nn::TrainingSession session =
+        NN_UNWRAP(nn::TrainingSession::create(std::move(model), scfg));
 
-    // 4. 编码文本 → token IDs
-    std::string text = /* ... 读取文本文件 ... */;
-    auto tokens = tokenizer->encode(text);
+    // 4. 数据集直连训练工厂：内部建 TextSampleSet（样本 = seq_len 窗口）并跑 epoch × step
+    auto trainer = NN_UNWRAP(nn::TextTrainer::create(std::move(session), dataset, recipe));
+    nn::TextTrainReport report = NN_UNWRAP(trainer.fit());
+    std::printf("steps=%zu samples=%zu final_lr=%.3e\n",
+                report.steps_executed, report.samples_executed,
+                static_cast<double>(report.final_lr));
 
-    // 5. 训练循环（next-token prediction）
-    const std::size_t seq_len = 256;
-    const std::size_t batch_size = 32;
-
-    for (int epoch = 0; epoch < 10; ++epoch) {
-        for (std::size_t step = 0; step < steps_per_epoch; ++step) {
-            optimizer->zero_grad();
-
-            // 采样 batch: x = tokens[t:t+seq_len], y = tokens[t+1:t+seq_len+1]
-            nn::Matrix x_tokens(seq_len, batch_size);  // (seq, batch)
-            nn::Matrix y_onehot(vocab_size, seq_len * batch_size);
-            // ... 填充数据 ...
-
-            auto x_t = engine.from_matrix(x_tokens);
-            auto y_t = engine.from_matrix(y_onehot);
-            nn::Tensor input = std::move(*x_t);
-            nn::Tensor target = std::move(*y_t);
-
-            // 前向传播
-            auto logits = model.forward(input);
-            auto loss = loss_fn.forward(engine, *logits, target);
-
-            // 反向传播 + 更新
-            auto grad = loss_fn.backward();
-            model.backward(*grad);
-            optimizer->step();
-
-            std::cout << "Step " << step << "  loss=" << *loss << "\n";
-        }
-    }
-
-    // 6. 保存模型（含嵌入词表）
-    // 注意：自描述格式（v4+，当前写入 v5）将 ModelSpec 和 tokenizer 的 JSON 嵌入文件头部，
-    // 推理时无需单独指定 --vocab 参数。
-    nn::save_model("gpt_model.bin", model, *model.spec(), tokenizer_json);
+    // 5. 保存：用 nn::save_model(..., nn::ModelRole::Model) 写 .nnmodel；
+    //    训练断点（.nnckpt）由 TextTrainerHooks::on_checkpoint 落盘。
+    //    现成 CLI 见上面的 text_train（--save 默认 gpt_model.nnmodel / --save-interval 写 .nnckpt）。
 }
 ```
+
+> **单位约定**：`.nndataset` 的存储单位是 **doc**；训练单位是 **样本**（`seq_len` 窗口，
+> 可跨 doc 边界）；`step = ceil(样本数 / batch_size)` 是**派生量**
+> （`TextSampleSet::steps_per_epoch(batch_size)`）——`steps_per_epoch` **不是** CLI 旗标，
+> 也不再由调用方手算。已切好样本集时用高性能入口
+> `TextTrainer::create(session, train_set, test_set, recipe)`；样本集 /
+> batch 装配接口见 [`../development/cpp-api-manual.md`](../development/cpp-api-manual.md) §13.3。
 
 ### GPT 推理（自回归生成）
 

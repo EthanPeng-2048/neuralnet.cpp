@@ -132,3 +132,40 @@ GPT `d_model=64 / heads=4 / layers=2 / d_ff=128 / seq_len=128 / batch=8`，850M 
 2. **Linux + 850M / 40HX / libc++ / libstdc++ / MSVC 矩阵未重跑**（沿用 v1.9.0 记录，代码变更已通过 clang 22 + MSVC STL 的现有 CI 口径编译）；
 3. **`scan_bitwise_test` 仍按平台口径 skip**（逐位锚权威 = Linux + 850M）；
 4. `layer_bench` 配对 A/B 未在本 rc 重跑：本次改动不含数值路径变更（CPU/GPU 逐位一致性由 `expr_fuse_test` / `fused_gpu_test` / `expr_fold_test` 覆盖）。
+
+---
+
+## 6. 2026-10-21 v1.10.0-rc0.1 预发布记录
+
+> 分支 `dev/lifetime_refresh`。发布标识：release 名称 **v1.10.0-rc0.1**，git tag **`v1.10.rc0.1`**（`CMakeLists.txt` 的
+> `project(... VERSION ...)` 仍为 1.10.0）。本 rc 只覆盖 **P2b 训练工厂**（样本层 /
+> `TextTrainer` / `TextTrainConfig` / `TrainingSession` 持有 `TrainState` / CLI 迁移）；
+> 完整四编译器矩阵与 Linux+850M 权威口径**未在本次重跑**，正式版前仍按本文件 §1–§3 全量执行。
+
+### 6.1 构建与测试
+
+| 树 | 结果 |
+|---|---|
+| CPU ctest（Release，`NN_ENABLE_GPU=OFF`，`NN_ENABLE_TESTS=ON`） | **57/57 通过**（GPU-only 用例按 77 skip） |
+| GPU ctest（Release，Vulkan，NVIDIA CMP 40HX / 驱动 616.92） | **59/59 通过** |
+| ASan（Windows，`NN_ENABLE_PCH=OFF`） | `dataset_samples_test` / `text_trainer_test` / `training_session_test` / `text_train_modules_test` / `dataset_test` 全绿（无 LSan） |
+| 单测回归 | `dataset_test` / `train_state_test` / `text_train_modules_test` / `model_roles_test` / `optimizer_state_test` 全绿（CPU/GPU 口径） |
+| 真实文本端到端（GPU，tinystories 子集 20k docs / 5.7M tokens） | f32 20 步 6.77→6.14；`--f16` 6.57→6.16；`.nnckpt` + `--resume` 续训通过 |
+| 文本训练冒烟（CPU） | 训练 / 测试评估 / 定期 `.nnckpt` / `--resume` 续训均跑通，输出文案与 P1-1 锚一致 |
+
+### 6.2 新增测试
+
+- `dataset_samples_test`：样本概念（doc vs sample vs step）、切窗/样本视图、batch 逐位、
+  assistant 掩码、错误语义、断点旧键兼容；
+- `text_trainer_test`：数据集直连工厂、`fit()` 端到端、`TrainState` 装配（含
+  `--max-steps` 终态）、断点、高性能样本集入口 + `nullopt` test、前置条件
+  （`batch_size>0` / `log_interval>0` / 配方与 Session 逐项一致）；
+- `training_session_test` 增 `TrainState` 用例。
+
+### 6.3 未覆盖 / 明示风险
+
+1. **Linux + 850M / libc++ / libstdc++ / MSVC 矩阵未在本 rc 重跑**——GPU ctest 与端到端仅在
+   本机 NVIDIA CMP 40HX 验证，见 release note v1.10.0-rc0.1 §6/§7；
+2. **P2-4 流式 DataLoader 仍未做**：`TextSampleSet` 仍整段物化 `TextCorpus`；
+3. `TextTrainer` 只服务文本/GPT（内置 sparse-CE），通用 Step 协议未抽象；
+4. 断点旧键兼容是**单向**的（rc0.1 写 `dataset_samples`，rc0 二进制读不到），v8 版本号不变。

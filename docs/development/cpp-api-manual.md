@@ -22,9 +22,9 @@
 | 用表达式 DSL 写逐元素 / 归约数学 | §6（细节见引擎手册 §8） |
 | 搭 MLP / Transformer / CNN / GPT / RAPT 模型 | §7、§8 |
 | 用现成模型工厂一条命令建模型 | §8 |
-| 算 loss、建优化器、写训练循环 | §9、§10、§11 |
+| 算 loss、建优化器、写训练循环 | §9、§10、§11（文本训练推荐 `nn::TextTrainer`） |
 | 保存 / 加载 `.nnmodel` / `.nnckpt`、读架构 spec | §12 |
-| 读 `.nndataset` 数据集 | §13 |
+| 读 `.nndataset` 数据集（含训练样本/窗口） | §13 |
 | 训练 / 使用分词器、编码解码 | §14 |
 | 自回归生成文本 | §15 |
 | 剖析性能、看环境变量开关 | §16 |
@@ -643,6 +643,67 @@ NN_UNWRAP(opt->step());
 
 ## 11. 完整训练循环模板
 
+### 11.1 推荐：数据集直连训练工厂 `nn::TextTrainer`（P2b）
+
+文本/GPT 训练的最小闭环 = **Dataset →（内部切样本）→ TrainingSession → TextTrainer**。
+`nn::TextTrainConfig` 是**训练配方唯一真源**（`seq_len`/`batch_size`/`epochs`/lr 调度…）；
+epoch×step 循环、shuffle、梯度累积/裁剪、lr 调度、测试评估、断点状态装配都在库里，
+调用方不用自己切窗或填 batch：
+
+```cpp
+#include <neuralnet.cpp/nn.hpp>
+#include <neuralnet.cpp/text_trainer.hpp>   // 训练工厂（L5；不在 nn.hpp 聚合头内）
+
+auto engine_owner = nn::CpuEngine::create();
+nn::CpuEngine& engine = *engine_owner;
+
+// 1. 模型（也可 build_gpt_model_from_spec）
+nn::Model model = NN_UNWRAP(nn::build_gpt_model(engine, /*vocab=*/10000,
+                                                /*d_model=*/128, /*seq_len=*/256,
+                                                /*heads=*/4, /*d_ff=*/512,
+                                                /*layers=*/4));
+
+// 2. Session（Model + Optimizer + TrainState）：优化器侧配置的唯一真源
+nn::TrainingConfig scfg;
+scfg.optimizer      = "adamw";
+scfg.lr             = 3e-4f;
+scfg.clip_grad_norm = 1.0f;               // 梯度裁剪（0 = 不裁剪）
+auto session = NN_UNWRAP(nn::TrainingSession::create(std::move(model), scfg));
+
+// 3. 训练配方：从 Session 派生（优化器/精度/lr 同源），再改数据网格与调度
+nn::TextTrainConfig recipe = nn::make_text_train_config(session);
+recipe.seq_len     = 256;
+recipe.batch_size  = 8;
+recipe.epochs      = 2;
+recipe.lr_schedule = "cosine";
+
+// 4. 数据集直连训练工厂：内部建 TextSampleSet 并跑 epoch × step
+auto dataset = NN_UNWRAP(nn::Dataset::open("train.nndataset"));
+auto trainer = NN_UNWRAP(nn::TextTrainer::create(std::move(session), dataset, recipe));
+nn::TextTrainReport report = NN_UNWRAP(trainer.fit());
+std::printf("steps=%zu samples=%zu final_lr=%.3e\n",
+            report.steps_executed, report.samples_executed,
+            static_cast<double>(report.final_lr));
+```
+
+要点：
+
+- **配方与 Session 的重叠字段必须一致**（`optimizer`/`lr`/`weight_decay`/`beta1`/`beta2`/
+  `precision`/`max_norm`），`TextTrainer::create` 会逐项校验并明确报错；用
+  `nn::make_text_train_config(session)` 起步最省事。
+
+- 已切好样本集（如 CLI 先打印数据集统计）时用高性能入口
+  `TextTrainer::create(session, std::move(train_set), std::move(test_set), recipe)`，避免重复加载/哈希；
+  样本集由 `nn::TextSampleSet::create(dataset, nn::DatasetSubset::Train, {seq_len, stride, pad_id})` 建。
+- 训练进度/断点/探针走 `nn::TextTrainerHooks`（`out`/`err`/`on_batch_ready`/`on_probe_check`/
+  `on_update`/`on_checkpoint`/`on_phase`）；断点请求 = `nn::TextCheckpointRequest{session, state}`，
+  落盘由调用方决定（CLI 用 `save_model` 的 `CheckpointState`）。
+- **单位约定**：存储单位 = doc（`.nndataset`）；训练单位 = **样本**（`seq_len` 窗口）；
+  `step = ceil(样本数 / batch_size)` 是**派生量**（`TextSampleSet::steps_per_epoch(batch_size)`）。
+- `TextTrainer` 目前内置文本 sparse-CE，只服务文本/GPT 任务；MNIST/自定义任务用下面的低层模板。
+
+### 11.2 低层手写循环（自定义任务 / 非文本）
+
 ```cpp
 #include <neuralnet.cpp/nn.hpp>
 
@@ -681,7 +742,8 @@ int main()
 }
 ```
 
-> 含真实数据加载的完整版见 `src/mnist_train.cpp` / `src/text_train.cpp`，以及
+> 含真实数据加载的完整版见 `src/mnist_train.cpp`（Session 手写循环）与 `src/text_train.cpp`
+> （CLI 接线：Dataset → `TextSampleSet` → Session → `TextTrainer`），以及
 > [`../usage/02-quickstart-train-infer.md`](../usage/02-quickstart-train-infer.md) 的「C++ API 编程训练」节。
 > GPU 上把 forward / backward 包进 `engine.begin_batch()` / `engine.end_batch()` 可消去
 > per-primitive 提交开销（见引擎手册 §3.5）。
@@ -752,7 +814,7 @@ NN_UNWRAP(nn::load_model("ternary.nnmodel", model2, nullptr, nullptr,
 ./build/dataset_convert vocab old.json -o old.nnvocab
 ```
 
-### 13.2 C++ 读取
+### 13.2 C++ 读取：数据集（存储单位 = doc）
 
 ```cpp
 #include <neuralnet.cpp/dataset.hpp>
@@ -760,16 +822,49 @@ NN_UNWRAP(nn::load_model("ternary.nnmodel", model2, nullptr, nullptr,
 nn::Dataset ds = NN_UNWRAP(nn::Dataset::open("llm.nndataset"));   // 也接受 .nnvocab（词表独立场景）
 const nn::DatasetInfo& info = ds.info();    // kind / num_docs / test_docs / loss_scope / source_*
 
-nn::TextCorpus train = NN_UNWRAP(ds.load_text(false));   // train 子集
-nn::TextCorpus test  = NN_UNWRAP(ds.load_text(true));    // test 子集（无则报错）
+nn::TextCorpus train = NN_UNWRAP(ds.load_text(nn::DatasetSubset::Train));  // train 子集
+nn::TextCorpus test  = NN_UNWRAP(ds.load_text(nn::DatasetSubset::Test));   // test 子集（无则报错）
+
+std::uint64_t n_docs = ds.doc_count(nn::DatasetSubset::Train);   // 存储单位 = doc
+nn::TextDoc doc0 = NN_UNWRAP(ds.text_doc(nn::DatasetSubset::Train, 0));  // 单 doc（检查/调试）
 
 const nn::KeyValueRecord& vocab = ds.vocab_kvrec();      // 词表（模型 v6 内嵌词表来源）
 ```
 
 `nn::TextCorpus { token_flow, doc_ids, loss_mask }`——三者都是扁平数组，
 `doc_ids` 是每 token 的文档 id（1 起），`loss_mask` 在 `loss_scope=all` 时全 1。
-从 `token_flow` 到训练张量（拼流 → 滑窗 → batch）的写法见 `src/text_train.cpp`；
-窗口是**训练策略**，不在数据集里（数据集只读、不做窗口化）。
+`Dataset` 只读、**不做窗口化**（存储单位是 doc）。
+
+### 13.3 训练样本：`nn::TextSampleSet`（训练单位 = 样本/窗口）
+
+窗口化是**训练策略**，在 `dataset_samples.hpp`：`TextSampleSet` 把子集 corpus 切成
+`seq_len` 窗口（**样本**），并负责 batch 装配；**`step` 是派生量**，不属于数据集格式。
+
+```cpp
+#include <neuralnet.cpp/dataset_samples.hpp>
+
+nn::TextWindowConfig win;
+win.seq_len = 256;
+win.stride  = 128;          // 0 = 不重叠（stride = seq_len）
+win.pad_id  = 0;            // 末窗不足 seq_len 时的填充 id（通常 = tokenizer.pad_id()）
+
+nn::TextSampleSet samples =
+    NN_UNWRAP(nn::TextSampleSet::create(ds, nn::DatasetSubset::Train, win));
+
+std::size_t n_samples = samples.sample_count();                    // 训练样本数
+std::size_t n_steps   = samples.steps_per_epoch(/*batch_size=*/8); // ceil(样本数/batch)
+nn::TextSample s0     = samples.sample(0);   // tokens/doc_ids/loss_mask/valid_len/offset 视图
+
+// 按样本下标装配一个 batch（末批可不满）：
+nn::TextSampleBatch batch;
+std::vector<std::size_t> indices = {0, 1, 2, 3, 4, 5, 6, 7};
+std::size_t valid_tokens = NN_UNWRAP(samples.make_batch(indices, batch));
+// batch.input = (seq_len, batch)；batch.flat_targets / flat_mask / doc_ids 是 batch-major
+// （i = b·seq_len + t）；valid_tokens = Σ 参与 loss 的位置数
+```
+
+> 大多数调用方不需要直接操作 `TextSampleSet`：`nn::TextTrainer` 在内部建好 train/test
+> 样本集并完成 batch 装配（§11.1）。需要自定义循环时才按上面的接口取样本/装配 batch。
 
 ---
 
