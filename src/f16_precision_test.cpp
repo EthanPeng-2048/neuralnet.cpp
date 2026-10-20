@@ -801,7 +801,8 @@ int main()
 #ifdef NN_HAS_VULKAN
     // GPU（可选；设备不可用则跳过 GPU 部分而不是失败）
     {
-        auto& backend = nn::GpuBackend::instance();
+        auto backend_owner = nn::GpuBackend::shared();
+    nn::GpuBackend& backend = *backend_owner;
         if (backend.initialize())
         {
             auto gpu_owner = nn::GpuEngine::create(backend);

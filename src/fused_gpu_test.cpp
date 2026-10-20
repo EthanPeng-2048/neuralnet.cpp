@@ -850,7 +850,8 @@ int main()
               << "  AOT 融合 shader GPU 数值验证（端到端）\n"
               << "========================================\n";
     auto cpu_engine = CpuEngine::create();
-    auto& backend = GpuBackend::instance();
+    auto backend_owner = GpuBackend::shared();
+    GpuBackend& backend = *backend_owner;
     auto init_r = backend.initialize();
     if (!init_r)
     {

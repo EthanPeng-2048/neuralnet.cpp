@@ -136,7 +136,8 @@ int main(int argc, char* argv[])
     std::cout << "[1/6] 初始化引擎..." << std::flush;
     auto cpu_engine = CpuEngine::create();
 
-    auto& backend = GpuBackend::instance();
+    auto backend_owner = GpuBackend::shared();
+    GpuBackend& backend = *backend_owner;
     auto init_result = backend.initialize(gpu_device);
     if (!init_result)
     {

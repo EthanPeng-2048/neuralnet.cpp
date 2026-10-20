@@ -469,7 +469,8 @@ int run_batch_dispatch(nn::CpuEngine& cpu, nn::GpuEngine& gpu)
     }
 
     // ── GPU：批量（默认）与逐个（NN_IRC_NO_BATCH=1）各跑一遍 ────────────
-    auto& backend = nn::GpuBackend::instance();
+    auto backend_owner = nn::GpuBackend::shared();
+    nn::GpuBackend& backend = *backend_owner;
     std::vector<nn::Matrix> outs[2];
     const auto run_gpu = [&](bool no_batch, std::vector<nn::Matrix>& out) -> bool
     {
@@ -579,7 +580,8 @@ int main()
     std::printf("========================================\n");
 
     auto cpu_engine = nn::CpuEngine::create();
-    auto& backend = nn::GpuBackend::instance();
+    auto backend_owner = nn::GpuBackend::shared();
+    nn::GpuBackend& backend = *backend_owner;
     auto init_r = backend.initialize();
     if (!init_r)
     {

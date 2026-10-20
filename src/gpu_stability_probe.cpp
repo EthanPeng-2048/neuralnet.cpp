@@ -23,7 +23,7 @@
 // 退出码：0 = 两轮逐位一致（io：全部用例过）；1 = 不一致；2 = 运行错误。
 // 用法：gpu_stability_probe [--steps N] [--init-hash] [--io-roundtrip]
 //       [--gpu [索引|--gpu=<名称>]] [--help]
-//   设备选择在首个 GpuBackend::instance() 之前注入 NN_VULKAN_DEVICE。
+//   设备选择在首个 GpuBackend::shared() 之前注入 NN_VULKAN_DEVICE。
 // ────────────────────────────────────────────────────────────────────────
 
 #include <cinttypes>
@@ -94,15 +94,16 @@ namespace
         return h;
     }
 
-    // 设备引擎（GPU 在首个 GpuBackend::instance() 前已注入 NN_VULKAN_DEVICE）
+    // 设备引擎（GPU 在首个 GpuBackend::shared() 前已注入 NN_VULKAN_DEVICE）
     nn::Result<std::shared_ptr<nn::ComputeEngine>> make_engine(bool gpu)
     {
         std::shared_ptr<nn::ComputeEngine> eng;
         if (gpu)
         {
 #ifdef NN_HAS_VULKAN
-            auto &backend = nn::GpuBackend::instance();
-            // 修复（16 §7-2 根因）：instance() 只是惰性单例，Vulkan 设备要
+            auto backend_owner = nn::GpuBackend::shared();
+            nn::GpuBackend& backend = *backend_owner;
+            // 修复（16 §7-2 根因）：shared() 只建 backend，Vulkan 设备要
             // initialize() 才建立——本探针原先漏调，首个 vkCreateBuffer 拿到
             // VK_NULL_HANDLE 即 "Invalid device" 崩溃。与 cli_engine_factory
             // 及全部 GPU 测试入口同法。无显式 selector 时 initialize() 内部

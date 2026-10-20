@@ -56,7 +56,8 @@ int run_test()
     const std::size_t d_ff     = 128;
     const std::size_t num_layers = 6;
 
-    auto& backend = GpuBackend::instance();
+    auto backend_owner = GpuBackend::shared();
+    GpuBackend& backend = *backend_owner;
     auto init_r = backend.initialize();
     if (!init_r)
     {

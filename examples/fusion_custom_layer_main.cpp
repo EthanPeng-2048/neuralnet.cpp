@@ -64,7 +64,8 @@ int main()
 
 #ifdef NN_HAS_VULKAN
     // ── GPU ──────────────────────────────────────────────────────────────
-    nn::GpuBackend& backend = nn::GpuBackend::instance();
+    auto backend_owner = nn::GpuBackend::shared();
+    nn::GpuBackend& backend = *backend_owner;
     if (auto ir = backend.initialize(); !ir)
     {
         std::fprintf(stderr, "[example] GPU 初始化失败（跳过）：%s\n",

@@ -150,7 +150,8 @@ void take_sample(const std::string& label)
 {
     Sample s;
     s.label = label;
-    auto& backend = nn::GpuBackend::instance();
+    auto backend_owner = nn::GpuBackend::shared();
+    nn::GpuBackend& backend = *backend_owner;
     if (backend.is_initialized())
     {
         s.persist = backend.memory_pool().pool_debug_stats();

@@ -159,7 +159,8 @@ int main(int argc, char* argv[])
 
 #ifdef NN_HAS_VULKAN
     {
-        auto& backend = nn::GpuBackend::instance();
+        auto backend_owner = nn::GpuBackend::shared();
+    nn::GpuBackend& backend = *backend_owner;
         auto init_r = backend.initialize(gpu_device);
         if (!init_r)
         {

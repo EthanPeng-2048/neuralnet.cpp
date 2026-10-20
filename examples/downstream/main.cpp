@@ -101,7 +101,8 @@ int main()
 #ifdef NN_HAS_VULKAN
     // ── GPU 路径（neuralnet::nn 自动传入 NN_HAS_VULKAN 才编译进来）────────
     // 无 Vulkan 设备/初始化失败 → 按 ctest 约定返回 77（skip），不算失败。
-    auto& backend = nn::GpuBackend::instance();
+    auto backend_owner = nn::GpuBackend::shared();
+    nn::GpuBackend& backend = *backend_owner;
     if (auto ir = backend.initialize(); !ir)
     {
         std::printf("[downstream] GPU 初始化失败，跳过 GPU 校验：%s\n",

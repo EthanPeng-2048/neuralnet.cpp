@@ -165,6 +165,33 @@ void test_optimizer_keeps_engine_alive()
     CHECK(step, "Optimizer 持有引擎强引用，step 正常");
 }
 
+void test_backend_shared_weak_cache()
+{
+#ifdef NN_HAS_VULKAN
+    // D5：shared() = weak 缓存。有活使用者时复用；全部释放后确定性回收；
+    // 下一次 shared() 重新创建（不初始化设备，调用方仍需 initialize()）。
+    std::weak_ptr<nn::GpuBackend> watch;
+    {
+        auto b = nn::GpuBackend::shared();
+        CHECK(b != nullptr, "shared() 返回实例");
+        watch = b;
+        auto b2 = nn::GpuBackend::shared();
+        CHECK(b2.get() == b.get(), "有活使用者时 shared() 复用同一实例");
+
+        auto engine = nn::GpuEngine::create(b);
+        b.reset();
+        b2.reset();
+        CHECK(!watch.expired(), "引擎句柄保活 backend");
+        engine.reset();
+    }
+    CHECK(watch.expired(), "全部使用者释放后 backend 确定性回收");
+    auto b3 = nn::GpuBackend::shared();
+    CHECK(b3 != nullptr, "回收后 shared() 可重建");
+#else
+    std::printf("[SKIP] backend weak 缓存：构建未启用 Vulkan\n");
+#endif
+}
+
 void test_cross_domain_rejected()
 {
 #ifdef NN_HAS_VULKAN
@@ -252,6 +279,7 @@ int main()
     test_model_keeps_engine_alive();
     test_cross_engine_reinit_rejected();
     test_optimizer_keeps_engine_alive();
+    test_backend_shared_weak_cache();
     test_cross_domain_rejected();
     test_layer_init_failure_rollback();
 

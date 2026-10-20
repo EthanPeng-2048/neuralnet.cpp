@@ -759,12 +759,21 @@ public:
         return reinterpret_cast<DomainId>(this);
     }
 
-    // 进程共享 backend：函数局部 static shared_ptr——⚠ 该 static 强引用永不
-    // 释放（Vulkan 资源活到进程退出，D5；P3 改 weak 缓存）。GpuBuffer 也持有
-    // 强引用，因此 Tensor/GpuBuffer 晚于 GpuEngine 析构仍安全。
+    // 进程共享 backend（生命周期 v3 / D5）：weak 缓存 + mutex。
+    //   · 有活使用者（GpuEngine / GpuBuffer / 调用方句柄）时共享同一实例；
+    //   · 全部释放后 backend 及其 Vulkan 资源**确定性回收**（地址可被新
+    //     backend 复用——GpuBuffer 的 keepalive 保证张量存活期内不复用）；
+    //   · 下一次 shared() 重新创建（无设备初始化，调用方仍需 initialize()）。
+    // 需要独立生命周期（测试/多设备）用 create()。
     [[nodiscard]] static std::shared_ptr<GpuBackend> shared()
     {
-        static std::shared_ptr<GpuBackend> backend(new GpuBackend());
+        static std::mutex mu;
+        static std::weak_ptr<GpuBackend> weak;
+        std::lock_guard<std::mutex> lock(mu);
+        if (auto alive = weak.lock())
+            return alive;
+        std::shared_ptr<GpuBackend> backend(new GpuBackend());
+        weak = backend;
         return backend;
     }
 
@@ -772,13 +781,6 @@ public:
     [[nodiscard]] static std::shared_ptr<GpuBackend> create()
     {
         return std::shared_ptr<GpuBackend>(new GpuBackend());
-    }
-
-    // 兼容旧入口：返回 shared() 的引用。新代码应直接持有 shared()。
-    [[nodiscard]] static GpuBackend& instance()
-    {
-        static std::shared_ptr<GpuBackend> keepalive = shared();
-        return *keepalive;
     }
 
     [[nodiscard]] std::shared_ptr<GpuBackend> keepalive() noexcept

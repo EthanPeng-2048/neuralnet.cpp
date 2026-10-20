@@ -7,7 +7,8 @@
 
 int main() {
     printf("=== GPU f16 Capability Check ===\n");
-    auto& backend = nn::GpuBackend::instance();
+    auto backend_owner = nn::GpuBackend::shared();
+    nn::GpuBackend& backend = *backend_owner;
 
     // Explicitly initialize
     auto init_r = backend.initialize();

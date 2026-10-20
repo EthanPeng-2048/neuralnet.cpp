@@ -565,7 +565,8 @@ int main()
 #ifndef NN_HAS_VULKAN
     std::cout << "[SKIP] 无 Vulkan，跳过 GPU 部分\n";
 #else
-    auto& backend = nn::GpuBackend::instance();
+    auto backend_owner = nn::GpuBackend::shared();
+    nn::GpuBackend& backend = *backend_owner;
     auto init_r = backend.initialize();
     if (!init_r)
     {
