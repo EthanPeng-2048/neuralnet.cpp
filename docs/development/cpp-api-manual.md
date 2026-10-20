@@ -153,7 +153,7 @@ SPIR-V 嵌入头目录、Vulkan 链接与 shader 生成顺序。嵌入时 `NN_BU
 ## 3. 引擎：选择与创建
 
 引擎由 `shared_ptr` 管理。`Layer` / `Model` / `Optimizer` 会持有强引用，
-`Tensor` 只保存 8B `EngineId`；不再需要“引擎最后析构”的调用约定。
+`Tensor` 不保存引擎身份（设备域从存储派生）；不再需要“引擎最后析构”的调用约定。
 ⚠ 但这**不覆盖**优化器与模型的顺序：`Optimizer` 的参数/梯度是 Model 内
 Tensor 的非拥有引用，**优化器必须先于 Model 销毁**（否则 `step()` UAF）；
 用 `nn::TrainingSession` 统一拥有两者可结构性避免（[`todo/29`](../todo/29-session-architecture.md)）。

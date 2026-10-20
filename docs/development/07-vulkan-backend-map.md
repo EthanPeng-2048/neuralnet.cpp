@@ -153,7 +153,7 @@ binding 数 / push 字节数 / 能力要求），算子侧用 `PipelineId` 选�
 任何一步结构改动都按下面的门槛走（编译时间是观测量，不是验收项）：
 
 - `ctest --test-dir build-gpu`（GPU + CPU）全绿；
-- `NN_BIND_DEBUG=1 ctest` 全绿；
+- 设备域检查默认生效（无独立开关；跨域操作数 = 明确 `Result` 错误）；
 - 字节锚不变：`gpu_stability_probe --steps 20`、
   `layer_bench --op matmul,matmul_q,matmul_q_bw,scan_prefix,scan_suffix --f16 --hash`、
   `rapt_test --gpu` / `--f16 --gpu`、`scan_bitwise_test`；

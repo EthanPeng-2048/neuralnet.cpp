@@ -102,3 +102,33 @@ GPT `d_model=64 / heads=4 / layers=2 / d_ff=128 / seq_len=128 / batch=8`，850M 
   不再因 1 MB 默认栈 SegFault。
 - **`scan_bitwise_test` 平台口径**：逐位锚以 Linux Release + 850M 为权威；Windows 与
   Debug 构建按 77 skip（数值正确性仍由 `gpu_test` 的容差用例覆盖）。
+
+---
+
+## 5. 2026-10-20 `v1.10.0-rc0` 预发布记录（分支 `dev/lifetime_refresh`）
+
+> 本 rc 只覆盖本分支新增的三块能力（生命周期 v3 / `TrainingSession` / backend 弱缓存）；
+> 完整四编译器矩阵与 Linux+850M 权威口径**未在本次重跑**（见 §4 的 v1.9.0 记录）。
+> 正式版（P2b 完成后）需按本文件 §1–§3 全量重跑。
+
+### 5.1 构建与测试
+
+| 树 | 命令 | 结果 |
+|---|---|---|
+| CPU Release（clang 22，`NN_ENABLE_GPU=OFF`，`NN_ENABLE_TESTS=ON`） | `cmake --preset cpu` + build + `ctest` | **55/55 通过**（GPU-only 用例按 77 skip） |
+| GPU Release（clang 22，Vulkan，RTX 2060 SUPER / 驱动 580） | `cmake --preset dev` + build + `ctest` | **57/57 通过** |
+| ASan（clang 22，`-fsanitize=address`，Windows，`NN_ENABLE_PCH=OFF`） | 单独目标构建 + 运行 | `lifetime_contract_test` / `training_session_test` / `layer_lifetime_test` **全绿**（Windows ASan 不支持 LSan，泄漏检测未跑） |
+| `sizeof(Tensor)` | 探针编译 | CPU **56 B** / GPU **80 B**（v1.9.0：64 / 88） |
+
+### 5.2 门禁
+
+- `bench/doc_align_audit.ps1`：exit 0（`[A]`/`[D]`/`[E]`/`[F]` 可行动均为 0）；
+- `bench/doc_inventory.ps1`：exit 0（`virtual methods` 52/52、`L2-VIOLATIONS: 0`、`HANDWRITTEN-RESIDUE: 0`、`TERMINATING-CALLS: 0`）；
+- `grep -E 'EngineId|NN_BIND_DEBUG'` 在 `include/src/tools/examples/CMakeLists/CONTRIBUTING/.github` 零命中（历史归档与 release-notes 的历史提及除外）。
+
+### 5.3 未覆盖 / 明示风险
+
+1. **P2b 未做**：CLI 仍用自由工厂 + 手工训练状态（见 `29-session-architecture.md` §8）；
+2. **Linux + 850M / 40HX / libc++ / libstdc++ / MSVC 矩阵未重跑**（沿用 v1.9.0 记录，代码变更已通过 clang 22 + MSVC STL 的现有 CI 口径编译）；
+3. **`scan_bitwise_test` 仍按平台口径 skip**（逐位锚权威 = Linux + 850M）；
+4. `layer_bench` 配对 A/B 未在本 rc 重跑：本次改动不含数值路径变更（CPU/GPU 逐位一致性由 `expr_fuse_test` / `fused_gpu_test` / `expr_fold_test` 覆盖）。

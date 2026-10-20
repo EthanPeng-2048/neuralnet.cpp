@@ -1,7 +1,9 @@
 # 28 — 生命周期 v3：设备域模型与所有权收敛
 
 > **读者**：项目开发者（本仓内部工作文档）。分册定位见 [`README.md`](README.md)。
-> **状态**：🟡 **已立项，待实施（2026-10-20）**。决策记录见 §3；Session 层（原第 3 项）拆到
+> **状态**：✅ **已实施（2026-10-20，分支 `dev/lifetime_refresh`，发布 `v1.10.0-rc0`）**。
+> P0（安全修复）/ P1（v3 core）/ P3（backend 弱缓存）已完成并全绿；Session 层 P2a 见
+> [`29`](29-session-architecture.md)（P2b 未做）；P4 文档收尾随本分支。决策记录见 §3；Session 层（原第 3 项）拆到
 > [`29-session-architecture.md`](29-session-architecture.md)。
 > **替代关系**：本文取代 [`../development/08-object-lifetimes.md`](../development/08-object-lifetimes.md)
 > 与 [`../development/09-engine-ownership.md`](../development/09-engine-ownership.md) 里"Tensor 保存
@@ -23,7 +25,7 @@
 | # | 债 | 严重度 | 证据 / 触发条件 |
 |---|---|---|---|
 | D1 | **绑定检查没有比较 `this`**：`bind_check_` 只让操作数互相比较（首个 bound 作基准），从不验证操作数属于当前引擎 ⇒ 单操作数入口可让外来 GPU 张量进入任意引擎；`GpuEngine::import_impl` 对 `src.is_gpu()` 直接返回别名，跨 backend 传张量是 UB | 高 | `compute_engine.hpp` 的 `bind_check_one_`；`compute_gpu_engine.hpp` 的 `import_impl`；全仓无 mixed-engine 拒绝测试 |
-| D2 | **provenance 传播机器是持续维护税**：`core_engine_id.hpp` 83 行；`stamp_` 35 处；`adopt` 18 处；`bind_check_` 42 处；`NN_BIND_DEBUG` 3 处 + CI 第二轮 ctest。新增回退路径必须记得 stamp（历史上 RV-06、v1.9 f16 回退 cast 两次补漏） | 高 | 计数见 `bench/doc_inventory.ps1` 之外的 grep 口径；`docs/history/history.md` 对应条目 |
+| D2 | **provenance 传播机器是持续维护税**：core_engine_id.hpp 83 行；`stamp_` 35 处；`adopt` 18 处；`bind_check_` 42 处；`NN_BIND_DEBUG` 3 处 + CI 第二轮 ctest。新增回退路径必须记得 stamp（历史上 RV-06、v1.9 f16 回退 cast 两次补漏） | 高 | 计数见 `bench/doc_inventory.ps1` 之外的 grep 口径；`docs/history/history.md` 对应条目 |
 | D3 | **Optimizer 的 owner 契约是假的**：`params_/grads_` 是非拥有 `TensorRef` 指向 Model/Layer 成员 Tensor；Model 先析构 ⇒ `step()` UAF；两份文档却写"优化器晚于 Model 存活也安全" | 高 | `compute_optimizer.hpp`；`09-engine-ownership.md`、`08-object-lifetimes.md`；`layer_lifetime_test` 未覆盖 |
 | D4 | **activation offload 状态机缺口**：`export_activations` 在 `offloaded_` 为真时静默 `return {}`，只有 import 清标志 ⇒ 两次 forward 之间可能静默用上一步 slab；slab 以 f32 记账，f16/t1_58 + offload 无配置期拒绝、无测试 | 中高 | `compute_layer_base.hpp` 的 `ActivationOffloader`；`cli/text_train_config.hpp` 未校验组合 |
 | D5 | **GPU 后端生命周期不具确定性**：`GpuBackend::shared()` 的函数局部 static 强引用使 Vulkan 资源活到进程退出；`instance()` 叠加第二层 static，16 个调用点 | 中 | `backend/compute_vk_backend.hpp`；`09-engine-ownership.md` 声称 RAII 即时回收 |
@@ -72,10 +74,10 @@
 
 | 删除 | 新增 |
 |---|---|
-| `core_engine_id.hpp`（70 行）、`core_engine_lease.hpp`（13 行）；`EngineId` 字段/`id()`/ID 分配器 | `DomainId` 概念 + `kHostDomain`；`Tensor::device_domain_()`（friend 引擎，raw 访问器，避免 `shared_ptr` 原子） |
+| core_engine_id.hpp（70 行）、core_engine_lease.hpp（13 行）；`EngineId` 字段/`id()`/ID 分配器 | `DomainId` 概念 + `kHostDomain`；`Tensor::device_domain_()`（friend 引擎，raw 访问器，避免 `shared_ptr` 原子） |
 | `stamp_` 35 处 + `adopt` 18 处 + `to_prec` 内部 stamp；`reshape` 的 id 传播 | `GpuBuffer::backend_identity()` + 裸 buffer 访问器（import 热路约 1 700 次/step，禁止新增原子） |
 | `bound()`/unbound 三态；`NN_BIND_DEBUG` 3 处 + CI 第二轮 ctest；`bind_check_` 的旧比较逻辑 | `bind_check_` 新实现（调用点 42 处不变）；`import` 快路设备守卫；错误信息"设备域不匹配" |
-| `core_engine_id.hpp` 的 include（`compute_tensor`/`expr_dsl`/`expr_graph`/`model_container`） | 文档：单源生命周期文档（09 重写、08 删除/转发）、usage/03、cpp-api-manual、AGENTS 索引 |
+| core_engine_id.hpp 的 include（`compute_tensor`/`expr_dsl`/`expr_graph`/`model_container`） | 文档：单源生命周期文档（09 重写、08 删除/转发）、usage/03、cpp-api-manual、AGENTS 索引 |
 
 净代码约 **−120 行**；机制点 **101 → 42**（只留 bind 调用点）。**预期数值路径零改动**：CPU/GPU 字节锚
 必须逐位不变。

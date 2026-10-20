@@ -1,7 +1,8 @@
 # 29 — Session 层：TrainingSession / InferenceSession / RLTrainingSession
 
 > **读者**：项目开发者（本仓内部工作文档）。分册定位见 [`README.md`](README.md)。
-> **状态**：🟡 **设计稿 + 待实施（2026-10-20 命名与方案已确认）**。
+> **状态**：✅ **P2a 已实施（2026-10-20，`training_session.hpp` + `training_session_test`）**；
+> P2b（CLI 迁移 + 训练状态收编）未做，计划在正式版前完成（见 §8）。
 > **依赖**：[`28-lifecycle-v3.md`](28-lifecycle-v3.md)（P1 生命周期 v3 先落；本文对应执行计划 P2）。
 > 执行排序见 [`27-execution-plan.md`](27-execution-plan.md)；裁定台账见 [`18-roadmap.md`](18-roadmap.md) §4.2 P1-8。
 

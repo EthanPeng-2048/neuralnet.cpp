@@ -69,7 +69,7 @@
 | [`05-mixed-precision.md`](development/05-mixed-precision.md) | 多精度语义契约（写层/选 profile 必读）+ 实测限制 |
 | [`06-rapt-algorithm.md`](development/06-rapt-algorithm.md) | 线性注意力（RLA → RAPT → RLA-2）算法 + 扫描原语落地 |
 | [`07-vulkan-backend-map.md`](development/07-vulkan-backend-map.md) | Vulkan 后端结构地图（维护者）：调用链 / 所有权 / 依赖方向 / 扩展步骤 |
-| [`08-object-lifetimes.md`](development/08-object-lifetimes.md) | 对象生命周期契约 v2：EngineId / shared_ptr 强所有权 / GPU buffer keepalive（迁移检查清单） |
+| [`08-object-lifetimes.md`](development/08-object-lifetimes.md) | 对象生命周期契约 v3 转发页（唯一真源 = `09`：设备域从存储派生 / 入口逐操作数检查 / `import` 是唯一跨域入口） |
 | [`09-engine-ownership.md`](development/09-engine-ownership.md) | 引擎/ backend 所有权设计：不变量、改动范围、API 影响、性能口径与实施顺序 |
 | [`20-custom-layer-ergonomics.md`](development/20-custom-layer-ergonomics.md) | 写自定义层的**实测报告**：接入契约与 7 个摩擦点（库外使用者视角） |
 
@@ -95,7 +95,7 @@
 | [`../CMakePresets.json`](../CMakePresets.json) | 预设构建（`cmake --preset dev` 等）——见 CONTRIBUTING §1 |
 | [`benchmarks/2026-09-25-vulkan-vs-cuda.md`](benchmarks/2026-09-25-vulkan-vs-cuda.md) | Vulkan 后端 vs CUDA（torch）基准 |
 | [`benchmarks/2026-10-06-vulkan-vs-torch.md`](benchmarks/2026-10-06-vulkan-vs-torch.md) | 第二轮复测 |
-| `release-notes/v1.5.0.md` … `v1.9.0.md` | 版本变更说明，覆盖 v1.5.0 → v1.9.0 的全部 tag（`v1.5.1` / `v1.6.1` / `v1.7.1` / `v1.8.0` 为 2026-10-18 补写；**大版本发布要求**见 [`todo/25-release-requirements.md`](todo/25-release-requirements.md)） |
+| `release-notes/v1.5.0.md` … `v1.10.0-rc0.md` | 版本变更说明，覆盖 v1.5.0 → v1.10.0-rc0 的全部 tag（`v1.5.1` / `v1.6.1` / `v1.7.1` / `v1.8.0` 为 2026-10-18 补写；**大版本发布要求**见 [`todo/25-release-requirements.md`](todo/25-release-requirements.md)） |
 
 ## 3. 2026-10-11 文档整理记录
 

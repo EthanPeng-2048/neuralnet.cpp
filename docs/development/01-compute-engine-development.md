@@ -831,7 +831,7 @@ TEST_CASE("linear_gradcheck") {
 3. 检查 `VK_ERROR_DEVICE_LOST` 错误
 4. 使用 RenderDoc 捕获 frame
 5. 环境诊断开关：`NN_PREC_TRACE=1`（融合精度分派 `#a`/`#x` 命中与 miss 逐条打日志）、
-   `NN_BIND_DEBUG=1`（Tensor 跨引擎绑定检查，抓未绑定/串引擎）、`NN_MEM_STATS=1`（内存池账本）、
+   设备域检查（v3 起默认生效，无独立开关：跨域操作数直接 `Result` 错误）、`NN_MEM_STATS=1`（内存池账本）、
    `NN_VULKAN_DEVICE`（多 GPU 选择，CLI 另有 `--gpu`）
 
 ### Q3: 如何添加新的激活函数？
