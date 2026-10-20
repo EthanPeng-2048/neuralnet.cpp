@@ -8,9 +8,9 @@ cmake_minimum_required(VERSION 3.30)
 # 否则链接期会出现 std 符号 ABI 不匹配）。
 # 本文件不再隐式挑选编译器或 stdlib，避免与调用方/CI 的设置冲突。
 
-# VERSION 以 git tag 为准（当前 v1.9.0；本仓无 CONFIGURE_FILE 消费该字段，
+# VERSION 以 git tag 为准（当前 v1.10.0-rc0；本仓无 CONFIGURE_FILE 消费该字段，
 # 它只是元数据——发版时同步到最新 tag，实际版本以 git tag / gh release 为准）
-project(neuralnet.cpp VERSION 1.9.0 LANGUAGES CXX)
+project(neuralnet.cpp VERSION 1.10.0 LANGUAGES CXX)
 
 # ══════════════════════════════════════════════════════════════════════════
 #  作为库被消费（add_subdirectory / FetchContent 嵌入 3rd_party）的门控
@@ -659,6 +659,10 @@ if(NN_BUILD_APPS OR NN_ENABLE_TESTS)
     # optimizer 先于 Model 析构的正常顺序。
     nn_add_executable(lifetime_contract_test src/lifetime_contract_test.cpp)
     list(APPEND NN_TEST_TARGETS lifetime_contract_test)
+
+    # -- P2a: TrainingSession (Model + Optimizer 同生共死, docs/todo/29) --
+    nn_add_executable(training_session_test src/training_session_test.cpp)
+    list(APPEND NN_TEST_TARGETS training_session_test)
 
     # ── F1：危险精度组合启动期告警（仅警告，不拒绝；docs/todo/24 §2.3）────
     # [1][2] 头文件函数组合矩阵（含 all=f16）单测；[3] 子进程跑 text_train/

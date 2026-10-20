@@ -62,6 +62,13 @@ public:
     // D7（15 §4.7，M6 裁定=删除死码）：原 `set_engine(ComputeEngine&)` 全仓
     // 零调用方，且"绑定后换引擎"与"层已在 add() 时 init 绑定"冲突——绑定只经
     // 构造函数 `Model(ComputeEngine&)`（或移动后沿用既有绑定）。
+    // 是否已绑定引擎（不触发 fail-fast 的只读查询；TrainingSession::create
+    // 等"编排层"在构造前用它做 Result 错误而不是 abort）。
+    [[nodiscard]] bool engine_bound() const noexcept
+    {
+        return static_cast<bool>(engine_);
+    }
+
     [[nodiscard]] ComputeEngine& engine(
         std::source_location loc = std::source_location::current()) const
     {

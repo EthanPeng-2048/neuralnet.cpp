@@ -36,3 +36,4 @@
 #include "loss.hpp"
 #include "optimizer.hpp"
 #include "model.hpp"
+#include "training_session.hpp"   // TrainingSession（推荐：Model + Optimizer 同生共死）
