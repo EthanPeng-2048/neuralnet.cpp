@@ -646,9 +646,9 @@ if(NN_BUILD_APPS OR NN_ENABLE_TESTS)
     nn_add_executable(assert_always_test src/assert_always_test.cpp)
     list(APPEND NN_TEST_TARGETS assert_always_test)
 
-    # ── 引擎借用生命周期（EngineLease / Layer 状态机 / 引擎先析构路径）──
-    # 覆盖：令牌三态、init 失败回滚、跨引擎重绑拒绝、Layer/Model/Tensor 在
-    # 引擎销毁后的 fail-fast（子进程断言）与正常顺序回归。
+    # ── 生命周期 v3（设备域 / Layer 状态机 / 引擎先析构路径）────────────
+    # 覆盖：域模型与跨域拒绝、import 唯一入口、backend weak 缓存回收、
+    # init 失败回滚、跨引擎重绑拒绝、Tensor 活过引擎。
     nn_add_executable(layer_lifetime_test src/layer_lifetime_test.cpp)
     list(APPEND NN_TEST_TARGETS layer_lifetime_test)
 

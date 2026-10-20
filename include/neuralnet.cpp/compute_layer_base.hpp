@@ -775,7 +775,13 @@ public:
     void set_enabled(bool enabled) noexcept
     {
         enabled_ = enabled;
-        if (!enabled) { slab_ = Tensor{}; offloaded_ = false; }  // 释放持久缓冲
+        if (!enabled)
+        {
+            // 关闭即作废：已导出的激活数据无法回填（成员张量在 export 时被
+            // 置空），保留 Offloaded 状态只会让后续 import 读到不一致的 slab。
+            discard();
+            slab_ = Tensor{};   // 释放持久缓冲
+        }
     }
     [[nodiscard]] bool enabled() const noexcept { return enabled_; }
     [[nodiscard]] bool offloaded() const noexcept { return offloaded_; }
@@ -804,7 +810,12 @@ public:
         if (offloaded_)
             NN_FAIL("ActivationOffloader::export_activations: 上一轮导出的激活尚未 import"
                     "（forward 未配对 backward，且 forward 入口未 discard）");
-        refs_ = std::move(refs);
+        // 只保留有效缓存：refs_/shapes_/offsets_ 必须逐项对齐（import 用同一下标
+        // 写回 refs_），因此在这里**压缩**，而不是在写入循环里 skip 无效项。
+        refs_.clear();
+        for (auto& ref : refs)
+            if (ref.get().valid())
+                refs_.push_back(ref);
         offsets_.clear();
         shapes_.clear();
         // slab 容量校验：slab 必须容纳**本次**导出的激活总量（批大小/
@@ -815,7 +826,6 @@ public:
         std::size_t needed = 0;
         for (auto& ref : refs_)
         {
-            if (!ref.get().valid()) continue;
             // 精度协议：slab 恒按 f32 记账/存储（offload_save 把 f16 抬成 f32，
             // restore 出来是 f32 张量），restore 后成员激活的精度与 forward 时
             // 不一致——该组合无测试、无精度协议，静默漂移不可接受，一律
@@ -828,6 +838,13 @@ public:
             needed += ref.get().size();
         }
         if (needed == 0) { offloaded_ = false; return {}; }
+        // CPU 引擎的 offload 原语是 no-op（restore 返回 1×1）——export 会把成员
+        // 缓存置空、import 再把 1×1 写回，等于毒化 backward。CLI 早已忽略该组合，
+        // 这里对**所有**非 CLI 调用方统一 fail-fast（唯一的正确做法是别开）。
+        if (engine.device() != Device::GPU)
+            NN_FAIL("ActivationOffloader::export_activations: activation offload 仅支持"
+                    " GPU 引擎（CPU 引擎的 offload 原语是 no-op，开启会破坏 backward；"
+                    "请改用 --checkpoint-every）");
         if (!slab_.valid() || slab_.size() < needed)
         {
             NN_TRY(slab, engine.create_offload_buffer(needed));
@@ -836,7 +853,6 @@ public:
         std::size_t offset = 0;
         for (auto& ref : refs_)
         {
-            if (!ref.get().valid()) continue;
             NN_TRY(r, engine.offload_save(slab_, offset, ref.get()));
             shapes_.push_back({ref.get().rows(), ref.get().cols()});
             offsets_.push_back(offset);

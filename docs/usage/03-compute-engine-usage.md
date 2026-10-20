@@ -295,15 +295,21 @@ struct nn::PrecisionProfile {
 
 `nn::f16` 是 IEEE binary16 值类型：2 字节、与 GPU R16F 内存布局一致（**同精度 CPU↔GPU 传输 = 原始字节拷贝**）、算术为"f32 参考 + 舍入到 f16"、`static_cast<float>(x)` 升位精确无损。所有 f32↔f16 转换统一 **round-half-to-even**。
 
-### 3.4 出生绑定与跨引擎检查
+### 3.4 设备域与跨域检查（v3）
 
-张量在**引擎入口产物处自动记录**创建它的引擎 `EngineId`（8B，不保存指针）。
-该身份随拷贝/reshape 传播，仅用于跨引擎混用诊断；Tensor 可以安全地晚于引擎析构。
+**Tensor 不保存引擎身份**：设备域从**存储**派生（CPU 存储 → `kHostDomain`；GPU 存储 →
+其 `GpuBuffer` 的 backend 标识；空/无效 → 0 唯一豁免）。域正确性是存储的必然属性，
+不存在"忘记传播身份"的缺口；Tensor 可以安全地晚于引擎析构（GPU 由 `GpuBuffer` 的
+backend keepalive 保证）。
 
-- `engine` 的每个公共入口都做 `bind_check_`：本轮调用的所有操作数中，**双方都绑定且引擎指针不同 → `Result` 硬错误**；单侧未绑定按库外豁免放行。
-- 设置 `NN_BIND_DEBUG=1`（进程启动前）后，**未绑定输入进引擎**也报错，用来抓漏网。错误带 `source_location`（file:line）与张量形状，并同步打到 stderr。
-- **跨设备互传只准经 `import`**（见 §5.4）。`ensure_gpu` 这个名字已不存在（改名即防线）。
-- 引擎生命周期必须长于其创建的所有张量（一期不加析构探测）。
+- 每个引擎公共入口（NVI）都做域检查：**每个非空操作数必须属于本引擎域**，否则
+  `Result` 硬错误（带 `source_location`、形状与两侧域值 + 迁移提示）。
+- 跨域只准经两个入口：CPU→GPU 用 `engine.import(t)`；GPU→CPU 用 `engine.to_matrix(t)`。
+  跨 GPU backend 直接使用 = 错误（先 `to_matrix` 落宿主再 `import`）。
+- **没有调试开关**：域检查是默认行为（v2 的 `NN_BIND_DEBUG` 已删除）。
+- 多引擎共享：所有 CPU 引擎同属 `kHostDomain`（跨 CPU 引擎使用张量合法）；GPU 引擎
+  共享同一 `GpuBackend` 时同域。
+- `engine.domain()` 只读诊断；**不要**从张量反查引擎。
 
 ### 3.5 GPU 批处理录制生命周期（铁律 #6）
 
@@ -966,7 +972,7 @@ auto bad = nn::dsl::matmul(q, k, true, false, 1, 0.125f);
 
 ```cpp
 NN_TRY(seg_begin, engine.begin_expr());       // 开始录制（GPU 真录制）
-nn::ExprSegment seg(engine);                  // RAII：作用域退出自动兜底收口
+nn::ExprSegment seg(engine_owner);            // RAII：持引擎强引用，作用域退出自动兜底收口
 // 录制期内正常写 dsl::compute / compute_into，GPU 上入图不求值
 NN_TRY_CHECK(seg.end());                      // 显式收口；end_expr 错误照常传播
 ```
@@ -1622,12 +1628,11 @@ public:
 > 都不参与编译，环境变量设了也一律无效（避免"设了环境变量就悄悄拖慢正常
 > 训练/推理"）。探针可执行目标 `mem_probe` / `f16_cpu_probe` /
 > `gpu_stability_probe` 同样只在 `NN_ENABLE_PROBES=ON` 时创建。
-> 例外：`NN_BIND_DEBUG`、`NN_VULKAN_*`、`NN_POOL_*` 是**初始化期读一次**的
-> 行为开关，任何构建都有效（零热路径开销）。
+> 例外：`NN_VULKAN_*`、`NN_POOL_*` 是**初始化期读一次**的行为开关，任何构建都有效
+> （零热路径开销）。设备域检查是默认行为，没有调试开关。
 
 | 环境变量 | 作用 |
 |---|---|
-| `NN_BIND_DEBUG=1` | 未绑定输入进引擎也报错（抓库内 stamp 漏网）；错误同步打 stderr，带 `file:line` 与形状。**建议作为门禁运行 `NN_BIND_DEBUG=1 ctest`** |
 | `NN_PREC_TRACE=1`（**需探针构建**） | 打印每个 `(结构 key, 精度签名)`；`[prec][alu-hit]` = 命中**变体**（`key#x` 运行期精度分派 **或** `key#a` native16，key 本身即区分）；`[prec][fallback]` = 该结构没有可用的 `#x`（回退基类边界 cast）；`[into] branch=…` 打印 `eval_expr_into` 的分支。**`[prec][miss]` 保留为通用诊断**（V1 覆盖后 f16 融合路径实测 `miss=0`）；"回填清单"工作流（`tools/prec_backfill.txt`）已随"运行期精度分派"删除。日志只由真正 dispatch 的入口、且在确认命中后打——`supports_expr_precision_variant` 是查询，不产生命中日志 |
 | `NN_F16_DEBUG=1`（**需探针构建**） | f16 中间量数值扫描（`nn_dbg_scan`）、`accumulate` 巨值打印、`compute_into` 预绑定失败原因 |
 | `NN_MEM_STATS=1`（**需探针构建**） | 训练中内存采样（配合 `pool_stats()`） |

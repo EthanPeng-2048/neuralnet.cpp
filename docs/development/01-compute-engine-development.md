@@ -107,8 +107,8 @@ engine.end_batch();  // 提交并等待
 ```
 
 > **接口分层（NVI，P-1/P1 之后）**：引擎的**公共入口全部非虚**——承载边界 cast
-> （f16 抬 f32 算→按 P 落回，15 §4.1）、`bind_check_`（跨引擎检查，15 §4.3 D3）
-> 与 `stamp_`（张量出生绑定，15 §3.1）；**引擎实现侧是 protected 的虚 `*_impl`**。
+> （f16 抬 f32 算→按 P 落回，15 §4.1）、`bind_check_`（设备域检查，docs/todo/28 §4.3）
+> ；**引擎实现侧是 protected 的虚 `*_impl`**。
 > 下文各"原语"清单列出的就是引擎需要实现的 `*_impl` 签名；调用方（Layer/测试）
 > 永远调用**同名公共入口**（不带 `_impl`）。
 
@@ -158,13 +158,13 @@ Result<void> set_index(Tensor& t, std::size_t row, std::size_t col, Scalar v);
 **实现注意**：
 - `from_matrix_impl` 应返回拷贝，避免外部修改影响
 - `to_matrix` 应返回拷贝，避免内部状态泄露
-- `create_tensor_impl` 失败时可返回 `Tensor()` 空槽——公共入口的 `stamp_`
-  只 stamp 有效张量，空槽保持不绑定（15 §3.1）
+- `create_tensor_impl` 失败时可返回 `Tensor()` 空槽——公共入口不做身份绑定；
+  空槽保持无效（域检查豁免，v3）
 
 ### 4. 矩阵级原语
 
 ```cpp
-// 矩阵乘法（实现侧；公共入口 matmul 带 bind_check_ + stamp_，下同）
+// 矩阵乘法（实现侧；公共入口 matmul 带设备域检查，下同）
 [[nodiscard]] virtual Result<Tensor> matmul_impl(
     const Tensor& A, const Tensor& B,
     bool transA, bool transB,
@@ -412,7 +412,7 @@ public:
         return Tensor::cpu(rows, cols);
     }
 
-    // 4. 矩阵乘法（委托给 Matrix::multiply；公共入口 matmul 带 bind_check_+stamp_）
+    // 4. 矩阵乘法（委托给 Matrix::multiply；公共入口 matmul 带设备域检查）
     [[nodiscard]] Result<Tensor> matmul_impl(
         const Tensor& A, const Tensor& B,
         bool transA, bool transB, Precision P) override {
@@ -573,7 +573,7 @@ public:
 ### 步骤 1：在接口中声明
 
 在 `compute_engine.hpp` 中按 NVI 模式声明**两件套**：公共非虚入口
-（`bind_check_` 跨引擎检查 + `stamp_` 出生绑定）+ protected 纯虚实现
+（`bind_check_` 设备域检查）+ protected 纯虚实现
 （引擎真正 `override` 的）：
 
 ```cpp
@@ -584,7 +584,7 @@ public:
 {
     if (auto ec = bind_check_({&A, &B}); !ec)
         return std::unexpected(ec.error());
-    return stamp_(elementwise_abs_diff_impl(A, B));
+    return elementwise_abs_diff_impl(A, B);
 }
 // 2) protected 虚实现（引擎侧实现这个）
 [[nodiscard]] virtual Result<Tensor> elementwise_abs_diff_impl(

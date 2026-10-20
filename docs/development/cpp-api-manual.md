@@ -925,7 +925,6 @@ nn::prof::dump(stdout);       // 进程结束前打表（stage / op / GPU / per-
 |---|---|
 | `NN_PROFILE=1` / `NN_PROFILE_TRACE=<path>` / `NN_PROFILE_EVERY=<n>` | host + 设备侧聚合计时 / Chrome trace / 每 n 次 dump 打表 |
 | `NN_F16_DEBUG` / `NN_PREC_TRACE` / `NN_NAN_TRACE` / `NN_MEM_STATS` | 精度 / NaN / 内存归因探针（探针门 `NN_ENABLE_PROBES`） |
-| `NN_BIND_DEBUG=1` | 未绑定输入进引擎即报错（抓漏网绑定） |
 | `NN_VULKAN_DEVICE` / `NN_VULKAN_NO_16BIT_ALU` / `NN_VULKAN_NO_TIMELINE` | GPU 设备与特性逃生阀 |
 | `NN_POOL_BLOCK_MB` / `NN_POOL_LADDER_MAX_MB` / `NN_NO_EARLY_REAP` / `NN_CPU_PAUSE` / `NN_GPU_PROFILE` | 内存池 / 调度 A/B |
 

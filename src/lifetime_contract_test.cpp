@@ -40,7 +40,14 @@ void test_expr_segment_holds_engine()
 
 void test_offload_state_machine()
 {
-    auto engine = nn::CpuEngine::create();
+#ifdef NN_HAS_VULKAN
+    auto backend = nn::GpuBackend::create();
+    if (!backend->initialize())
+    {
+        std::printf("[SKIP] offload 状态机：本机无可用 Vulkan 设备\n");
+        return;
+    }
+    auto engine = nn::GpuEngine::create(backend);
     nn::Tensor a = engine->create_tensor(2, 3, nn::Precision::F32);
     nn::Tensor b = engine->create_tensor(4, 1, nn::Precision::F32);
     CHECK(a.valid() && b.valid(), "创建 F32 激活张量");
@@ -71,6 +78,31 @@ void test_offload_state_machine()
     auto im = off.import_activations(*engine);
     CHECK(im, "import 成功");
     CHECK(!off.offloaded(), "import 后状态 = Idle");
+
+    // 关闭开关 = 作废未消费的导出（成员缓存已置空，不能静默保留 Offloaded）
+    CHECK(off.export_activations(*engine, {a, b}), "再次 export");
+    off.set_enabled(false);
+    CHECK(!off.offloaded(), "set_enabled(false) 复位状态");
+#else
+    std::printf("[SKIP] offload 状态机：构建未启用 Vulkan\n");
+#endif
+}
+
+void test_offload_rejects_cpu_engine()
+{
+    // CPU 引擎的 offload 原语是 no-op（restore 返回 1×1）→ export 必须拒绝，
+    // 否则成员缓存被置空、backward 拿到 1×1 张量（CLI 与 Session 也各自拒绝）。
+    auto engine = nn::CpuEngine::create();
+    nn::Tensor a = engine->create_tensor(2, 2, nn::Precision::F32);
+    nn::ActivationOffloader off;
+    off.set_enabled(true);
+    auto r = off.export_activations(*engine, {a});
+    CHECK(!r, "CPU 引擎 export 必须 fail-fast");
+    if (!r)
+        CHECK(r.error().message.find("仅支持") != std::string::npos,
+              "错误信息说明仅支持 GPU");
+    CHECK(!off.offloaded(), "失败后状态保持 Idle");
+    CHECK(a.valid(), "失败路径不得改动激活张量");
 }
 
 void test_offload_rejects_non_f32()
@@ -117,6 +149,7 @@ int main()
     std::printf("── P0 生命周期契约（ExprSegment / offload / optimizer 顺序）──\n");
     test_expr_segment_holds_engine();
     test_offload_state_machine();
+    test_offload_rejects_cpu_engine();
     test_offload_rejects_non_f32();
     test_optimizer_before_model_order();
 

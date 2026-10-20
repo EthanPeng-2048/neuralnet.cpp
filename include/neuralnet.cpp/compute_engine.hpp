@@ -352,6 +352,7 @@ public:
         std::size_t rows, std::size_t cols)
     {
         NN_PROF_OP("offload_restore");
+        NN_TRY(ec, bind_check_({&buffer}));
         return offload_restore_impl(buffer, offset, rows, cols);
     }
 
@@ -390,7 +391,7 @@ public:
 
     // ── 张量工厂（统一接口，§6.4, §6.5）────────────────────────────────
     // P 由调用方显式指定（§8.5）：无隐式推导，无 Auto
-    // P1（docs/history/history.md「15 号归档」 §3.1）：公共非虚入口在尾部统一 stamp 出生绑定，
+    // 公共非虚入口在尾部统一做设备域检查（v3，docs/todo/28 §4.3），
     // 引擎只实现 create_tensor_impl / from_matrix_impl（protected）——避免
     // 每个 override 各自漏 stamp。to_matrix 输出 Matrix（宿主），不参与 stamp。
     // RV-02（工厂错误协议收敛）：错误**结构化**上抛，不再"空张量 + stderr"。
@@ -742,7 +743,7 @@ public:
 
     // ── reshape（M1，docs/todo/17 §3 D10：修改类操作一律引擎方法）──
     // 语义同原 Tensor::reshape：GPU 共享底层 buffer（零拷贝视图）、CPU 按
-    // precision_ 复制数据到新形状；绑定随 src 传播（15 §3.1），未出生绑定
+    // precision_ 复制数据到新形状；设备域随存储派生（v3），空槽保持无效
     // 的输入形状由引擎校验。元素数不匹配返回错误（原 NN_ASSERT 升级）。
     [[nodiscard]] Result<Tensor> reshape(const Tensor& t, std::size_t new_rows,
                                           std::size_t new_cols)
@@ -1490,7 +1491,7 @@ protected:
     // 上层拿到，旧形态 `return Tensor();` 把原因整块丢弃。
     [[nodiscard]] virtual Result<Tensor> create_tensor_impl(std::size_t rows, std::size_t cols, Precision P) = 0;
     [[nodiscard]] virtual Result<Tensor> from_matrix_impl(const Matrix& m, Precision P) = 0;
-    // 跨设备/引擎拉取（M6；公共入口 `import` 带 bind_check_ + stamp_）。
+    // 跨设备拉取（M6；v3 起是唯一 CPU→GPU 跨域入口，公共入口做设备域检查）。
     // 默认实现 = 经宿主中转；同设备快路（别名 / 引擎内 cast）也在默认实现内。
     // GpuEngine override 为"CPU → 设备直传"（原 ensure_gpu 路径）。
     [[nodiscard]] virtual Result<Tensor> import_impl(const Tensor& src, Precision P)
@@ -1514,7 +1515,7 @@ protected:
     }
     // offload 占位默认（激活 offload 是 GPU 特性；CPU 开启只得到 1×1 张量）
     // D8（15 §4.8）：走 `create_tensor` 而非 `Tensor::cpu` 静态工厂——出生即经
-    // 引擎入口（P1 出生绑定），形状/语义不变（仍是 1×1 占位）。
+    // 引擎入口，形状/语义不变（仍是 1×1 占位）。
     [[nodiscard]] virtual Result<Tensor> create_offload_buffer_impl(std::size_t /*bytes*/)
     {
         return create_tensor(1, 1);

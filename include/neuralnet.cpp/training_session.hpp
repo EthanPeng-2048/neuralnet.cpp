@@ -72,11 +72,18 @@ public:
             NN_FAIL("TrainingSession::create: Model 未绑定引擎"
                     "（请用 Model(engine) / build_*_model 构建）");
 
-        // 模型侧训练期开关先应用（离线/检查点/offload 都由 Model 自己实现）。
+        // 模型侧训练期开关先应用（检查点/offload 都由 Model 自己实现）。
         if (cfg.checkpoint_every > 0)
             model.set_checkpoint_every(cfg.checkpoint_every);
         if (cfg.activation_offload)
+        {
+            // CPU 引擎的 offload 原语是 no-op（restore 返回 1×1）→ 开启会破坏
+            // backward。CLI 早已忽略；Session 对编程式调用方直接拒绝。
+            if (model.engine().device() != Device::GPU)
+                NN_FAIL("TrainingSession::create: activation_offload 仅支持 GPU 引擎"
+                        "（CPU 的 offload 原语是 no-op，请改用 checkpoint_every）");
             model.set_activation_offload(true);
+        }
 
         ComputeEngine& engine = model.engine();
         auto opt = create_optimizer(cfg.optimizer, engine, model.parameters(),

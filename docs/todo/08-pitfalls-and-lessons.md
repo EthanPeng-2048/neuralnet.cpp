@@ -47,7 +47,7 @@
 
 - **症状**：`VK_ERROR_DEVICE_LOST` / 违反 `VUID-vkDestroyBuffer-buffer-00922`。
 - **根因**：命令录制期引用的 GPU buffer 被提前析构（如 `forward_sparse` 中局部 `shifted`），提交时引用已释放内存；copy-on-write 原语替换 Tensor 时，旧 `GpuBuffer` 析构 → `vkDestroyBuffer`，但已录制 descriptor 仍引用它。
-- **当前机制/规则**：所有录制期引用的张量存活到 `end_batch()` 之后；销毁转入 `pending_destroys_` 延迟队列，`end_batch/flush_batch` 释放 desc sets 后统一销毁。`GpuBackend::instance()` 用 new-leak 单例规避静态析构顺序问题。
+- **当前机制/规则**：所有录制期引用的张量存活到 `end_batch()` 之后；销毁转入 `pending_destroys_` 延迟队列，`end_batch/flush_batch` 释放 desc sets 后统一销毁。`GpuBackend::shared()`（v3）改 weak 缓存：有使用者才存活、全部释放后确定性回收；不再有 new-leak 单例。
 - **教训**："命令录制"与"命令执行"是两段时间线，对象生命周期必须覆盖到执行完成。
 
 ### 2.5 多卡选错设备 + 二进制信号量重复 wait

@@ -872,7 +872,7 @@ public:
             static_cast<std::uint32_t>(wpr), /*f16=*/false));
         Tensor res = Tensor::from_gpu(std::move(*out));
         if (P == Precision::F32) return res;
-        // 静态工厂直构（未 stamp）→ 进公共 cast（内含 bind_check_）前补绑定
+        // 静态工厂直构的 GPU 张量：设备域从存储派生（v3），直接进公共 cast
         // （同 CPU matmul_q_impl；17 §5 M6 的基类内部中转）。
         return cast(std::move(res), P);
     }

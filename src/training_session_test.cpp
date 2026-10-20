@@ -197,6 +197,14 @@ void test_errors()
     nn::Model unbound;   // 未绑定引擎
     auto r2 = nn::TrainingSession::create(std::move(unbound));
     CHECK(!r2, "未绑定引擎的 Model 返回 Result 错误");
+
+    // CPU 引擎上的 activation offload 是 no-op（会毒化 backward）→ 配置期拒绝
+    nn::Model m2(*engine);
+    CHECK(m2.add<nn::Linear>(3, 2), "add");
+    nn::TrainingConfig offload_cfg;
+    offload_cfg.activation_offload = true;
+    auto r3 = nn::TrainingSession::create(std::move(m2), offload_cfg);
+    CHECK(!r3, "CPU 引擎 + activation_offload 返回 Result 错误");
 }
 
 void test_destroy_order()

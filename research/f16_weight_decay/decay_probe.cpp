@@ -167,8 +167,8 @@ int main(int argc, char* argv[])
             std::fprintf(stderr, "GPU 初始化失败: %s\n", init_r.error().message.c_str());
             return 77;
         }
-        nn::GpuEngine gpu(backend);
-        nn::ComputeEngine& adapter = gpu;
+        auto gpu_owner = nn::GpuEngine::create(backend);
+        nn::ComputeEngine& adapter = *gpu_owner;
         std::printf("── GPU（%s）──\n", backend.device().device_name().c_str());
         run_all(adapter, "gpu");
     }
