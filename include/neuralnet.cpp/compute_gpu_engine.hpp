@@ -285,6 +285,9 @@ public:
             return Matrix(t.cpu_matrix());
         }
         // GPU tensor → drain + download
+        if (t.valid() && t.device_domain_() != domain())
+            NN_FAIL("to_matrix: 张量不在本 GPU 引擎的设备域（跨 backend 请先用"
+                    "创建它的引擎 to_matrix 落宿主）");
         if (in_batch())
         {
             auto r = end_batch();

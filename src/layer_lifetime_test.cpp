@@ -235,6 +235,8 @@ void test_cross_domain_rejected()
         auto gpu2 = nn::GpuEngine::create(backend2);
         auto cross = gpu2->clone(dev);
         CHECK(!cross, "跨 GPU backend 直接使用张量返回错误");
+        auto cross_dl = gpu2->to_matrix(dev);
+        CHECK(!cross_dl, "跨 GPU backend to_matrix 返回错误（不读外来 buffer）");
         auto back = gpu->to_matrix(dev);
         CHECK(back, "GPU→宿主 to_matrix 正常");
     }
