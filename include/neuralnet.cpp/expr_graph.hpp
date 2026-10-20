@@ -42,7 +42,7 @@
 #include <vector>
 
 #include "compute_tensor.hpp"
-#include "core_engine_id.hpp"
+#include "core_domain.hpp"
 #include "precision.hpp"
 #include "expr_spec.hpp"
 #include "expr_opt.hpp"

@@ -63,7 +63,8 @@ private:
     std::shared_ptr<GpuBackend> backend_;
 
     explicit GpuEngine(std::shared_ptr<GpuBackend> backend)
-        : backend_(std::move(backend)) {}
+        : ComputeEngine(backend ? backend->identity() : 0),
+          backend_(std::move(backend)) {}
 
 public:
     // 引擎必须由 shared_ptr 管理：Layer / Model / Optimizer 会保存强引用。
@@ -347,29 +348,9 @@ public:
             }
             NN_FAIL("cast: unsupported precision conversion");
         }
-        // CPU path
-        if (src.precision() == Precision::F16 && dst == Precision::F32)
-        {
-            const auto& m16 = src.cpu_matrix<Precision::F16>();
-            Matrix m32(m16.rows(), m16.cols());
-            const auto s = m16.span();
-            auto d = m32.span();
-            for (std::size_t i = 0; i < s.size(); ++i)
-                d[i] = static_cast<float>(s[i]);
-            return from_matrix(m32, Precision::F32);
-        }
-        if (src.precision() == Precision::F32 && dst == Precision::F16)
-        {
-            const auto& m32 = src.cpu_matrix();
-            MatrixT<Precision::F16> m16(m32.rows(), m32.cols());
-            const auto s = m32.span();
-            auto d = m16.span();
-            for (std::size_t i = 0; i < s.size(); ++i)
-                d[i] = s[i];
-            // CPU f16 tensor
-            return Tensor::from_matrix(std::move(m16));
-        }
-        NN_FAIL("cast: unsupported precision conversion");
+        // v3：GPU 引擎的 cast 只接受本引擎域内的 GPU 张量（CPU 数据必须先
+        // import 成 GPU 张量）。原 CPU 回退分支已删除——跨域在入口即被拒。
+        NN_FAIL("cast: 操作数不在本 GPU 引擎的设备域（CPU 张量请先 import）");
     }
 
     // ── cast_into / copy_into（多精度适配层的"写回原存储"路径，§6.5）──────
@@ -384,34 +365,19 @@ public:
             NN_FAIL("copy_into: shape mismatch");
         if (dst.precision() != src.precision())
             NN_FAIL("copy_into: precision mismatch");
-        if (dst.is_cpu() != src.is_cpu())
-            NN_FAIL("copy_into: device mismatch");
+        // v3：本引擎的 copy_into 只接受本域内的 GPU 张量（CPU 数据先 import）
+        if (dst.device_domain_() != domain() || src.device_domain_() != domain())
+            NN_FAIL("copy_into: 操作数不在本 GPU 引擎的设备域");
         const std::size_t count = dst.rows() * dst.cols();
-        if (dst.is_gpu())
-        {
-            if (dst.precision() == Precision::F16)
-                return backend_->copy_buffer_gpu(
-                    src.gpu_tensor<Precision::F16>().buffer().impl(),
-                    dst.gpu_tensor<Precision::F16>().buffer().impl(),
-                    static_cast<VkDeviceSize>(count * 2u));
-            return backend_->copy_buffer_gpu(
-                src.gpu_tensor().buffer().impl(),
-                dst.gpu_tensor().buffer().impl(),
-                static_cast<VkDeviceSize>(count * sizeof(float)));
-        }
         if (dst.precision() == Precision::F16)
-        {
-            const auto s = src.cpu_matrix<Precision::F16>().span();
-            auto d = dst.cpu_matrix<Precision::F16>().span();
-            for (std::size_t i = 0; i < s.size(); ++i) d[i] = s[i];
-        }
-        else
-        {
-            const auto s = src.cpu_matrix().span();
-            auto d = dst.cpu_matrix().span();
-            for (std::size_t i = 0; i < s.size(); ++i) d[i] = s[i];
-        }
-        return {};
+            return backend_->copy_buffer_gpu(
+                src.gpu_tensor<Precision::F16>().buffer().impl(),
+                dst.gpu_tensor<Precision::F16>().buffer().impl(),
+                static_cast<VkDeviceSize>(count * 2u));
+        return backend_->copy_buffer_gpu(
+            src.gpu_tensor().buffer().impl(),
+            dst.gpu_tensor().buffer().impl(),
+            static_cast<VkDeviceSize>(count * sizeof(float)));
     }
 
     [[nodiscard]] Result<void> cast_into(const Tensor& src, Tensor& dst) override
@@ -422,35 +388,18 @@ public:
             NN_FAIL("cast_into: shape mismatch");
         if (src.precision() == dst.precision())
             return copy_into(dst, src);
-        if (dst.is_cpu() != src.is_cpu())
-            NN_FAIL("cast_into: device mismatch");
+        // v3：本引擎的 cast_into 只接受本域内 GPU 张量
+        if (dst.device_domain_() != domain() || src.device_domain_() != domain())
+            NN_FAIL("cast_into: 操作数不在本 GPU 引擎的设备域");
         const std::size_t count = dst.rows() * dst.cols();
-        if (dst.is_gpu())
-        {
-            if (src.precision() == Precision::F16 && dst.precision() == Precision::F32)
-                return backend_->cast_gpu(
-                    src.gpu_tensor<Precision::F16>().buffer(),
-                    dst.gpu_tensor().buffer(), count, /*kind=*/0u);
-            if (src.precision() == Precision::F32 && dst.precision() == Precision::F16)
-                return backend_->cast_gpu(
-                    src.gpu_tensor().buffer(),
-                    dst.gpu_tensor<Precision::F16>().buffer(), count, /*kind=*/1u);
-            NN_FAIL("cast_into: unsupported precision conversion");
-        }
         if (src.precision() == Precision::F16 && dst.precision() == Precision::F32)
-        {
-            const auto s = src.cpu_matrix<Precision::F16>().span();
-            auto d = dst.cpu_matrix().span();
-            for (std::size_t i = 0; i < s.size(); ++i) d[i] = static_cast<float>(s[i]);
-            return {};
-        }
+            return backend_->cast_gpu(
+                src.gpu_tensor<Precision::F16>().buffer(),
+                dst.gpu_tensor().buffer(), count, /*kind=*/0u);
         if (src.precision() == Precision::F32 && dst.precision() == Precision::F16)
-        {
-            const auto s = src.cpu_matrix().span();
-            auto d = dst.cpu_matrix<Precision::F16>().span();
-            for (std::size_t i = 0; i < s.size(); ++i) d[i] = s[i];
-            return {};
-        }
+            return backend_->cast_gpu(
+                src.gpu_tensor().buffer(),
+                dst.gpu_tensor<Precision::F16>().buffer(), count, /*kind=*/1u);
         NN_FAIL("cast_into: unsupported precision conversion");
     }
 
@@ -459,12 +408,8 @@ public:
     {
         if (dst.rows() != src.rows() || dst.cols() != src.cols())
             NN_FAIL("copy_from: shape mismatch");
-        if (dst.is_cpu())
-        {
-            // 防御性：dst 应为 GPU Tensor，但若为 CPU 则直接拷贝
-            dst = Tensor::from_matrix(Matrix(src));
-            return {};
-        }
+        if (dst.device_domain_() != domain())
+            NN_FAIL("copy_from: dst 不在本 GPU 引擎的设备域");
         // ── 非 fresh（既有张量）：必须先 drain（提交不等待）──────────────
         // dst 是当前帧已引用的既有 buffer——当前帧尚未提交，若先把上传提交
         // 到队列，GPU 会先执行上传、后执行当前帧命令 → 本帧后续对 dst 的
@@ -512,11 +457,9 @@ public:
 
     [[nodiscard]] Result<Tensor> clone_impl(const Tensor& src) override
     {
-        if (src.is_cpu())
-        {
-            // 防御性：CPU Tensor 深拷贝
-            return Tensor::from_matrix(Matrix(src.cpu_matrix()));
-        }
+        // v3：只接受本域内 GPU 张量（CPU 数据先 import；原 CPU 回退已删除）
+        if (src.device_domain_() != domain())
+            NN_FAIL("clone: 操作数不在本 GPU 引擎的设备域");
         if (src.precision() == Precision::F16)   // 原生 f16 字节拷贝（后端模板化实现）
         {
             auto r16 = backend_->clone_gpu(src.gpu_tensor<Precision::F16>());
@@ -599,7 +542,7 @@ public:
             auto r = backend_->gather_gpu(t32->gpu_tensor(), idx_ref.gpu_tensor());
             NN_TRY_CHECK(r);
             Tensor out32 = Tensor::from_gpu(std::move(*r));
-            return cast(adopt(std::move(out32)), Precision::F16);
+            return cast(std::move(out32), Precision::F16);
         }
         auto r = backend_->gather_gpu(tbl_gpu->gpu_tensor(), idx_gpu->gpu_tensor());
         NN_TRY_CHECK(r);
@@ -687,7 +630,7 @@ public:
                 inverse ? 1u : 0u);
             NN_TRY_CHECK(r);
             Tensor out32 = Tensor::from_gpu(std::move(*r));
-            return cast(adopt(std::move(out32)), Precision::F16);
+            return cast(std::move(out32), Precision::F16);
         }
         auto r = backend_->rearrange_3d_gpu(
             x_gpu->gpu_tensor(),
@@ -721,7 +664,7 @@ public:
             auto r32 = backend_->transpose_gpu(a32->gpu_tensor());
             NN_TRY_CHECK(r32);
             Tensor out32 = Tensor::from_gpu(std::move(*r32));
-            return cast(adopt(std::move(out32)), Precision::F16);
+            return cast(std::move(out32), Precision::F16);
         }
         auto r = backend_->transpose_gpu(a_gpu->gpu_tensor());
         NN_TRY_CHECK(r);
@@ -757,7 +700,7 @@ public:
                                          C, H, W, k, stride, pad, OH, OW);
             NN_TRY_CHECK(r);
             Tensor out32 = Tensor::from_gpu(std::move(*r));
-            return cast(adopt(std::move(out32)), Precision::F16);
+            return cast(std::move(out32), Precision::F16);
         }
         auto r = backend_->im2col_gpu(x_gpu->gpu_tensor(),
                                      C, H, W, k, stride, pad, OH, OW);
@@ -791,7 +734,7 @@ public:
                                          C, H, W, k, stride, pad, OH, OW);
             NN_TRY_CHECK(r);
             Tensor out32 = Tensor::from_gpu(std::move(*r));
-            return cast(adopt(std::move(out32)), Precision::F16);
+            return cast(std::move(out32), Precision::F16);
         }
         auto r = backend_->col2im_gpu(c_gpu->gpu_tensor(),
                                      C, H, W, k, stride, pad, OH, OW);
@@ -928,7 +871,7 @@ public:
         if (P == Precision::F32) return res;
         // 静态工厂直构（未 stamp）→ 进公共 cast（内含 bind_check_）前补绑定
         // （同 CPU matmul_q_impl；17 §5 M6 的基类内部中转）。
-        return cast(adopt(std::move(res)), P);
+        return cast(std::move(res), P);
     }
 
     [[nodiscard]] Result<Tensor> matmul_impl(
@@ -998,7 +941,7 @@ public:
             NN_TRY_CHECK(r);
             // cast 回 f16
             Tensor result_f32 = Tensor::from_gpu(std::move(*r));
-            return cast(adopt(std::move(result_f32)), Precision::F16);
+            return cast(std::move(result_f32), Precision::F16);
         }
 
         NN_FAIL("matmul: unsupported precision");
@@ -1094,7 +1037,7 @@ public:
                 static_cast<float>(alpha));
             NN_TRY_CHECK(r);
             Tensor result_f32 = Tensor::from_gpu(std::move(*r));
-            return cast(adopt(std::move(result_f32)), Precision::F16);
+            return cast(std::move(result_f32), Precision::F16);
         }
 
         NN_FAIL("batched_matmul: unsupported precision");

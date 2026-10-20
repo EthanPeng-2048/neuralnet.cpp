@@ -89,9 +89,9 @@ nn::Tensor to_gpu(nn::GpuEngine& gpu, const nn::Tensor& t)
 
 nn::Matrix matrix_of(const nn::Tensor& t)
 {
-    if (!t.bound())
+    if (!t.valid())
     {
-        std::printf("[FAIL] to_matrix: 张量未绑定引擎\n");
+        std::printf("[FAIL] to_matrix: 张量无效\n");
         ++g_fail;
         return nn::Matrix(0, 0);
     }
@@ -249,8 +249,11 @@ int run_non_recording(nn::CpuEngine& cpu, nn::GpuEngine& gpu)
         std::mt19937 rng(42 + static_cast<unsigned>(C));
         const nn::Tensor x = make_cpu_tensor(cpu, R, C, rng);
         const nn::Tensor g = make_cpu_tensor(cpu, R, 1, rng);
+        // v3：GPU 引擎拒绝 CPU 操作数——显式 import（唯一跨域入口）
+        const nn::Tensor xg = to_gpu(gpu, x);
+        const nn::Tensor gg = to_gpu(gpu, g);
         auto cr = nn::test_fuse::one_shot_rb2(cpu, x, g, R, C);
-        auto gr = nn::test_fuse::one_shot_rb2(gpu, x, g, R, C);
+        auto gr = nn::test_fuse::one_shot_rb2(gpu, xg, gg, R, C);
         if (!cr || !gr)
         {
             std::printf("[FAIL] 未录制路径求值失败（未命中 AOT shader？）: cols=%zu\n", C);

@@ -14,7 +14,7 @@
 //   - 函数参数：表示可选的观察者输入
 //   - 返回值：表示可能为空的查询结果
 //
-// ⚠ 引擎生命周期不要用 observer_ptr：Tensor 只保存 EngineId；Layer / Model /
+// ⚠ 引擎生命周期不要用 observer_ptr：Tensor 不保存引擎身份（设备域从存储派生）；Layer / Model /
 //   Optimizer / ExprGraph 持有 shared_ptr<ComputeEngine>。详见
 //   docs/development/09-engine-ownership.md。
 // ─────────────────────────────────────────────────────────────────────────

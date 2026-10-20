@@ -34,7 +34,7 @@
 #include <ranges>
 
 #include "core_config.hpp"   // NN_PROBES_ENABLED（探针编译门）
-#include "core_engine_id.hpp"
+#include "core_domain.hpp"
 #include "core_env.hpp"      // RV-09：环境变量读取唯一入口
 
 namespace nn::dsl
@@ -1666,7 +1666,7 @@ template <typename E>
             scan_reject(v.error());
         const int node = g->add_node(spec, inputs, rows, cols,
                                      /*vector_out=*/false, P);
-        Tensor ph = eng.adopt(P == Precision::F16
+        Tensor ph = (P == Precision::F16
             ? TensorAccess::cpu<Precision::F16>(rows, cols)
             : TensorAccess::cpu(rows, cols));
         ph.set_virtual_tag(g->tag_of_node[static_cast<std::size_t>(node)]);
@@ -1674,7 +1674,7 @@ template <typename E>
         return ph;
     }
     (void)reg_spec;
-    return eng.adopt(P == Precision::F16 ? TensorAccess::cpu<Precision::F16>(rows, cols)
+    return (P == Precision::F16 ? TensorAccess::cpu<Precision::F16>(rows, cols)
                                          : TensorAccess::cpu(rows, cols));
 #else
     if (eng.device() == Device::CPU)
@@ -1688,7 +1688,7 @@ template <typename E>
                 // 预绑定只是**优化**：任何前置条件不满足（形状/设备不符等）就
                 // 回退解释器（同一表达式的等价求值路径），不引入正确性风险。
                 if (auto r = cpu_prepare(e, eng, rows, cols); r)
-                    return eng.adopt(eval_cpu(e, rows, cols, P));
+                    return (eval_cpu(e, rows, cols, P));
             }
             // 含归约且不可预绑定（或预绑定失败）：模板求值无法表达"全行/全列
             // 归约"，折叠成 ExprSpec 走引擎 eval_expr（CPU 扩展语义处理归约
@@ -1697,7 +1697,7 @@ template <typename E>
             NN_TRY(v, validate_expr_spec(spec, inputs.size()));
             return eng.eval_expr(spec, inputs, rows, cols, P);
         }
-        return eng.adopt(eval_cpu(e, rows, cols, P));
+        return (eval_cpu(e, rows, cols, P));
     }
 
     auto [spec, inputs] = to_expr_spec(e);
@@ -1883,7 +1883,7 @@ template <typename E>
         const int raxis0 = expr_spec_reduce_axis(rspec);
         const int node = g->add_node(rspec, rinputs, rows, cols,
                                      /*vector_out=*/true, P);
-        Tensor ph = eng.adopt(P == Precision::F16
+        Tensor ph = (P == Precision::F16
             ? ((raxis0 == 0) ? TensorAccess::cpu<Precision::F16>(rows, 1)
                : (raxis0 == 1) ? TensorAccess::cpu<Precision::F16>(1, cols)
                : TensorAccess::cpu<Precision::F16>(rows, cols))
@@ -1897,10 +1897,10 @@ template <typename E>
     const ExprSpec spec = reg_spec;
     const int raxis = expr_spec_reduce_axis(spec);
     if (P == Precision::F16)
-        return eng.adopt((raxis == 0) ? TensorAccess::cpu<Precision::F16>(rows, 1)
+        return ((raxis == 0) ? TensorAccess::cpu<Precision::F16>(rows, 1)
              : (raxis == 1) ? TensorAccess::cpu<Precision::F16>(1, cols)
              : TensorAccess::cpu<Precision::F16>(rows, cols));
-    return eng.adopt((raxis == 0) ? TensorAccess::cpu(rows, 1)
+    return ((raxis == 0) ? TensorAccess::cpu(rows, 1)
          : (raxis == 1) ? TensorAccess::cpu(1, cols)
          : TensorAccess::cpu(rows, cols));
 #else
@@ -1915,11 +1915,9 @@ template <typename E>
             {
                 auto v = reduce_vector_tensor(e, rows, cols);
                 if (P == Precision::F32)
-                    return eng.adopt(std::move(v));
+                    return (std::move(v));
                 // f16 目标：归约向量求值在 f32 参考空间，结果舍入到 f16（§7.3）
-                // 先 adopt 补出生绑定再 cast（cast 内有 bind_check_）——否则
-                // NN_BIND_DEBUG 门禁会把这条库内中转判成未绑定输入（M6）。
-                return eng.cast(eng.adopt(std::move(v)), P);
+                return eng.cast(std::move(v), P);
             }
         }
     }

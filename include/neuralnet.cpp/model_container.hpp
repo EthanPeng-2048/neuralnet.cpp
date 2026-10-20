@@ -24,7 +24,7 @@
 #include <vector>
 
 #include "core_assert.hpp"
-#include "core_engine_id.hpp"
+#include "core_domain.hpp"
 #include "compute_layer.hpp"
 #include "model_spec.hpp"
 

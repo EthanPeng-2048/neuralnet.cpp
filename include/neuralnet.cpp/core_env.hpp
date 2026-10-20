@@ -11,7 +11,7 @@
 //      （→ `NN_PROBES_ENABLED==0`）时**恒 false / 空串，且不求值 getenv**——
 //      默认构建里诊断开关不产生任何分支/字符串/系统调用。
 //   2) **行为开关**（env_flag_raw / env_string_raw / env_int_raw）：初始化期
-//      读一次并缓存的开关（NN_BIND_DEBUG / NN_VULKAN_DEVICE / NN_POOL_* …）
+//      读一次并缓存的开关（NN_VULKAN_DEVICE / NN_POOL_* …）
 //      用原始读取；调用点自行写 `static const bool on = ...` 缓存（进程内恒定）。
 //
 // 取值约定：raw flag = "存在、非空、首字符 != '0'"（"0" = 关）。这是全仓统一

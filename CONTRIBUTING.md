@@ -192,11 +192,11 @@ clang-format -i path/to/new_file.hpp
 
 * Linux + Windows，**Clang**，Release，`NN_ENABLE_NATIVE=OFF`（可移植基线），带 Vulkan SDK（GPU 编译）；
 * `-DNN_ENABLE_TESTS=ON` 构建并**真跑 `ctest`**（需 Vulkan 的用例在无 GPU 的 runner 上按退出码 77 记 skip，非失败）；
-* 再跑一轮 `NN_BIND_DEBUG=1 ctest`（**绑定不变量门禁**：任何"未绑定输入进引擎"一律报错，抓库内 stamp 漏网）；
+* 设备域检查是**默认入口检查**（v3 起每个操作数必须属于本引擎域），不再需要绑定调试开关的第二轮 ctest；
 * 构建 **8** 个应用入口（`mnist_train/infer`、`text_train/infer`、`tokenizer_train/infer`、`dataset_gen`、`dataset_convert`）并打包成 `.7z` 产物；
 * push 到 `main` 时创建/更新 `nightly` 预发布。
 
-> 本地复现 CI 的三条门禁：`ctest --preset dev`、`NN_BIND_DEBUG=1 ctest --test-dir build`（都应全绿）。
+> 本地复现 CI 门禁：`ctest --preset dev`（应全绿；需 Vulkan 的用例无设备时按 77 记 skip）。
 
 **大版本发布**（版本号 `1.x.y → 1.(x+1).0`）在 CI 门禁之上还有一份必做清单——端到端模型训练测试
 （这类测试**不进默认 ctest**）、发布文档、完整 ctest + **Debug** 构建、多编译器 × 标准库矩阵——

@@ -38,7 +38,7 @@ inline constexpr std::size_t kExprParallelThreshold = 65536;
 class CpuEngine final : public ComputeEngine
 {
 private:
-    CpuEngine() = default;
+    CpuEngine() : ComputeEngine(kHostDomain) {}
 
 public:
     // 引擎必须由 shared_ptr 管理：Layer / Model / Optimizer 会保存强引用。
@@ -785,10 +785,9 @@ public:
             NN_TRY(r, matmul_q_impl(packed, scale, *b32, transA, out_rows,
                                     Precision::F32));
             if (P == Precision::F32) return r;
-            // 递归产物是 `*_impl` 直构（未 stamp）；进公共 cast（内含 bind_check_）
-            // 前先补出生绑定，否则 NN_BIND_DEBUG 门禁把"基类内部中转"误判成库内
-            // 漏网（17 §5 M6）。
-            return cast(adopt(std::move(*r)), P);
+            // 递归产物是 `*_impl` 直构；v3 起设备域从存储派生，进公共 cast
+            // （内含 bind_check_）无需补任何身份。
+            return cast(std::move(*r), P);
         }
         if (packed.precision() != Precision::F32 || scale.precision() != Precision::F32 ||
             B.precision() != Precision::F32)

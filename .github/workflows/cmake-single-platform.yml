@@ -221,21 +221,9 @@ jobs:
       shell: pwsh
       run: ctest --test-dir ${{github.workspace}}/build --output-on-failure
 
-    # ========== 绑定不变量门禁（RV-06）==========
-    # NN_BIND_DEBUG=1：任何"未绑定输入进引擎"一律报错（默认只对"双方都绑定且
-    # 不同"报错）。它抓库内 stamp 漏网——必须全绿，故升为默认 CI 门禁。
-    - name: Test ctest + NN_BIND_DEBUG (Linux)
-      if: runner.os == 'Linux'
-      run: ctest --test-dir ${{github.workspace}}/build --output-on-failure
-      env:
-        NN_BIND_DEBUG: "1"
-
-    - name: Test ctest + NN_BIND_DEBUG (Windows)
-      if: runner.os == 'Windows'
-      shell: pwsh
-      run: ctest --test-dir ${{github.workspace}}/build --output-on-failure
-      env:
-        NN_BIND_DEBUG: "1"
+    # 注：v3 生命周期起删除"绑定调试开关"第二轮 ctest —— 设备域检查已从
+    # "库外豁免 + 调试开关"升级为**默认入口检查**（每个操作数必须属于本引擎域），
+    # 不再需要补丁式第二轮门禁。见 docs/todo/28-lifecycle-v3.md §4.3。
 
     # 将编译产物打包为 7z
     - name: Package binaries (Linux)

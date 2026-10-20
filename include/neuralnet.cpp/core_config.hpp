@@ -68,7 +68,7 @@ namespace nn
     // 关闭（默认）时它们**不参与编译**：正常训练没有额外分支、没有字符串、
     // 没有 host 下载路径，相关环境变量一律无效——探针只在排障时按需打开，
     // 不允许"设了环境变量就悄悄拖慢正常训练"。
-    // 新增探针一律走这个门；初始化期读一次的**行为开关**（`NN_BIND_DEBUG`
+    // 新增探针一律走这个门；初始化期读一次的**行为开关**（`NN_VULKAN_DEVICE`
     // 正确性检查、`NN_VULKAN_*` 设备/特性逃生阀、`NN_POOL_*` 池 A/B）不在此列。
     // 门经 `nn_core` 的 INTERFACE 定义传播 → 所有 TU（含嵌入消费方）取值一致。
 #if defined(NN_ENABLE_PROBES) && NN_ENABLE_PROBES

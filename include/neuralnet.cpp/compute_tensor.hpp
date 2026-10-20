@@ -10,8 +10,9 @@
 //   - 访问器按 P 模板化（P 默认 F32）
 //   - precision_ 与 device_ 共同唯一确定存储的有效类型
 //   - 使用 shared_ptr 内部持有存储，拷贝廉价（零拷贝传递）
-//   - 出生身份（v2）：engine_id_ 只记录创建本张量的引擎 ID；不保存指针，
-//     拷贝/reshape 传播该整数。详见 docs/development/09-engine-ownership.md
+//   - 设备域（v3）：不保存任何身份字段；`device_domain_()` 从**存储**派生
+//     （CPU → kHostDomain；GPU → GpuBuffer 的 backend 标识；空 → 0）。
+//     详见 docs/todo/28-lifecycle-v3.md
 // ─────────────────────────────────────────────────────────────────────────
 
 #include <algorithm>
@@ -25,15 +26,15 @@
 
 #include "core_config.hpp"
 #include "core_errors.hpp"
-#include "core_engine_id.hpp"
+#include "core_domain.hpp"
 #include "precision.hpp"
 #include "algebra_matrix.hpp"
 
 namespace nn
 {
 
-// ComputeEngine 前置声明：Tensor 只保存 EngineId（8B），不保存引擎指针；
-// 详见 docs/development/09-engine-ownership.md。
+// ComputeEngine 前置声明：Tensor 不保存引擎指针/身份，设备域从存储派生
+//（docs/todo/28-lifecycle-v3.md §4）。
 class ComputeEngine;
 class CpuEngine;
 class GpuEngine;
@@ -71,11 +72,6 @@ private:
     std::size_t rows_ = 0;
     std::size_t cols_ = 0;
 
-    // ── 出生身份（v2）──────────────────────────────────────────────────
-    // 只保存 8 字节 EngineId：无指针、无控制块、拷贝零原子操作。Tensor 可以
-    // 晚于引擎析构；它只用于 bind_check_ 的跨引擎诊断，从不据此解引用引擎。
-    EngineId engine_id_;
-
     // ── IR-C 录制占位标记（图节点输出识别，expr_graph.hpp）──────────────
     // begin_expr/end_expr 录制期内，eval 出口给占位 Tensor 打上节点标号
     // （= 节点下标 + 1，0 = 非节点输出）；add_node 据此识别输入依赖边。
@@ -83,7 +79,7 @@ private:
     std::uint64_t virtual_tag_ = 0;
 
     // ── M1 访问收口（docs/todo/17 §4.1）：存储与创建只对引擎域内开放 ──
-    // 公共面只剩形状/精度/设备查询、bound()/engine()、valid()、shape_str()。
+    // 公共面只剩形状/精度/设备查询、valid()、shape_str()。
     // 绕过引擎摸存储 = 编译错误（库内豁免：引擎 friend + detail::TensorAccess）。
     friend class ComputeEngine;
     friend class CpuEngine;
@@ -136,6 +132,21 @@ private:
     {
         constexpr auto slot = static_cast<std::size_t>(P);
         return gpu_data_.index() == slot ? std::get<slot>(gpu_data_) : nullptr;
+    }
+
+    // 同 gpu_get，但返回**裸指针、不拷贝 shared_ptr**（设备域派生/import 热路径：
+    // 每次拷贝 shared_ptr 都是一对原子操作）。
+    template <Precision P>
+    [[nodiscard]] GpuTensorT<P>* gpu_get_ptr() noexcept
+    {
+        constexpr auto slot = static_cast<std::size_t>(P);
+        return gpu_data_.index() == slot ? std::get<slot>(gpu_data_).get() : nullptr;
+    }
+    template <Precision P>
+    [[nodiscard]] const GpuTensorT<P>* gpu_get_ptr() const noexcept
+    {
+        constexpr auto slot = static_cast<std::size_t>(P);
+        return gpu_data_.index() == slot ? std::get<slot>(gpu_data_).get() : nullptr;
     }
 #endif
 
@@ -258,13 +269,6 @@ public:
         return false;
 #endif
     }
-
-    // ── 出生身份（v2）──────────────────────────────────────────────────
-    // bound()：是否记录过出生引擎。engine_id()：该身份（0 = 未绑定）。
-    // Tensor 不提供 engine()/engine_alive()：它不是引擎句柄，也不会反向
-    // 延长/查询引擎生命周期。
-    [[nodiscard]] bool bound() const noexcept { return engine_id_.bound(); }
-    [[nodiscard]] EngineId engine_id() const noexcept { return engine_id_; }
 
     // ── valid：存储匹配 precision_ 且非空 ────────────────────────────────
     [[nodiscard]] bool valid() const noexcept
@@ -389,9 +393,31 @@ public:
     }
 
 private:
+    // ── 设备域（v3）────────────────────────────────────────────────────
+    // 域**从存储派生**，不是字段：空/无效张量 → 0（唯一豁免）；CPU 存储 →
+    // kHostDomain（进程级常量，所有 CPU 引擎共享，无需 keepalive）；GPU 存储 →
+    // 其 GpuBuffer 的 backend 标识（buffer 的 shared_ptr keepalive 保证该地址
+    // 在张量存活期内不被新 backend 复用）。只读、无原子操作——import 热路径
+    // 约 1 700 次/step，禁止在这里复制 shared_ptr。
+    // 私有 + friend 引擎：不重新引入"从张量找引擎"的用法。
+    [[nodiscard]] DomainId device_domain_() const noexcept
+    {
+        if (device_ == Device::CPU)
+            return valid() ? kHostDomain : 0;
+#ifdef NN_HAS_VULKAN
+        if (!valid())
+            return 0;
+        if (const auto* t16 = gpu_get_ptr<Precision::F16>())
+            return t16->buffer().backend_identity();
+        if (const auto* t32 = gpu_get_ptr<Precision::F32>())
+            return t32->buffer().backend_identity();
+#endif
+        return 0;
+    }
+
     // ── reshape（GPU 共享底层 buffer；CPU 复制数据）──────────────────────
     // M1（docs/todo/17 §3 D10）：移入引擎——公共入口是
-    // ComputeEngine::reshape（bind_check + stamp），本实现只对引擎域内可见。
+    // ComputeEngine::reshape（bind_check 后调用），本实现只对引擎域内可见。
     // 后端无关入口：上层无需直接访问 gpu_tensor() / cpu_matrix() 即可调整形状。
     // GPU：共享底层 buffer，仅改形状元数据（零拷贝）；CPU：Matrix 无"零拷贝
     // 视图"能力，按 precision_ 复制数据到新形状的 Matrix（§6.1）。
@@ -404,7 +430,6 @@ private:
         t.precision_ = precision_;
         t.rows_ = new_rows;
         t.cols_ = new_cols;
-        t.engine_id_ = engine_id_;  // 传播：reshape 沿用 src 身份
 #ifdef NN_HAS_VULKAN
         t.gpu_data_ = gpu_data_;
 #endif

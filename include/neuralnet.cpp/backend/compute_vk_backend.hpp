@@ -56,6 +56,7 @@
 #include "../expr_spec.hpp"
 #include "compute_memory_pool.hpp"
 #include "compute_gpu_storage.hpp"
+#include "../core_domain.hpp"
 #include "compute_vk_pipeline_catalog.hpp"
 #include "compute_staging_ring.hpp"
 
@@ -751,9 +752,16 @@ public:
     GpuBackend(GpuBackend&&) = delete;
     GpuBackend& operator=(GpuBackend&&) = delete;
 
-    // 进程共享 backend：函数局部 static shared_ptr，最后一个强引用释放时
-    // 正常执行析构（不再故意泄漏）。GpuBuffer 也持有强引用，因此
-    // Tensor/GpuBuffer 晚于 GpuEngine 析构仍安全。
+    // 设备域标识（生命周期 v3）：backend 对象地址。GpuBuffer 持 keepalive ⇒
+    // 张量存活期内该地址不会被新 backend 复用（P3 改 weak 缓存后依然成立）。
+    [[nodiscard]] DomainId identity() const noexcept
+    {
+        return reinterpret_cast<DomainId>(this);
+    }
+
+    // 进程共享 backend：函数局部 static shared_ptr——⚠ 该 static 强引用永不
+    // 释放（Vulkan 资源活到进程退出，D5；P3 改 weak 缓存）。GpuBuffer 也持有
+    // 强引用，因此 Tensor/GpuBuffer 晚于 GpuEngine 析构仍安全。
     [[nodiscard]] static std::shared_ptr<GpuBackend> shared()
     {
         static std::shared_ptr<GpuBackend> backend(new GpuBackend());

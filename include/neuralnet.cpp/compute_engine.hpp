@@ -30,7 +30,7 @@
 //   - **in-place** 原语（add_inplace / scale_inplace / zero / eval_expr_into）**
 //     存储精度不可变**（§8.3）。
 //   - **精度策略住在各引擎的 `*_impl` 里**：基类公共入口只做 bind 检查 +
-//     出生绑定（`stamp_`）后**直通** `*_impl`，**不做任何能力分支**；"原生
+//     设备域检查后**直通** `*_impl`，**不做任何能力分支**；"原生
 //     f16 直读直写"还是"抬 f32 算 → 按 P 落回"由引擎自己决定（CPU 引擎基于
 //     f32 Matrix → 边界 cast；GPU 引擎有 f16 变体/字节级原语 → 原生）。
 //     基类只保留**通用 cast 助手**（`to_f32` / `to_prec` / `move_` /
@@ -60,7 +60,7 @@
 #include "core_errors.hpp"
 #include "core_assert.hpp"
 #include "core_env.hpp"       // RV-09：环境变量读取唯一入口
-#include "core_engine_id.hpp"
+#include "core_domain.hpp"
 #include "core_profile.hpp"   // 训练 step 剖析（NN_PROFILE=1 门控；默认零开销）
 #include "compute_tensor.hpp"
 #include "expr_opt.hpp"   // canonicalize_expr_spec（trace 归因用，与 gen_fused 同源 key）
@@ -73,9 +73,9 @@ namespace nn
 namespace dsl
 {
     // 前置声明（compute_engine.hpp 不能反向 include expr_dsl.hpp）：
-    // nn::dsl::compute / compute_reduce 是 ComputeEngine::adopt 的 friend
-    // 调用方——DSL 静态工厂产物的库内 stamp 通道（15 §4.2 D2）。
     // 默认实参（P = F32）在 expr_dsl.hpp 的定义处。
+    // 生命周期 v3 起不再有库内 stamp/adopt 通道：DSL 静态工厂产出的 CPU
+    // 张量天然属于宿主域，设备域从存储派生。
     template <typename E>
     [[nodiscard]] Result<Tensor> compute(ComputeEngine& eng, const E& e,
                                          std::size_t rows, std::size_t cols,
@@ -229,23 +229,25 @@ struct EngineInfo
 // ══════════════════════════════════════════════════════════════════════════
 //
 // 分层（NVI：Non-Virtual Interface）：
-//   public  非虚入口 = 薄适配层：bind 检查 + `stamp_` 出生绑定 → 直通 `*_impl`。
+//   public  非虚入口 = 薄适配层：设备域检查 + 参数检查 → 直通 `*_impl`。
 //           **不做能力分支**（精度策略下沉到各引擎的 `*_impl`）。
 //   protected 虚 `*_impl` = 引擎实现：既管算，也管自己的精度边界策略。
 //   能力：各引擎私有事实（`*_` 私有成员 / 编译期常量）；对外只经 `describe()`。
 class ComputeEngine : public std::enable_shared_from_this<ComputeEngine>
 {
 public:
-    // ── 身份与所有权（docs/development/09-engine-ownership.md）────────────
+    // ── 生命周期与设备域（docs/todo/28-lifecycle-v3.md）──────────────────
     // 引擎必须由 shared_ptr 管理（CpuEngine::create / GpuEngine::create）。
-    // Tensor 只保存 id()；会解引用引擎的 Layer / Model / Optimizer /
-    // ExprGraph 保存 keepalive()，因此不依赖析构顺序约定。
+    // 会解引用引擎的 Layer / Model / Optimizer / ExprGraph / ExprSegment 保存
+    // keepalive()；Tensor 不保存引擎身份——设备域从**存储**派生。
     virtual ~ComputeEngine() = default;
 
     ComputeEngine(const ComputeEngine&) = delete;
     ComputeEngine& operator=(const ComputeEngine&) = delete;
 
-    [[nodiscard]] EngineId id() const noexcept { return id_; }
+    // 本引擎的设备域：CpuEngine = kHostDomain；GpuEngine = backend 标识。
+    // 每个入口逐个操作数比较 `Tensor::device_domain_()` 与本值。
+    [[nodiscard]] DomainId domain() const noexcept { return domain_; }
 
     // 取得本引擎的强引用。未由 shared_ptr 管理时返回空指针（调用方必须
     // 把它当错误处理，不能继续解引用 this 之外的任何生命周期假设）。
@@ -255,7 +257,7 @@ public:
     }
 
 protected:
-    ComputeEngine() : id_(detail::next_engine_id()) {}
+    explicit ComputeEngine(DomainId domain) : domain_(domain) {}
 
 public:
 
@@ -329,7 +331,7 @@ public:
     [[nodiscard]] Result<Tensor> create_offload_buffer(std::size_t bytes)
     {
         NN_PROF_OP("create_offload_buffer");
-        return stamp_(create_offload_buffer_impl(bytes));
+        return create_offload_buffer_impl(bytes);
     }
     // 把 src 复制到 buffer 的 offset（float 单位）处
     // ── 边界 cast 入口：f16 激活在写入 slab 前抬到 f32（slab 恒 f32 存）──
@@ -350,7 +352,7 @@ public:
         std::size_t rows, std::size_t cols)
     {
         NN_PROF_OP("offload_restore");
-        return stamp_(offload_restore_impl(buffer, offset, rows, cols));
+        return offload_restore_impl(buffer, offset, rows, cols);
     }
 
     // ── 异步标量回读（非阻塞取 loss）──────────────────────────────
@@ -406,7 +408,7 @@ public:
         NN_PROF_OP("create_tensor");
         NN_TRY(pc, check_precision_supported(P));
         NN_TRY(shape_ok, check_shape_(rows, cols));
-        return stamp_(create_tensor_impl(rows, cols, P));
+        return create_tensor_impl(rows, cols, P);
     }
     [[nodiscard]] Tensor create_tensor(std::size_t rows, std::size_t cols,
                                        Precision P = Precision::F32)
@@ -428,12 +430,12 @@ public:
         switch (spec.kind)
         {
         case InitSpec::Kind::Uninitialized:
-            return stamp_(create_tensor_impl(rows, cols, P));
+            return create_tensor_impl(rows, cols, P);
         case InitSpec::Kind::Zero:
         {
             // 分配 + 整张清零（GPU 分配未初始化，zero() 是必要写；CPU 分配
             // 已零填充仍走一遍 zero() 统一契约）。
-            NN_TRY(t_r, stamp_(create_tensor_impl(rows, cols, P)));
+            NN_TRY(t_r, create_tensor_impl(rows, cols, P));
             NN_TRY(z, zero(*t_r));
             return std::move(*t_r);
         }
@@ -441,7 +443,7 @@ public:
             break;
         }
         // Constant / Uniform / Normal：host 生成 + 上传（from_matrix 内部
-        // 自带 stamp_；f16 由 from_matrix 做 RHE 舍入，与层手填路径一致）。
+        // f16 由 from_matrix 做 RHE 舍入，与层手填路径一致）。
         Matrix m(rows, cols, Matrix::uninitialized_tag{});
         fill_host_(m, spec, init_seq_++);
         return from_matrix(m, P);
@@ -457,40 +459,44 @@ public:
         NN_PROF_OP("from_matrix");
         // 同上：非存储精度不得作为张量的存储标签（返回 Result，故直接上抛原因）
         NN_TRY(pc, check_precision_supported(P));
-        return stamp_(from_matrix_impl(m, P));
+        return from_matrix_impl(m, P);
     }
     [[nodiscard]] virtual Result<Matrix> to_matrix(const Tensor& t, Precision P = Precision::F32) = 0;
 
-    // ── 跨设备/引擎拉取（M6，17 §4.3 / 15 §3.2 P3）────────────────────────
+    // ── 跨设备拉取（M6，17 §4.3 / 15 §3.2 P3；v3 起是唯一跨域入口）────────
     // 目标侧拉取语义（15 §3.2）：
-    //   同设备 + 同精度 = 零拷贝别名；同设备 + 异精度 = 引擎内 cast；
-    //   跨设备 = 经宿主中转（基类默认实现），引擎可 override 成原生上传
-    //   （GpuEngine = 原 `ensure_gpu` 的直接上载路径，省一次宿主拷贝）。
+    //   同域 + 同精度 = 零拷贝别名；同域 + 异精度 = 引擎内 cast；
+    //   CPU → GPU = 上载（GpuEngine 原生上传路径，省一次宿主拷贝）；
+    //   GPU → CPU **不走这里**（用 to_matrix 落宿主）；GPU 异 backend = 报错。
     // 返回**新句柄**，绝不改写调用方的 `src`——需要就地重绑定必须在调用点
     // 显式写 `t = std::move(*import(t))`（与 `cast_into` 的不替换红线同族）。
-    // 命名即防线：跨设备互传只准经 `import`（16 §2 的 43 处 ensure_gpu 已迁完）。
-    [[nodiscard]] Result<Tensor> import(const Tensor& src)
+    [[nodiscard]] Result<Tensor> import(
+        const Tensor& src,
+        std::source_location loc = std::source_location::current())
     {
         NN_PROF_OP("import");
-        return import(src, src.precision());
+        return import(src, src.precision(), loc);
     }
 
-    [[nodiscard]] Result<Tensor> import(const Tensor& src, Precision P)
+    [[nodiscard]] Result<Tensor> import(
+        const Tensor& src, Precision P,
+        std::source_location loc = std::source_location::current())
     {
         NN_PROF_OP("import");
-        // 热路径快路：同一引擎已绑定、精度也一致时，import_impl 只会
-        // 原样返回共享句柄。optimizer 每 step 会对每个 DSL leaf 反复走
-        // 此入口（profile 约 3.4 万次/20 steps）；在这里提前返回可跳过
-        // bind_check_ 与 virtual dispatch，同时保留跨引擎/跨精度的完整路径。
-        // 身份比较只读 8 字节 EngineId，不解引用引擎；不同引擎永远不相等
-        // （ID 进程内单调递增、永不复用）。
-        if (src.valid() && src.bound() && src.engine_id() == id() &&
-            src.precision() == P)
+        // 热路径快路：同一设备域且精度一致时，import_impl 只会原样返回共享
+        // 句柄。optimizer 每 step 会对每个 DSL leaf 反复走此入口（profile 约
+        // 3.4 万次/20 steps）；在这里提前返回可跳过下方检查与 virtual dispatch。
+        // 域从存储派生（只读、无原子操作）。
+        if (src.valid() && src.precision() == P && src.device_domain_() == domain_)
             return src;
-        NN_TRY(ec, bind_check_({&src}));
         if (!src.valid())
             NN_FAIL("import: invalid tensor");
-        return stamp_(import_impl(src, P));
+        const DomainId d = src.device_domain_();
+        // 唯一允许的跨域方向：宿主域 → 本引擎（GPU 上载）。CPU 引擎收到 GPU
+        // 张量、或 GPU 引擎收到另一个 backend 的张量，一律明确报错。
+        if (d != domain_ && d != kHostDomain)
+            NN_FAIL(domain_error_(src, loc));
+        return import_impl(src, P);
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -737,7 +743,7 @@ public:
     // ── reshape（M1，docs/todo/17 §3 D10：修改类操作一律引擎方法）──
     // 语义同原 Tensor::reshape：GPU 共享底层 buffer（零拷贝视图）、CPU 按
     // precision_ 复制数据到新形状；绑定随 src 传播（15 §3.1），未出生绑定
-    // 的输入由 stamp_ 补绑定。元素数不匹配返回错误（原 NN_ASSERT 升级）。
+    // 的输入形状由引擎校验。元素数不匹配返回错误（原 NN_ASSERT 升级）。
     [[nodiscard]] Result<Tensor> reshape(const Tensor& t, std::size_t new_rows,
                                           std::size_t new_cols)
     {
@@ -745,7 +751,7 @@ public:
         NN_TRY(ec, bind_check_({&t}));
         if (t.rows() * t.cols() != new_rows * new_cols)
             NN_FAIL("reshape: element count mismatch");
-        return stamp_(t.reshape(new_rows, new_cols));
+        return t.reshape(new_rows, new_cols);
     }
 
     // ── cast 原语（§7.5，唯一"变精度"算子，永远显式）────────────────
@@ -755,7 +761,7 @@ public:
     {
         NN_PROF_OP("cast");
         NN_TRY(ec, bind_check_({&src}));
-        return stamp_(cast_impl(src, dst));
+        return cast_impl(src, dst);
     }
 
     // ── cast_into：把 src 按精度转换后写入 **dst 的既有存储**（不替换对象）
@@ -857,7 +863,7 @@ public:
         NN_PROF_OP("clone");
         NN_TRY(ec, bind_check_({&src}));
         // 精度策略（原生 f16 字节拷贝 / 抬 f32 再落回）在引擎的 clone_impl 内。
-        return stamp_(clone_impl(src));
+        return clone_impl(src);
     }
 
     // 将 CPU Matrix 数据写入已有 Tensor（CPU 拷贝 / GPU 上传）
@@ -900,7 +906,7 @@ public:
     {
         NN_PROF_OP("slice_rows");
         NN_TRY(ec, bind_check_({&src}));
-        return stamp_(slice_rows_impl(src, start_row, count));
+        return slice_rows_impl(src, start_row, count);
     }
 
     // 将 src 的所有行写入 dst 的行 [dst_start_row, dst_start_row + src.rows())。
@@ -927,7 +933,7 @@ public:
     {
         NN_PROF_OP("gather_rows");
         NN_TRY(ec, bind_check_({&table, &indices}));
-        return stamp_(gather_rows_impl(table, indices));
+        return gather_rows_impl(table, indices);
     }
 
     // scatter_add_rows: 按 indices 把 grad 的行原子累加到 dst 的对应行
@@ -959,7 +965,7 @@ public:
     {
         NN_PROF_OP("rearrange_3d");
         NN_TRY(ec, bind_check_({&x}));
-        return stamp_(rearrange_3d_impl(x, M, B, N, inverse));
+        return rearrange_3d_impl(x, M, B, N, inverse);
     }
 
     // ── 矩阵转置：A (R, C) → out (C, R) ──
@@ -968,7 +974,7 @@ public:
     {
         NN_PROF_OP("transpose");
         NN_TRY(ec, bind_check_({&A}));
-        return stamp_(transpose_impl(A));
+        return transpose_impl(A);
     }
 
     // ── 卷积/池化窗口展开原语（op-level 数据搬运，零算法语义）─────────────
@@ -990,7 +996,7 @@ public:
     {
         NN_PROF_OP("im2col");
         NN_TRY(ec, bind_check_({&x}));
-        return stamp_(im2col_impl(x, C, H, W, k, stride, pad, OH, OW));
+        return im2col_impl(x, C, H, W, k, stride, pad, OH, OW);
     }
 
     // col2im：im2col 的伴随（adjoint / 反向散射）。
@@ -1008,7 +1014,7 @@ public:
     {
         NN_PROF_OP("col2im");
         NN_TRY(ec, bind_check_({&col}));
-        return stamp_(col2im_impl(col, C, H, W, k, stride, pad, OH, OW));
+        return col2im_impl(col, C, H, W, k, stride, pad, OH, OW);
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -1031,11 +1037,11 @@ public:
         NN_PROF_OP("matmul");
         NN_TRY(ec, bind_check_({&A, &B}));
         if (P != Precision::F32)
-            return stamp_(matmul_impl(A, B, transA, transB, P));
-        return stamp_(binary_(A, B, P, [this, transA, transB](const Tensor& a, const Tensor& b)
+            return matmul_impl(A, B, transA, transB, P);
+        return binary_(A, B, P, [this, transA, transB](const Tensor& a, const Tensor& b)
         {
             return matmul_impl(a, b, transA, transB, Precision::F32);
-        }));
+        });
     }
 
     // 批量矩阵乘法：对每个 batch b 计算 C_b = alpha * op(A_b, B_b)，结果垂直堆叠
@@ -1058,13 +1064,13 @@ public:
         NN_PROF_OP("batched_matmul");
         NN_TRY(ec, bind_check_({&A, &B}));
         if (P != Precision::F32)
-            return stamp_(batched_matmul_impl(A, B, batch, transA, transB, alpha, P));
-        return stamp_(binary_(A, B, P,
+            return batched_matmul_impl(A, B, batch, transA, transB, alpha, P);
+        return binary_(A, B, P,
             [this, batch, transA, transB, alpha](const Tensor& a, const Tensor& b)
         {
             return batched_matmul_impl(a, b, batch, transA, transB, alpha,
                                        Precision::F32);
-        }));
+        });
     }
 
     // ── matmul + broadcast bias（统一精度处理）────────────────────────────
@@ -1082,12 +1088,12 @@ public:
         if (P != Precision::F32 &&
             (A.precision() != Precision::F32 || B.precision() != Precision::F32 ||
              bias.precision() != Precision::F32))
-            return stamp_(matmul_with_bias_impl(A, B, bias, transA, transB, P));
+            return matmul_with_bias_impl(A, B, bias, transA, transB, P);
 
         if (P == Precision::F32 && A.precision() == Precision::F32 &&
             B.precision() == Precision::F32 && bias.precision() == Precision::F32)
-            return stamp_(matmul_with_bias_impl(A, B, bias, transA, transB,
-                                         Precision::F32));
+            return matmul_with_bias_impl(A, B, bias, transA, transB,
+                                         Precision::F32);
         auto a = to_f32(A);
         NN_TRY_CHECK(a);
         auto b = to_f32(B);
@@ -1097,7 +1103,7 @@ public:
         auto r = matmul_with_bias_impl(*a, *b, *bi, transA, transB,
                                        Precision::F32);
         NN_TRY_CHECK(r);
-        return stamp_(to_prec(std::move(*r), P));
+        return to_prec(std::move(*r), P);
     }
 
     // 梯度累加：dst += src（dst 存储精度不可变，§8.3）
@@ -1184,7 +1190,7 @@ public:
     [[nodiscard]] Result<Tensor> trit_pack(const Tensor& w, const Tensor& scale)
     {
         NN_TRY(ec, bind_check_({&w, &scale}));
-        return stamp_(trit_pack_impl(w, scale));
+        return trit_pack_impl(w, scale);
     }
 
     [[nodiscard]] Result<Tensor> matmul_q(const Tensor& packed, const Tensor& scale,
@@ -1213,7 +1219,7 @@ private:
         // 精度策略与 matmul 同款：非 f32 下传引擎自行决定（GPU 有 in-kernel f16
         // 变体 → 直读 f16 的 B / 直写 f16 的 C，零边界 cast；CPU/无变体时由
         // 引擎内部抬 f32 计算 + 按 P 落回，见各 *matmul_q_impl*）。
-        return stamp_(matmul_q_impl(packed, scale, B, transA, out_rows, P));
+        return matmul_q_impl(packed, scale, B, transA, out_rows, P);
     }
 
 public:
@@ -1264,8 +1270,8 @@ public:
         NN_PROF_OP("scan_prefix_outer");
         NN_TRY(ec, bind_check_({&K, &V, &P, &R, &A0, &B0, &boundary}));
         // 精度策略（原生 f16 扫描 / 引擎内边界 cast）在引擎的 *_impl 内。
-        return stamp_(scan_prefix_outer_impl(K, V, P, R, A0, B0, has_state, dk, heads,
-                                             causal, boundary, has_bnd, prec));
+        return scan_prefix_outer_impl(K, V, P, R, A0, B0, has_state, dk, heads,
+                                             causal, boundary, has_bnd, prec);
     }
 
     // 后缀扫描（RLA 反向 pass 2）：
@@ -1282,8 +1288,8 @@ public:
     {
         NN_PROF_OP("scan_suffix_outer");
         NN_TRY(ec, bind_check_({&D, &X, &Y, &boundary}));
-        return stamp_(scan_suffix_outer_impl(D, X, Y, dk, heads, causal, boundary,
-                                            has_bnd, prec));
+        return scan_suffix_outer_impl(D, X, Y, dk, heads, causal, boundary,
+                                            has_bnd, prec);
     }
 
     // 逐列外积（RLA 反向的 dL/dA、dL/dB 物化）：
@@ -1298,7 +1304,7 @@ public:
     {
         NN_PROF_OP("outer_col");
         NN_TRY(ec, bind_check_({&P, &R, &S}));
-        return stamp_(outer_col_impl(P, R, S, dk, has_scale, prec));
+        return outer_col_impl(P, R, S, dk, has_scale, prec);
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -1317,7 +1323,7 @@ public:
     {
         NN_PROF_OP("row_reduce_sum");
         NN_TRY(ec, bind_check_({&A}));
-        return stamp_(row_reduce_sum_impl(A, P));
+        return row_reduce_sum_impl(A, P);
     }
 
     // 按列求和：A (rows, cols) → out (1, cols)
@@ -1327,7 +1333,7 @@ public:
     {
         NN_PROF_OP("col_reduce_sum");
         NN_TRY(ec, bind_check_({&A}));
-        return stamp_(col_reduce_sum_impl(A, P));
+        return col_reduce_sum_impl(A, P);
     }
 
     // 按列求最大值：A (rows, cols) → out (1, cols)
@@ -1337,7 +1343,7 @@ public:
     {
         NN_PROF_OP("col_reduce_max");
         NN_TRY(ec, bind_check_({&A}));
-        return stamp_(col_reduce_max_impl(A, P));
+        return col_reduce_max_impl(A, P);
     }
 
     // ── 分组归约（segmented reduce，沿行方向按固定长度分组）───────────────
@@ -1353,7 +1359,7 @@ public:
     {
         NN_PROF_OP("grouped_reduce_sum");
         NN_TRY(ec, bind_check_({&x}));
-        return stamp_(grouped_reduce_sum_impl(x, G, R, P));
+        return grouped_reduce_sum_impl(x, G, R, P);
     }
     [[nodiscard]] Result<Tensor> grouped_reduce_max(
         const Tensor& x, std::size_t G, std::size_t R,
@@ -1361,7 +1367,7 @@ public:
     {
         NN_PROF_OP("grouped_reduce_max");
         NN_TRY(ec, bind_check_({&x}));
-        return stamp_(grouped_reduce_max_impl(x, G, R, P));
+        return grouped_reduce_max_impl(x, G, R, P);
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -1395,7 +1401,7 @@ public:
                                       /*vector_out=*/false, P);
         // 变体选路 / 边界 cast 归因**只做一次**：整段下沉到引擎的
         // eval_expr_impl（它本来就要算 key/精度签名）——F2 修复。
-        return stamp_(eval_expr_impl(spec, inputs, rows, cols, P));
+        return eval_expr_impl(spec, inputs, rows, cols, P);
     }
 
     // ── 归约向量原生形状输出（LayerNorm/RMSNorm 小向量缓存等） ──────────
@@ -1417,7 +1423,7 @@ public:
             return record_graph_node_(*g, spec, inputs, rows, cols,
                                       /*vector_out=*/true, P);
         // 变体选路 / 边界 cast 归因整段下沉到引擎的 eval_expr_reduce_impl（F2 修复）
-        return stamp_(eval_expr_reduce_impl(spec, inputs, rows, cols, P));
+        return eval_expr_reduce_impl(spec, inputs, rows, cols, P);
     }
 
     // ── 目标传递（destination-passing）：结果写入已有张量 ────────────────
@@ -1693,39 +1699,12 @@ protected:
     }
 
 protected:
-    // 下面这些是**引擎实现可复用的 cast / 绑定助手**（各引擎的 `*_impl`
-    // 在"原生路径不可用"时用它们表达边界 cast）。对外不可见。
+    // 下面这些是**引擎实现可复用的 cast 助手**（各引擎的 `*_impl` 在
+    // "原生路径不可用"时用它们表达边界 cast）。对外不可见。
     //
-    // 库内 stamp 通道（15 §4.2 D2）：有引擎在场、但产物走静态工厂的位置
-    // （dsl::compute 的 eval_cpu 出口与扫描占位、compute_reduce 的归约向量
-    // 出口）统一经此补绑定。非用户 API——friend 限定给 nn::dsl 两个入口。
-    template <typename E>
-    friend Result<Tensor> dsl::compute(ComputeEngine&, const E&, std::size_t,
-                                       std::size_t, Precision);
-    template <typename E>
-    friend Result<Tensor> dsl::compute_reduce(ComputeEngine&, const E&, std::size_t,
-                                              std::size_t, Precision);
-    [[nodiscard]] Tensor adopt(Tensor t) { return stamp_(std::move(t)); }
-
-    // ══════════════════════════════════════════════════════════════════════
-    // P1 出生 stamp（docs/history/history.md「15 号归档」 §3.1）：未绑定的产物补上 this；
-    // 只给"尚未记录出生身份"的有效张量打上当前引擎 ID。已绑定张量保持
-    // 原 ID（cast/reshape 等传播场景沿用来源身份）；跨引擎消费由
-    // bind_check_ 明确拒绝。
-    // 只 stamp 有效张量：失败路径返回的 Tensor() 空槽保持未绑定。
-    // ══════════════════════════════════════════════════════════════════════
-    [[nodiscard]] Tensor stamp_(Tensor t)
-    {
-        if (t.valid() && !t.bound())
-            t.engine_id_ = id();
-        return t;
-    }
-    [[nodiscard]] Result<Tensor> stamp_(Result<Tensor>&& r)
-    {
-        if (r && r->valid() && !r->bound())
-            r->engine_id_ = id();
-        return std::move(r);
-    }
+    // 注意（生命周期 v3）：不再有 `stamp_`/`adopt` 出生绑定通道。设备域从
+    // 存储派生（CPU → kHostDomain，GPU → GpuBuffer 的 backend 标识），静态工厂
+    // 产出的 CPU 张量天然属于宿主域，引擎内部中转无需补任何身份。
 
     // ── 形状合法性（RV-02）：rows*cols 溢出 size_t 直接拒绝 ────────────────
     // 溢出后按"回绕后的元素数"分配 = 立即越界，属参数错误而非分配失败，故在
@@ -1829,74 +1808,55 @@ protected:
         }
     }
 
-    // ── P1 跨引擎检查（15 §4.3 D3）──────────────────────────────────────
-    // 判定（D3 字面）：操作数指针判等——**双方都 bound 且不同 → Result 硬错误**；
-    // 单侧未绑定按库外豁免放行（P1 只加检查、零行为变化，ctest 不红）。
-    // NN_BIND_DEBUG=1（进程启动前设置）时"未绑定输入进引擎"也报错：用于抓
-    // 库内 stamp 漏网 + 产出 P2 库外迁移清单；P3 视情况转默认开并升 import。
+    // ── 设备域检查（生命周期 v3，docs/todo/28-lifecycle-v3.md §4.3）──────
+    // 每个 public NVI 入口逐个操作数比较 `Tensor::device_domain_()` 与本引擎
+    // 域：空/无效张量（域 = 0）豁免（交由各入口既有的无效/形状检查拒绝）；
+    // 其余必须**等于本引擎域**。跨域入口只有 `import`（CPU→GPU 上载）与
+    // `to_matrix`（GPU→CPU 落宿主）。
     // 错误带调用点 source_location（默认参在调用处求值）与张量形状。
-    [[nodiscard]] static bool bind_debug_enabled_()
+    [[nodiscard]] Error domain_error_(const Tensor& t, std::source_location loc) const
     {
-        // 行为开关（探针门的既有例外，AGENTS §2）：读一次 + 缓存（RV-09）。
-        static const bool on = ::nn::detail::env_flag_raw("NN_BIND_DEBUG");
-        return on;
-    }
-
-    [[nodiscard]] static Error bind_error_(const char* kind, const Tensor* t,
-                                           const Tensor* other,
-                                           std::source_location loc)
-    {
-        std::string s = std::string("bind_check_ ") + kind + " at "
-                      + loc.file_name() + ":" + std::to_string(loc.line()) + "  "
-                      + (t ? t->shape_str() : std::string("?"));
-        if (t && other)
-            s += " vs " + other->shape_str();
-        // M6 门禁化（17 §5 M6）：错误若只藏在 Result 里，ctest 门禁失败时
-        // 无从定位——NN_BIND_DEBUG 下同步打到 stderr，带调用点与形状。
-        if (bind_debug_enabled_())
-            std::fprintf(stderr, "[NN_BIND_DEBUG] %s\n", s.c_str());
+        std::string s = "设备域不匹配 at " + std::string(loc.file_name()) + ":"
+                      + std::to_string(loc.line()) + "  " + t.shape_str()
+                      + "  tensor_domain=" + std::to_string(t.device_domain_())
+                      + " engine_domain=" + std::to_string(domain_);
+        const DomainId d = t.device_domain_();
+        if (d == kHostDomain && domain_ != kHostDomain)
+            s += "\n  CPU 张量不能直接进入 GPU 引擎：请先经 engine.import(t) 上载";
+        else if (d != kHostDomain && domain_ == kHostDomain)
+            s += "\n  GPU 张量不能直接进入 CPU 引擎：请先经 engine.to_matrix(t) 落宿主";
+        else
+            s += "\n  跨 GPU backend：请先 to_matrix 落宿主，再 import 到目标 backend";
         return Error{std::move(s)};
     }
 
-    // 单操作数判定核心：维护"首个 bound 引擎"基准 ref，后续 bound 必须与之相等
-    [[nodiscard]] Result<void> bind_check_one_(const Tensor*& ref, const Tensor* t,
+    [[nodiscard]] Result<void> bind_check_one_(const Tensor& t,
                                                std::source_location loc) const
     {
-        if (!t)
+        const DomainId d = t.device_domain_();
+        if (d == 0 || d == domain_)
             return {};
-        if (!t->bound())
-        {
-            if (bind_debug_enabled_())
-                NN_FAIL(bind_error_("unbound input into engine", t, nullptr, loc));
-            return {};   // 库外豁免（D3）
-        }
-        if (!ref)
-        {
-            ref = t;
-            return {};
-        }
-        // 身份比较只读 EngineId（无指针、永不复用）。
-        if (t->engine_id() != ref->engine_id())
-            NN_FAIL(bind_error_("mixed engines (both bound, identities differ)", ref, t, loc));
-        return {};
+        NN_FAIL(domain_error_(t, loc));
     }
 
     [[nodiscard]] Result<void> bind_check_(std::initializer_list<const Tensor*> ts,
                                            std::source_location loc = std::source_location::current()) const
     {
-        const Tensor* ref = nullptr;
         for (const Tensor* t : ts)
-            if (auto r = bind_check_one_(ref, t, loc); !r)
+        {
+            if (!t)
+                continue;
+            if (auto r = bind_check_one_(*t, loc); !r)
                 return r;
+        }
         return {};
     }
 
     [[nodiscard]] Result<void> bind_check_(std::span<const Tensor> ts,
                                            std::source_location loc = std::source_location::current()) const
     {
-        const Tensor* ref = nullptr;
         for (const Tensor& t : ts)
-            if (auto r = bind_check_one_(ref, &t, loc); !r)
+            if (auto r = bind_check_one_(t, loc); !r)
                 return r;
         return {};
     }
@@ -1935,12 +1895,10 @@ protected:
             return t;
         note_temp_(t.rows(), t.cols(), /*to_f32=*/false,
                    static_cast<std::uint32_t>(loc.line()));
-        // 入参常是 `*_impl` 的产物（unary_/binary_/move_ 等）——它在本基类内
-        // 还没走到调用方的 stamp_。先把出生绑定补上再进 `cast`（内部有
-        // bind_check_），否则 NN_BIND_DEBUG 门禁会把"基类内部中转"误判成
-        // 库内漏网（M6 门禁化前的既有现象，17 §5 M6）。
-        t = stamp_(std::move(t));
-        return stamp_(cast(std::move(t), P));
+        // 入参常是 `*_impl` 的产物（unary_/binary_/move_ 等）。v3 起设备域
+        // 从存储派生，基类内部中转无需补任何身份；cast 的 bind_check_ 直接
+        // 比较存储域与本引擎域。
+        return cast(std::move(t), P);
     }
 
     // 一批操作数抬到 f32（顺序与输入一致；ExprSpec 的 views 依赖该顺序）
@@ -2165,8 +2123,9 @@ protected:
     std::uint64_t init_seq_ = 0;
 
 private:
-    // 进程内单调递增、永不复用的身份。Tensor 只保存这个值。
-    EngineId id_;
+    // 设备域 token（v3）：派生类构造时写入；入口检查据此拒绝跨域操作数。
+    // 0 = 未设置（仅基类抽象态，派生引擎必须给非零域）。
+    DomainId domain_ = 0;
 };
 
 namespace detail {

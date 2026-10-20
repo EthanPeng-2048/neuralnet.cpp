@@ -23,6 +23,7 @@
 
 #include "../core_errors.hpp"
 #include "../core_observer_ptr.hpp"
+#include "../core_domain.hpp"
 #include "../precision.hpp"
 #include "compute_memory_pool.hpp"
 
@@ -62,6 +63,13 @@ private:
     std::uint64_t write_epoch_{0};
 
 public:
+    // 设备域标识（生命周期 v3）：backend 对象地址。buffer 持 backend keepalive
+    // ⇒ 张量存活期内该 backend 不会被析构、其地址不会被新 backend 复用。
+    [[nodiscard]] DomainId backend_identity() const noexcept
+    {
+        return reinterpret_cast<DomainId>(backend_keepalive_.get());
+    }
+
     [[nodiscard]] std::uint64_t write_epoch() const noexcept { return write_epoch_; }
     void mark_content_changed() noexcept { ++write_epoch_; }
 

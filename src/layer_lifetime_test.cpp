@@ -1,13 +1,16 @@
-// ── layer_lifetime_test — EngineId + 强所有权生命周期 ─────────────────────
+// ── layer_lifetime_test — 生命周期 v3：设备域模型与强所有权 ────────────────
 //
-// v2 契约（docs/development/09-engine-ownership.md）：
-//   [1] EngineId：8B、平凡复制、进程内不复用；引擎不可栈上构造
-//   [2] Tensor 只保存 EngineId：引擎析构后仍可复制/析构，不存在悬垂指针
-//   [3] Layer 持有 shared_ptr<ComputeEngine>：外部 shared_ptr 释放后仍可 forward
-//   [4] Model 持有强引用：引擎随 Model 存活
-//   [5] 跨引擎重绑返回 Result 错误
-//   [6] Optimizer 持有强引用：外部引擎句柄释放后 step 仍安全
-//   [7] Layer 的 init 失败回滚与 profile 注入
+// v3 契约（docs/todo/28-lifecycle-v3.md §4）：
+//   [1] 域从存储派生：CPU 张量 → kHostDomain；空/无效 = 0（唯一豁免）；
+//       Tensor 不再保存任何引擎身份字段
+//   [2] 引擎不可栈上构造（必须由 create() 的 shared_ptr 管理）
+//   [3] Tensor 晚于引擎析构仍可复制/析构（只拥有存储）
+//   [4] Layer / Model / Optimizer 持有 shared_ptr<ComputeEngine>：外部句柄释放
+//       后仍可 forward/step
+//   [5] 跨 CPU 引擎使用张量合法（同一宿主域）；Layer 跨引擎重绑仍拒绝
+//   [6] 跨域 op 拒绝（CPU 张量进 GPU 引擎 / GPU 张量进 CPU 引擎 / 跨 backend），
+//       import 是唯一 CPU→GPU 入口（GPU 构建 + 可用设备时）
+//   [7] Layer init 失败回滚与 profile 注入
 // ─────────────────────────────────────────────────────────────────────────
 
 #include <cstdio>
@@ -50,11 +53,11 @@ protected:
     }
 };
 
-void test_engine_id()
+void test_domain_model()
 {
-    static_assert(sizeof(nn::EngineId) == sizeof(void*),
-                  "EngineId 必须保持 8B");
-    static_assert(std::is_trivially_copyable_v<nn::EngineId>);
+    static_assert(std::is_same_v<nn::DomainId, std::uintptr_t>,
+                  "DomainId = 不透明整数域标识");
+    static_assert(nn::kHostDomain != 0, "宿主域非零（0 保留给空张量）");
     static_assert(!std::is_default_constructible_v<nn::CpuEngine>,
                   "CpuEngine 不允许栈上构造（必须用 create()）");
 #ifdef NN_HAS_VULKAN
@@ -62,37 +65,34 @@ void test_engine_id()
                   "GpuEngine 不允许栈上构造（必须用 create()）");
 #endif
 
-    nn::EngineId unbound;
-    CHECK(!unbound.bound(), "默认 EngineId 未绑定");
-
     auto e1 = nn::CpuEngine::create();
     auto e2 = nn::CpuEngine::create();
-    CHECK(e1->id().bound() && e2->id().bound(), "引擎构造后带非零身份");
-    CHECK(e1->id() != e2->id(), "不同引擎身份不相等");
+    CHECK(e1->domain() == nn::kHostDomain, "CPU 引擎域 = kHostDomain");
+    CHECK(e2->domain() == nn::kHostDomain, "所有 CPU 引擎共享宿主域");
 
-    const nn::EngineId a = e1->id();
-    const nn::EngineId b = a;
-    CHECK(a == b, "EngineId 复制保持相等");
+    // 空张量 = 域 0（唯一豁免）；非空 CPU 张量属于宿主域。
+    // device_domain_() 是引擎私有通道，库外不暴露：这里用"跨 CPU 引擎可用"
+    // 间接证明两台 CPU 引擎确实同域。
+    nn::Tensor t = e1->create_tensor(2, 2, nn::Precision::F32);
+    CHECK(t.valid(), "e1 创建张量");
+    auto c = e2->clone(t);
+    CHECK(c, "跨 CPU 引擎使用张量合法（同一宿主域）");
 }
 
 void test_tensor_survives_engine()
 {
     nn::Tensor t;
-    nn::EngineId id;
     {
         auto engine = nn::CpuEngine::create();
         t = engine->create_tensor(2, 2, nn::Precision::F32);
-        id = t.engine_id();
-        CHECK(t.bound(), "引擎产物出生即带身份");
-        CHECK(id == engine->id(), "Tensor::engine_id() == 创建引擎 id");
     }
 
-    // 引擎已析构：Tensor 只是 8 字节身份 + 共享存储，复制/析构都安全。
-    CHECK(t.bound(), "引擎析构后 Tensor 仍记录出生身份");
-    CHECK(t.engine_id() == id, "身份不随引擎析构改变");
+    // 引擎已析构：Tensor 只拥有存储，复制/析构/读元数据都安全。
+    CHECK(t.valid() && t.rows() == 2 && t.cols() == 2, "引擎析构后张量仍有效");
     nn::Tensor copy = t;
-    CHECK(copy.engine_id() == id, "Tensor 拷贝传播 EngineId");
-    CHECK(copy.rows() == 2 && copy.cols() == 2, "Tensor 元数据可安全读取");
+    CHECK(copy.valid(), "Tensor 可安全复制");
+    t = nn::Tensor{};
+    CHECK(copy.valid(), "原句柄释放后副本仍有效");
 }
 
 void test_layer_keeps_engine_alive()
@@ -165,40 +165,54 @@ void test_optimizer_keeps_engine_alive()
     CHECK(step, "Optimizer 持有引擎强引用，step 正常");
 }
 
-void test_gpu_buffer_outlives_engine()
+void test_cross_domain_rejected()
 {
 #ifdef NN_HAS_VULKAN
-    // 独立 backend 的完整初始化在部分老卡上要几十秒；默认只跑 CPU 生命周期。
-    // 需要验证"最后一个 GpuBuffer 释放 → backend 正常析构"时手动设
-    // NN_GPU_LIFETIME_FULL=1。
-    if (!nn::detail::env_flag_raw("NN_GPU_LIFETIME_FULL"))
-        return;
-
-    nn::Tensor t;
+    // 独立 backend（不污染进程共享实例）；无设备/初始化失败 → 跳过
+    auto backend = nn::GpuBackend::create();
+    if (!backend->initialize())
     {
-        // 独立 backend（不是进程共享实例），这样作用域结束时确实是最后一个
-        // 强引用链的起点。初始化失败（CI 无 GPU）→ 本子用例跳过。
-        auto backend = nn::GpuBackend::create();
-        auto init = backend->initialize();
-        if (!init)
-        {
-            std::printf("[SKIP] GpuBuffer 生命周期：%s\n",
-                        init.error().message.c_str());
-            return;
-        }
-        auto engine = nn::GpuEngine::create(backend);
-        t = engine->create_tensor(16, 16, nn::Precision::F32);
-        CHECK(t.is_gpu() && t.valid(), "创建 GPU 张量");
+        std::printf("[SKIP] 跨域拒绝：本机无可用 Vulkan 设备\n");
+        return;
+    }
+    auto gpu = nn::GpuEngine::create(backend);
+    auto cpu = nn::CpuEngine::create();
+
+    nn::Tensor host = cpu->create_tensor(2, 2, nn::Precision::F32);
+    nn::Tensor dev = gpu->create_tensor(2, 2, nn::Precision::F32);
+
+    // GPU 引擎拒绝 CPU 操作数（不再有逐 op 自动 import）
+    auto bad_clone = gpu->clone(host);
+    CHECK(!bad_clone, "CPU 张量进 GPU 引擎 : clone 返回错误");
+    if (!bad_clone)
+        CHECK(bad_clone.error().message.find("设备域") != std::string::npos,
+              "错误信息点明设备域不匹配");
+
+    // CPU 引擎拒绝 GPU 操作数（落宿主必须走 to_matrix）
+    auto bad_cpu = cpu->clone(dev);
+    CHECK(!bad_cpu, "GPU 张量进 CPU 引擎 : clone 返回错误");
+
+    // import 是唯一 CPU→GPU 入口；导入后同域 op 正常
+    auto imported = gpu->import(host);
+    CHECK(imported, "import(CPU 张量) 成功");
+    if (imported)
+    {
+        auto ok = gpu->clone(*imported);
+        CHECK(ok, "import 后的 GPU 张量可参与 GPU 引擎 op");
     }
 
-    // engine / backend 的局部 shared_ptr 都已释放；GpuBuffer 自己持有
-    // backend keepalive，因此这里的复制与析构都必须安全。
-    CHECK(t.valid() && t.is_gpu(), "GpuEngine 析构后 GPU 张量仍有效");
-    nn::Tensor copy = t;
-    CHECK(copy.valid(), "GPU 张量可安全复制");
-    t = nn::Tensor{};
-    CHECK(copy.valid(), "原句柄释放后副本仍有效");
-    // copy 在函数结束时析构：最后一个 buffer 释放 → backend 正常析构。
+    // 跨 backend：另一个独立 backend 的引擎拒绝该张量（提示先落宿主）
+    auto backend2 = nn::GpuBackend::create();
+    if (backend2->initialize())
+    {
+        auto gpu2 = nn::GpuEngine::create(backend2);
+        auto cross = gpu2->clone(dev);
+        CHECK(!cross, "跨 GPU backend 直接使用张量返回错误");
+        auto back = gpu->to_matrix(dev);
+        CHECK(back, "GPU→宿主 to_matrix 正常");
+    }
+#else
+    std::printf("[SKIP] 跨域拒绝：构建未启用 Vulkan\n");
 #endif
 }
 
@@ -231,14 +245,14 @@ void test_layer_init_failure_rollback()
 
 int main()
 {
-    std::printf("── EngineId / Layer / Model / Optimizer / Tensor 生命周期 ──\n");
-    test_engine_id();
+    std::printf("── 生命周期 v3：设备域 / 强所有权 / 跨域拒绝 ──\n");
+    test_domain_model();
     test_tensor_survives_engine();
     test_layer_keeps_engine_alive();
     test_model_keeps_engine_alive();
     test_cross_engine_reinit_rejected();
     test_optimizer_keeps_engine_alive();
-    test_gpu_buffer_outlives_engine();
+    test_cross_domain_rejected();
     test_layer_init_failure_rollback();
 
     if (g_fail == 0)
