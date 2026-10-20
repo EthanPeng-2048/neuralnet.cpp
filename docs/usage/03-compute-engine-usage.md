@@ -113,6 +113,10 @@ nn::CpuEngine& engine = *engine_owner;
 >
 > ⚠ **生命周期**：`Model` / `Layer` / `Optimizer` 都持有引擎强引用，
 > 不再要求调用方按声明顺序保证“引擎最后析构”；Tensor 只保存 `EngineId`。
+> **但优化器与模型之间仍需顺序**：`Optimizer` 的 `params_/grads_` 是 Model
+> 内 Tensor 的非拥有引用，**必须早于 Model 销毁**（Model 先析构 → `step()`
+> UAF）。由 `nn::TrainingSession` 统一拥有两者可结构性避免
+> （[`todo/29`](../todo/29-session-architecture.md)）。
 
 **统一工厂**（CLI 入口用的写法，可直接复用）：
 

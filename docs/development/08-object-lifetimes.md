@@ -11,7 +11,7 @@
   `Optimizer`、`ExprGraph` / `ExprBlock`；
 - **`GpuBuffer` 持有 `shared_ptr<GpuBackend>` keepalive**：GPU 张量可以晚于
   `GpuEngine` 析构；
-- 引擎与 backend 都由 `shared_ptr` 管理，最后一个强引用释放时按 RAII 析构。
+- 引擎由 `shared_ptr` 管理，最后一个强引用释放时按 RAII 析构；`GpuBackend::create()` 同样确定性回收。**例外**：`GpuBackend::shared()` 目前是函数局部 `static std::shared_ptr`，不随使用者归零回收（Vulkan 资源活到进程退出），P3 改为 weak 缓存后才有确定性回收（[`todo/28`](../todo/28-lifecycle-v3.md) D5）。
 
 因此不再需要“引擎必须比借用方活得久”的调用约定，也不再需要进程级令牌池。
 
@@ -21,7 +21,7 @@
 auto cpu = nn::CpuEngine::create();          // shared_ptr<CpuEngine>
 
 #ifdef NN_HAS_VULKAN
-auto backend = nn::GpuBackend::shared();     // 进程共享；RAII 析构
+auto backend = nn::GpuBackend::shared();     // 进程共享（当前为 static 强引用，见 §1）
 auto gpu = nn::GpuEngine::create(backend);
 #endif
 ```
@@ -36,7 +36,7 @@ auto gpu = nn::GpuEngine::create(backend);
 | `Tensor` | `EngineId`（8 B） | 只用于跨引擎诊断；不提供 `engine()` / `engine_alive()` |
 | `Layer` | `shared_ptr<ComputeEngine>` | `engine_ref()` 直接解引用；层存活则引擎存活 |
 | `Model` | `shared_ptr<ComputeEngine>` | `Model::engine()` 返回 `*engine_` |
-| `Optimizer` | `shared_ptr<ComputeEngine>` | 优化器晚于 Model 存活也安全 |
+| `Optimizer` | `shared_ptr<ComputeEngine>` | **只保证引擎存活**：`params_/grads_` 是 Model 内 Tensor 的非拥有引用 ⇒ 优化器**必须早于 Model 销毁**（否则 `step()` UAF）；该契约由 `TrainingSession` 结构化保证（[`todo/29`](../todo/29-session-architecture.md)） |
 | `ExprGraph` | `shared_ptr<ComputeEngine>` | 录制图存在期间引擎不会析构 |
 | `ExprBlock` | `shared_ptr<ComputeEngine>` | `end_expr` 直接使用强引用 |
 | `GpuBuffer` | `shared_ptr<GpuBackend>` | 延迟销毁 / 归还 pool 时 backend 必然存活 |
@@ -70,7 +70,7 @@ auto gpu = nn::GpuEngine::create(backend);
 1. `EngineId` 8 B / 平凡复制 / 不复用；
 2. Tensor 晚于引擎析构仍可复制、可析构；
 3. Layer / Model 在外部引擎句柄释放后仍可 forward；
-4. Optimizer 在外部引擎句柄释放后仍可 step；
+4. Optimizer 在外部引擎句柄释放后仍可 step（前提：Model 仍存活——非拥有 TensorRef 的契约）；
 5. 跨引擎重绑返回 `Result` 错误；
 6. init 失败回滚与 profile 注入；
 7. `NN_GPU_LIFETIME_FULL=1` 下验证 GpuBuffer 晚于 GpuEngine/backend 析构。

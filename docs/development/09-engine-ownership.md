@@ -163,7 +163,11 @@ class Layer
 - `Model` 持有 `std::shared_ptr<ComputeEngine>`；`Model::engine()` 直接
   返回 `*engine_`；
 - `Optimizer` 持有 `std::shared_ptr<ComputeEngine>`（引用成员绑定到
-  `*owner`），优化器晚于 Model 存活也安全；
+  `*owner`）——这只保证**引擎**存活。`params_/grads_` 是指向 Model 内 Layer
+  Tensor 成员的**非拥有引用**，因此优化器**必须早于 Model 销毁**；Model 先
+  析构时 `step()` 是 UAF（D3，见 [`todo/28`](../todo/28-lifecycle-v3.md)）。
+  正确的所有权组合由 `TrainingSession` 提供
+  （[`todo/29`](../todo/29-session-architecture.md)）；
 - `ExprGraph::owner` 与 `ExprBlock::eng` 持有强引用；录制段内引擎不会
   析构。
 
@@ -184,7 +188,11 @@ public:
 ```
 
 `shared()` 使用函数局部 `static std::shared_ptr<GpuBackend>`，不再 `new` 后
-故意泄漏。最后一个引用释放时 `~GpuBackend()` 正常执行：
+故意泄漏——⚠ **但 static 强引用本身永不释放**：最后一个使用者归零时
+backend **不会**析构，Vulkan 资源活到进程退出（D5，
+[`todo/28`](../todo/28-lifecycle-v3.md)；P3 改为 weak 缓存后才"有使用者才
+存活"的确定性回收）。`create()` 返回的独立实例是确定性 RAII——
+最后一个引用释放时 `~GpuBackend()` 正常执行：
 
 1. `vkDeviceWaitIdle`；
 2. 释放 scratch（`reduce_partial_` 改为 backend 自有的裸 `VkBuffer`，不再
@@ -214,7 +222,7 @@ public:
 | Tensor 由引擎 A 创建，交给引擎 B 使用 | `Result` 错误 `mixed engines` |
 | Tensor 的引擎已析构 | Tensor 仍可复制/读取元数据/析构；不提供 `engine()` |
 | `GpuEngine` 析构但 Tensor 仍存活 | `GpuBuffer` 的 backend keepalive 保证 backend 存活 |
-| backend 析构 | 只会在所有 buffer 释放后发生；资源按序释放 |
+| backend 析构 | 只会在所有 buffer 释放后发生；资源按序释放。注意 `shared()` 当前是 static 强引用，**不会**在使用者归零时发生（P3 修复） |
 
 所有失败都发生在 `Result` 或构造期诊断，不依赖“调用方记得让引擎最后析构”。
 
