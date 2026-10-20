@@ -9,7 +9,7 @@
   未修故障、审查/评审整改立项。
 - **裁定与计划分家（2026-10-15 起）**：**裁定台账**（要不要做 / 条件触发 / 不做 + 验收口径）住
   [`18-roadmap.md`](18-roadmap.md)；**执行计划**（先做哪个 / 第一步动作 / 并行与工时）一律**单独成文**，
-  18 号只留指针（当前执行排序 = [`27-execution-plan.md`](27-execution-plan.md)，专项方案 = `26` / `04` / `25`）。
+  18 号只留指针（当前执行排序 = [`27-execution-plan.md`](27-execution-plan.md)，专项方案 = `26` / `04` / `25` / `28` / `29`）。
   新增内容先判断属于哪一类：能二值化成"做/不做"的进 18，只描述顺序与动作的进 27。
 - **允许带进度状态**（✅ 已实施 / ⏳ 待做 / ❌ 已否决），但**不写历史叙事**——
   演进过程、被否决方案的理由、旧数字一律进 `../history/history.md`。
@@ -39,6 +39,8 @@
 | [`21-quantized-weights.md`](21-quantized-weights.md) | 三值（1.58-bit）量化权重与 `BitLinear`：`Precision::T1_58`、按槽能力声明、打包 GEMM |
 | [`22-bitnet-2b4t-architecture.md`](22-bitnet-2b4t-architecture.md) | BitNet b1.58 2B4T 的结构对齐：SubLN / GQA / tied embedding（与 21 号正交） |
 | [`23-library-design-cleanup-and-model-file-roles.md`](23-library-design-cleanup-and-model-file-roles.md) | 库级违规设计清理：模型文件角色（`.nnmodel` / `.nnckpt`）+ 参数形态协议 + 引擎能力体系 |
+| [`28-lifecycle-v3.md`](28-lifecycle-v3.md) | **生命周期 v3（2026-10-20 立项）**：删 `EngineId`/`stamp_`/`adopt`/`bound`/`NN_BIND_DEBUG`，设备域从存储派生（统一 CPU/GPU 域）；P0/P1/P3/P4 + CPU 独立轨道 P-CPU。改生命周期/Tensor/引擎绑定前读 |
+| [`29-session-architecture.md`](29-session-architecture.md) | **Session 层（2026-10-20 设计）**：`TrainingSession` 拥有 Model + Optimizer（结构性修复非拥有引用 UAF）；`InferenceSession` / `RLTrainingSession` 占位。改 Model/Optimizer/训练入口前读 |
 
 ### 现状盘点 / 规范 / 教训 / 故障
 
