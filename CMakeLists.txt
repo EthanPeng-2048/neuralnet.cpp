@@ -652,6 +652,14 @@ if(NN_BUILD_APPS OR NN_ENABLE_TESTS)
     nn_add_executable(layer_lifetime_test src/layer_lifetime_test.cpp)
     list(APPEND NN_TEST_TARGETS layer_lifetime_test)
 
+    # ── P0 生命周期契约负例（docs/todo/28 §5 P0）──────────────────────────
+    # 覆盖：ExprSegment 强引用（录制段内丢外部引擎句柄仍可 end）、
+    # ActivationOffloader 状态机（未 import 的重复 export = fail-fast；
+    # discard 作废通道）与精度门（slab 恒 f32 ⇒ 非 F32 激活拒绝）、
+    # optimizer 先于 Model 析构的正常顺序。
+    nn_add_executable(lifetime_contract_test src/lifetime_contract_test.cpp)
+    list(APPEND NN_TEST_TARGETS lifetime_contract_test)
+
     # ── F1：危险精度组合启动期告警（仅警告，不拒绝；docs/todo/24 §2.3）────
     # [1][2] 头文件函数组合矩阵（含 all=f16）单测；[3] 子进程跑 text_train/
     # mnist_train，捕获 stderr 断言告警出现 + 退出码不变；二进制缺失 → 77 = SKIP
