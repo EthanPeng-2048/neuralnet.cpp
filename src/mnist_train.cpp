@@ -779,12 +779,22 @@ int main(int argc, char *argv[])
         }
     }
 
-    // ── 训练 ─────────────────────────────────────────────────
-    auto optimizer = nn::create_optimizer(
-        cfg.optimizer_name, *engine,
-        model.parameters(), model.param_gradients(), cfg.lr,
-        cfg.weight_decay, cfg.precision);
-    NN_EXIT(optimizer, 1, "错误：未知优化器名称: ");
+    // ── 训练生命周期容器（P2b，docs/todo/29）─────────────────
+    // Session 同时拥有 Model + Optimizer（成员声明顺序保证 optimizer 先析构），
+    // 结构性消除"优化器必须早于参数所有者销毁"的调用约定。model 在此前已完成
+    // resume 载入（--resume 需要 model 存在），故顺序 = build → resume → create。
+    // activation_offload / checkpoint_every 保持默认（迁移前本入口从未对 model
+    // 调用 set_activation_offload / set_checkpoint_every）。
+    nn::TrainingConfig train_cfg;
+    train_cfg.optimizer = cfg.optimizer_name;   // 等价于迁移前的 create_optimizer(name,…)
+    train_cfg.lr = cfg.lr;
+    train_cfg.weight_decay = cfg.weight_decay;
+    train_cfg.precision = cfg.precision;        // 只作用于优化器状态（同 create_optimizer 透传）
+    // beta1/beta2 保留 TrainingConfig 默认 0.9/0.999（= 迁移前 create_optimizer 默认值，
+    // 本 CLI 无对应参数）；clip_grad_norm 保留 0（迁移前不做梯度裁剪）。
+    auto session_result = nn::TrainingSession::create(std::move(model), std::move(train_cfg));
+    NN_EXIT(session_result, 1, "错误：未知优化器名称");
+    nn::TrainingSession session = std::move(*session_result);
 
     Scalar optimizer_current_lr = cfg.lr;
 
@@ -824,7 +834,7 @@ int main(int argc, char *argv[])
         Scalar epoch_lr = nn::cli::compute_epoch_lr(lr_sched_cfg, epoch);
         if (epoch_lr != optimizer_current_lr)
         {
-            optimizer->set_lr(epoch_lr);
+            session.set_lr(epoch_lr);
             optimizer_current_lr = epoch_lr;
         }
 
@@ -866,7 +876,7 @@ int main(int argc, char *argv[])
             NN_EXIT(bb, 1, "\nbegin_batch failed: ");
 
             // ── 前向 ──
-            auto out_r = model.forward(*x_tensor_r);
+            auto out_r = session.model().forward(*x_tensor_r);
             NN_EXIT(out_r, 1, "\nForward pass failed: ");
 
             // ── 计算损失 ──
@@ -879,7 +889,7 @@ int main(int argc, char *argv[])
             auto grad_r = ce_loss.backward();
             NN_EXIT(grad_r, 1, "\nLoss backward failed: ");
 
-            auto bwd_r = model.backward(*grad_r);
+            auto bwd_r = session.model().backward(*grad_r);
             NN_EXIT(bwd_r, 1, "\nModel backward failed: ");
 
             // ── 提交并等待所有录制的命令 ──
@@ -891,14 +901,14 @@ int main(int argc, char *argv[])
             auto obb = engine->begin_batch();
             NN_EXIT(obb, 1, "\nbegin_batch (optimizer) failed: ");
 
-            auto step_result = optimizer->step();
+            auto step_result = session.step();
             if (!step_result) {
                 std::cerr << "\n优化器 step 失败: " << step_result.error().message << '\n';
                 (void)engine->end_batch();
                 return 1;
             }
 
-            auto zero_result = optimizer->zero_grad();
+            auto zero_result = session.zero_grad();
             if (!zero_result) {
                 std::cerr << "\n优化器 zero_grad 失败: " << zero_result.error().message << '\n';
                 (void)engine->end_batch();
@@ -929,8 +939,8 @@ int main(int argc, char *argv[])
         // 评估分块大小取训练 batch：CNN 的 im2col 展开是 k²·C_in 倍，
         // 不分块时全量 60000 样本单次 forward 需 ~6.4 GB 显存 → OOM。
         const std::size_t eval_n = (cfg.arch == ArchType::Transformer) ? cfg.eval_samples : 0;
-        auto train_acc_r = nn::cli::evaluate_mnist(model, *engine, train_x, train_y, eval_n, cfg.batch_size);
-        auto test_acc_r  = nn::cli::evaluate_mnist(model, *engine, test_x, test_y, eval_n, cfg.batch_size);
+        auto train_acc_r = nn::cli::evaluate_mnist(session.model(), *engine, train_x, train_y, eval_n, cfg.batch_size);
+        auto test_acc_r  = nn::cli::evaluate_mnist(session.model(), *engine, test_x, test_y, eval_n, cfg.batch_size);
         if (!train_acc_r || !test_acc_r)
         {
             const auto &err = !train_acc_r ? train_acc_r.error() : test_acc_r.error();
@@ -954,7 +964,7 @@ int main(int argc, char *argv[])
 
     // ── 保存模型 ─────────────────────────────────────────────
     // 推理模型（Model 角色）：三值层写打包形态 + τ（不含训练参数）
-    auto save_result = nn::save_model(cfg.save_path, model, spec, {},
+    auto save_result = nn::save_model(cfg.save_path, session.model(), spec, {},
                                       nn::ModelRole::Model);
     NN_EXIT(save_result, 1, "保存模型失败: ");
     std::cout << "\n训练完成! 总耗时: " << std::fixed << std::setprecision(1) << total_sec << "s" << std::endl;
