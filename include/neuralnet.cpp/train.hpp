@@ -7,7 +7,7 @@
 // 序列化，够写完整训练循环。详见 `engine.hpp` 头注释。
 //
 // 仍需**单独按需** include 的：
-//   · 模型工厂 / 分词器 → `domain_*.hpp`（如 domain_gpt.hpp、domain_tokenizer.hpp）
+//   · 模型工厂 → `domain_*.hpp`（如 domain_gpt.hpp；`TextTrainer` 已带分词器头）
 //   · 数据集 CSV 读取   → `cli/cli_mnist_io.hpp`（当前挂在 CLI 头下）
 //
 // 用法（完整训练循环骨架，签名细节见 AGENTS.md §8）：
@@ -37,3 +37,8 @@
 #include "optimizer.hpp"
 #include "model.hpp"
 #include "training_session.hpp"   // TrainingSession（推荐：Model + Optimizer 同生共死）
+#include "dataset.hpp"            // Dataset（.nndataset 只读）
+#include "dataset_samples.hpp"    // TextSampleSet：数据集 → 训练样本（窗口）
+#include "lr_scheduler.hpp"       // 学习率调度（epoch / step 级）
+#include "text_train_config.hpp"  // TextTrainConfig（训练配方）
+#include "text_trainer.hpp"       // TextTrainer：数据集直接接入的训练工厂

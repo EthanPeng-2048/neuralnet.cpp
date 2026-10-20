@@ -121,7 +121,7 @@ std::filesystem::path scratch_dir()
     s.dataset.sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     s.dataset.num_tokens = 40960;
     s.dataset.num_docs = 128;
-    s.dataset.num_windows = 320;
+    s.dataset.num_samples = 320;
     s.dataset.steps_per_epoch = 40;
     s.dataset.loss_scope = "assistant";
     s.optimizer_step = 987;
@@ -157,7 +157,7 @@ std::filesystem::path scratch_dir()
            a.dataset.path == b.dataset.path && a.dataset.sha256 == b.dataset.sha256 &&
            a.dataset.num_tokens == b.dataset.num_tokens &&
            a.dataset.num_docs == b.dataset.num_docs &&
-           a.dataset.num_windows == b.dataset.num_windows &&
+           a.dataset.num_samples == b.dataset.num_samples &&
            a.dataset.steps_per_epoch == b.dataset.steps_per_epoch &&
            a.dataset.loss_scope == b.dataset.loss_scope;
 }
@@ -471,12 +471,12 @@ void test_dataset_identity()
 
     auto changed = saved;
     changed.sha256 = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
-    changed.num_windows = saved.num_windows + 1;
+    changed.num_samples = saved.num_samples + 1;
     changed.steps_per_epoch = saved.steps_per_epoch + 1;
     const std::string why = nn::dataset_mismatch_reason(saved, changed);
     CHECK(!why.empty(), "身份变化 → 有差异说明");
     CHECK(why.find("sha256") != std::string::npos, "列出 sha256 变化");
-    CHECK(why.find("窗口数") != std::string::npos, "列出窗口数变化");
+    CHECK(why.find("样本数") != std::string::npos, "列出样本数变化");
     CHECK(why.find("每 epoch 步数") != std::string::npos, "列出每 epoch 步数变化");
     CHECK(why.find("token 数") == std::string::npos, "未变化的项不列出");
 }

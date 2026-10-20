@@ -50,6 +50,9 @@ namespace nn
 
 enum class DatasetKind : std::uint64_t { Text = 0, Tabular = 1 };
 
+// 数据集子集：训练 / 测试（`.nndataset` 的 "train" / "test" 两条记录）。
+enum class DatasetSubset : std::uint8_t { Train = 0, Test = 1 };
+
 struct DatasetInfo
 {
     DatasetKind kind = DatasetKind::Text;
@@ -67,6 +70,17 @@ struct TextCorpus
     std::vector<std::size_t> token_flow;
     std::vector<std::size_t> doc_ids;      // 每 token 的文档 id（序号 + 1）
     std::vector<unsigned char> loss_mask;  // loss_scope=all 时为全 1
+};
+
+// ── 存储单位：一个 doc（数据集里的一行文本）─────────────────────────────
+// **样本（训练单位）= 窗口**，由 dataset_samples.hpp 的 TextSampleSet 给出；
+// doc 只是 `.nndataset` 的存储/切分单位（裁决 #2/#3，docs/todo/19 §0）。
+// 本结构给"按 doc 访问"用（检查数据/切分调试），训练走窗口样本。
+struct TextDoc
+{
+    std::size_t doc_id = 0;                 // 子集内序号 + 1
+    std::vector<std::size_t> tokens;        // 该 doc 的 token 序列
+    std::vector<unsigned char> loss_mask;   // 与 tokens 等长；loss_scope=all 时全 1
 };
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -441,17 +455,64 @@ public:
 
     [[nodiscard]] const DatasetInfo &info() const noexcept { return info_; }
 
+    // 数据集文件路径（身份/诊断用；与 `.nndataset` 内容无关）
+    [[nodiscard]] const std::string &path() const noexcept { return path_; }
+
     // 词表 kvrec（companion.vocab；模型 v6 内嵌词表的字节来源）
     [[nodiscard]] const KeyValueRecord &vocab_kvrec() const noexcept { return vocab_; }
 
-    // 一次性给出训练所需的全部三样（流式留待 P2-4 后半）。
-    // test=false → train 子集；true → test 子集（无 test 子集则报错）。
-    [[nodiscard]] Result<TextCorpus> load_text(bool test = false) const
+    // 子集的存储单位（doc）数量：训练样本数见 dataset_samples.hpp。
+    [[nodiscard]] std::uint64_t doc_count(DatasetSubset subset = DatasetSubset::Train) const
+        noexcept
+    {
+        return subset == DatasetSubset::Test ? info_.test_docs : info_.num_docs;
+    }
+
+    // 读取单个 doc（含生成期 loss 掩码；loss_scope=all 时合成全 1）。
+    // 训练路径批量读取走 load_text（一次 IO 拿整个子集），本接口供检查/调试。
+    [[nodiscard]] Result<TextDoc> text_doc(DatasetSubset subset, std::size_t index) const
     {
         if (is_vocab_only_)
             NN_FAIL("该文件是 .nnvocab 词表，不含数据集子集: " + path_);
         if (info_.kind != DatasetKind::Text)
             NN_FAIL("tabular 数据集尚未支持（阶段四预留，见 docs/todo/19 §4.4）");
+        if (subset == DatasetSubset::Test && info_.test_docs == 0)
+            NN_FAIL("该数据集没有 test 子集: " + path_);
+        const std::vector<std::uint64_t>& index_table =
+            (subset == DatasetSubset::Test) ? test_index_ : train_index_;
+        const std::size_t n = index_table.empty() ? 0 : index_table.size() - 1;
+        if (index >= n)
+            NN_FAIL("doc 下标越界（subset="
+                    + std::string(subset == DatasetSubset::Test ? "test" : "train")
+                    + ", index=" + std::to_string(index) + ", count="
+                    + std::to_string(n) + "）");
+
+        std::ifstream ifs(path_, std::ios::binary);
+        if (!ifs)
+            NN_FAIL("无法打开数据集文件: " + path_);
+        const bool has_mask = (info_.loss_scope == "assistant");
+        NN_TRY(blk, detail::read_doc_block(ifs, index_table[index], has_mask));
+
+        TextDoc out;
+        out.doc_id = index + 1;
+        out.tokens = std::move(blk->first);
+        if (has_mask)
+            out.loss_mask = std::move(blk->second);
+        else
+            out.loss_mask.assign(out.tokens.size(), 1u);
+        return out;
+    }
+
+    // 一次性给出子集训练所需的全部三样（流式留待 P2-4 后半）。
+    // 子集 = Train/Test（Test 无 test 子集则报错）。
+    [[nodiscard]] Result<TextCorpus>
+    load_text(DatasetSubset subset = DatasetSubset::Train) const
+    {
+        if (is_vocab_only_)
+            NN_FAIL("该文件是 .nnvocab 词表，不含数据集子集: " + path_);
+        if (info_.kind != DatasetKind::Text)
+            NN_FAIL("tabular 数据集尚未支持（阶段四预留，见 docs/todo/19 §4.4）");
+        const bool test = (subset == DatasetSubset::Test);
         const std::vector<std::uint64_t> &index = test ? test_index_ : train_index_;
         if (test && info_.test_docs == 0)
             NN_FAIL("该数据集没有 test 子集");

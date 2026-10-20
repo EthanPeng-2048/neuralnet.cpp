@@ -40,6 +40,7 @@
 #include "core_errors.hpp"
 #include "model_container.hpp"
 #include "precision.hpp"
+#include "train_state.hpp"   // nn::TrainState（P2b：训练状态由 Session 持有）
 
 namespace nn
 {
@@ -112,6 +113,14 @@ public:
     [[nodiscard]] const TrainingConfig& config() const noexcept { return cfg_; }
     [[nodiscard]] std::uint64_t step_count() const noexcept { return step_count_; }
 
+    // ── 训练状态（P2b）──────────────────────────────────────────────────
+    // `TrainState` = 计数器 / lr 配方 / 数据集身份 / 优化器指针。**写入方是训练
+    // 驱动**（epoch × step 的位置只有循环知道）；Session 只负责持有它，保证
+    // "断点状态与模型/优化器同生共死"，调用方不必再手工搬运一份状态。
+    [[nodiscard]] const TrainState& train_state() const noexcept { return state_; }
+    [[nodiscard]] TrainState& train_state() noexcept { return state_; }
+    void set_train_state(TrainState state) { state_ = std::move(state); }
+
     // 训练原语（epoch/step 循环与数据集仍留在调用方/CLI）
     [[nodiscard]] Result<void> zero_grad() { return model_.zero_grad(); }
 
@@ -139,6 +148,7 @@ private:
     std::unique_ptr<Optimizer> opt_{};
     TrainingConfig cfg_{};
     std::uint64_t step_count_ = 0;
+    TrainState state_{};
 
     TrainingSession(Model model, std::unique_ptr<Optimizer> opt, TrainingConfig cfg)
         : model_(std::move(model)), opt_(std::move(opt)), cfg_(std::move(cfg))

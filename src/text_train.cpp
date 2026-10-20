@@ -3,28 +3,24 @@
 // 输入：.nndataset 数据集（docs/todo/19-unified-dataset.md）——
 //   tokenize、loss 掩码、词表都在生成期（dataset_gen）定好并嵌入数据集。
 //
-// 数据流（滑动窗口，GPT 预训练标准做法）：
-//   nn::Dataset::load_text → token 流 + doc_ids + loss_mask（与旧 tokcache
-//     + mark_assistant_spans 产物逐位同构）→ 各 doc token 纯拼接成连续 token 流
-//     （行间无分隔符、不插入 BOS/EOS；行边界由 doc_ids 记录，窗口可跨行，
-//       上下文连续）
-//   按 stride 对 token 流滑动切 seq_len 窗口 → 每窗口 = 一个训练样本
-//   每 batch：窗口 → Matrix(seq_len, batch) → engine.from_matrix → Tensor
-//     → GPTModel.forward(Tensor) → Tensor(vocab_size, seq_len×batch)
-//     → ce_loss.forward_sparse(engine, logits, flat_labels, loss_mask) → Scalar
-//     → ce_loss.backward() → Tensor
-//     → model.backward(Tensor) → (丢弃)
-//     → optimizer.step() / zero_grad()
+// 数据流（P2b：数据集 → **样本** → 训练工厂）：
+//   nn::Dataset::open → nn::TextSampleSet（每样本 = 一个 seq_len 滑动窗口，
+//     token/目标/掩码/doc_ids 由样本层统一装配）→ nn::TextTrainer（训练驱动）
+//     → TrainingSession（Model + Optimizer + TrainState）→ GPTModel → 稀疏 CE
+//     → backward → optimizer step。
+//   本文件只负责：数据集/词表加载、样本集切分、模型构建、恢复、训练配方映射、
+//   收尾产物（.nnmodel）与退出码。训练循环在 `nn::TextTrainer::fit()`。
 //
 // 引擎选择：--gpu 启用 GpuEngine（需要 Vulkan），否则 CpuEngine。
 //
-// 结构（P1-1 模块化，docs/todo/18-roadmap.md §4.2）——本文件只留**入口**：
-//   * cli/text_train_config.hpp   ：TrainConfig + --help + argv 解析
-//                                   （唯一允许 std::exit 的层）
-//   * cli/text_train_recovery.hpp ：--resume（角色门禁 / 按规格重建 / 载参）
-//   * cli/text_train_loop.hpp     ：训练循环（epoch × step + 辅助件/探针）
+// 模块结构（P1-1 模块化 + P2b 训练工厂）：
+//   * cli/text_train_config.hpp  ：TrainConfig + --help + argv 解析
+//                                  （唯一允许 std::exit 的层）
+//   * cli/text_train_recovery.hpp：--resume（角色门禁 / 按规格重建 / 载参）
+//   * cli/text_train_loop.hpp    ：CLI hooks（梯度日志/探针/断点）+ 调 fit()
 //   * cli/text_train_checkpoint.hpp：断点与推理模型产出（记账 + 退出码语义）
-// 本文件不再直接终止进程：`main` 是唯一出口（Result → 退出码）。
+//   * text_trainer.hpp / dataset_samples.hpp / training_session.hpp：库层训练工厂
+// 本文件不直接终止进程：`main` 是唯一出口（Result → 退出码）。
 // ─────────────────────────────────────────────────────────────────────────
 
 #include <cstddef>
@@ -32,6 +28,7 @@
 #include <iomanip>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -39,8 +36,8 @@
 #include <neuralnet.cpp/nn.hpp>
 #include <neuralnet.cpp/domain_gpt.hpp>
 #include <neuralnet.cpp/precision.hpp>
+#include <neuralnet.cpp/text_trainer.hpp>   // 训练工厂（数据集 + 样本 + 循环）
 #include <neuralnet.cpp/cli/cli_engine_factory.hpp>
-#include <neuralnet.cpp/cli/cli_lr_scheduler.hpp>
 #include <neuralnet.cpp/cli/cli_precision_warning.hpp>
 #include <neuralnet.cpp/cli/text_train_checkpoint.hpp>
 #include <neuralnet.cpp/cli/text_train_config.hpp>
@@ -75,67 +72,69 @@ namespace
     NN_TRY_MSG(tokenizer_r, "加载数据集内嵌词表失败",
                nn::load_tokenizer_from_kvrec(dataset.vocab_kvrec()));
     std::unique_ptr<nn::Tokenizer> tokenizer = std::move(*tokenizer_r);
-    const std::size_t pad_id = tokenizer->pad_id();
     const std::string tokenizer_bytes = nn::write_nnvocab(dataset.vocab_kvrec());
 
-    // ── 训练子集（与旧 tokcache + mark_assistant_spans 产物逐位同构）──
-    // base 模式纯拼接、不插入 BOS/EOS（行间无分隔符），文档边界由
-    // doc_ids 表示（每行 = 一篇文档）。
-    const std::size_t stride = (cfg.stride == 0) ? cfg.seq_len : cfg.stride;
-    NN_TRY_MSG(corpus_r, "读取训练子集失败", dataset.load_text(false));
-    std::vector<std::size_t> token_flow = std::move(corpus_r->token_flow);
-    std::vector<std::size_t> flow_doc_ids = std::move(corpus_r->doc_ids);
-    std::vector<unsigned char> flow_assistant = std::move(corpus_r->loss_mask);
-    if (token_flow.empty())
-        NN_FAIL("数据集 train 子集为空: " + cfg.text_path);
-    std::cout << "训练子集: " << dataset.info().num_docs << " docs / "
-              << token_flow.size() << " tokens  loss_scope=" << loss_scope << "\n";
+    // ── 训练样本集（P2b：样本概念的唯一载体）──────────────────────────
+    // 每样本 = 一个 seq_len 滑动窗口（可能跨 doc 边界）；目标 = 输入左移一位。
+    // 窗口化策略留在训练侧（TextWindowConfig），`.nndataset` 只存 docs。
+    const nn::TextWindowConfig window{cfg.seq_len, cfg.stride, tokenizer->pad_id()};
+    NN_TRY_MSG(train_samples_r, "读取训练样本集失败",
+               nn::TextSampleSet::create(dataset, nn::DatasetSubset::Train, window));
+    nn::TextSampleSet train_samples = std::move(*train_samples_r);
+    if (train_samples.sample_count() == 0)
+        NN_FAIL("数据集 train 子集为空（无 token）: " + cfg.text_path);
 
+    std::optional<nn::TextSampleSet> test_samples;
+    if (dataset.info().test_docs > 0)
+    {
+        NN_TRY_MSG(test_samples_r, "读取测试样本集失败",
+                   nn::TextSampleSet::create(dataset, nn::DatasetSubset::Test, window));
+        // 空 test 子集（合法文件：test 全是空 doc）⇒ 视为无 test，跳过评估
+        if (test_samples_r->sample_count() > 0)
+            test_samples = std::move(*test_samples_r);
+    }
+
+    std::cout << "训练子集: " << train_samples.doc_count() << " docs / "
+              << train_samples.token_count() << " tokens  loss_scope=" << loss_scope
+              << "\n";
     // 文档感知：doc_ids 非空（每 doc = 一篇文档）即启用块对角掩码。
-    if (!flow_doc_ids.empty())
+    if (!train_samples.corpus().doc_ids.empty())
         std::cout << "文档感知掩码已启用（每行 = 一篇文档，"
-                  << flow_doc_ids.back() << " 篇文档）\n";
+                  << train_samples.corpus().doc_ids.back() << " 篇文档）\n";
 
     // loss 掩码在生成期已定（loss_scope=all 为全 1）：仅掩码内的预测目标
     // 参与 loss（对话 SFT 时 = <|assistant|>…<|end_of_assistant|> 段）。
     if (loss_scope == "assistant")
     {
         std::size_t asst_tokens = 0;
-        for (unsigned char m : flow_assistant) asst_tokens += m;
+        for (unsigned char m : train_samples.corpus().loss_mask) asst_tokens += m;
         std::cout << "assistant loss 掩码已启用（" << asst_tokens << " / "
-                  << token_flow.size() << " tokens 作为预测目标参与 loss）\n";
+                  << train_samples.token_count()
+                  << " tokens 作为预测目标参与 loss）\n";
     }
 
-    // 切窗口：每个窗口 = 一个训练样本（长度 seq_len，末窗不足则 PAD）。
-    // 保留全部窗口（含跨文档）；文档感知掩码在单 fold 融合 kernel 内生效
-    // （fold body 逐块 select 屏蔽，不物化 (BH·seq,seq)），无需再丢弃跨文档窗口。
-    std::vector<std::size_t> window_offsets;  // 每个窗口在 token_flow 中的起始偏移
-    window_offsets.reserve(token_flow.size() / stride + 1);
-    for (std::size_t pos = 0; pos < token_flow.size(); pos += stride)
-    {
-        window_offsets.push_back(pos);
-    }
-    std::cout << "滑动窗口: seq_len=" << cfg.seq_len << " stride=" << stride
-              << " 样本数=" << window_offsets.size() << "\n" << std::endl;
+    std::cout << "滑动窗口: seq_len=" << cfg.seq_len
+              << " stride=" << train_samples.stride()
+              << " 样本数=" << train_samples.sample_count() << "\n" << std::endl;
 
     // ── 数据集身份（P1-2 断点门禁的"内容"侧）────────────────────────────
-    // 路径是**位置**（机器相关、CLI 优先），sha256 + 网格三元组是**身份**
-    // （断点权威）。身份不同 ⇒ 窗口网格、step 号语义、lr 曲线形状全变 ⇒
-    // 续训路径硬报错（出口 = 从 .nnmodel 开新一轮，docs/todo/23 §2.1.1）。
+    // 路径是**位置**（机器相关、CLI 优先），sha256 + 网格是**身份**（断点权威）。
+    // 身份不同 ⇒ 样本网格、step 号语义、lr 曲线形状全变 ⇒ 续训路径硬报错
+    // （出口 = 从 .nnmodel 开新一轮，docs/todo/23 §2.1.1）。
     nn::DatasetIdentity dataset_identity;
     dataset_identity.path = cfg.text_path;
     NN_TRY_MSG(sha_r, "计算数据集身份失败", nn::sha256_file_hex(cfg.text_path));
     dataset_identity.sha256 = std::move(*sha_r);
-    dataset_identity.num_tokens = token_flow.size();
-    dataset_identity.num_docs = dataset.info().num_docs;
-    dataset_identity.num_windows = window_offsets.size();
+    dataset_identity.num_tokens = train_samples.token_count();
+    dataset_identity.num_docs = train_samples.doc_count();
+    dataset_identity.num_samples = train_samples.sample_count();
     dataset_identity.loss_scope = loss_scope;
-    // 网格三元组的最后一项（与 loop 内同一公式）：身份门禁靠它判断"续训语义是否成立"
+    // steps_per_epoch 是**派生量**（样本数 ÷ batch），与训练工厂同一公式。
     dataset_identity.steps_per_epoch =
-        (window_offsets.size() + cfg.batch_size - 1) / cfg.batch_size;
+        train_samples.steps_per_epoch(cfg.batch_size);
 
     // ── 数据集身份门禁（硬错、无逃生阀；docs/todo/23 §2.1.1）────────────
-    // 数据集变 ⇒ 窗口数变 ⇒ steps_per_epoch 变 ⇒ step 级调度的 total_steps、
+    // 数据集变 ⇒ 样本数变 ⇒ steps_per_epoch 变 ⇒ step 级调度的 total_steps、
     // global_step 语义、epoch 边界同时改变 ⇒ "同一断点 + 不同数据集"没有正确
     // 的续训语义。合法出口 = 从 .nnmodel 开新一轮（下面的 warm start 分支）。
     if (adoption.adopted)
@@ -336,16 +335,23 @@ namespace
         // 只有测试消费，主流程按进度打印即可。
         NN_TRY_CHECK(nn::cli::resume_text_train(*engine, cfg, model, spec, std::cout, std::cerr));
     }
-    // ── 优化器 ─────────────────────────────────────────────
+
+    // ── 训练会话（P2b）：Model + Optimizer 同生共死 ───────────────────────
     // 精度配置透传：状态张量（m/v/momentum）按 profile.optimizer 创建，
-    // 参数更新走 in-place（存储精度不可变，§8.3）
-    std::unique_ptr<nn::Optimizer> optimizer_holder =
-        nn::create_optimizer(cfg.optimizer_name, *engine, model.parameters(),
-                             model.param_gradients(), cfg.lr, cfg.weight_decay,
-                             cfg.precision, cfg.beta1, cfg.beta2);
-    if (!optimizer_holder)
-        NN_FAIL("错误：未知优化器名称: " + cfg.optimizer_name);
-    nn::Optimizer& optimizer = *optimizer_holder;
+    // 参数更新走 in-place（存储精度不可变，§8.3）。
+    // 注意：模型侧的 flush/checkpoint/offload 已在上面直接设置（CPU offload 是
+    // 警告后忽略，TrainingSession 会拒绝），这里不重复传。
+    nn::TrainingConfig session_cfg;
+    session_cfg.optimizer = cfg.optimizer_name;
+    session_cfg.lr = cfg.lr;
+    session_cfg.weight_decay = cfg.weight_decay;
+    session_cfg.precision = cfg.precision;
+    session_cfg.beta1 = cfg.beta1;
+    session_cfg.beta2 = cfg.beta2;
+    session_cfg.clip_grad_norm = cfg.max_norm;
+    NN_TRY_MSG(session_r, "创建训练会话失败",
+               nn::TrainingSession::create(std::move(model), session_cfg));
+    nn::TrainingSession session = std::move(*session_r);
     mem_probe.mark(*engine, "optimizer-created");
 
     // ── 优化器状态恢复（P1-2；含 Adam 的 `t`）────────────────────────────
@@ -353,66 +359,47 @@ namespace
     // 位置必须在优化器构造之后：状态张量按优化器自身的缓冲形状回写。
     if (adoption.adopted)
     {
-        NN_TRY_CHECK(nn::cli::load_optimizer_state(*engine, cfg.resume_path, optimizer,
-                                                  std::cout));
+        NN_TRY_CHECK(nn::cli::load_optimizer_state(*engine, cfg.resume_path,
+                                                   session.optimizer(), std::cout));
     }
 
-    nn::CrossEntropyLoss ce_loss;
-    // loss 链精度 = profile.stable（§9.1 / D9：softmax/log/大词表归约的溢出防线；
-    // 默认 F32 = loss 链全程 f32）
-    ce_loss.set_precision_profile(cfg.precision);
+    // ── 训练工厂：数据集（样本集）直接接入 ───────────────────────────────
+    // 配方字段就是 TrainConfig 的基类（nn::TextTrainConfig）；数据集身份复用上面
+    // 已算好的 sha256/网格（避免大文件二次哈希）。
+    cfg.identity = dataset_identity;
+    NN_TRY_MSG(trainer_r, "创建训练工厂失败",
+               nn::TextTrainer::create(std::move(session), std::move(train_samples),
+                                       std::move(test_samples), cfg));
+    nn::TextTrainer trainer = std::move(*trainer_r);
 
-    // ── 训练循环 ─────────────────────────────────────────────
-    // 每样本 = 一个 seq_len 滑动窗口（可能跨行），目标 = 输入左移一位。
-    if (window_offsets.empty())
-        NN_FAIL("无有效训练样本（文本 token 流为空）");
-    std::cout << "训练窗口样本数: " << window_offsets.size() << "\n" << std::endl;
+    std::cout << "训练窗口样本数: " << trainer.sample_count() << "\n" << std::endl;
 
-    // ── 训练循环（epoch × step）──────────────────────────────────────
-    // 实现在 cli/text_train_loop.hpp：采样/前向/反向/累积/裁剪/优化器、
-    // 非阻塞 loss 回读、测试评估、--max-steps 与定期断点全在那里。
-    const nn::cli::TextTrainLoopInput loop_in{
-        .cfg = cfg,
-        .engine = *engine,
-        .model = model,
-        .ce_loss = ce_loss,
-        .optimizer = optimizer,
-        .dataset = dataset,
-        .window_offsets = window_offsets,
-        .token_flow = token_flow,
-        .flow_doc_ids = flow_doc_ids,
-        .flow_assistant = flow_assistant,
-        .spec = spec,
-        .tokenizer_bytes = tokenizer_bytes,
-        .pad_id = pad_id,
-        .vocab_size = tokenizer->vocab_size(),
-        .stride = stride,
-        .dataset_identity = dataset_identity,
-        .mem_probe = mem_probe,
-    };
-    NN_TRY_MSG(loop_r, "训练循环失败", nn::cli::run_text_train_loop(loop_in));
-    const nn::cli::TextTrainLoopOutcome loop = std::move(*loop_r);
+    // ── 训练循环（库层 TextTrainer；CLI 只装诊断/断点 hooks）──────────────
+    NN_TRY_MSG(loop_r, "训练循环失败",
+               nn::cli::run_text_train_loop(trainer, cfg, spec, tokenizer_bytes, mem_probe));
+    const nn::TextTrainReport report = std::move(*loop_r);
 
-    // 探针中止（NN_NAN_TRACE 命中，退出码 9）：与旧 `return 9` 一致——跳过
-    // 剖析报告与收尾保存，直接以该退出码结束。
-    if (loop.abort_code != 0) return loop.abort_code;
+    // 探针中止（NN_NAN_TRACE 命中，退出码 9）：跳过剖析报告与收尾保存，直接以该
+    // 退出码结束（与旧 `return 9` 一致）。
+    if (report.abort_code != 0) return report.abort_code;
 
     // ── step 剖析报告（NN_PROFILE=1 / NN_PROFILE_TRACE 时生效）────────────
     if (nn::prof::enabled())
-        nn::prof::dump(stderr, loop.elapsed_ns);
+        nn::prof::dump(stderr, report.elapsed_ns);
 
     // ── 保存模型（含规格 + 嵌入 tokenizer） ──────────────────
     // 推理模型（Model 角色）：三值层写打包形态 + τ（不含训练参数）。
     // 写不出去 = 这一轮训练对用户没有产出 ⇒ 失败退出（错误经 Result 回报）。
     NN_TRY_MSG(save_result, "推理模型保存失败",
-               nn::cli::save_text_train_model(cfg.save_path, model, spec, tokenizer_bytes));
+               nn::cli::save_text_train_model(cfg.save_path, trainer.session().model(), spec,
+                                              tokenizer_bytes));
     (void)save_result;
     std::cout << "\n训练完成! 总耗时: " << std::fixed << std::setprecision(1)
-              << loop.seconds << "s"
+              << report.seconds << "s"
               << "  词表已嵌入模型文件" << std::endl;
     // 退出码语义（P1-1）：有断点没写出去 ⇒ 非零退出。推理模型文件已落盘，
     // 但"可续训"这一性质不成立，上层不得把它当成功（文案在 checkpoint 模块）。
-    return nn::cli::text_train_ckpt_exit_code(loop.ckpt_failures, std::cerr);
+    return nn::cli::text_train_ckpt_exit_code(report.ckpt_failures, std::cerr);
 }
 } // namespace
 

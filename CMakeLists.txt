@@ -8,7 +8,7 @@ cmake_minimum_required(VERSION 3.30)
 # 否则链接期会出现 std 符号 ABI 不匹配）。
 # 本文件不再隐式挑选编译器或 stdlib，避免与调用方/CI 的设置冲突。
 
-# VERSION 以 git tag 为准（当前 v1.10.0-rc0；本仓无 CONFIGURE_FILE 消费该字段，
+# VERSION 以 git tag 为准（当前 v1.10.0-rc0.1；本仓无 CONFIGURE_FILE 消费该字段，
 # 它只是元数据——发版时同步到最新 tag，实际版本以 git tag / gh release 为准）
 project(neuralnet.cpp VERSION 1.10.0 LANGUAGES CXX)
 
@@ -717,6 +717,20 @@ if(NN_BUILD_APPS OR NN_ENABLE_TESTS)
     # ── .nndataset / nn::Dataset（生成→读取与旧 tokcache 产物逐位一致）─────
     nn_add_executable(dataset_test src/dataset_test.cpp)
     list(APPEND NN_TEST_TARGETS dataset_test)
+
+    # ── P2b：训练样本概念（数据集的训练单位 = 窗口样本；step 是派生量）───────
+    # [1] 切窗/样本视图；[2] make_batch 逐位约定（PAD/目标/掩码/doc_ids/
+    # batch-major 扁平化）；[3] assistant 掩码按目标位置；[4] 缺 test 子集与
+    # 非法窗口参数报错；[5] 断点状态段旧键 dataset_windows 兼容读。
+    nn_add_executable(dataset_samples_test src/dataset_samples_test.cpp)
+    list(APPEND NN_TEST_TARGETS dataset_samples_test)
+
+    # ── P2b：训练工厂 TextTrainer（数据集直接接入 + 训练状态 + 断点）─────────
+    # [1] create(dataset) 建样本集/词表/数据身份；[2] fit 端到端（步数/参数移动/
+    # 输出锚）；[3] max-steps/start_step；[4] 断点钩子 → TrainState → .nnckpt；
+    # [5] 前置条件（batch=0 / 裁剪配置不一致）。
+    nn_add_executable(text_trainer_test src/text_trainer_test.cpp)
+    list(APPEND NN_TEST_TARGETS text_trainer_test)
 
 endif()
 

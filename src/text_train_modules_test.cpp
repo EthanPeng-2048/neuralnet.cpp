@@ -207,7 +207,7 @@ void test_role_gate_and_roundtrip(const std::filesystem::path& dir)
         a.sha256 = std::string(64, 'a');
         a.num_tokens = 100;
         a.num_docs = 2;
-        a.num_windows = 4;
+        a.num_samples = 4;
         a.steps_per_epoch = 2;
         a.loss_scope = "all";
         CHECK(nn::cli::verify_dataset_identity(a, a, "x").has_value(), "同一身份放行");
@@ -454,14 +454,18 @@ void test_train_state_wiring(const std::filesystem::path& dir)
     id.sha256 = std::string(64, 'c');
     id.num_tokens = 64;
     id.num_docs = 2;
-    id.num_windows = 4;
+    id.num_samples = 4;
     id.loss_scope = "all";
 
     const auto path = dir / "wire.nnckpt";
     std::ostringstream err;
     nn::cli::TextTrainCheckpointLog log;
-    nn::cli::save_ckpt_with_state(path.string(), model, spec, kTokenizerBytes, cfg, id, log,
-                                  1, 2, 2, 1e-3, *opt, err);
+    // P2b：状态装配唯一实现 = nn::make_text_train_state（TextTrainer 内部同一函数）
+    const nn::TrainState state = nn::make_text_train_state(
+        cfg, id, /*steps_per_epoch=*/2, /*epoch=*/1, /*step_done=*/2, 1e-3,
+        opt->state_step());
+    nn::cli::save_ckpt_with_state(path.string(), model, spec, kTokenizerBytes, state, *opt,
+                                  log, err);
     CHECK(log.failures() == 0 && err.str().empty(), "带状态的断点应一次写成功");
 
     auto st = nn::peek_train_state(path.string());
@@ -479,12 +483,12 @@ void test_train_state_wiring(const std::filesystem::path& dir)
                   st->recipe.total_steps == 6 && st->recipe.optimizer == "adam",
               "配方随断点落盘（batch / epochs / 曲线形状 / 优化器名）");
         CHECK(st->dataset.sha256 == id.sha256 && st->dataset.steps_per_epoch == 2 &&
-                  st->dataset.num_windows == 4,
+                  st->dataset.num_samples == 4,
               "数据集身份 + 网格随断点落盘");
 
         // 数据集身份门禁走的就是断点里的这份身份
         nn::DatasetIdentity changed = id;
-        changed.num_windows = 5;
+        changed.num_samples = 5;
         CHECK(!nn::cli::verify_dataset_identity(st->dataset, changed, path.string()).has_value(),
               "断点记录的身份 vs 变化的网格 ⇒ 硬报错（接线一致）");
     }

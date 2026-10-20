@@ -31,6 +31,7 @@
 #include "neuralnet.cpp/domain_gpt.hpp"         // GPT_* 默认形状
 #include "neuralnet.cpp/model_spec.hpp"         // PosEncodingType / ActivationType / NormType
 #include "neuralnet.cpp/precision.hpp"          // nn::Precision / PrecisionProfile
+#include "neuralnet.cpp/text_train_config.hpp"  // nn::TextTrainConfig（配方唯一真源）
 #include "neuralnet.cpp/cli/cli_gpu_option.hpp"    // nn::cli::parse_gpu_option
 #include "neuralnet.cpp/cli/cli_help.hpp"          // nn::cli::Help
 
@@ -134,36 +135,21 @@ void print_text_train_usage(const char *prog)
     help.opt("--precision-stable <f16|f32>", "数值敏感算子精度 (softmax/LayerNorm/loss，默认: f32)");
     help.opt("--precision-optimizer <f16|f32>", "优化器状态精度 (Adam m/v，默认: f32)");
 }
-struct TrainConfig
+struct TrainConfig : nn::TextTrainConfig
 {
+    // ── 入口相关（不属于训练配方）────────────────────────────────────────
     std::string text_path;
     // 推理模型（.nnmodel，Model 角色）：只含推理所需参数（三值层写打包形态）。
     std::string save_path = "gpt_model.nnmodel";
     std::string resume_path;
-    std::string optimizer_name = "adam";
-    int epochs = 10;
-    int start_epoch = 0;          // resume 后从第几个 epoch 继续（0-based，默认从头）
-    std::size_t start_step = 0;   // resume 后本 epoch 内从第几步继续（0-based）
-    Scalar lr = 0.001;
-    Scalar weight_decay = 0.01f;  // AdamW 权重衰减系数
-    std::size_t batch_size = 32;
-    std::size_t accum_steps = 1;    // 梯度累积步数（1 = 不累积）
-    std::size_t seq_len = nn::GPT_SEQ_LEN;
-    std::size_t stride = 0;   // 滑动窗口步长，0 = 默认等于 seq_len（不重叠）
     std::size_t d_model = nn::GPT_D_MODEL;
     std::size_t num_heads = nn::GPT_NUM_HEADS;
     std::size_t num_layers = nn::GPT_NUM_LAYERS;
     std::size_t d_ff = nn::GPT_D_FF;
     std::string model_type = "gpt";   // gpt / rapt（zipt 已移除）
-    std::size_t log_interval = 50;
-    std::size_t save_interval = 100;  // checkpoint 保存间隔（独立于 log_interval）
-    std::size_t max_steps = 0;        // 本进程最多训练步数（0 = 不限，按 epoch 跑完）
-    Scalar beta1 = 0.9f;              // Adam/AdamW 一阶动量衰减（sgd/muon 忽略）
-    Scalar beta2 = 0.999f;            // Adam/AdamW 二阶动量衰减（LLM 预训练常取 0.95）
     bool load_existing = false;
     bool gpu_enabled = false;
     std::string gpu_device;         // --gpu 的可选设备选择子（空 = 自动选卡）
-    bool grad_log = false;          // 显示梯度统计
     nn::PosEncodingType pos_encoding = nn::PosEncodingType::Learned;
     nn::ActivationType activation = nn::ActivationType::GeLU;  // FFN 激活
     nn::NormType norm_type = nn::NormType::LayerNorm;           // 归一化层类型
@@ -180,19 +166,6 @@ struct TrainConfig
 
     // activation offload（L1-offload）：把每块内部激活搬 host-visible，backward 拷回
     bool activation_offload = false;         // false=不启用（默认）
-
-    // 学习率调度
-    std::string lr_schedule = "fixed";  // fixed / cosine / step_cosine
-    int warmup_epochs = 0;              // 线性预热轮数（epoch 级）
-    std::size_t warmup_steps = 0;       // 线性预热步数（step 级）
-    Scalar min_lr = 1e-6f;              // 余弦退火最低 lr
-    std::vector<Scalar> lr_per_epoch;   // 手动指定每轮 lr（为空则自动计算）
-
-    // 梯度裁剪
-    Scalar max_norm = 0.0f;             // 0 = 不裁剪
-
-    // 混合精度控制（docs/development/05-mixed-precision.md §9.1）
-    nn::PrecisionProfile precision;     // 默认全 F32（零回归）
 
     // ── 本进程**显式给出**的 A/B 类旗标（P1-2；按旗标名登记，不含值）──────
     // 断点续训（role=Checkpoint 且带训练状态段）时，这些旗标一律禁止输入
@@ -247,6 +220,9 @@ inline constexpr std::string_view kForbiddenResumeFlags[] = {
 TrainConfig parse_text_train_args(int argc, char *argv[])
 {
     TrainConfig cfg;
+    // 配方默认值继承自 nn::TextTrainConfig；seq_len 的 CLI 默认是 GPT 序列长度，
+    // 这里显式对齐一次（库层配方不反向依赖 domain_gpt）。
+    cfg.seq_len = nn::GPT_SEQ_LEN;
     for (int i = 1; i < argc; ++i)
     {
         std::string arg = argv[i];

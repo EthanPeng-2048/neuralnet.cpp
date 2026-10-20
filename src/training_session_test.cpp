@@ -99,6 +99,36 @@ void test_create_and_train()
     CHECK(infer.has_value(), "session.model().forward 推理可用");
 }
 
+void test_train_state_container()
+{
+    // P2b：TrainState 由 Session 持有（写入方是训练驱动；Session 负责生命周期），
+    // 移动 Session 后状态仍在（与 optimizer 的 TensorRef 同理）。
+    auto engine = nn::CpuEngine::create();
+    nn::Model model(*engine);
+    CHECK(model.add<nn::Linear>(4, 3), "state: add");
+    nn::TrainingConfig cfg;
+    cfg.optimizer = "sgd";
+    auto s = nn::TrainingSession::create(std::move(model), cfg);
+    CHECK(s.has_value(), "state: create");
+    if (!s) return;
+    CHECK(s->train_state().counters.global_step == 0, "state: 初始为空状态");
+
+    nn::TrainState st;
+    st.counters.epoch = 2;
+    st.counters.global_step = 42;
+    st.dataset.num_samples = 7;
+    st.dataset.sha256 = std::string(64, 'd');
+    s->set_train_state(st);
+    CHECK(s->train_state().counters.epoch == 2 &&
+              s->train_state().dataset.num_samples == 7,
+          "state: set/get 往返");
+
+    nn::TrainingSession moved = std::move(*s);
+    CHECK(moved.train_state().counters.global_step == 42, "state: Session 移动后保留");
+    moved.train_state().counters.step_in_epoch = 3;   // 训练驱动可原地推进
+    CHECK(moved.train_state().counters.step_in_epoch == 3, "state: 可原地推进");
+}
+
 void test_move_session_keeps_refs_valid()
 {
     auto engine = nn::CpuEngine::create();
@@ -231,6 +261,7 @@ int main()
 {
     std::printf("── TrainingSession：所有权 / 训练原语 / 精度透传 ──\n");
     test_create_and_train();
+    test_train_state_container();
     test_move_session_keeps_refs_valid();
     test_inference_without_session();
     test_precision_passthrough();

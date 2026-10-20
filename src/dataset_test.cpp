@@ -238,7 +238,7 @@ int main()
                tag + ": 词表 kvrec 往返字节稳定");
 
         // train 子集逐位一致（空 doc 不产生 token、但不改后续 doc_id）
-        auto corpus_r = ds.load_text(false);
+        auto corpus_r = ds.load_text(nn::DatasetSubset::Train);
         expect(static_cast<bool>(corpus_r), tag + ": load_text(train) 成功");
         if (!corpus_r) continue;
         expect(corpus_r->token_flow == exp_flow, tag + ": token_flow 逐位一致");
@@ -247,7 +247,7 @@ int main()
                tag + (assistant ? ": loss_mask 逐位一致" : ": loss_scope=all 合成全 1 掩码"));
 
         // test 子集（前 3 个 doc）逐位一致
-        auto test_r = ds.load_text(true);
+        auto test_r = ds.load_text(nn::DatasetSubset::Test);
         expect(static_cast<bool>(test_r), tag + ": load_text(test) 成功");
         if (!test_r) continue;
         std::vector<std::size_t> t_flow, t_ids;
@@ -277,7 +277,7 @@ int main()
         expect(static_cast<bool>(ds_r), ".nnvocab 可被 Dataset::open 嗅探打开");
         if (ds_r)
         {
-            auto bad = ds_r->load_text(false);
+            auto bad = ds_r->load_text(nn::DatasetSubset::Train);
             expect(!bad, ".nnvocab 的 load_text 明确报错（不含数据集子集）");
             expect(nn::write_nnvocab(ds_r->vocab_kvrec()) == read_file(vpath),
                    ".nnvocab 词表 kvrec 逐字节稳定");

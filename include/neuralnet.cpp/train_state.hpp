@@ -9,7 +9,8 @@
 //     `optimizer_blob_count`）；
 //   * **训练配方**：精度 profile 四槽 / lr 调度配方与**曲线形状** /
 //     batch_size、accum_steps、max_norm、stride；
-//   * **数据集身份**：`.nndataset` 文件 sha256 + tokens/docs/windows/
+//   * **数据集身份**：`.nndataset` 文件 sha256 + tokens/docs/**样本数**（文本训练 =
+//     滑动窗口数；字段 `num_samples`，旧 rc0 断点键 `dataset_windows` 兼容读）/
 //     steps_per_epoch/loss_scope（+ 路径，仅作位置回落）。
 //
 // 为什么这些必须随断点走（而不是续训时由 CLI 再给一遍）：docs/todo/18 §4.2
@@ -77,14 +78,17 @@ struct TrainRecipe
 };
 
 // ── 数据集身份（内容权威；路径仅作位置回落）────────────────────────────
+// P2b：字段名从 `num_windows` 改为 `num_samples`（**样本**是训练单位；窗口只是
+// 文本样本的落地形态），落盘键 `dataset_samples`；旧 rc0 断点的
+// `dataset_windows` 仍可读（缺失时回退），写出一律用新键。
 struct DatasetIdentity
 {
     std::string path;                 // 位置（机器相关；resume 未给路径时的回落值）
     std::string sha256;               // 身份（`.nndataset` 文件字节的 sha256 hex）
     std::uint64_t num_tokens = 0;     // 训练子集 token 数
     std::uint64_t num_docs = 0;       // 训练子集文档数
-    std::uint64_t num_windows = 0;    // 滑动窗口样本数
-    std::uint64_t steps_per_epoch = 0;// = ceil(num_windows / batch_size)
+    std::uint64_t num_samples = 0;    // 训练样本数（文本训练 = 滑动窗口数）
+    std::uint64_t steps_per_epoch = 0;// = ceil(num_samples / batch_size)
     std::string loss_scope;           // all / assistant（生成期定好，随数据集）
 };
 
@@ -151,7 +155,7 @@ inline constexpr std::uint64_t TRAIN_STATE_VERSION = 1;
     kv.set("dataset_sha256", s.dataset.sha256);
     kv.set("dataset_tokens", s.dataset.num_tokens);
     kv.set("dataset_docs", s.dataset.num_docs);
-    kv.set("dataset_windows", s.dataset.num_windows);
+    kv.set("dataset_samples", s.dataset.num_samples);
     kv.set("dataset_steps_per_epoch", s.dataset.steps_per_epoch);
     kv.set("dataset_loss_scope", s.dataset.loss_scope);
     return kv;
@@ -225,7 +229,12 @@ inline constexpr std::uint64_t TRAIN_STATE_VERSION = 1;
     if (!kv.get("dataset_sha256", s.dataset.sha256)) s.dataset.sha256.clear();
     if (kv.get("dataset_tokens", u)) s.dataset.num_tokens = u;
     if (kv.get("dataset_docs", u)) s.dataset.num_docs = u;
-    if (kv.get("dataset_windows", u)) s.dataset.num_windows = u;
+    // 新键优先；rc0 旧断点只有 dataset_windows（同一语义：窗口数 = 样本数）
+    {
+        std::uint64_t samples = 0;
+        if (kv.get("dataset_samples", samples) || kv.get("dataset_windows", samples))
+            s.dataset.num_samples = samples;
+    }
     if (kv.get("dataset_steps_per_epoch", u)) s.dataset.steps_per_epoch = u;
     if (!kv.get("dataset_loss_scope", s.dataset.loss_scope)) s.dataset.loss_scope.clear();
     return s;
@@ -234,7 +243,7 @@ inline constexpr std::uint64_t TRAIN_STATE_VERSION = 1;
 // ═════════════════════════════════════════════════════════════════════════
 //  数据集身份校验（续训门禁；docs/todo/18 §4.2 P1-2）
 //
-//  一致判据 = **sha256 相同且网格三元组相同**。数据集一变，窗口数变 ⇒
+//  一致判据 = **sha256 相同且网格三元组相同**。数据集一变，样本数/网格变 ⇒
 //  steps_per_epoch 变 ⇒ step 级调度的 total_steps、global_step 的语义、
 //  epoch 边界**同时**改变 ⇒ "同一断点 + 不同数据集"不存在正确的续训语义，
 //  因此续训路径必须**硬报错**（无逃生阀；出口 = 从 `.nnmodel` warm start）。
@@ -260,8 +269,8 @@ inline constexpr std::uint64_t TRAIN_STATE_VERSION = 1;
         add("token 数    : " + u64(saved.num_tokens) + " → " + u64(current.num_tokens));
     if (saved.num_docs != current.num_docs)
         add("文档数      : " + u64(saved.num_docs) + " → " + u64(current.num_docs));
-    if (saved.num_windows != current.num_windows)
-        add("窗口数      : " + u64(saved.num_windows) + " → " + u64(current.num_windows));
+    if (saved.num_samples != current.num_samples)
+        add("样本数      : " + u64(saved.num_samples) + " → " + u64(current.num_samples));
     if (saved.steps_per_epoch != current.steps_per_epoch)
         add("每 epoch 步数: " + u64(saved.steps_per_epoch) + " → " +
             u64(current.steps_per_epoch));
