@@ -182,6 +182,9 @@ public:
         return offloader_.slab_bytes();
     }
 
+    // 新一轮 forward 入口：上一轮导出未被 backward 消费（推理/评估）时作废
+    void discard_offloaded_activations() noexcept { offloader_.discard(); }
+
     [[nodiscard]] Result<Tensor> forward(
         const Tensor& input) override
     {
@@ -494,6 +497,11 @@ public:
         const Tensor& input) override
     {
         ComputeEngine& engine = engine_ref();
+        // 新一轮 forward：上一轮 offload 的激活若未被 backward 消费（推理/评估
+        // 路径），其 slab 数据已作废——入口统一丢弃，保证 export 状态机从
+        // Idle 开始；否则本轮 export 会被 fail-fast 拒绝 / backward 导回旧激活。
+        if (activation_offload_)
+            for (auto& b : blocks_) b.discard_offloaded_activations();
         const std::size_t seq_len = input.rows();
         batch_size_ = input.cols();
         // ── 1. gather 所有 token 的 embedding（统一采用 batch-major 列序） ──

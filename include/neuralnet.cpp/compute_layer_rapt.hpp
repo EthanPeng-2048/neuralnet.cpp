@@ -973,6 +973,9 @@ public:
         return offloader_.slab_bytes();
     }
 
+    // 新一轮 forward 入口：上一轮导出未被 backward 消费（推理/评估）时作废
+    void discard_offloaded_activations() noexcept { offloader_.discard(); }
+
     std::vector<TensorRef> activation_cache() override
     {
         std::vector<TensorRef> r;
@@ -1235,6 +1238,11 @@ public:
         const Tensor& input) override
     {
         ComputeEngine& engine = engine_ref();
+        // 新一轮 forward：上一轮 offload 的激活若未被 backward 消费（推理/评估
+        // 路径），其 slab 数据已作废——入口统一丢弃，保证 export 状态机从
+        // Idle 开始。
+        if (activation_offload_)
+            for (auto& b : blocks_) b.discard_offloaded_activations();
         const std::size_t seq = input.rows();
         const std::size_t batch = input.cols();
         batch_size_ = batch;

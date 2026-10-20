@@ -780,11 +780,30 @@ public:
     [[nodiscard]] bool enabled() const noexcept { return enabled_; }
     [[nodiscard]] bool offloaded() const noexcept { return offloaded_; }
 
+    // 丢弃本轮导出（不回填）。语义 = "这些激活不会再被 backward 使用"：
+    //   · 推理/评估路径：forward 没有配对的 backward，export 出的 slab 数据
+    //     在下次 forward 时已作废——必须在 forward 入口丢弃，否则状态机会把
+    //     上一轮的 slab 当成这一轮的激活导回（静默错值）。
+    //   · slab 本身保留复用（host 内存在下次 export 时按需覆盖），不重建。
+    void discard() noexcept
+    {
+        refs_.clear();
+        shapes_.clear();
+        offsets_.clear();
+        offloaded_ = false;
+    }
+
     // 导出：逐个写入 slab，写入后置空成员张量（数据已在 host slab）
     [[nodiscard]] Result<void> export_activations(
         ComputeEngine& engine, std::vector<TensorRef> refs)
     {
-        if (!enabled_ || offloaded_) return {};
+        if (!enabled_) return {};
+        // 状态机：Offloaded 状态只能经 import（消费）或 discard（作废）离开。
+        // 走到这里说明上一轮导出既没被 backward 消费、也没在 forward 入口丢弃
+        // ——继续覆盖 slab 会让后续 backward 静默读到本轮写了一半的数据。
+        if (offloaded_)
+            NN_FAIL("ActivationOffloader::export_activations: 上一轮导出的激活尚未 import"
+                    "（forward 未配对 backward，且 forward 入口未 discard）");
         refs_ = std::move(refs);
         offsets_.clear();
         shapes_.clear();
@@ -795,7 +814,19 @@ public:
         // 不足则重建。
         std::size_t needed = 0;
         for (auto& ref : refs_)
-            if (ref.get().valid()) needed += ref.get().size();
+        {
+            if (!ref.get().valid()) continue;
+            // 精度协议：slab 恒按 f32 记账/存储（offload_save 把 f16 抬成 f32，
+            // restore 出来是 f32 张量），restore 后成员激活的精度与 forward 时
+            // 不一致——该组合无测试、无精度协议，静默漂移不可接受，一律
+            // fail-fast（CLI 侧另有更早的配置期拒绝）。
+            if (ref.get().precision() != Precision::F32)
+                NN_FAIL("ActivationOffloader::export_activations: 仅支持 F32 激活（当前 "
+                        + std::string(precision_name(ref.get().precision()))
+                        + "）；offload slab 恒 f32，混合精度/三值精度请改用"
+                          " --checkpoint-every");
+            needed += ref.get().size();
+        }
         if (needed == 0) { offloaded_ = false; return {}; }
         if (!slab_.valid() || slab_.size() < needed)
         {

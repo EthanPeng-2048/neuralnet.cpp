@@ -115,7 +115,7 @@ void print_text_train_usage(const char *prog)
 
     help.section("显存优化");
     help.opt("--checkpoint-every <n>", "每 N 个 Transformer block 重算一次 forward (激活重计算，默认: 0=不启用)\n1=每块都重算，显存收益最大，以约 1 次额外前向\nFLOPs 为代价省去整层激活驻留");
-    help.opt("--activation-offload", "把每块激活搬 host-visible，backward 拷回\n不重算，FLOPs 保持 1.0×，代价是 PCIe 传输；可与\n--checkpoint-every 混合使用：checkpoint 块重算、其余块 offload；仅 GPU 有效");
+    help.opt("--activation-offload", "把每块激活搬 host-visible，backward 拷回\n不重算，FLOPs 保持 1.0×，代价是 PCIe 传输；可与\n--checkpoint-every 混合使用：checkpoint 块重算、其余块 offload；仅 GPU 有效；\n与 --f16/--t1_58/--precision-* 不兼容（slab 恒 f32，配置期拒绝）");
     help.note("GPU 训练每 step 末尾自动归还完全空闲的内存池底材 (L2 整块释放)。");
 
     help.section("Batch 录制粒度");
@@ -570,6 +570,24 @@ TrainConfig parse_text_train_args(int argc, char *argv[])
     if (cfg.text_path.empty())
     {
         std::cerr << "请指定数据集文件 (.nndataset)\n使用 --help 查看用法\n";
+        std::exit(1);
+    }
+
+    // ── 精度 × activation offload 组合校验（D4，2026-10-20）────────────
+    // offload slab 恒按 f32 记账/存储：f16 激活经 offload_save 抬成 f32，
+    // offload_restore 出来也是 f32 ⇒ backward 拿到的缓存精度与 forward 时不一致。
+    // 该组合无测试/无精度协议，配置期显式拒绝（库内 ActivationOffloader 另有
+    // 同口径 fail-fast，覆盖非 CLI 调用方）。需要省显存请用 --checkpoint-every。
+    if (cfg.activation_offload && cfg.gpu_enabled &&
+        (cfg.precision.param != nn::Precision::F32 ||
+         cfg.precision.compute != nn::Precision::F32 ||
+         cfg.precision.stable != nn::Precision::F32 ||
+         cfg.precision.optimizer != nn::Precision::F32))
+    {
+        std::cerr << "--activation-offload 与混合精度/三值精度不兼容（--f16 / --t1_58 /"
+                     " --precision-*）：\n"
+                     "  offload slab 恒 f32，f16 激活 restore 后会变成 f32（精度语义漂移）。\n"
+                     "  请改用 --checkpoint-every，或去掉 --activation-offload。\n";
         std::exit(1);
     }
 
