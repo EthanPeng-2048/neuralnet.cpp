@@ -117,8 +117,13 @@ public:
     [[nodiscard]] Result<void> end_expr() override
     {
         auto& owner = fused::recording_graph_owner();
+        // 录制图是 thread_local：跨线程 end_expr 看不到别人线程的 begin_expr。
+        // 原实现静默 return {} ⇒ 录制图悬挂到下一次 begin_expr 才以"嵌套录制"
+        // 报错（现场丢失）。这里明确报错，把"begin/end 必须同线程配对"变成
+        // 可诊断事实。
         if (!owner)
-            return {};
+            NN_FAIL("GpuEngine::end_expr: 当前线程没有进行中的 begin_expr"
+                    "（begin_expr/end_expr 必须同线程严格配对）");
         ExprGraph g = std::move(*owner);
         owner.reset();
         return execute_fused_graph(g);

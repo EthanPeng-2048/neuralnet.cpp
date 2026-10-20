@@ -524,7 +524,7 @@ public:
         // CPU begin/end 为 no-op（行为不变）；NN_EXPR_SCAN 下本段把复合 spec
         // 登记进闭合世界（scan_exprs 的优化器 dry-run 正是经此登记）。
         NN_TRY(b, engine_.begin_expr());
-        ExprSegment seg(engine_);
+        ExprSegment seg(engine_owner_);
         for (std::size_t i = 0; i < params_.size(); ++i)
         {
             NN_TRY(ur, adam_update_(i, inv_bc1, inv_bc2));
@@ -617,7 +617,7 @@ public:
         // （先衰减后更新 = AdamW 语义）；两者不连通 → 各自独立 kernel，天然
         // 顺序执行，不会同 kernel 双写 p。
         NN_TRY(b, engine_.begin_expr());
-        ExprSegment seg(engine_);
+        ExprSegment seg(engine_owner_);
         for (std::size_t i = 0; i < params_.size(); ++i)
         {
             // 权重衰减解耦：p = (1 - lr*wd) * p（目标传递：原地、单 dispatch）

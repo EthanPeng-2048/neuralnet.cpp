@@ -58,6 +58,7 @@
 
 #include "core_config.hpp"
 #include "core_errors.hpp"
+#include "core_assert.hpp"
 #include "core_env.hpp"       // RV-09：环境变量读取唯一入口
 #include "core_engine_id.hpp"
 #include "core_profile.hpp"   // 训练 step 剖析（NN_PROFILE=1 门控；默认零开销）
@@ -2235,25 +2236,32 @@ namespace detail {
 // ── IR-C 录制段 RAII 守卫（P2）───────────────────────────────
 // 作用域退出（含 NN_TRY 错误早退）自动 end_expr 收口，防录制图悬挂；
 // 正常路径显式 end() 收口并把 end_expr 的错误照常传播（守卫只兜底）。
+// 持**强引用**：录制段存活期内引擎不会被销毁（原裸引用在作用域内释放最后
+// 一个引擎句柄时会在析构里解引用已销毁对象 = UAF）。
 class ExprSegment
 {
 public:
-    explicit ExprSegment(ComputeEngine& e) noexcept : e_(e) {}
+    explicit ExprSegment(std::shared_ptr<ComputeEngine> e) noexcept
+        : e_(std::move(e))
+    {
+        if (!e_)
+            NN_FATAL("ExprSegment: 引擎句柄为空（必须由 shared_ptr 管理）");
+    }
     ExprSegment(const ExprSegment&) = delete;
     ExprSegment& operator=(const ExprSegment&) = delete;
     ~ExprSegment()
     {
         if (!done_)
-            (void)e_.end_expr();   // 兜底收口（错误已被上层传播或忽略）
+            (void)e_->end_expr();   // 兜底收口（错误已被上层传播或忽略）
     }
     [[nodiscard]] Result<void> end()
     {
         done_ = true;
-        return e_.end_expr();
+        return e_->end_expr();
     }
 
 private:
-    ComputeEngine& e_;
+    std::shared_ptr<ComputeEngine> e_;
     bool done_ = false;
 };
 
