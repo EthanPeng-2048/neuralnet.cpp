@@ -8,7 +8,7 @@ cmake_minimum_required(VERSION 3.30)
 # 否则链接期会出现 std 符号 ABI 不匹配）。
 # 本文件不再隐式挑选编译器或 stdlib，避免与调用方/CI 的设置冲突。
 
-# VERSION 以 git tag 为准（当前 v1.10.0-rc0.1；本仓无 CONFIGURE_FILE 消费该字段，
+# VERSION 以 git tag 为准（当前 v1.10.0；本仓无 CONFIGURE_FILE 消费该字段，
 # 它只是元数据——发版时同步到最新 tag，实际版本以 git tag / gh release 为准）
 project(neuralnet.cpp VERSION 1.10.0 LANGUAGES CXX)
 

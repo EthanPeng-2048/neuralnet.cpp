@@ -169,3 +169,75 @@ GPT `d_model=64 / heads=4 / layers=2 / d_ff=128 / seq_len=128 / batch=8`，850M 
 2. **P2-4 流式 DataLoader 仍未做**：`TextSampleSet` 仍整段物化 `TextCorpus`；
 3. `TextTrainer` 只服务文本/GPT（内置 sparse-CE），通用 Step 协议未抽象；
 4. 断点旧键兼容是**单向**的（rc0.1 写 `dataset_samples`，rc0 二进制读不到），v8 版本号不变。
+
+---
+
+## 7. 2026-10-21 `v1.10.0` 正式发布实跑记录
+
+> 分支 `dev/lifetime_refresh` 的发布提交（tag **`v1.10.0`**）。口径：**`NN_ENABLE_NATIVE=OFF` 可移植基线**；
+> GPU = **NVIDIA CMP 40HX / Vulkan 1.4.351 / 驱动 616.92**（原生 Vulkan 计算设备，自动选卡）；
+> 最终源码 = `a9c6c6f` + 发布审查修复（P1-1 / P2-1 / P2-2，见 `docs/release-notes/v1.10.0.md` §2.5）。
+> 全部构建目录为**全新构建**（`build/review/*`，不复用旧产物）。原始报告在 `build/review/*.md`（构建产物目录，不入库）。
+
+### 7.1 第 1 项：真实数据集端到端训练（最终二进制）
+
+数据集：`datasets/tinystories_full.txt` 前 20000 行 → **20,000 docs / 4,244,522 tokens / 8192 词表 /
+66,321 个 seq64 训练窗口**（`dataset_gen`）。GPT `d_model=64 / heads=4 / layers=2 / d_ff=128 /
+seq_len=64 / batch=8`，每种配方 **20 step**，GPU：
+
+| 配方 | loss 起 → 止 | 结果 |
+|---|---|---|
+| f32 | **9.0211 → 7.7263**（−14.4%） | 健康下降，无 NaN/Inf/冻结，grad_norm 1.01→1.08 |
+| `--f16` | **9.0319 → 7.6534**（−15.3%） | 健康下降，无 NaN/Inf/冻结，曲线与 f32 基本重合 |
+| `--t1_58`（仅 GPT） | **9.0319 → 8.1533**（−9.7%） | 健康下降，无 NaN/冻结，grad_norm 0.19–0.29（STE 预期量级） |
+
+参数确实移动：三组 20-step 模型分别 warm start 再训 1 step，文件大小不变而 sha256 改变
+（f32 `82B6732A…`→`9FFC159D…`、f16 `A514070D…`→`4BE13E15…`、t1_58 `A3165608…`→`AC0EF908…`），全程梯度非零。
+断点续训：f32 `--save-interval 5` 产出 step20 `.nnckpt` → `--resume` 续 5 步，step21–25 loss
+**7.5669 → 7.2324**；日志确认 `global_step=20`、优化器状态 76 张量 / `t=20`（adam）恢复、数据集身份校验通过。
+复现命令与日志见 `build/review/e2e-report.md`。
+
+### 7.2 第 2 项：发布文档
+
+- `docs/release-notes/v1.10.0.md` 落盘：发布范围（v1.9.0 → v1.10.0）、主题、破坏性变更 + 合并去重后的
+  完整迁移表（引擎层 13 行 + 数据集/训练 API 10 行）、验收基线（§7）、提交索引、已知限制；
+  `v1.10.0-rc0` / `v1.10.0-rc0.1` 两份预发布记录保留。
+- 独立发布审查（见 §7.5）结论与修复（P1-1 / P2-1 / P2-2）写入 release note §2.5。
+
+### 7.3 第 3 项：完整 ctest（Release / Debug）
+
+| 树 | 构建 | 完整 ctest |
+|---|---|---|
+| Windows clang 23.1 + MSVC STL / **Release** / Vulkan（40HX） | 全新目录 219/219 步，0 warning，782.2 s；最终源码增量 6/6 | **59 注册 → 58 pass + 1 skip + 0 fail**（229.52 s，最终源码）；skip = `scan_bitwise_test`（平台口径：逐位锚以 Linux+850M 为权威） |
+| Windows clang 23.1 + MSVC STL / **Debug** / Vulkan | 全新目录 219/219 步，0 warning，511.2 s；最终源码增量 6/6 | **59 注册 → 58 pass + 1 skip + 0 fail**（547.12 s，最终源码）；skip 同上；`rapt_test_f16` **Passed**（完整 ctest 2 次 + 直跑 3 次全通过，无 NaN/断言/崩溃）；Debug 迭代器断言零触发 |
+| Windows cl.exe 19.51 + MSVC STL / **Debug** / CPU-only | 全新目录，525.5 s，0 error | **57 注册 → 37 pass + 20 skip + 0 fail**（236.62 s，最终源码）；CI 口径（`-E "^rapt_test_f16$"`）**56 → 36 pass + 20 skip + 0 fail**（196.57 s）；`rapt_test_f16` 累计 5/5 通过（未复现 C11） |
+
+> MSVC 的 20 个 skip = 17 GPU 依赖 + 1 Vulkan 探针 + 2 个 app 发现类用例
+> （`cli_precision_warning_test` / `chat_prompt_test`：VS 多配置生成的 app exe 在 `<build>/Debug/`，
+> 用例候选路径找不到 ⇒ 77 skip；对 CI `windows-latest` 的 MSVC Debug job 同样成立，记为已知覆盖缺口）。
+
+### 7.4 第 4 项：四组「编译器 × 标准库」全新构建 + ctest（CPU-only 两树）
+
+| 配置 | 结果 |
+|---|---|
+| WSL clang++ **24.0.0 + libc++**（Release / CPU-only） | 112/112 步 OK；**57 注册 → 39 pass + 18 skip + 0 fail**（13.57 s，最终源码）；`ldd` 确认链 libc++.so.1 + libc++abi.so.1 |
+| WSL g++ **15.2.0 + libstdc++**（Release / CPU-only） | 112/112 步 OK，0 warning；**57 → 39 pass + 18 skip + 0 fail**（13.95 s，最终源码）；链 libstdc++.so.6 |
+| Windows clang 23.1 + **MSVC STL**（Release / Vulkan） | 见 §7.3 第 1 行（59：58 pass + 1 skip + 0 fail） |
+| Windows cl.exe 19.51 + **MSVC STL**（Debug / CPU-only） | 见 §7.3 第 3 行（57：37 pass + 20 skip + 0 fail） |
+
+> WSL 的 18 个 skip 均为无 Vulkan 导致的 GPU/offload 用例（预期）；两树 0 失败、无 `std::__cxx11` /
+> undefined reference、无源码 `-Werror` 警告。libc++ 树需给 clang 驱动警告
+> `-Wgcc-install-dir-libstdcxx`（镜像同装 GCC 15/16）加 `-Wno-error=...`——工具链环境差异，非源码问题。
+
+### 7.5 门禁与独立发布审查
+
+- `bench/doc_align_audit.ps1` exit 0（[A]/[D]/[E]/[F] 可行动 0）；`bench/doc_inventory.ps1` exit 0
+  （`virtual methods` 52/52、`L2-VIOLATIONS: 0`、`HANDWRITTEN-RESIDUE: 0`、`TERMINATING-CALLS: 0`）；
+  `bench/gui_cli_audit.py` exit 0（七节 PASS）；`bench/audit_dangling.ps1` exit 0。
+- 代码/CI 零 `EngineId` / `NN_BIND_DEBUG` 残留（仅剩 `compute_engine.hpp` 一处解释性注释）。
+- **独立发布审查**（`v1.9.0..HEAD`，只读）：**P0 = 0、P1 = 1、P2 = 9**。P1-1（`TextTrainer::create`
+  缺配方 seq_len ↔ 模型 seq_len 校验）+ P2-1（`--resume` + `--activation-offload` 绕过配置期拒绝）+
+  P2-2（空 test 子集不再打印"样本数: 0"）已在发布前修复并随最终源码复验全绿；其余 P2 记录为后续项。
+- `layer_bench` 配对 A/B **未做系统性回归对比**：本版无 kernel 数值路径改动；最终源码单次功能冒烟
+  GPU `matmul` 4.365 ms / 491.9 GFLOPS（hash `cbf7d4478bd536ab`）、`matmul_q` 0.796 ms / 2697.2 GFLOPS
+  （hash `c5860cfcfcb371f9`），CPU 512³ 小规模两组哈希齐全（计时受并发负载影响，仅参考）。

@@ -3,7 +3,7 @@
 > 适用范围：`ComputeEngine`、`GpuBackend`、`CpuEngine` / `GpuEngine`、`Layer`、
 > `Model`、`Optimizer`、`TrainingSession`、`Tensor`、`ExprGraph` / `ExprSegment`。
 >
-> **本文是生命周期契约的唯一真源**（v3，2026-10-20，随 `v1.10.0-rc0` 发布）。
+> **本文是生命周期契约的唯一真源**（v3，2026-10-20 落地，随 `v1.10.0` 正式发布；预发布候选为 `v1.10.0-rc0`）。
 > [`08-object-lifetimes.md`](08-object-lifetimes.md) 已降为 3 行转发。设计与审计证据见
 > [`todo/28-lifecycle-v3.md`](../todo/28-lifecycle-v3.md)；Session 层见
 > [`todo/29-session-architecture.md`](../todo/29-session-architecture.md)。
@@ -110,7 +110,7 @@ auto gpu = nn::GpuEngine::create(backend_owner);
 
 ## 7. 性能口径（v3 实测）
 
-| 项 | v2（v1.9.0） | v3（v1.10.0-rc0） |
+| 项 | v2（v1.9.0） | v3（v1.10.0） |
 |---|---|---|
 | `sizeof(Tensor)` CPU / GPU | 64 B / 88 B | **56 B / 80 B** |
 | Tensor 拷贝 | 一次 8 B 身份复制 + 存储原子对 | 少一次 8 B 复制（原子行为不变） |

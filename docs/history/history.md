@@ -49,6 +49,7 @@
 - [录制窗口排空隐藏 + SpecBuilder 输入槽去重（项目 4/5）](#录制窗口排空隐藏 + SpecBuilder 输入槽去重（项目 4/5，2026-10-08）)（1 条）
 - [代码审查整改 批 A/B（RV-01..RV-04，2026-10-11）](#代码审查整改 批 A/B（RV-01..RV-04，2026-10-11）)（1 条）
 - [仓库历史整理（legacy 接入 + 大文件剔除，2026-10-18）](#仓库历史整理（legacy 接入 + 大文件剔除，2026-10-18）)（1 条）
+- [生命周期 v3 与 Session 层（v1.10.0，2026-10-20/21）](#生命周期 v3 与 Session 层（v1.10.0，2026-10-20/21）)（1 条）
 
 ---
 
@@ -5216,3 +5217,41 @@ P0-4 的 `install()/find_package` 与 P2-9）；剩 13 项 = 部分完成 5（P0
   `legacy/compiler-compat` 与全部版本 tag 均已 force 更新。旧克隆不要再向这些分支
   合并或推送，按 `git fetch --all --prune --force` + `git reset --hard origin/<branch>`
   重新对齐；改写前的完整备份 bundle 保存在维护者本机（不进入仓库）。
+
+---
+
+# 生命周期 v3 与 Session 层（v1.10.0，2026-10-20/21）
+
+- 类型：演进记录 / 删除清单 / 设计裁决（**当前契约**以 `docs/development/09-engine-ownership.md`
+  与 `docs/todo/28-lifecycle-v3.md`、`docs/todo/29-session-architecture.md` 为准；本条只归档
+  「为什么删/为什么这样改」与已否决方案）。
+- **原状（v1.9.0）**：`Tensor` 保存 `EngineId` provenance + `stamp_` / `adopt` / `bound` 出生绑定机制
+  （`core_engine_id.hpp` 83 行；`stamp_` 35 处、`adopt` 18 处、`bind_check_` 42 处、
+  `NN_BIND_DEBUG` 3 处 + CI 第二轮 ctest）。`bind_check_` 只让操作数**互相**比较（首个 bound 作基准），
+  从不验证操作数属于当前引擎 ⇒ **D1**：单操作数入口可让外来 GPU 张量进入任意引擎（读外来
+  `VkBuffer` = UB）。
+- **裁定（用户）**：设备域从**存储**派生 —— CPU 存储 → 进程常量 host 域；GPU 存储 → 其
+  `GpuBuffer` 的 backend 标识（buffer 持 backend keepalive）；空/无效 → 0（交给既有无效检查）。
+  删除 `EngineId`、`stamp_`、`adopt`、`bound`、`NN_BIND_DEBUG` 与 `ComputeEngine::id()`；
+  `import` 是唯一跨域入口；每个 public NVI 入口**逐操作数**比较设备域。机制点 **101 → 42**，
+  `sizeof(Tensor)` **CPU 64→56 B / GPU 88→80 B**，净代码约 −120 行。
+- **同批收口**：D1（`GpuEngine::to_matrix` 拒绝异 backend）；D3（`TrainingSession` 同时拥有
+  Model + Optimizer + TrainState，结构性消除 optimizer 非拥有 `TensorRef` 的 UAF）；D4（offload
+  状态机 fail-fast + `discard()` 作废通道 + 精度组合配置期拒绝）；D5（`GpuBackend::shared()` 改
+  weak 缓存 + 删 `instance()`，最后使用者释放后确定性回收）；D6（`ExprSegment` 持 `shared_ptr`；
+  GPU `end_expr` 无录制明确报错）；D9 洁癖项（`BindingState` 三态化等）留后续。
+- **P2b（v1.10.0-rc0.1）**：数据集存储单位 = **doc**、训练单位 = **sample**（`seq_len` 窗口）、
+  `step = ceil(样本数 / batch)` 是派生量；`TextTrainer` 把 epoch×step / 累积 / 裁剪 / lr 调度 /
+  测试评估 / 断点状态装配上收库层；`TrainingSession` 持有 `TrainState`；断点身份键
+  `dataset_windows` → `dataset_samples`（**单向**旧键兼容），`num_windows` → `num_samples`。
+- **正式版（v1.10.0）收尾**：独立发布审查 P0 = 0 / P1 = 1 / P2 = 9；发布前修 P1-1
+  （`TextTrainer::create` 校验配方 seq_len ↔ 模型 `spec.seq_len`）、P2-1（`--resume` 的
+  `adopt_resume_state` 之后重新校验精度×offload 组合）、P2-2（空 test 子集恢复打印"样本数: 0"）；
+  其余 P2 记录在 `docs/release-notes/v1.10.0.md` §2.5 / §9。四棵树矩阵与真实数据端到端验收
+  见 `docs/todo/25-release-requirements.md` §7。
+- **否决方案**：① 保留 provenance 但"按操作数两两比较 + 补 `this` 比较"（D1 漏点仍在、机制税照付）；
+  ② 用 `dynamic_cast` 查具体层类型做形状校验（铁律 #14 禁止）；③ 把 offload slab 精度协议化
+  （本轮选"配置期拒绝"的最短正确路径）；④ `Layer::sequence_length()` 全覆盖形状校验
+  （留后续，本轮用 `Model::spec()` 校验带 spec 的模型）。
+- **影响**：破坏性 API（迁移表见 `docs/release-notes/v1.10.0.md` §6）；模型文件格式 v8 不变；
+  v1.9.0 二进制读不到 rc0.1+ 写出的 `dataset_samples` 键。
