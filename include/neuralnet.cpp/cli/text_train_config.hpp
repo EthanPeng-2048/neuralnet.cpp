@@ -19,6 +19,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <iostream>
+#include <optional>
 #include <span>
 #include <sstream>
 #include <string>
@@ -215,6 +216,33 @@ inline constexpr std::string_view kForbiddenResumeFlags[] = {
         s += f;
     }
     return s;
+}
+
+// ── 精度 × activation offload 组合校验（D4，2026-10-20）────────────────
+// offload slab 恒按 f32 记账/存储：f16 激活经 offload_save 抬成 f32，
+// offload_restore 出来也是 f32 ⇒ backward 拿到的缓存精度与 forward 时不一致。
+// 该组合无测试/无精度协议，配置期显式拒绝（库内 ActivationOffloader 另有
+// 同口径 fail-fast，覆盖非 CLI 调用方）。需要省显存请用 --checkpoint-every。
+//
+// **必须在两处校验**：① argparse 结束；② `--resume` 的 adopt_resume_state 之后
+// （adopt 会用断点状态段覆盖 cfg.precision，只看解析后的默认值会被绕开 ⇒ 变成
+// 运行期才在首个 block 失败）。返回空 = 合法；否则返回用户可见文案，由调用方
+// 决定出口（argparse 层 `std::exit`；`run_text_train` 经 `NN_FAIL` 走 `Result`，
+// 保持"三模块不终止进程"不变量）。
+[[nodiscard]] inline std::optional<std::string>
+precision_offload_combo_error(const TrainConfig &cfg)
+{
+    if (!cfg.activation_offload || !cfg.gpu_enabled) return std::nullopt;
+    if (cfg.precision.param == nn::Precision::F32 &&
+        cfg.precision.compute == nn::Precision::F32 &&
+        cfg.precision.stable == nn::Precision::F32 &&
+        cfg.precision.optimizer == nn::Precision::F32)
+        return std::nullopt;
+    return std::string(
+        "--activation-offload 与混合精度/三值精度不兼容（--f16 / --t1_58 /"
+        " --precision-*）：\n"
+        "  offload slab 恒 f32，f16 激活 restore 后会变成 f32（精度语义漂移）。\n"
+        "  请改用 --checkpoint-every，或去掉 --activation-offload。\n");
 }
 
 TrainConfig parse_text_train_args(int argc, char *argv[])
@@ -550,20 +578,10 @@ TrainConfig parse_text_train_args(int argc, char *argv[])
     }
 
     // ── 精度 × activation offload 组合校验（D4，2026-10-20）────────────
-    // offload slab 恒按 f32 记账/存储：f16 激活经 offload_save 抬成 f32，
-    // offload_restore 出来也是 f32 ⇒ backward 拿到的缓存精度与 forward 时不一致。
-    // 该组合无测试/无精度协议，配置期显式拒绝（库内 ActivationOffloader 另有
-    // 同口径 fail-fast，覆盖非 CLI 调用方）。需要省显存请用 --checkpoint-every。
-    if (cfg.activation_offload && cfg.gpu_enabled &&
-        (cfg.precision.param != nn::Precision::F32 ||
-         cfg.precision.compute != nn::Precision::F32 ||
-         cfg.precision.stable != nn::Precision::F32 ||
-         cfg.precision.optimizer != nn::Precision::F32))
+    // 见 precision_offload_combo_error 的注释；adopt_resume_state 之后需再校验一次。
+    if (auto combo_err = precision_offload_combo_error(cfg))
     {
-        std::cerr << "--activation-offload 与混合精度/三值精度不兼容（--f16 / --t1_58 /"
-                     " --precision-*）：\n"
-                     "  offload slab 恒 f32，f16 激活 restore 后会变成 f32（精度语义漂移）。\n"
-                     "  请改用 --checkpoint-every，或去掉 --activation-offload。\n";
+        std::cerr << *combo_err;
         std::exit(1);
     }
 

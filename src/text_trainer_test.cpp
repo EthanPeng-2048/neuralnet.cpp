@@ -435,6 +435,16 @@ void test_preconditions(const std::string& dir)
         auto t = nn::TextTrainer::create(std::move(s), *ds, cfg);
         CHECK(!t, "log_interval=0 → Result 错误");
     }
+    {
+        // 发布审查 P1-1：配方 seq_len 必须等于模型 spec.seq_len（模型用
+        // build_gpt_model_from_spec 建 ⇒ spec 存在）。不一致时 GPT 的 forward 用
+        // input.rows()、位置编码/掩码却按模型 seq_len 构建 ⇒ GPU 越界读。
+        nn::TrainingSession s = make_session(f);
+        nn::TextTrainConfig cfg = default_cfg(s);
+        cfg.seq_len = 16;   // fixture 模型 spec.seq_len = 8
+        auto t = nn::TextTrainer::create(std::move(s), *ds, cfg);
+        CHECK(!t, "配方 seq_len 与模型 spec.seq_len 不一致 → Result 错误");
+    }
 }
 } // namespace
 

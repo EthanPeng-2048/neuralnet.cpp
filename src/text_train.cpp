@@ -60,6 +60,12 @@ namespace
     {
         NN_TRY(adopt_r, nn::cli::adopt_resume_state(cfg, std::cout, std::cerr));
         adoption = std::move(*adopt_r);
+        // adopt 会用断点状态段覆盖 cfg.precision：必须在覆盖之后再校验一次
+        // "精度 × activation offload" 组合，否则 rc0 承诺的配置期拒绝会被绕开
+        // （残余路径只能到首个 block 才由库层 fail-fast）。这里经 Result 上抛
+        // （不用 std::exit），保持三模块不终止进程的不变量。
+        if (auto combo_err = nn::cli::precision_offload_combo_error(cfg))
+            NN_FAIL(*combo_err);
     }
 
     // ── 打开数据集（.nndataset；token 流/掩码/词表都在生成期定好）──────
@@ -85,13 +91,17 @@ namespace
         NN_FAIL("数据集 train 子集为空（无 token）: " + cfg.text_path);
 
     std::optional<nn::TextSampleSet> test_samples;
+    // 空 test 子集（合法文件：test 全是空 doc）⇒ 视为无 test、跳过评估；
+    // 但启动信息行保持 v1.9.0 锚（打印"样本数: 0"），不静默吞掉测试集概况。
+    std::optional<std::size_t> empty_test_tokens;
     if (dataset.info().test_docs > 0)
     {
         NN_TRY_MSG(test_samples_r, "读取测试样本集失败",
                    nn::TextSampleSet::create(dataset, nn::DatasetSubset::Test, window));
-        // 空 test 子集（合法文件：test 全是空 doc）⇒ 视为无 test，跳过评估
         if (test_samples_r->sample_count() > 0)
             test_samples = std::move(*test_samples_r);
+        else
+            empty_test_tokens = test_samples_r->token_count();
     }
 
     std::cout << "训练子集: " << train_samples.doc_count() << " docs / "
@@ -116,6 +126,17 @@ namespace
     std::cout << "滑动窗口: seq_len=" << cfg.seq_len
               << " stride=" << train_samples.stride()
               << " 样本数=" << train_samples.sample_count() << "\n" << std::endl;
+
+    // 空 test 子集的启动信息（v1.9.0 锚：仍打印"样本数: 0"；评估跳过由
+    // TextTrainer 的 nullopt test 语义保证）。
+    if (empty_test_tokens)
+    {
+        if (loss_scope == "assistant")
+            std::cout << "测试集 assistant 掩码: 0 / " << *empty_test_tokens
+                      << " tokens 参与评估\n";
+        std::cout << "测试集: " << dataset.info().test_docs << " docs  样本数: 0  tokens: "
+                  << *empty_test_tokens << std::endl;
+    }
 
     // ── 数据集身份（P1-2 断点门禁的"内容"侧）────────────────────────────
     // 路径是**位置**（机器相关、CLI 优先），sha256 + 网格是**身份**（断点权威）。

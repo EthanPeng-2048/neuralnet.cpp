@@ -306,6 +306,18 @@ private:
         if (cfg.start_epoch > cfg.epochs)
             NN_FAIL("TextTrainer::create: start_epoch 超出 epochs");
         if (train.sample_count() == 0) NN_FAIL("TextTrainer::create: 训练样本集为空");
+        // 模型序列长度校验（发布审查 P1-1）：窗口 seq_len 必须等于模型构建时的
+        // seq_len。GPTModel::forward 用 input.rows() 解释序列长度，位置编码/
+        // 因果掩码却按模型 seq_len 构建（GPU 行 gather 无越界守卫 ⇒ 越界读），
+        // backward 又固定用 seq_len_ ⇒ 形状错配。spec 只在 spec 工厂/加载路径
+        // 上存在；手工 build_* 调用没有 spec 时无法在此校验（该缺口记入
+        // v1.10.0 release note 已知限制）。
+        if (const auto& spec = session.model().spec();
+            spec.has_value() && spec->seq_len > 0 && cfg.seq_len != spec->seq_len)
+            NN_FAIL("TextTrainer::create: 配方 seq_len 与模型 spec.seq_len 不一致（"
+                    + std::to_string(cfg.seq_len) + " vs "
+                    + std::to_string(spec->seq_len)
+                    + "）；请让 TextTrainConfig.seq_len 与模型构建时的 seq_len 对齐");
         if (tokenizer->pad_id() != train.pad_id())
             NN_FAIL("TextTrainer::create: 样本集 pad_id 与词表不一致");
         // 空 test 子集 = 不评估（旧 CLI 语义：样本数 0 ⇒ 跳过测试评估，不终止训练）
