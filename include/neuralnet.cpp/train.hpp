@@ -19,17 +19,12 @@
 //     NN_UNWRAP(model.add<nn::ReLU>());
 //     NN_UNWRAP(model.add<nn::Linear>(256, 10));
 //
-//     auto opt = NN_UNWRAP(nn::create_optimizer("adam", *engine,
-//                 model.parameters(), model.param_gradients(), 1e-3f, 0.01f));
+//     nn::TrainingConfig tcfg; tcfg.optimizer = "adam"; tcfg.lr = 1e-3f;
+//     auto session = NN_UNWRAP(nn::TrainingSession::create(std::move(model), tcfg));
 //     nn::CrossEntropyLoss loss_fn;
 //
-//     // 每步 = 清零 → 前向 → 损失 → 反向 → 更新（签名细节见 AGENTS.md §8）
-//     NN_UNWRAP(model.zero_grad());
-//     nn::Tensor logits = NN_UNWRAP(model.forward(x));
-//     nn::Scalar loss   = NN_UNWRAP(loss_fn.forward(engine, logits, y));
-//     nn::Tensor grad   = NN_UNWRAP(loss_fn.backward());
-//     NN_UNWRAP(model.backward(*grad));
-//     NN_UNWRAP(opt->step());
+//     // 每个 micro-batch：任务回调返回 output grad；Session 管累积/裁剪/update。
+//     // 完整签名见 AGENTS.md §8 与 training_session.hpp。
 
 #include "engine.hpp"
 #include "layer.hpp"

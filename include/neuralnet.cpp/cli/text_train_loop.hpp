@@ -2,9 +2,10 @@
 //
 // P2b 起训练循环本身已上收到库层 `nn::TextTrainer`（text_trainer.hpp）：
 //   · 数据装配 = `nn::TextSampleSet`（dataset_samples.hpp）；
-//   · 生命周期 = `nn::TrainingSession`（Model + Optimizer + TrainState）；
-//   · epoch×step / lr 调度 / 梯度累积 / 裁剪 / 非阻塞 loss 回读 / 测试评估 /
-//     断点状态装配 = TextTrainer::fit()。
+//   · 生命周期 = `nn::TrainingSession`（Model + Optimizer + update state）；
+//   · epoch×step / lr 调度 / global→micro 切分 / 非阻塞 loss 回读 / 测试评估 /
+//     运行态 TrainState 与断点状态装配 = TextTrainer::fit()；
+//   · micro-step 梯度累积 / 裁剪 / optimizer update = TrainingSession。
 //
 // 本模块只保留 **CLI 侧策略**（都属于"入口/诊断"，不属于训练语义）：
 //   * 进度输出/EPOCH 汇总由 Trainer 默认打印（文案锚：与 P1-1 逐字一致）；

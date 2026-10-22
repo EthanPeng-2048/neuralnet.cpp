@@ -134,7 +134,8 @@ struct Fixture
 }
 
 [[nodiscard]] nn::TrainingSession make_session(Fixture& f, nn::Scalar lr = 1e-2f,
-                                               nn::Scalar clip = 0)
+                                               nn::Scalar clip = 0,
+                                               std::size_t accum_steps = 1)
 {
     auto built = nn::build_gpt_model_from_spec(*f.engine, f.spec);
     NN_ASSERT_ALWAYS(built, "text_trainer_test: 构建小 GPT 失败");
@@ -143,6 +144,7 @@ struct Fixture
     tcfg.lr = lr;
     tcfg.weight_decay = 0.0f;
     tcfg.clip_grad_norm = clip;
+    tcfg.grad_accum_steps = accum_steps;
     auto s = nn::TrainingSession::create(std::move(*built), tcfg);
     NN_ASSERT_ALWAYS(s, "text_trainer_test: TrainingSession::create 失败");
     return std::move(*s);
@@ -211,8 +213,8 @@ void test_fit_end_to_end(const std::string& dir)
     CHECK(report.samples_executed == samples, "fit 消费样本数 = 样本数");
     CHECK(report.ckpt_failures == 0 && report.abort_code == 0, "无断点失败/探针中止");
     CHECK(trainer.session().step_count() == steps, "Session 的 step_count 与循环一致");
-    CHECK(trainer.session().train_state().dataset.num_samples == samples,
-          "Session 持有的训练状态含数据集身份");
+    CHECK(trainer.train_state().dataset.num_samples == samples,
+          "Trainer 持有的运行状态含数据集身份");
 
     // 输出锚：进度行 + epoch 汇总 + 测试 loss（文案由 Trainer 默认打印）
     const std::string text = out.str();
@@ -252,7 +254,7 @@ void test_step_range(const std::string& dir)
         CHECK(t1->train_state().counters.epoch == 0 &&
                   t1->train_state().counters.step_in_epoch == 1 &&
                   t1->train_state().counters.global_step == 1,
-              "Session.TrainState 在 max_steps 下 = 下一步位置（非 epochs,0）");
+              "Trainer.TrainState 在 max_steps 下 = 下一步位置（非 epochs,0）");
     }
 
     // start_step = 1 ⇒ 本进程只跑 [1, steps)
@@ -269,6 +271,53 @@ void test_step_range(const std::string& dir)
         CHECK(r && r->samples_executed == t2->sample_count() - cfg2.batch_size,
               "start_step 跳过的样本不再消费");
     }
+}
+
+// ── [3a] global batch / micro batch / Session 内置累积 ────────────────────
+void test_global_batch_accumulation(const std::string& dir)
+{
+    Fixture f = make_fixture(dir);
+    auto ds = nn::Dataset::open(f.dataset_path);
+    CHECK(ds, "accum: Dataset::open");
+    if (!ds) return;
+
+    nn::TrainingSession session = make_session(f, 1e-2f, 0.0f, /*accum_steps=*/2);
+    nn::TextTrainConfig cfg = default_cfg(session);
+    cfg.batch_size = 4;
+    cfg.accum_steps = 2;
+    cfg.log_interval = 100;
+
+    std::size_t micro_batches = 0;
+    std::size_t updates = 0;
+    nn::TextTrainerHooks hooks;
+    hooks.out = nullptr;
+    hooks.on_batch_ready = [&](nn::TrainingSession&, const nn::TextSampleBatch& batch,
+                               std::size_t) { micro_batches += batch.batch; };
+    hooks.on_update = [&](nn::TrainingSession&, std::size_t, std::size_t, nn::Scalar) {
+        ++updates;
+    };
+
+    auto trainer_r = nn::TextTrainer::create(std::move(session), *ds, cfg, hooks);
+    CHECK(trainer_r, "accum: create");
+    if (!trainer_r) return;
+    CHECK(trainer_r->micro_batch_size() == 2, "accum: micro = global / accum");
+    const std::size_t samples = trainer_r->sample_count();
+    const std::size_t expected_steps = (samples + 3) / 4;
+    CHECK(trainer_r->steps_per_epoch() == expected_steps,
+          "accum: steps_per_epoch 按 global batch");
+
+    auto report = trainer_r->fit();
+    CHECK(report && report->steps_executed == expected_steps,
+          "accum: update step 数正确");
+    CHECK(report && report->samples_executed == samples, "accum: 样本数正确");
+    CHECK(trainer_r->session().step_count() == expected_steps,
+          "accum: Session step_count 按 update 计");
+    CHECK(updates == expected_steps, "accum: on_update 每 update 一次");
+    CHECK(micro_batches == samples, "accum: micro-batch 样本列数总和");
+    CHECK(trainer_r->train_state().recipe.batch_size_is_global,
+          "accum: 状态标记 global batch 语义");
+    CHECK(trainer_r->train_state().recipe.micro_batch_size == 2,
+          "accum: 状态记录派生 micro-batch");
 }
 
 // ── [3b] 高性能入口（CLI 实际路径）：样本集 + nullopt test ─────────────────
@@ -412,6 +461,21 @@ void test_preconditions(const std::string& dir)
         CHECK(!t, "batch_size=0 → Result 错误");
     }
     {
+        nn::TrainingSession s = make_session(f);
+        nn::TextTrainConfig cfg = default_cfg(s);
+        cfg.batch_size = 3;
+        cfg.accum_steps = 2;
+        auto t = nn::TextTrainer::create(std::move(s), *ds, cfg);
+        CHECK(!t, "global batch 不被 accum_steps 整除 → Result 错误");
+    }
+    {
+        nn::TrainingSession s = make_session(f);
+        nn::TextTrainConfig cfg = default_cfg(s);
+        cfg.accum_steps = 2;
+        auto t = nn::TextTrainer::create(std::move(s), *ds, cfg);
+        CHECK(!t, "配方 accum_steps 与 Session 不一致 → Result 错误");
+    }
+    {
         // 梯度裁剪真源是 Session 的 TrainingConfig；配方不一致必须拒绝
         nn::TrainingSession s = make_session(f, 1e-2f, /*clip=*/0.0f);
         nn::TextTrainConfig cfg = default_cfg(s);
@@ -457,6 +521,7 @@ int main()
 
     test_fit_end_to_end(d);
     test_step_range(d);
+    test_global_batch_accumulation(d);
     test_fast_path_sets(d);
     test_checkpoint_hook(d);
     test_preconditions(d);

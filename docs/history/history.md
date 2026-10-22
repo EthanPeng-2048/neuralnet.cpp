@@ -49,7 +49,7 @@
 - [录制窗口排空隐藏 + SpecBuilder 输入槽去重（项目 4/5）](#录制窗口排空隐藏 + SpecBuilder 输入槽去重（项目 4/5，2026-10-08）)（1 条）
 - [代码审查整改 批 A/B（RV-01..RV-04，2026-10-11）](#代码审查整改 批 A/B（RV-01..RV-04，2026-10-11）)（1 条）
 - [仓库历史整理（legacy 接入 + 大文件剔除，2026-10-18）](#仓库历史整理（legacy 接入 + 大文件剔除，2026-10-18）)（1 条）
-- [生命周期 v3 与 Session 层（v1.10.0，2026-10-20/21）](#生命周期 v3 与 Session 层（v1.10.0，2026-10-20/21）)（1 条）
+- [生命周期 v3 与 Session 层（v1.10.0，2026-10-20/21）](#生命周期 v3 与 Session 层（v1.10.0，2026-10-20/21）)（2 条）
 
 ---
 
@@ -5255,3 +5255,30 @@ P0-4 的 `install()/find_package` 与 P2-9）；剩 13 项 = 部分完成 5（P0
   （留后续，本轮用 `Model::spec()` 校验带 spec 的模型）。
 - **影响**：破坏性 API（迁移表见 `docs/release-notes/v1.10.0.md` §6）；模型文件格式 v8 不变；
   v1.9.0 二进制读不到 rc0.1+ 写出的 `dataset_samples` 键。
+
+## TrainingSession 单步边界与 global/micro batch 语义（2026-10-22）
+
+- 类型：演进记录 / 破坏性 API 修订 / 设计裁决
+- **原状**：`TrainingSession` 名义上只拥有 Model + Optimizer，但同时持有包含 epoch、lr 曲线、
+  batch/accum 与数据集身份的 `TrainState`；`TextTrainer` 与 `mnist_train` 各自手写
+  zero_grad → forward/loss/backward → clip → step 管线。CLI 的 `batch_size` 是单次
+  forward/backward 的 micro-batch，`accum_steps` 实际把 update batch 放大为
+  `batch_size × accum_steps`。
+- **裁定**：`TrainingSession` 接收已装配的 **micro-batch**，通过任务 Step 回调执行
+  forward/loss/backward，内置梯度累积，并在 update 边界完成归一化、裁剪、step、zero_grad；
+  不拥有数据、epoch、lr 曲线、评估或断点策略。`batch_size` 改为一次 optimizer update
+  的理论 **global batch**，`micro_batch_size = batch_size / accum_steps`；step、lr 调度、
+  checkpoint 与计数器统一按 optimizer update 计数。
+- **归一化裁决**：禁止把各 micro 的均值简单乘 `1/accum_steps`。Step 回调报告已采用的
+  `gradient_units`，Run Driver 传入整个 global update 的 `normalization_units`，Session
+  按 `gradient_units / normalization_units` 缩放后再累积。文本 sparse-CE 以全 global
+  batch 的有效 token 数为分母；`TextSample.loss_mask` 是 token 是否参与 loss 的最终样本语义。
+- **状态拆分**：Session 只保留 lr/optimizer step/累积 microsteps/pending loss；运行态
+  `TrainState` 由 `TextTrainer` 装配持有，`.nnckpt` 保存时与 Session/optimizer 状态合并。
+  外层 v8 文件格式不变，训练状态段新增 `batch_size_semantics` 与 `micro_batch_size`。
+- **兼容**：旧状态缺语义键时按 legacy micro-batch 解释，恢复为
+  `global_batch_size = legacy_batch_size × accum_steps`，并把 micro step 计数折算成 update
+  step。旧断点若落在累积中间，pending gradients 原本未落盘，只能从最近 update 边界继续。
+- **证据**：远端 Windows clang + MSVC STL / Vulkan，全量构建 120/120；ctest 59 注册，
+  58 pass + 1 个平台条件 skip（`scan_bitwise_test`）+ 0 failed。`doc_align_audit`、
+  `doc_inventory`、`gui_cli_audit` 均 exit 0。

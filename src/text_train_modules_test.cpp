@@ -130,6 +130,10 @@ void test_role_gate_and_roundtrip(const std::filesystem::path& dir)
     nn::TrainState ckpt_state;   // P1-2：断点带训练状态段（本用例不挂优化器状态张量）
     ckpt_state.counters.epoch = 1;
     ckpt_state.recipe.optimizer = "adam";
+    ckpt_state.recipe.batch_size = 4;
+    ckpt_state.recipe.micro_batch_size = 4;
+    ckpt_state.recipe.batch_size_is_global = true;
+    ckpt_state.recipe.accum_steps = 1;
     const std::vector<nn::Tensor> no_blobs;
     log.save(ckpt_file, original, spec, kTokenizerBytes, ckpt_state, no_blobs, std::cerr);
     CHECK(log.failures() == 0, "断点写到可写路径不应记账失败");
@@ -200,6 +204,35 @@ void test_role_gate_and_roundtrip(const std::filesystem::path& dir)
             CHECK(ar3.error().message.find("--lr") != std::string::npos &&
                       ar3.error().message.find("禁止") != std::string::npos,
                   "报错文案应列出被禁旗标与规则");
+
+        // docs/todo/30：旧断点缺 batch 语义键 ⇒ micro-batch 解释，
+        // 恢复时换成等效 global，并把 micro step 计数折成 update step。
+        nn::TrainState legacy_state;
+        legacy_state.counters.epoch = 1;
+        legacy_state.counters.step_in_epoch = 3;
+        legacy_state.recipe.optimizer = "adam";
+        legacy_state.recipe.batch_size = 2;
+        legacy_state.recipe.accum_steps = 2;
+        legacy_state.recipe.epochs = 3;
+        legacy_state.dataset.num_samples = 10;
+        legacy_state.dataset.steps_per_epoch = 5;
+        const std::string legacy_ckpt = (dir / "legacy.nnckpt").string();
+        nn::cli::TextTrainCheckpointLog legacy_log;
+        legacy_log.save(legacy_ckpt, original, spec, kTokenizerBytes, legacy_state,
+                        no_blobs, std::cerr);
+        nn::cli::TrainConfig legacy_cfg;
+        legacy_cfg.resume_path = legacy_ckpt;
+        legacy_cfg.load_existing = true;
+        std::ostringstream legacy_out, legacy_err;
+        auto legacy_r = nn::cli::adopt_resume_state(legacy_cfg, legacy_out, legacy_err);
+        CHECK(legacy_r && legacy_cfg.batch_size == 4 &&
+                  legacy_cfg.accum_steps == 2 && legacy_cfg.start_step == 1,
+              "旧 micro-batch 断点 → global=4 / accum=2 / update step=1");
+        if (legacy_r)
+            CHECK(legacy_r->state.recipe.batch_size_is_global &&
+                      legacy_r->state.recipe.micro_batch_size == 2 &&
+                      legacy_r->state.dataset.steps_per_epoch == 3,
+                  "旧断点状态已转换为 global batch 语义");
 
         // 数据集身份门禁（硬错、无逃生阀）
         nn::DatasetIdentity a;

@@ -79,8 +79,8 @@ void print_text_train_usage(const char *prog)
     help.opt("--resume-step <n>", "从本 epoch 内第 n 步继续 (0-based，需配合 --resume；默认 0)");
     help.opt("--epochs <n>", "训练轮数 (默认: 10)");
     help.opt("--lr <lr>", "学习率 (默认: 0.001)");
-    help.opt("--batch-size <n>", "批大小 (默认: 32)");
-    help.opt("--accum-steps <n>", "梯度累积步数 (默认: 1)\n每 n 步 forward/backward 累加梯度后再更新参数，等效放大 batch_size×n");
+    help.opt("--batch-size <n>", "理论 global batch / 每次参数更新的样本数 (默认: 32)");
+    help.opt("--accum-steps <n>", "梯度累积次数 (默认: 1)\n实际 micro-batch = batch-size / accum-steps；必须整除");
     help.opt("--seq-len <n>", "序列长度 (默认: 256)");
     help.opt("--stride <n>", "滑动窗口步长 (默认: 等于 --seq-len，即不重叠)\n设小可产生重叠窗口，增加训练样本数");
     // RV-04：名单文本由 nn::optimizer_table()（唯一真源）生成，不再手抄
@@ -92,8 +92,8 @@ void print_text_train_usage(const char *prog)
     help.opt("--beta2 <b>", "Adam/AdamW 二阶动量衰减 β2 (默认: 0.999，sgd/muon 忽略)\nLLM 预训练惯例常取 0.95 (GPT-3/LLaMA 配方)");
     help.opt("--max-norm <f>", "梯度裁剪最大全局 L2 范数 (默认: 0=不裁剪)");
     help.opt("--log-interval <n>", "每隔多少 step 显示进度 (默认: 50)");
-    help.opt("--save-interval <n>", "每隔多少 step 保存训练断点 .nnckpt (默认: 100；\n文件名 = --save 的路径换 .nnckpt 扩展名)");
-    help.opt("--max-steps <n>", "本次运行最多训练多少 step 后停止并保存 (默认: 0=不限)\n按本进程执行的步数计，可与 --resume 组合分段跑；用于吞吐实测/分段训练");
+    help.opt("--save-interval <n>", "每隔多少 update step 保存训练断点 .nnckpt (默认: 100；\n文件名 = --save 的路径换 .nnckpt 扩展名)");
+    help.opt("--max-steps <n>", "本次运行最多执行多少 update step (默认: 0=不限)\n按本进程参数更新次数计，可与 --resume 组合分段跑；用于吞吐实测/分段训练");
     help.opt("--grad-log", "显示梯度统计 (范数/最大值/均值)");
     help.opt("--gpu [索引|名称]", "启用 GPU 加速 (需要 Vulkan SDK)\n空格形式只收枚举索引；名称子串用 --gpu=<名称>，如 --gpu=NVIDIA / --gpu=40HX");
     help.opt("--help, -h", "显示此帮助信息");
@@ -117,7 +117,7 @@ void print_text_train_usage(const char *prog)
 
     help.section("显存优化");
     help.opt("--checkpoint-every <n>", "每 N 个 Transformer block 重算一次 forward (激活重计算，默认: 0=不启用)\n1=每块都重算，显存收益最大，以约 1 次额外前向\nFLOPs 为代价省去整层激活驻留");
-    help.opt("--activation-offload", "把每块激活搬 host-visible，backward 拷回\n不重算，FLOPs 保持 1.0×，代价是 PCIe 传输；可与\n--checkpoint-every 混合使用：checkpoint 块重算、其余块 offload；仅 GPU 有效；\n与 --f16/--t1_58/--precision-* 不兼容（slab 恒 f32，配置期拒绝）");
+    help.opt("--activation-offload", "把每块激活搬 host-visible，backward 拷回\n不重算，FLOPs 保持 1.0×，代价是 PCIe 传输；可与\n--checkpoint-every 混合使用：checkpoint 块重算、其余块 offload；仅 GPU 有效；\n与 --f16 / --t1_58 / 四槽精度参数不兼容（slab 恒 f32，配置期拒绝）");
     help.note("GPU 训练每 step 末尾自动归还完全空闲的内存池底材 (L2 整块释放)。");
 
     help.section("Batch 录制粒度");
@@ -240,7 +240,7 @@ precision_offload_combo_error(const TrainConfig &cfg)
         return std::nullopt;
     return std::string(
         "--activation-offload 与混合精度/三值精度不兼容（--f16 / --t1_58 /"
-        " --precision-*）：\n"
+        " 四槽精度参数）：\n"
         "  offload slab 恒 f32，f16 激活 restore 后会变成 f32（精度语义漂移）。\n"
         "  请改用 --checkpoint-every，或去掉 --activation-offload。\n");
 }

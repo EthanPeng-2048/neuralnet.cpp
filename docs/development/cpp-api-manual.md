@@ -645,10 +645,10 @@ NN_UNWRAP(opt->step());
 
 ### 11.1 推荐：数据集直连训练工厂 `nn::TextTrainer`（P2b）
 
-文本/GPT 训练的最小闭环 = **Dataset →（内部切样本）→ TrainingSession → TextTrainer**。
+文本/GPT 训练的最小闭环 = **Dataset →（内部切样本）→ TextTrainer → global/micro batch → TrainingSession**。
 `nn::TextTrainConfig` 是**训练配方唯一真源**（`seq_len`/`batch_size`/`epochs`/lr 调度…）；
-epoch×step 循环、shuffle、梯度累积/裁剪、lr 调度、测试评估、断点状态装配都在库里，
-调用方不用自己切窗或填 batch：
+epoch×step 循环、shuffle、global→micro 切分、lr 调度、测试评估、断点状态装配都在 Trainer；
+Session 只接收 micro-batch，内部累积并按 global batch 有效单位归一化后执行 update：
 
 ```cpp
 #include <neuralnet.cpp/nn.hpp>
@@ -663,17 +663,19 @@ nn::Model model = NN_UNWRAP(nn::build_gpt_model(engine, /*vocab=*/10000,
                                                 /*heads=*/4, /*d_ff=*/512,
                                                 /*layers=*/4));
 
-// 2. Session（Model + Optimizer + TrainState）：优化器侧配置的唯一真源
+// 2. Session（Model + Optimizer + update state）：优化器侧配置的唯一真源
 nn::TrainingConfig scfg;
 scfg.optimizer      = "adamw";
 scfg.lr             = 3e-4f;
 scfg.clip_grad_norm = 1.0f;               // 梯度裁剪（0 = 不裁剪）
+scfg.grad_accum_steps = 4;
 auto session = NN_UNWRAP(nn::TrainingSession::create(std::move(model), scfg));
 
 // 3. 训练配方：从 Session 派生（优化器/精度/lr 同源），再改数据网格与调度
 nn::TextTrainConfig recipe = nn::make_text_train_config(session);
 recipe.seq_len     = 256;
-recipe.batch_size  = 8;
+recipe.batch_size  = 8;                   // 理论 global batch；每 micro = 2
+recipe.accum_steps = 4;
 recipe.epochs      = 2;
 recipe.lr_schedule = "cosine";
 
@@ -689,7 +691,7 @@ std::printf("steps=%zu samples=%zu final_lr=%.3e\n",
 要点：
 
 - **配方与 Session 的重叠字段必须一致**（`optimizer`/`lr`/`weight_decay`/`beta1`/`beta2`/
-  `precision`/`max_norm`），`TextTrainer::create` 会逐项校验并明确报错；用
+  `precision`/`max_norm`/`accum_steps`），`TextTrainer::create` 会逐项校验并明确报错；用
   `nn::make_text_train_config(session)` 起步最省事。
 
 - 已切好样本集（如 CLI 先打印数据集统计）时用高性能入口
@@ -699,7 +701,8 @@ std::printf("steps=%zu samples=%zu final_lr=%.3e\n",
   `on_update`/`on_checkpoint`/`on_phase`）；断点请求 = `nn::TextCheckpointRequest{session, state}`，
   落盘由调用方决定（CLI 用 `save_model` 的 `CheckpointState`）。
 - **单位约定**：存储单位 = doc（`.nndataset`）；训练单位 = **样本**（`seq_len` 窗口）；
-  `step = ceil(样本数 / batch_size)` 是**派生量**（`TextSampleSet::steps_per_epoch(batch_size)`）。
+  `batch_size` = 一次 update 的理论 global batch，`micro_batch_size = batch_size / accum_steps`；
+  `step = ceil(样本数 / batch_size)` 按 optimizer update 计。
 - `TextTrainer` 目前内置文本 sparse-CE，只服务文本/GPT 任务；MNIST/自定义任务用下面的低层模板。
 
 ### 11.2 低层手写循环（自定义任务 / 非文本）
@@ -712,10 +715,14 @@ int main()
     auto engine_owner = nn::CpuEngine::create();
     nn::CpuEngine& engine = *engine_owner;
 
-    // 1. 模型 + 优化器 + 损失
+    // 1. Model + Optimizer + Loss（Task Step 回调持有 Loss）
     nn::Model model = NN_UNWRAP(nn::build_mnist_mlp_model(engine));
-    auto opt = nn::create_optimizer("adam", engine, model.parameters(),
-                                    model.param_gradients(), 1e-3f);
+    nn::TrainingConfig cfg;
+    cfg.optimizer = "adam";
+    cfg.lr = 1e-3f;
+    cfg.grad_accum_steps = 1;
+    nn::TrainingSession session =
+        NN_UNWRAP(nn::TrainingSession::create(std::move(model), cfg));
     nn::CrossEntropyLoss loss;
 
     const std::size_t batch = 64;
@@ -726,17 +733,25 @@ int main()
         nn::Tensor y = engine.create_tensor(10,  batch, nn::Precision::F32);
         // ... 用 engine.write(...) / engine.from_matrix(...) 填 x, y ...
 
-        // 3. 一步
-        NN_UNWRAP(opt->zero_grad());
-        nn::Tensor out  = NN_UNWRAP(model.forward(x));
-        nn::Scalar l    = NN_UNWRAP(loss.forward(engine, out, y));
-        nn::Tensor grad = NN_UNWRAP(loss.backward());
-        (void)NN_UNWRAP(model.backward(grad));
-        NN_UNWRAP(opt->clip_grad_norm(1.0f));
-        NN_UNWRAP(opt->step());
-
-        if (step % 50 == 0)
-            std::printf("[step %d] loss=%.4f\n", step, static_cast<double>(l));
+        // 3. Session 完成一次 micro-step；累积到边界时自动 update
+        nn::TrainingStepOptions opts;
+        opts.lr = 1e-3f;
+        opts.clip_grad_norm = 1.0f;
+        opts.normalization_units = batch;
+        auto report = NN_UNWRAP(session.train_step(
+            x, opts,
+            [&](nn::Model& m, nn::ComputeEngine& e, const nn::Tensor& input)
+                -> nn::Result<nn::TrainingStepOutput> {
+                auto out = m.forward(input);
+                if (!out) return std::unexpected(out.error());
+                auto l = loss.forward(e, *out, y);
+                if (!l) return std::unexpected(l.error());
+                auto grad = loss.backward();
+                if (!grad) return std::unexpected(grad.error());
+                return nn::TrainingStepOutput{std::move(*grad), batch};
+            }));
+        if (report.parameters_updated && step % 50 == 0)
+            std::printf("[update %d]\n", step);
     }
     return 0;
 }
@@ -745,8 +760,8 @@ int main()
 > 含真实数据加载的完整版见 `src/mnist_train.cpp`（Session 手写循环）与 `src/text_train.cpp`
 > （CLI 接线：Dataset → `TextSampleSet` → Session → `TextTrainer`），以及
 > [`../usage/02-quickstart-train-infer.md`](../usage/02-quickstart-train-infer.md) 的「C++ API 编程训练」节。
-> GPU 上把 forward / backward 包进 `engine.begin_batch()` / `engine.end_batch()` 可消去
-> per-primitive 提交开销（见引擎手册 §3.5）。
+> GPU 录制作用域由 `TrainingSession::train_step` 统一管理；调用方无需再手工包
+> `begin_batch/end_batch`。
 
 ---
 
@@ -852,7 +867,7 @@ nn::TextSampleSet samples =
     NN_UNWRAP(nn::TextSampleSet::create(ds, nn::DatasetSubset::Train, win));
 
 std::size_t n_samples = samples.sample_count();                    // 训练样本数
-std::size_t n_steps   = samples.steps_per_epoch(/*batch_size=*/8); // ceil(样本数/batch)
+std::size_t n_steps   = samples.steps_per_epoch(/*global_batch_size=*/8); // update step 数
 nn::TextSample s0     = samples.sample(0);   // tokens/doc_ids/loss_mask/valid_len/offset 视图
 
 // 按样本下标装配一个 batch（末批可不满）：

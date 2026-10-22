@@ -27,6 +27,10 @@ namespace nn
 // 本结构的同名字段只是"喂给循环/断点状态"的副本，必须与 Session 完全一致
 // （`TextTrainer::create` 逐项校验并报错）。起步用 `nn::make_text_train_config(session)`。
 //
+// **Batch 语义（docs/todo/30）**：`batch_size` 是一次 optimizer update 覆盖的
+// 理论 global batch；每次 forward/backward 的 micro batch =
+// `batch_size / accum_steps`。`steps_per_epoch` 与计数器均以 update step 为单位。
+//
 // 默认值 = 原 `text_train` CLI 默认值（2026-10 口径）。`seq_len` 的 CLI 默认
 // 是 `nn::GPT_SEQ_LEN`（当前 256），CLI 构造 TrainConfig 时显式对齐一次，
 // 避免本头反向依赖 domain_gpt。
@@ -35,12 +39,12 @@ struct TextTrainConfig
     // ── 数据网格（样本/step 的派生根）────────────────────────────────────
     std::size_t seq_len = 256;   // 每个训练样本（窗口）的 token 数
     std::size_t stride = 0;      // 窗口步长；0 = seq_len（不重叠）
-    std::size_t batch_size = 32;
+    std::size_t batch_size = 32; // global batch（一次 optimizer update）
     int epochs = 10;
     int start_epoch = 0;         // resume 后从第几个 epoch 继续（0-based）
     std::size_t start_step = 0;  // resume 后本 epoch 内从第几步继续（0-based）
     std::size_t max_steps = 0;   // 本进程最多训练步数（0 = 按 epoch 跑完）
-    std::size_t accum_steps = 1; // 梯度累积步数（1 = 不累积）
+    std::size_t accum_steps = 1; // 梯度累积次数；micro = batch_size / accum_steps
 
     // ── 学习率调度 ───────────────────────────────────────────────────────
     std::string lr_schedule = "fixed";  // fixed / cosine / step_cosine

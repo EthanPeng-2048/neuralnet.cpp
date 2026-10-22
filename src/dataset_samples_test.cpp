@@ -1,7 +1,7 @@
 // ── dataset_samples_test — 训练样本概念（TextSampleSet / TextSample / batch）──
 //
 // P2b 验收（docs/todo/29 §8）：数据集只存 doc；**训练单位 = 样本（窗口）**；
-// step = ceil(样本数 / batch_size) 是派生量。本测试锁住：
+// update step = ceil(样本数 / global_batch_size) 是派生量。本测试锁住：
 //   [1] 切窗：偏移序列、样本数、steps_per_epoch（派生）
 //   [2] sample(i) 的视图（tokens/doc_ids/loss_mask/valid_len）
 //   [3] make_batch 的逐位约定：PAD、目标 = 下一 token、掩码按**目标**位置、
@@ -103,7 +103,7 @@ void test_windowing_and_samples()
 
     // [1] 切窗：偏移 = 0,2,4,6,8（9 token / stride 2）⇒ 5 个样本
     CHECK(set.sample_count() == 5, "样本数 = ceil(token 数 / stride)");
-    CHECK(set.steps_per_epoch(2) == 3, "step = ceil(样本数 / batch_size)（派生）");
+    CHECK(set.steps_per_epoch(2) == 3, "step = ceil(样本数 / global_batch_size)（派生）");
     CHECK(set.steps_per_epoch(5) == 1, "batch = 样本数 ⇒ 1 步");
     CHECK(set.steps_per_epoch(0) == 0, "batch_size=0 ⇒ 0（调用方负责拒绝）");
     CHECK(set.stride() == 2 && set.seq_len() == 4, "窗口参数回显");
@@ -128,7 +128,10 @@ void test_windowing_and_samples()
         const std::vector<std::size_t> idx{3, 4};
         nn::TextSampleBatch batch;
         auto vr = set.make_batch(idx, batch);
+        auto units_r = set.valid_target_count(idx);
         CHECK(vr && *vr == 2, "make_batch 返回本批参与 loss 的位置数");
+        CHECK(units_r && *units_r == 2,
+              "valid_target_count 与 batch 的 loss 有效单位一致");
         CHECK(batch.batch == 2 && batch.seq_len == 4, "batch 形状");
         CHECK(batch.valid_tokens == 2, "valid_tokens");
         // input: (seq_len, batch) 列 = 样本
@@ -151,7 +154,9 @@ void test_windowing_and_samples()
         const std::vector<std::size_t> idx{4};
         nn::TextSampleBatch batch;
         const auto vr = set.make_batch(idx, batch);
+        const auto units_r = set.valid_target_count(idx);
         CHECK(vr && *vr == 0, "单 token 末窗：无目标 ⇒ 0 个有效位置");
+        CHECK(units_r && *units_r == 0, "valid_target_count：末窗无目标 ⇒ 0");
         CHECK(batch.batch == 1 && batch.flat_targets.size() == 4, "末批可不满");
     }
 

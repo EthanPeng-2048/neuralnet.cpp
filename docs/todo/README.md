@@ -40,7 +40,8 @@
 | [`22-bitnet-2b4t-architecture.md`](22-bitnet-2b4t-architecture.md) | BitNet b1.58 2B4T 的结构对齐：SubLN / GQA / tied embedding（与 21 号正交） |
 | [`23-library-design-cleanup-and-model-file-roles.md`](23-library-design-cleanup-and-model-file-roles.md) | 库级违规设计清理：模型文件角色（`.nnmodel` / `.nnckpt`）+ 参数形态协议 + 引擎能力体系 |
 | [`28-lifecycle-v3.md`](28-lifecycle-v3.md) | **生命周期 v3（2026-10-20 立项）**：删 `EngineId`/`stamp_`/`adopt`/`bound`/`NN_BIND_DEBUG`，设备域从存储派生（统一 CPU/GPU 域）；P0/P1/P3/P4 + CPU 独立轨道 P-CPU。改生命周期/Tensor/引擎绑定前读 |
-| [`29-session-architecture.md`](29-session-architecture.md) | **Session 层（P2a/P2b 已实施）**：`TrainingSession` 拥有 Model + Optimizer + `TrainState`（结构性修复非拥有引用 UAF）；数据集经 `TextSampleSet` 接入训练工厂 `TextTrainer`（v1.10.0-rc0.1）；`InferenceSession` / `RLTrainingSession` 占位。改 Model/Optimizer/训练入口前读 |
+| [`29-session-architecture.md`](29-session-architecture.md) | Session 层历史与所有权设计：Model + Optimizer 同生共死、`InferenceSession` / `RLTrainingSession` 占位。P2b 的训练状态归属已由 30 号修订 |
+| [`30-training-session-step.md`](30-training-session-step.md) | **TrainingSession 单步协议（已实施）**：Session 接收 micro-batch、内置梯度累积、按 global batch 有效单位归一化并完成一次 optimizer update；`batch_size` 是理论 batch；Loss mask 固化在 Sample；epoch/lr 曲线/评估/运行态 `TrainState` 归 `TextTrainer`。改训练入口前读 |
 
 ### 现状盘点 / 规范 / 教训 / 故障
 

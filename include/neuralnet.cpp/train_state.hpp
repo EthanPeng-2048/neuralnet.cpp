@@ -71,7 +71,11 @@ struct TrainRecipe
     std::uint64_t total_steps = 0;    // **曲线形状**（step 级调度的 total_steps）
     std::uint64_t warmup_epochs = 0;
     std::uint64_t warmup_steps = 0;
-    std::uint64_t batch_size = 0;     // 决定 steps_per_epoch ⇒ 也决定步号语义
+    // docs/todo/30：新状态写 global batch；旧状态缺语义键时 batch 仍按
+    // micro-batch 解释。步号在新语义下均指 optimizer update。
+    std::uint64_t batch_size = 0;
+    std::uint64_t micro_batch_size = 0;
+    bool batch_size_is_global = false;
     std::uint64_t accum_steps = 0;
     std::uint64_t stride = 0;         // 滑动窗口步长（0 = 等于 seq_len）
     std::vector<double> lr_per_epoch;// 逐个 epoch 的手动 lr（空 = 自动调度）
@@ -141,6 +145,9 @@ inline constexpr std::uint64_t TRAIN_STATE_VERSION = 1;
     kv.set("warmup_epochs", s.recipe.warmup_epochs);
     kv.set("warmup_steps", s.recipe.warmup_steps);
     kv.set("batch_size", s.recipe.batch_size);
+    kv.set("micro_batch_size", s.recipe.micro_batch_size);
+    kv.set("batch_size_semantics",
+           std::string(s.recipe.batch_size_is_global ? "global" : "micro"));
     kv.set("accum_steps", s.recipe.accum_steps);
     kv.set("stride", s.recipe.stride);
     {
@@ -213,6 +220,16 @@ inline constexpr std::uint64_t TRAIN_STATE_VERSION = 1;
     if (kv.get("warmup_epochs", u)) s.recipe.warmup_epochs = u;
     if (kv.get("warmup_steps", u)) s.recipe.warmup_steps = u;
     if (kv.get("batch_size", u)) s.recipe.batch_size = u;
+    if (kv.get("micro_batch_size", u)) s.recipe.micro_batch_size = u;
+    {
+        std::string semantics;
+        if (kv.get("batch_size_semantics", semantics))
+        {
+            if (semantics != "global" && semantics != "micro")
+                NN_FAIL("训练状态的 batch_size_semantics 非法（只接受 global/micro）");
+            s.recipe.batch_size_is_global = (semantics == "global");
+        }
+    }
     if (kv.get("accum_steps", u)) s.recipe.accum_steps = u;
     if (kv.get("stride", u)) s.recipe.stride = u;
     {

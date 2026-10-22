@@ -114,6 +114,8 @@ std::filesystem::path scratch_dir()
     s.recipe.warmup_epochs = 1;
     s.recipe.warmup_steps = 200;
     s.recipe.batch_size = 8;
+    s.recipe.micro_batch_size = 2;
+    s.recipe.batch_size_is_global = true;
     s.recipe.accum_steps = 4;
     s.recipe.stride = 128;
     s.recipe.lr_per_epoch = {1e-3, 5e-4, 2.5e-4};
@@ -151,6 +153,8 @@ std::filesystem::path scratch_dir()
            a.recipe.warmup_epochs == b.recipe.warmup_epochs &&
            a.recipe.warmup_steps == b.recipe.warmup_steps &&
            a.recipe.batch_size == b.recipe.batch_size &&
+           a.recipe.micro_batch_size == b.recipe.micro_batch_size &&
+           a.recipe.batch_size_is_global == b.recipe.batch_size_is_global &&
            a.recipe.accum_steps == b.recipe.accum_steps &&
            a.recipe.stride == b.recipe.stride &&
            a.recipe.lr_per_epoch == b.recipe.lr_per_epoch &&

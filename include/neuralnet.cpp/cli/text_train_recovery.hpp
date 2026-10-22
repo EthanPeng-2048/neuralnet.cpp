@@ -109,7 +109,7 @@ struct ResumeStateAdoption
                "配方仍取命令行）\n";
         return result;
     }
-    const nn::TrainState& s = *state_r;
+    nn::TrainState s = *state_r;
 
     // ── 禁列校验（显式给出 A/B 类旗标即报错）────────────────────────────
     if (!cfg.explicit_train_flags.empty())
@@ -142,8 +142,31 @@ struct ResumeStateAdoption
     cfg.max_norm = static_cast<nn::Scalar>(s.recipe.max_norm);
     cfg.warmup_epochs = static_cast<int>(s.recipe.warmup_epochs);
     cfg.warmup_steps = static_cast<std::size_t>(s.recipe.warmup_steps);
-    cfg.batch_size = static_cast<std::size_t>(s.recipe.batch_size);
     cfg.accum_steps = static_cast<std::size_t>(s.recipe.accum_steps);
+    if (s.recipe.batch_size_is_global)
+    {
+        cfg.batch_size = static_cast<std::size_t>(s.recipe.batch_size);
+    }
+    else
+    {
+        // docs/todo/30：旧状态的 batch_size 是 micro-batch；还原成等效 global。
+        // 旧断点若落在累积中间，pending gradients 不在文件里，只能从最近的
+        // 已完成 update 边界继续。
+        if (s.recipe.accum_steps == 0)
+            NN_FAIL("旧断点的 accum_steps=0，无法转换 batch_size 语义");
+        cfg.batch_size = static_cast<std::size_t>(
+            s.recipe.batch_size * s.recipe.accum_steps);
+        if (s.recipe.accum_steps > 0)
+            s.counters.step_in_epoch /= s.recipe.accum_steps;
+        s.recipe.batch_size = static_cast<std::uint64_t>(cfg.batch_size);
+        s.recipe.micro_batch_size = static_cast<std::uint64_t>(s.recipe.batch_size /
+                                                               s.recipe.accum_steps);
+        s.recipe.batch_size_is_global = true;
+        if (s.dataset.num_samples > 0)
+            s.dataset.steps_per_epoch =
+                (s.dataset.num_samples + s.recipe.batch_size - 1) /
+                s.recipe.batch_size;
+    }
     cfg.stride = static_cast<std::size_t>(s.recipe.stride);
     cfg.lr_per_epoch.clear();
     cfg.lr_per_epoch.reserve(s.recipe.lr_per_epoch.size());
@@ -165,7 +188,9 @@ struct ResumeStateAdoption
         << nn::precision_name(s.recipe.precision.stable) << "/"
         << nn::precision_name(s.recipe.precision.optimizer)
         << "  优化器=" << s.recipe.optimizer
-        << "  batch=" << s.recipe.batch_size << " accum=" << s.recipe.accum_steps
+        << "  global_batch=" << s.recipe.batch_size
+        << " micro_batch=" << s.recipe.micro_batch_size
+        << " accum=" << s.recipe.accum_steps
         << "  epochs=" << s.recipe.epochs << "\n";
     return result;
 }

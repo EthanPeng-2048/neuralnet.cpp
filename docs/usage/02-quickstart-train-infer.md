@@ -139,7 +139,8 @@ GPT 训练需要一份文本语料（如 `datasets/llm_corpus.txt`，用 `script
 
 > 词表、loss 范围（`all`/`assistant`）、test 子集都随数据集（生成期定好），
 > 不再是 `text_train` 的选项；窗口化（`--seq-len`/`--stride`）仍属训练策略，
-> P2b 起由库层 `TextSampleSet` / `TextTrainer` 承担（step = ceil(样本数/batch) 是派生量）。
+> 由库层 `TextSampleSet` / `TextTrainer` 承担；`batch` 指 global batch，
+> `step = ceil(样本数/global_batch_size)` 是一次 optimizer update。
 
 ### 推理
 
@@ -337,9 +338,9 @@ int main() {
 
 ### GPT 文本生成训练
 
-训练入口用库层训练工厂 `nn::TextTrainer`（P2b）：**Dataset →（内部切样本）→
-TrainingSession → TextTrainer**。`TextTrainConfig` 是训练配方唯一真源，epoch×step 循环、
-shuffle、梯度累积/裁剪、lr 调度、测试评估、断点状态都在库里——不再需要手工切窗/填 batch。
+训练入口用库层训练工厂 `nn::TextTrainer`：**Dataset →（内部切样本）→ global/micro batch →
+TrainingSession**。`TextTrainConfig` 是训练配方唯一真源；epoch×step 循环、shuffle、global→micro
+切分、lr 调度、测试评估、断点状态在 Trainer；Session 内置 micro-batch 梯度累积并完成 update。
 
 ```cpp
 #include <neuralnet.cpp/nn.hpp>
@@ -366,10 +367,11 @@ int main() {
         4       // num_layers
     ));
 
-    // 3. 训练配方（库层唯一真源）+ Session（Model + Optimizer + TrainState）
+    // 3. 训练配方 + Session（Model + Optimizer + update state）
     nn::TextTrainConfig recipe;
     recipe.seq_len      = 256;
-    recipe.batch_size   = 32;
+    recipe.batch_size   = 32;        // 理论 global batch
+    recipe.accum_steps  = 4;         // 实际 micro-batch = 8
     recipe.epochs       = 10;
     recipe.lr           = 0.001f;
     recipe.lr_schedule  = "cosine";
@@ -380,6 +382,7 @@ int main() {
     scfg.lr             = recipe.lr;
     scfg.weight_decay   = recipe.weight_decay;
     scfg.clip_grad_norm = recipe.max_norm;   // 必须与配方一致（Trainer 前置校验）
+    scfg.grad_accum_steps = recipe.accum_steps;
     nn::TrainingSession session =
         NN_UNWRAP(nn::TrainingSession::create(std::move(model), scfg));
 
@@ -397,8 +400,9 @@ int main() {
 ```
 
 > **单位约定**：`.nndataset` 的存储单位是 **doc**；训练单位是 **样本**（`seq_len` 窗口，
-> 可跨 doc 边界）；`step = ceil(样本数 / batch_size)` 是**派生量**
-> （`TextSampleSet::steps_per_epoch(batch_size)`）——`steps_per_epoch` **不是** CLI 旗标，
+> 可跨 doc 边界）；`batch_size` 是一次 update 的理论 global batch，
+> `micro_batch_size = batch_size / accum_steps`；`step = ceil(样本数 / batch_size)` 按 update 计
+> （`TextSampleSet::steps_per_epoch(global_batch_size)`）——`steps_per_epoch` **不是** CLI 旗标，
 > 也不再由调用方手算。已切好样本集时用高性能入口
 > `TextTrainer::create(session, train_set, test_set, recipe)`；样本集 /
 > batch 装配接口见 [`../development/cpp-api-manual.md`](../development/cpp-api-manual.md) §13.3。

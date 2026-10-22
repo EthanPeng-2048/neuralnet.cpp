@@ -99,34 +99,158 @@ void test_create_and_train()
     CHECK(infer.has_value(), "session.model().forward 推理可用");
 }
 
-void test_train_state_container()
+[[nodiscard]] nn::Result<nn::TrainingStepReport>
+run_mse_step(nn::TrainingSession& session, const nn::Tensor& x,
+             std::size_t normalization_units, bool force_update = false)
 {
-    // P2b：TrainState 由 Session 持有（写入方是训练驱动；Session 负责生命周期），
-    // 移动 Session 后状态仍在（与 optimizer 的 TensorRef 同理）。
+    nn::TrainingStepOptions opts;
+    opts.normalization_units = normalization_units;
+    opts.force_update = force_update;
+    return session.train_step(
+        x, opts,
+        [&](nn::Model& model, nn::ComputeEngine& engine, const nn::Tensor& input)
+            -> nn::Result<nn::TrainingStepOutput> {
+            auto logits_r = model.forward(input);
+            NN_TRY_CHECK(logits_r);
+            nn::MSELoss loss;
+            auto target = make_tensor(engine, logits_r->rows(), logits_r->cols(), 0.f, 0.f);
+            auto loss_r = loss.forward(engine, *logits_r, target);
+            NN_TRY_CHECK(loss_r);
+            auto grad_r = loss.backward();
+            NN_TRY_CHECK(grad_r);
+            nn::TrainingStepOutput out;
+            out.grad = std::move(*grad_r);
+            out.gradient_units = logits_r->size();
+            return out;
+        });
+}
+
+void test_accumulation_and_session_state()
+{
+    // docs/todo/30：Session 内部累积；未到边界不更新，移动后状态仍有效。
     auto engine = nn::CpuEngine::create();
     nn::Model model(*engine);
     CHECK(model.add<nn::Linear>(4, 3), "state: add");
     nn::TrainingConfig cfg;
     cfg.optimizer = "sgd";
+    cfg.lr = 0.01f;
+    cfg.grad_accum_steps = 2;
     auto s = nn::TrainingSession::create(std::move(model), cfg);
     CHECK(s.has_value(), "state: create");
     if (!s) return;
-    CHECK(s->train_state().counters.global_step == 0, "state: 初始为空状态");
+    CHECK(s->state().optimizer_step == 0, "state: 初始 optimizer_step=0");
 
-    nn::TrainState st;
-    st.counters.epoch = 2;
-    st.counters.global_step = 42;
-    st.dataset.num_samples = 7;
-    st.dataset.sha256 = std::string(64, 'd');
-    s->set_train_state(st);
-    CHECK(s->train_state().counters.epoch == 2 &&
-              s->train_state().dataset.num_samples == 7,
-          "state: set/get 往返");
+    const auto x1 = make_tensor(*engine, 4, 2, 0.1f, 0.05f);
+    const auto x2 = make_tensor(*engine, 4, 2, 0.2f, 0.05f);
+    auto r1 = run_mse_step(*s, x1, 6);
+    CHECK(r1 && !r1->parameters_updated, "accum: 第 1 个 micro 不更新");
+    CHECK(s->state().microsteps_in_update == 1, "accum: microstep 计数");
 
     nn::TrainingSession moved = std::move(*s);
-    CHECK(moved.train_state().counters.global_step == 42, "state: Session 移动后保留");
-    moved.train_state().counters.step_in_epoch = 3;   // 训练驱动可原地推进
-    CHECK(moved.train_state().counters.step_in_epoch == 3, "state: 可原地推进");
+    CHECK(moved.state().microsteps_in_update == 1, "state: Session 移动后累积状态保留");
+    auto r2 = run_mse_step(moved, x2, 6);
+    CHECK(r2 && r2->parameters_updated, "accum: 第 2 个 micro 完成一次 update");
+    CHECK(moved.step_count() == 1, "accum: 只推进一次 optimizer step");
+    CHECK(moved.state().microsteps_in_update == 0, "accum: 更新后状态复位");
+}
+
+void test_global_batch_normalization()
+{
+    auto engine = nn::CpuEngine::create();
+
+    auto make_zero_model = [&]() {
+        nn::Model model(*engine);
+        NN_ASSERT_ALWAYS(model.add<nn::Linear>(1, 1), "norm: add");
+        for (auto& p : model.parameters())
+            NN_ASSERT_ALWAYS(engine->zero(p.get()), "norm: zero parameter");
+        return model;
+    };
+    auto make_sgd_session = [&](std::size_t accum) {
+        nn::TrainingConfig cfg;
+        cfg.optimizer = "sgd";
+        cfg.lr = 0.1f;
+        cfg.weight_decay = 0.0f;
+        cfg.grad_accum_steps = accum;
+        auto s = nn::TrainingSession::create(make_zero_model(), cfg);
+        NN_ASSERT_ALWAYS(s, "norm: create session");
+        return std::move(*s);
+    };
+
+    nn::TrainingSession global = make_sgd_session(1);
+    const auto global_x = make_tensor(*engine, 1, 4, 0.1f, 0.1f);
+    auto global_r = run_mse_step(global, global_x, 4);
+    CHECK(global_r && global_r->parameters_updated, "norm: global batch update");
+
+    nn::TrainingSession accumulated = make_sgd_session(2);
+    const auto micro1 = make_tensor(*engine, 1, 2, 0.1f, 0.1f);
+    const auto micro2 = make_tensor(*engine, 1, 2, 0.3f, 0.1f);
+    auto m1 = run_mse_step(accumulated, micro1, 4);
+    auto m2 = run_mse_step(accumulated, micro2, 4);
+    CHECK(m1 && !m1->parameters_updated, "norm: micro1 只累积");
+    CHECK(m2 && m2->parameters_updated, "norm: micro2 完成 update");
+
+    const auto global_params = snapshot_params(*engine, global.model());
+    const auto accum_params = snapshot_params(*engine, accumulated.model());
+    CHECK(global_params.size() == accum_params.size(), "norm: 参数数量一致");
+    CHECK(l1_move(global_params, accum_params) < 1e-6,
+          "norm: global batch 与 micro 累积更新结果一致");
+}
+
+void test_force_update()
+{
+    auto engine = nn::CpuEngine::create();
+    nn::Model model(*engine);
+    CHECK(model.add<nn::Linear>(4, 3), "force: add");
+    nn::TrainingConfig cfg;
+    cfg.optimizer = "sgd";
+    cfg.lr = 0.01f;
+    cfg.grad_accum_steps = 4;
+    auto s = nn::TrainingSession::create(std::move(model), cfg);
+    CHECK(s, "force: create");
+    if (!s) return;
+    const auto x = make_tensor(*engine, 4, 2, 0.1f, 0.05f);
+    auto r = run_mse_step(*s, x, 6, /*force_update=*/true);
+    CHECK(r && r->parameters_updated, "force: 单个 micro 可强制提交尾部 update");
+    CHECK(s->step_count() == 1, "force: step_count 推进一次");
+}
+
+void test_before_update_abort()
+{
+    auto engine = nn::CpuEngine::create();
+    nn::Model model(*engine);
+    CHECK(model.add<nn::Linear>(4, 3), "abort: add");
+    nn::TrainingConfig cfg;
+    cfg.optimizer = "sgd";
+    cfg.grad_accum_steps = 1;
+    auto s = nn::TrainingSession::create(std::move(model), cfg);
+    CHECK(s, "abort: create");
+    if (!s) return;
+
+    const auto x = make_tensor(*engine, 4, 2, 0.1f, 0.05f);
+    nn::TrainingStepOptions opts;
+    opts.normalization_units = 6;
+    opts.before_update = []() -> nn::Result<bool> { return true; };
+    auto r = s->train_step(
+        x, std::move(opts),
+        [&](nn::Model& m, nn::ComputeEngine& e, const nn::Tensor& input)
+            -> nn::Result<nn::TrainingStepOutput> {
+            auto logits = m.forward(input);
+            NN_TRY_CHECK(logits);
+            nn::MSELoss loss;
+            auto target = make_tensor(e, logits->rows(), logits->cols(), 0.f, 0.f);
+            auto l = loss.forward(e, *logits, target);
+            NN_TRY_CHECK(l);
+            auto g = loss.backward();
+            NN_TRY_CHECK(g);
+            nn::TrainingStepOutput out;
+            out.grad = std::move(*g);
+            out.gradient_units = logits->size();
+            return out;
+        });
+    CHECK(r && r->aborted && !r->parameters_updated, "abort: 回调可在 update 前中止");
+    CHECK(s->step_count() == 0, "abort: optimizer step 未推进");
+    CHECK(s->state().microsteps_in_update == 0 && !s->state().accumulation_dirty,
+          "abort: 累积状态已清理");
 }
 
 void test_move_session_keeps_refs_valid()
@@ -261,7 +385,10 @@ int main()
 {
     std::printf("── TrainingSession：所有权 / 训练原语 / 精度透传 ──\n");
     test_create_and_train();
-    test_train_state_container();
+    test_accumulation_and_session_state();
+    test_global_batch_normalization();
+    test_force_update();
+    test_before_update_abort();
     test_move_session_keeps_refs_valid();
     test_inference_without_session();
     test_precision_passthrough();

@@ -47,6 +47,8 @@ struct TextWindowConfig
 };
 
 // 一个训练样本 = 一个窗口（**视图**，不拥有语料；TextSampleSet 存活期内有效）。
+// `loss_mask[i]` 是该 token 作为**目标位置**是否参与 loss 的最终样本语义：
+// TextSampleSet::make_batch 把它固化到 batch.flat_mask；Session 不解释 mask。
 struct TextSample
 {
     std::size_t index = 0;      // 样本序号（0-based）
@@ -116,11 +118,11 @@ public:
     // ── 样本概念 ────────────────────────────────────────────────────────
     [[nodiscard]] std::size_t sample_count() const noexcept { return offsets_.size(); }
 
-    // 训练步数 = ceil(样本数 / batch_size)（派生量：step 不是数据集概念）。
-    [[nodiscard]] std::size_t steps_per_epoch(std::size_t batch_size) const noexcept
+    // optimizer update 数 = ceil(样本数 / global_batch_size)（派生量）。
+    [[nodiscard]] std::size_t steps_per_epoch(std::size_t global_batch_size) const noexcept
     {
-        if (batch_size == 0) return 0;
-        return (offsets_.size() + batch_size - 1) / batch_size;
+        if (global_batch_size == 0) return 0;
+        return (offsets_.size() + global_batch_size - 1) / global_batch_size;
     }
 
     [[nodiscard]] TextSample sample(std::size_t index) const
@@ -190,6 +192,27 @@ public:
             }
         }
         out.valid_tokens = valid;
+        return valid;
+    }
+
+    // 只统计目标位置的 loss 有效数，不物化 batch。
+    // Global-batch 训练需要先知道整个 update 的归一化单位，再拆分 micro-batch。
+    [[nodiscard]] Result<std::size_t>
+    valid_target_count(std::span<const std::size_t> indices) const
+    {
+        std::size_t valid = 0;
+        for (std::size_t idx : indices)
+        {
+            if (idx >= offsets_.size())
+                NN_FAIL("TextSampleSet::valid_target_count: 样本下标越界（" +
+                        std::to_string(idx) + " >= " +
+                        std::to_string(offsets_.size()) + "）");
+            const std::size_t offset = offsets_[idx];
+            const std::size_t valid_len =
+                std::min(cfg_.seq_len, corpus_.token_flow.size() - offset);
+            for (std::size_t t = 0; t + 1 < valid_len; ++t)
+                if (corpus_.loss_mask[offset + t + 1] != 0) ++valid;
+        }
         return valid;
     }
 

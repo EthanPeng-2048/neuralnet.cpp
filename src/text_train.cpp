@@ -6,7 +6,7 @@
 // 数据流（P2b：数据集 → **样本** → 训练工厂）：
 //   nn::Dataset::open → nn::TextSampleSet（每样本 = 一个 seq_len 滑动窗口，
 //     token/目标/掩码/doc_ids 由样本层统一装配）→ nn::TextTrainer（训练驱动）
-//     → TrainingSession（Model + Optimizer + TrainState）→ GPTModel → 稀疏 CE
+//     → TrainingSession（Model + Optimizer + micro-step 累积）→ GPTModel → 稀疏 CE
 //     → backward → optimizer step。
 //   本文件只负责：数据集/词表加载、样本集切分、模型构建、恢复、训练配方映射、
 //   收尾产物（.nnmodel）与退出码。训练循环在 `nn::TextTrainer::fit()`。
@@ -370,6 +370,7 @@ namespace
     session_cfg.beta1 = cfg.beta1;
     session_cfg.beta2 = cfg.beta2;
     session_cfg.clip_grad_norm = cfg.max_norm;
+    session_cfg.grad_accum_steps = cfg.accum_steps;
     NN_TRY_MSG(session_r, "创建训练会话失败",
                nn::TrainingSession::create(std::move(model), session_cfg));
     nn::TrainingSession session = std::move(*session_r);

@@ -139,7 +139,7 @@ GPT `d_model=64 / heads=4 / layers=2 / d_ff=128 / seq_len=128 / batch=8`，850M 
 
 > 分支 `dev/lifetime_refresh`。发布标识：release 名称 **v1.10.0-rc0.1**，git tag **`v1.10.rc0.1`**（`CMakeLists.txt` 的
 > `project(... VERSION ...)` 仍为 1.10.0）。本 rc 只覆盖 **P2b 训练工厂**（样本层 /
-> `TextTrainer` / `TextTrainConfig` / `TrainingSession` 持有 `TrainState` / CLI 迁移）；
+> `TextTrainer` / `TextTrainConfig` / 运行态 `TrainState` / CLI 迁移；30 号起 Session 只持有单步与累积状态）；
 > 完整四编译器矩阵与 Linux+850M 权威口径**未在本次重跑**，正式版前仍按本文件 §1–§3 全量执行。
 
 ### 6.1 构建与测试

@@ -128,7 +128,8 @@ auto gpu = nn::GpuEngine::create(backend_owner);
 5. 训练入口优先用 `TrainingSession`（`Model` + `Optimizer` 同生共死）；继续用
    `create_optimizer` 时保证 optimizer 早于参数所有者销毁。文本/GPT 训练再优先用
    `nn::TextTrainer`（`text_trainer.hpp`：**数据集 + 训练循环**，内部持有
-   `TrainingSession`，并由它装配/持有 `TrainState`）。
+   `TrainingSession`，并自行装配/持有运行态 `TrainState`）。Session 接收 micro-batch，
+   内置梯度累积；epoch/lr 曲线/数据顺序仍归 Trainer。
 6. 不再需要 `NN_BIND_DEBUG`：域检查是默认行为。
 
 ## 9. 回归
