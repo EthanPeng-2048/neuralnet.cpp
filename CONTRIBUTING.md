@@ -232,8 +232,8 @@ clang-format -i path/to/new_file.hpp
 
 ## 9. 数据与第三方内容
 
-代码是 MIT（见 [`LICENSE`](LICENSE)）。但 `scripts/` 下的下载脚本拉取的**数据集各有自己的许可证**
-（TinyStories / OpenWebText / 中文 wiki 等），**不随本项目 MIT 分发**——请自行遵守其条款，
+代码是 LGPL-3.0（LGPLv3，含 GPL-3.0 条款，见 [`LICENSE`](LICENSE)）。但 `scripts/` 下的下载脚本拉取的**数据集各有自己的许可证**
+（TinyStories / OpenWebText / 中文 wiki 等），**不随本项目 LGPL 分发**——请自行遵守其条款，
 也不要把数据集或训练产物提交进仓库。
 
 ---
@@ -244,4 +244,4 @@ clang-format -i path/to/new_file.hpp
 
 ## 11. 许可证
 
-提交贡献即表示你同意以本项目的 [MIT License](LICENSE) 授权你的贡献。
+提交贡献即表示你同意以本项目的 [LGPL-3.0 License](LICENSE) 授权你的贡献。
