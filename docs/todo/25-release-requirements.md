@@ -241,3 +241,61 @@ seq_len=64 / batch=8`，每种配方 **20 step**，GPU：
 - `layer_bench` 配对 A/B **未做系统性回归对比**：本版无 kernel 数值路径改动；最终源码单次功能冒烟
   GPU `matmul` 4.365 ms / 491.9 GFLOPS（hash `cbf7d4478bd536ab`）、`matmul_q` 0.796 ms / 2697.2 GFLOPS
   （hash `c5860cfcfcb371f9`），CPU 512³ 小规模两组哈希齐全（计时受并发负载影响，仅参考）。
+
+## 8. 2026-10-23 `v1.11.0` 发布实跑记录
+
+> 测试对象 = `bc37df3`（`feat(session)!`：TrainingSession 单步协议与 global/micro batch 语义，docs/todo/30）。
+> 同步方式：`git bundle` → 102 `D:\Codes\nn_v111_test` 独立检出（不触碰 102 既有工作区）。
+> 口径：`NN_ENABLE_NATIVE=OFF` 可移植基线；GPU = **NVIDIA CMP 40HX / Vulkan SDK 1.4.350**（原生设备自动选卡）。
+
+### 8.1 第 3 项：完整 ctest（两树全新构建）
+
+| 树 | 构建 | 完整 ctest |
+|---|---|---|
+| 102 Windows clang 23.1 + MSVC STL / **Release** / Vulkan（40HX） | 全新目录 **219/219 步**，0 warning | **59 注册 → 58 pass + 1 skip + 0 fail**（540.31 s）；skip = `scan_bitwise_test`（Windows 平台口径） |
+| 102 WSL g++ 15.2.0 + libstdc++ / Release / **CPU-only** | 全新目录 **112/112 步** | **57 → 39 pass + 18 skip + 0 fail**（67.46 s）；18 skip 均为 GPU 依赖用例 |
+
+### 8.2 第 5 项：文档/门禁审计（Windows 侧，新二进制）
+
+- `bench/gui_cli_audit.py` **PASS 可行动 0**（七节全绿）；
+- `bench/doc_inventory.ps` **GATE PASS**（L2-VIOLATIONS 0、TERMINATING-CALLS 0）；
+- `bench/doc_align_audit.ps1` **可行动 0**。
+- 注：WSL 的 python 无 `tkinter`（无法 import `gui.py`），GUI 门禁以 Windows 侧为准；
+  本机旧二进制曾误报 2 个 GUI 问题（旧 `--help` 文案残留 `--precision-*` 字面量），换新二进制后消失。
+
+### 8.3 端到端训练（新 batch 语义 + 断点兼容，40HX）
+
+数据集 = v1.10.0 验收同款 `datasets/tinystories_20k.nndataset`（66,321 个 seq64 窗口）；
+GPT `d_model=64 / heads=4 / layers=2 / d_ff=128 / seq_len=64`；**`--batch-size 8 --accum-steps 2`
+（global 8 / micro 4）**，20 **update** step：
+
+| 用例 | 结果 |
+|---|---|
+| f32 | 8.7576 → 8.4025 → 8.0519 → **7.6022**（step5/10/15/20） |
+| `--f16` | 8.7676 → 8.3970 → 7.9907 → **7.7230** |
+| `--t1_58` | 8.9011 → 8.6990 → 8.4348 → **8.1010** |
+| 新格式 resume | step20 `.nnckpt` 续 2 步：**7.6539 → 7.5228**（优化器 76 张量 / `t=20` 恢复；计数器按 update step，steps_per_epoch=8291=66321/8） |
+| **legacy 兼容** | v1.10.0 二进制 `--batch-size 4 --accum-steps 2`（micro 语义）产 10 micro-step 断点 → 新二进制 `--resume`：**折算 update step 5**、global batch 恢复 8（=4×2），续训 8.6738 → 8.5822 与 legacy 末值 8.7711 连续 |
+| 禁列 | `resume + --batch-size` 明确报错（A/B 类旗标禁列表生效，输出禁列表 + 迁移提示） |
+
+均无 NaN/Inf/冻结；三组 20-step 约 1.5–2.3 s，loss 健康下降。
+
+### 8.4 环境事故记录（本机构建，非代码问题）
+
+本机 dev 树首轮构建中途出现 `PCH file ... uses an older format`：根因 = **apt 在构建进行中
+（2026-10-23 00:37:38）更新了 clang-24 nightly**，新旧编译器 PCH 格式不兼容，且中途产物混链不可信。
+处置 = 清空 `build/dev` 全新重建。教训：**发布验收构建期间不要更新工具链**。
+
+### 8.5 本机收尾实跑（Linux，2026-10-23）
+
+- **clang 24.0.0 nightly（+libc++）/ Release + GPU / dev preset**：清空 ¤build/dev¤ 全新构建
+  **219/219 步**；ctest **59 注册 → 57 pass + 2 fail**。
+- 2 个失败均为**沙箱内 llvmpipe 软件光栅**的环境差异（ctest 日志：¤GPU: llvmpipe (LLVM 21.1.8)¤；
+  沙箱不可见 ¤/dev/nvidia*¤，见 AGENTS「本机 GPU 测试」口径）：
+  - ¤scan_bitwise_test¤：57/61 例 f16 差 1–2 ULP（如 ¤cpu=0x3aecc000 gpu=0x3aeca000¤）——该测试
+    逐位锚本就以真卡为权威（Windows 平台口径 skip 同因）；
+  - ¤ce_fusion_test¤：CPU 全过；GPU 仅 ¤parity(3,100,x2)¤ 一例 ¤loss_err=5.745e-01¤；
+  - 同批用例在 102 的 40HX 真卡**全绿**（§8.1：ce_fusion/batchnorm 属 58 pass）。
+- ¤batchnorm_test_gpu¤ 首轮在内存颠簸时段 SEGFAULT，单独复跑 **Passed**（11.53 s）——偶发，非确定性失败。
+- 与本版 API 改动直接相关的 ¤training_session_test¤ / ¤text_trainer_test¤ / ¤train_state_test¤ /
+  ¤dataset_samples_test¤ / ¤text_train_modules_test¤ 本机全部 Passed。
