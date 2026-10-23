@@ -45,6 +45,7 @@
 | 只是**用引擎**（张量/矩阵/表达式） | [`../usage/03-compute-engine-usage.md`](../usage/03-compute-engine-usage.md) |
 | 把库**嵌进自己工程** | [`../usage/05-consume-as-library.md`](../usage/05-consume-as-library.md) |
 | 跑现成 CLI / GUI 训练推理 | [`../usage/02-quickstart-train-infer.md`](../usage/02-quickstart-train-infer.md) |
+| 写 RL / PPO / GRPO 或自定义 rollout | [`../usage/06-reinforcement-learning.md`](../usage/06-reinforcement-learning.md) |
 | 看**数据流/AOT 融合**的整体设计 | [`../introduction/01-architecture.md`](../introduction/01-architecture.md)、[`../introduction/04-innovative-designs.md`](../introduction/04-innovative-designs.md) |
 | 融合/IR 的**内部设计**（改库才需要） | [`../todo/02-operator-fusion.md`](../todo/02-operator-fusion.md)、[`../todo/03-ir-optimization.md`](../todo/03-ir-optimization.md) |
 

@@ -42,6 +42,7 @@
 | [计算引擎使用](docs/usage/03-compute-engine-usage.md) | 张量操作、矩阵运算、表达式融合 |
 | [训练包](docs/usage/04-train-package.md) | 用 `.nnpkg` 打包超参+训练集，跨设备一键复现训练 |
 | [作为库嵌入](docs/usage/05-consume-as-library.md) | 把本库嵌进自己的工程（`neuralnet::nn` 门面 / FetchContent） |
+| [强化学习与可组合训练](docs/usage/06-reinforcement-learning.md) | 具名多输出、GAE、REINFORCE/PPO/GRPO、多模型 Session 与 rollout pipeline |
 | [实测结论索引](research/README.md) | **可引用的实验结论**（MNIST 准确率 / f16 回弹根因 / 三值 STE / 三值尺度规则）：结论 + 证据 + 重跑命令 + 边界 |
 | [参与本项目](CONTRIBUTING.md) | 给非作者的入口：构建、测试、代码规范、提 PR、CI 口径 |
 
@@ -78,7 +79,8 @@ neuralnet.cpp/
 │       ├── 02-quickstart-train-infer.md  ← 训练推理教程
 │       ├── 03-compute-engine-usage.md    ← 引擎使用指南
 │       ├── 04-train-package.md           ← .nnpkg 训练包
-│       └── 05-consume-as-library.md      ← 作为库嵌入自己的工程
+│       ├── 05-consume-as-library.md      ← 作为库嵌入自己的工程
+│       └── 06-reinforcement-learning.md  ← RL 与可组合训练基础设施
 │   └── todo/                  ← 内部工作区（**项目开发者**：设计/路线图/盘点/规范/踩坑/故障/整改）
 ├── gui.py                       ← 图形化操作界面 (CustomTkinter)
 ├── include/neuralnet.cpp/

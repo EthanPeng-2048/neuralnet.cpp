@@ -23,6 +23,7 @@
 | 搭 MLP / Transformer / CNN / GPT / RAPT 模型 | §7、§8 |
 | 用现成模型工厂一条命令建模型 | §8 |
 | 算 loss、建优化器、写训练循环 | §9、§10、§11（文本训练推荐 `nn::TextTrainer`） |
+| 写 RL / PPO / GRPO / 多模型角色 / rollout pipeline | [`../usage/06-reinforcement-learning.md`](../usage/06-reinforcement-learning.md) |
 | 保存 / 加载 `.nnmodel` / `.nnckpt`、读架构 spec | §12 |
 | 读 `.nndataset` 数据集（含训练样本/窗口） | §13 |
 | 训练 / 使用分词器、编码解码 | §14 |
@@ -57,6 +58,7 @@
 #include <neuralnet.cpp/optimizer.hpp>  // Optimizer + create_optimizer
 #include <neuralnet.cpp/model.hpp>      // Model / ModelSpec / save_model / load_model
 #include <neuralnet.cpp/train.hpp>      // 上面五者的合集（写训练循环够用）
+#include <neuralnet.cpp/rl.hpp>         // RL：schema/named output/experience/objectives/pipeline
 ```
 
 模型工厂（`build_gpt_model` 等）与分词器在 `domain_*.hpp`（已随 `nn.hpp` 一起引入）。

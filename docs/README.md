@@ -56,6 +56,7 @@
 | [`03-compute-engine-usage.md`](usage/03-compute-engine-usage.md) | 计算引擎使用：张量、矩阵、表达式融合 |
 | [`04-train-package.md`](usage/04-train-package.md) | `.nnpkg` 训练包 |
 | [`05-consume-as-library.md`](usage/05-consume-as-library.md) | 把库嵌进自己工程（`neuralnet::nn` 门面 / FetchContent） |
+| [`06-reinforcement-learning.md`](usage/06-reinforcement-learning.md) | RL：具名多输出、experience/GAE、REINFORCE/PPO/GRPO、多模型 Session、可替换 rollout pipeline |
 
 ### development/（给调用者）
 
@@ -82,7 +83,7 @@
 - `todo/27-execution-plan.md` — **执行计划（优先级象限）**："下一个先做哪个"。
 - `todo/31-rl-training-primitives.md` — **当前 RL 主线与通用训练基础设施**：具名多输出、schema 化
   experience、可组合 policy objectives、`TrainingGroupSession` 与可替换编排（issue #23 是能力下界；
-  f16 / 训练性能项暂缓）。
+  f16 / 训练性能项暂缓）。**2026-10-23 ✅ 已实施**；调用指南见 `usage/06-reinforcement-learning.md`。
 - `todo/12` / `todo/17` / `todo/19` / `todo/21` / `todo/22` / `todo/23` — 现行设计/盘点。
 - `todo/28` / `todo/29` / `todo/30` — **生命周期 v3 / Session 层 / TrainingSession 单步协议**
   （P2a/P2b 已随 `v1.10.0` 发布；30 号于 2026-10-22 冻结 micro-batch、梯度累积与 global-batch 归一化边界，随 `v1.11.0` 发布）。

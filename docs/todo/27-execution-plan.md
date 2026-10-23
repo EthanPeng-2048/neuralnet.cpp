@@ -22,25 +22,15 @@
 - 归类描述**当前**判断。一项若天然分"定位"与"修复"两步，两步可落不同象限（例：C10 归因便宜、修复未定）。
 - 象限只回答顺序，**不改变验收口径**：每项的"做到什么算完成"一律引 18 号对应行。
 
-## 2. 当前主线（2026-10-23 用户裁定）
+## 2. RL 主线（2026-10-23 已完成）
 
-需求与架构唯一真源 = [`31-rl-training-primitives.md`](31-rl-training-primitives.md)；
-裁定台账 = [`18-roadmap.md`](18-roadmap.md) §4.6。issue #23 是能力下界；公共 API 按“未知
-库消费者”设计，保留 schema、组件和编排扩展面。MCTS / 游戏规则 / 自对局留在消费者。
+RL-0 → RL-1a/b/c/d → RL-2a/b 全链已落地，公共契约、组件与编排接口按
+[`31-rl-training-primitives.md`](31-rl-training-primitives.md) 冻结；验收与落点见该文 §11，
+裁定状态见 [`18-roadmap.md`](18-roadmap.md) §4.6。调用指南在
+[`../usage/06-reinforcement-learning.md`](../usage/06-reinforcement-learning.md)。
 
-| 顺序 | 项 | 为什么现在做 | 第一步动作 | 验收归属 |
-|---|---|---|---|---|
-| **1** | **公共基础契约** | 输出、experience、metrics、checkpoint 若各自造封闭结构，会锁定所有上层 API | 先冻结 `TensorSchema` / `NamedTensorSet` / `GradientBundle` / checkpoint section 的名称、shape 与 hot-path handle 语义 | 31 §3 / §8 / 18 §4.6 |
-| **2** | **RL-0 通用输出协议** | 具名多输出是通用模型能力；策略/价值双头只是首个用例 | 实现 named output + `OutputBundleLayer` + `RowBandPacking` + ModelSpec，先写 named/packed 等价与梯度分流门禁 | 31 §6 RL-0 / 18 §4.6 |
-| **3** | **RL-1a experience 与 transforms** | GAE、return/group normalization 是多个算法共同底座，且必须允许自定义字段 | 实现 schema 化 experience、字段 handle、GAE/done/mask/零方差 transform 与 scan 表达 | 31 §6 RL-1 / 18 §4.6 |
-| **4** | **RL-1b distribution + REINFORCE** | 先以最小闭环证明 named outputs、component gradient 与 TrainingSession 接线 | 实现 categorical distribution、低层 objective components、REINFORCE preset 和有限差分门禁 | 31 §6 RL-1 / 18 §4.6 |
-| **5** | **RL-1c PPO** | issue #23 的核心算法需求；验证 clip 三分支、value clip 与组件复用 | 手工组件组合与 PPO preset 对拍，再跑 CPU/GPU smoke | 31 §6 RL-1 / 18 §4.6 |
-| **6** | **RL-1d GRPO** | 复用 PPO surrogate 与 group transform，补多组/零方差边界 | 先写 group schema/transform，再接标准 preset | 31 §6 RL-1 / 18 §4.6 |
-| **7** | **RL-2a TrainingGroupSession** | 多模型生命周期与复用面远超 RL；专用 RL Session 会制造第二套更新语义 | 实现具名可训练/只读 role、移动/析构与 engine/schema 校验 | 31 §5.2 / §6 RL-2 |
-| **8** | **RL-2b 编排组件与 pipeline** | 未知消费者需要替换 rollout、buffer、sampler、metrics、checkpoint，而不是接受单一训练循环 | 先冻结接口，再装配标准 on-policy pipeline；buffer 存储/采样和 checkpoint section 分别验收 | 31 §5.3 / §6 RL-2 |
-
-**暂缓名单**：P2-14 真 f16、P2-15 标准 `--f16`、P4-1 性能利用率、P4-2 算子性能、
-P4-3 显存 L3。它们与 RL 无正确性依赖；RL 完成前不启动，也不成为 RL 门禁。
+按本文维护约定，完成项不再留在执行表。后续 RL 扩展（连续/多离散分布、领域 replay、
+消费者自定义 checkpoint 格式）由真实调用方触发；f16 与性能 backlog 仍按裁定暂缓。
 
 ## 3. 象限（一）重要且简单——建议按序做
 

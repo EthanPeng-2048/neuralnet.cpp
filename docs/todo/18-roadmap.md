@@ -11,9 +11,9 @@
 ## 0. 一句话
 
 项目已从“包揽训练/推理的应用”转向库，公共 API 不能只围绕已知内部调用方设计；能力边界优先按
-解耦、复用和可组合性规划，实施顺序再按资源分批。**当前主线（2026-10-23 用户裁定）= RL 与
-可组合训练基础设施**（具名输出/schema → experience/objective 组件 → 通用多模型会话/编排，
-见 [`31`](31-rl-training-primitives.md)）；f16 与训练性能优化保留为已立项 backlog，**当前暂缓执行**。
+解耦、复用和可组合性规划，实施顺序再按资源分批。**RL 与可组合训练基础设施已按 2026-10-23
+用户裁定完成**（具名输出/schema → experience/objective 组件 → 通用多模型会话/编排，
+见 [`31`](31-rl-training-primitives.md) §11）；f16 与训练性能优化保留为已立项 backlog，等待后续排序。
 工程门禁与生态缺口继续按既有裁定处理。
 
 ## 1. 定位与用法
@@ -159,7 +159,7 @@ P4 = 持续优化方向（底座已稳后继续加杠杆，2026-10-14 立项，�
 
 | 期 | 项数 | 项目 | 共同前置 |
 |---|---|---|---|
-| **RL（当前主线）** | 3 | **RL-0 通用多输出协议 → RL-1 schema 化 experience 与策略目标组件 → RL-2 通用多模型会话/编排**；issue #23 是能力下界，公共 API 面向未知库消费者；见 [`31`](31-rl-training-primitives.md)、[`27`](27-execution-plan.md) §2 | 无；以 f32 正确性先行，不等待 f16 / 性能项 |
+| **RL** ✅ 2026-10-23 | 3 | **RL-0 通用多输出协议 → RL-1 schema 化 experience 与策略目标组件 → RL-2 通用多模型会话/编排**；issue #23 是能力下界，公共 API 面向未知库消费者；见 [`31`](31-rl-training-primitives.md) §11、[`../usage/06-reinforcement-learning.md`](../usage/06-reinforcement-learning.md) | 无；以 f32 正确性先行，不等待 f16 / 性能项 |
 | **P0** | 5 | CI 真跑测试（**✅**）、文档一致性回正（**✅ 2026-10-15**）、BatchNorm 禁止静默回落（**✅**）、CMake install/export + presets（嵌入路径 ✅ / install 用户裁定不做）、**推理采样 top-k/top-p + 多轮对话闭环（✅ 2026-10-16，两半齐，见 §4.1 P0-5 行）** | 无（P0-1 是所有人的前置） |
 | **P1** | 8 | `text_train` 模块化（**✅ 2026-10-16**）、checkpoint 优化器状态（P1-2，**✅ 2026-10-16**）、危险精度组合启动期告警（细则见 [`24`](24-f16-training-defects.md)）、`gpt_test` flaky（**✅ 2026-10-15**）、CI 冒烟扩 MSVC Debug（**✅ 2026-10-18**）、**自定义层使用文档 + 精度自检**（P1-6 **✅ 2026-10-14**）、**三值模型续训入口**（P1-7，**✅ 2026-10-16**）、**生命周期 v3 + Session 层**（P1-8，🟡 2026-10-20 立项，见 [`28`](28-lifecycle-v3.md)/[`29`](29-session-architecture.md)） | P0-1；P1-6 无依赖 |
 | **P2** | 15 | `.bin` 校验和（**✅ 2026-10-16，随 P1-2 同批交付**）、Adafactor、RAPT/CNN f16、Dataset/DataLoader、Python/C 绑定、GUI 两项、header 拆分、F16C、step 内固定 I/O 开销（P2-9）、**原生 f16 算术用足（P2-10）**、**编译期精度特化（P2-11，已完成）**、**优化器 f16 批量派发（P2-12）**、**f16 K 切分/fine tile（P2-13）**、**全流程真 f16（P2-14，⏸）**、**标准 `--f16` / PyTorch AMP（P2-15，⏸）** | P0-1；P2-7 另需 P1-5（**✅ 2026-10-18**）；P2-6 另需 P0-5 |
@@ -280,9 +280,9 @@ ZiPT 恢复、LRLA、CUDA、分布式（7 项）。
 
 | 阶段 | 内容 | 验收口径 | 依赖 |
 |---|---|---|---|
-| **RL-0 通用输出协议** | `TensorSchema`/`NamedTensorSet`/`GradientBundle`、`OutputSchema`、具名 forward/backward、可选 `RowBandPacking`、ModelSpec 输出 schema | named API 可直接取端口；named backward 按端口分流并正确合并 trunk 梯度；packed 路径与 named 数值一致；非法 schema/布局明确报错；旧单输出文件零破坏 | 无 |
-| **RL-1 experience 与策略目标** | schema 化 experience、GAE/return/group transform、policy distribution、policy/value/entropy/KL components、REINFORCE/PPO/GRPO presets | 自定义字段可扩展；标准 preset 与手工组件组合数值一致；解析值/有限差分/边界/CPU-GPU smoke；只用 `Loss` + DSL，零新引擎原语 / shader | RL-0 |
-| **RL-2 通用多模型与编排** | `TrainingGroupSession`；rollout source、buffer、sampler、metrics sink、可扩展 checkpoint provider | 多可训练/只读角色生命周期正确；source/buffer/checkpoint 可替换；seed 可复现；不改变 TrainingSession 归一化语义 | 公共基础（RL-0/1 定型时一并冻结） |
+| **RL-0 通用输出协议** ✅ | `TensorSchema`/`NamedTensorSet`/`GradientBundle`、`OutputSchema`、具名 forward/backward、可选 `RowBandPacking`、ModelSpec 输出 schema | named API 可直接取端口；named backward 按端口分流并正确合并 trunk 梯度；packed 路径与 named 数值一致；非法 schema/布局明确报错；旧单输出文件零破坏 | 无 |
+| **RL-1 experience 与策略目标** ✅ | schema 化 experience、GAE/return/group transform、policy distribution、policy/value/entropy/KL components、REINFORCE/PPO/GRPO presets | 自定义字段可扩展；标准 preset 与手工组件组合数值一致；解析值/有限差分/边界/CPU-GPU smoke；只用 `Loss` + DSL，零新引擎原语 / shader | RL-0 |
+| **RL-2 通用多模型与编排** ✅ | `TrainingGroupSession`；rollout source、buffer、sampler、metrics sink、可扩展 checkpoint provider | 多可训练/只读角色生命周期正确；source/buffer/checkpoint 可替换；seed 可复现；不改变 TrainingSession 归一化语义 | 公共基础（RL-0/1 定型时一并冻结） |
 
 **设计边界**：issue #23 是能力下界，不是公共 API 上界。不得以 `TextTrainer`、
 go.neuralnet.cpp 或当前内部调用方式限制 schema、objective、buffer、RNG、metrics 和 checkpoint
@@ -291,8 +291,10 @@ go.neuralnet.cpp 或当前内部调用方式限制 schema、objective、buffer�
 **非目标（当前交付）**：MCTS、游戏规则、环境、自对局 worker 池（留在消费者）；
 CUDA、分布式训练；完整动态图/自动微分框架；为 RL 新增引擎原语或 shader。
 
-**优先级**：f16（P2-14/P2-15）与训练性能（P4-1/P4-2/P4-3）暂缓。RL 先以 f32 完成正确性，
-不把尚未完成的 f16 / 加速项作为前置。
+**实施状态（2026-10-23）**：RL-0、RL-1、RL-2 全部完成；实现/门禁清单见
+[`31`](31-rl-training-primitives.md) §11，使用文档见
+[`../usage/06-reinforcement-learning.md`](../usage/06-reinforcement-learning.md)。
+f16（P2-14/P2-15）与训练性能（P4-1/P4-2/P4-3）仍按原裁定暂缓，等待后续优先级重排。
 
 ## 5. 13 号清单逐条裁定表
 

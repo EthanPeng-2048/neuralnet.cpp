@@ -1,7 +1,7 @@
 # 31 — RL 训练原语与可组合训练基础设施
 
 > **读者**：项目开发者（本仓内部设计文档）。
-> **状态**：⏳ **架构已冻结、未实施（2026-10-23）**。
+> **状态**：✅ **已实施（2026-10-23，分支 `dev/rl_training`）**。
 > **需求来源**：[GitHub issue #23](https://github.com/EthanPeng-2048/neuralnet.cpp/issues/23)。
 > **用户裁定（2026-10-23）**：当前主线切到 RL；f16 与训练性能项继续后移，不作为 RL 的前置。
 > **2026-10-23 库化修正**：issue #23 是能力**下界**，不是范围上界。公共 API 不得以
@@ -482,3 +482,24 @@ go.neuralnet.cpp 只作为消费者样例：
 - 下游 smoke 至少证明 named output、组合梯度和一次 optimizer update。
 
 该示例不进入上游公共 API 命名，也不成为其他消费者的能力上限。
+
+## 11. 实施结果（2026-10-23）
+
+RL-0、RL-1a/b/c/d、RL-2a/b 已按依赖顺序落地：
+
+| 阶段 | 代码落点 | 门禁 |
+|---|---|---|
+| 公共契约 | `tensor_schema.hpp`、`named_tensor_set.hpp` | `tensor_schema_test` |
+| RL-0 | `compute_layer_bundle.hpp`、`Model::forward_named/backward_named`、ModelSpec schema/packing | `rl_output_test` |
+| RL-1a | `rl_experience.hpp`：TensorRecord/PolicyBatchView/GAE/return/group normalization | `rl_experience_test` |
+| RL-1b | `rl_policy.hpp`：PolicyDistribution、categorical、REINFORCE、value/entropy/KL 组件 | `rl_policy_test` |
+| RL-1c | ClippedPolicy/ClippedValue/PpoObjective | `rl_ppo_test` + `rl_gpu_smoke_test` |
+| RL-1d | GroupAdvantage + GrpoObjective | `rl_grpo_test` + `rl_gpu_smoke_test` |
+| RL-2a | `training_group_session.hpp` | `training_group_session_test` |
+| RL-2b | `rl_pipeline.hpp`：source/buffer/sampler/metrics/checkpoint/hooks | `rl_pipeline_test` |
+
+实现边界与设计一致：没有新增引擎原语/shader；environment/MCTS/规则仍在消费者；
+首版分布是 categorical，但 objective 依赖 `PolicyDistribution` 接口；通用 checkpoint
+provider 只固定 pipeline 自身 RNG/计数 section，消费者 buffer/replay 可保存自定义 section。
+
+调用文档：[`../usage/06-reinforcement-learning.md`](../usage/06-reinforcement-learning.md)。
