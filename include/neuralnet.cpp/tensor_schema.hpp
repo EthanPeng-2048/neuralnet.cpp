@@ -309,6 +309,9 @@ public:
     }
 };
 
+// 输出侧语义别名：端口、ModelSpec 与 GradientBundle 共享同一有序 schema。
+using OutputSchema = TensorSchema;
+
 // ── Schema 紧凑二进制编解码（ModelSpec / checkpoint 扩展 section 共用）────
 //
 // 布局（小端）：
