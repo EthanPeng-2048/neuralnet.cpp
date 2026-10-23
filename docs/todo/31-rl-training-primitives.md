@@ -503,3 +503,15 @@ RL-0、RL-1a/b/c/d、RL-2a/b 已按依赖顺序落地：
 provider 只固定 pipeline 自身 RNG/计数 section，消费者 buffer/replay 可保存自定义 section。
 
 调用文档：[`../usage/06-reinforcement-learning.md`](../usage/06-reinforcement-learning.md)。
+
+### 11.1 全量验收（2026-10-23，`ethan@192.168.1.102`）
+
+- Windows / clang 23.1 / MSVC STL / Debug；
+- CPU-only（`NN_ENABLE_GPU=OFF`，tests ON）：**66/66**，其中 **45 pass + 21 skip**；
+- Vulkan（40HX）：**68/68**，其中 **65 pass + 3 skip**；
+- `scan_exprs`：库内 **158 条**融合表达式，RL 的 PPO clip/value、梯度选择和 reduction
+  路径均已进入闭合世界；
+- `rl_gpu_smoke_test` 覆盖 GAE、PPO preset、GRPO preset 的设备执行，通过。
+
+skip 均为既有条件门禁（无 GPU 构建的 GPU 用例、缺失 CLI app 的发现类用例、以及
+`scan_bitwise_test` 的平台口径），没有 RL 用例被跳过。

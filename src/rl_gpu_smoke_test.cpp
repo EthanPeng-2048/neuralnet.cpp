@@ -42,7 +42,7 @@ bool finite(nn::ComputeEngine& engine, const nn::Tensor& tensor)
     return true;
 }
 
-void run_smoke(nn::ComputeEngine& engine)
+[[maybe_unused]] void run_smoke(nn::ComputeEngine& engine)
 {
     auto reward = matrix_tensor(engine, 2, 2, {1, 2, 3, 4});
     auto done = matrix_tensor(engine, 2, 2, {0, 0, 1, 1});
