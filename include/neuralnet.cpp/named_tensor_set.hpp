@@ -220,6 +220,10 @@ public:
     {
         return values_.require(handle);
     }
+    [[nodiscard]] Result<Tensor*> require(const FieldHandle& handle)
+    {
+        return values_.require(handle);
+    }
     [[nodiscard]] const Tensor* find(const FieldHandle& handle) const noexcept
     {
         return values_.find(handle);

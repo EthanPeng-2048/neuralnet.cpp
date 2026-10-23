@@ -205,11 +205,32 @@ nn::PpoObjective ppo(cfg);
 auto report = NN_UNWRAP(
     ppo.evaluate(engine, model_output_schema, policy_logits, value, view));
 
-NN_UNWRAP(model.backward_named(report.gradients));
+// 推荐：让 TrainingSession 统一处理 global normalization / 累积 / clip / step。
+nn::TrainingStepOptions options;
+options.normalization_units = valid_action_count;
+auto step = NN_UNWRAP(session.train_named_step(
+    micro_batch, options,
+    [&](nn::Model& model, nn::ComputeEngine& engine,
+        const MicroBatch& input) -> nn::Result<nn::NamedTrainingStepOutput> {
+        auto outputs = NN_UNWRAP(model.forward_named(input.tensor));
+        auto policy = NN_UNWRAP(outputs.require("policy"));
+        auto value = NN_UNWRAP(outputs.require("value"));
+        auto report = NN_UNWRAP(
+            ppo.evaluate(engine, model_output_schema,
+                         *policy, *value, view));
+        return nn::NamedTrainingStepOutput{
+            .gradients = std::move(report.gradients),
+            .gradient_units = valid_action_count,
+            .loss_sum = nn::Tensor{},
+            .loss_units = 0,
+        };
+    }));
 ```
 
 `PpoReport` 同时提供 policy/value loss、entropy、approx KL、policy/value clip
 fraction。缺失 `old_log_prob`、`old_value` 或显式 mask 会返回可定位错误。
+`train_named_step` 与单输出 `train_step` 使用同一 update/累积/归一化语义，只把
+最后一层 backward 换成 `Model::backward_named`。
 
 ## 8. GRPO
 
@@ -301,6 +322,7 @@ on-policy epoch 或自定义 sampler。
 | `rl_grpo_test` | 多组、零方差、preset 等价 |
 | `training_group_session_test` | 多 role 生命周期/引擎校验/move |
 | `rl_pipeline_test` | source/buffer/sampler/metrics/checkpoint/hooks/seed |
+| `rl_training_integration_test` | PPO named gradients → TrainingSession optimizer update |
 | `rl_gpu_smoke_test` | Vulkan AOT 闭合世界 |
 
 新增 RL 内联表达式时，`tools/scan_exprs.cpp` 必须触达对应运行路径；GPU 未登记

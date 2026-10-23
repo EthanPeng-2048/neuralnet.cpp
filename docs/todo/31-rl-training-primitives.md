@@ -497,6 +497,7 @@ RL-0、RL-1a/b/c/d、RL-2a/b 已按依赖顺序落地：
 | RL-1d | GroupAdvantage + GrpoObjective | `rl_grpo_test` + `rl_gpu_smoke_test` |
 | RL-2a | `training_group_session.hpp` | `training_group_session_test` |
 | RL-2b | `rl_pipeline.hpp`：source/buffer/sampler/metrics/checkpoint/hooks | `rl_pipeline_test` |
+| 单 Session 闭环 | `TrainingSession::train_named_step`：GradientBundle → backward_named → optimizer | `rl_training_integration_test` |
 
 实现边界与设计一致：没有新增引擎原语/shader；environment/MCTS/规则仍在消费者；
 首版分布是 categorical，但 objective 依赖 `PolicyDistribution` 接口；通用 checkpoint

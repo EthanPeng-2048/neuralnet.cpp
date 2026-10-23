@@ -87,6 +87,16 @@ struct TrainingStepOutput
     std::size_t loss_units = 0;
 };
 
+// 具名多输出模型的 micro-step 结果。字段必须覆盖本次 forward 产生的输出端口；
+// Session 只负责按 global normalization 缩放并交给 Model::backward_named。
+struct NamedTrainingStepOutput
+{
+    GradientBundle gradients;
+    std::size_t gradient_units = 0;
+    Tensor loss_sum;
+    std::size_t loss_units = 0;
+};
+
 struct TrainingStepOptions
 {
     std::optional<Scalar> lr;
@@ -251,6 +261,163 @@ public:
             else
             {
                 auto ar = engine().accumulate(state_.pending_loss_sum, out.loss_sum);
+                if (!ar)
+                {
+                    state_.accumulation_dirty = true;
+                    NN_FAIL(ar.error());
+                }
+            }
+            state_.pending_loss_units += out.loss_units;
+        }
+
+        auto end_r = rec.finish();
+        if (!end_r)
+        {
+            state_.accumulation_dirty = true;
+            NN_FAIL(end_r.error());
+        }
+        ++state_.microsteps_in_update;
+
+        const bool update_ready =
+            state_.microsteps_in_update >= cfg_.grad_accum_steps;
+        if (!update_ready && !options.force_update)
+        {
+            TrainingStepReport report;
+            report.optimizer_step = state_.optimizer_step;
+            report.microsteps_accumulated = state_.microsteps_in_update;
+            return report;
+        }
+
+        if (options.before_update)
+        {
+            auto stop_r = options.before_update();
+            if (!stop_r)
+            {
+                state_.accumulation_dirty = true;
+                NN_FAIL(stop_r.error());
+            }
+            if (*stop_r)
+            {
+                auto rr = reset_accumulation();
+                NN_TRY_CHECK(rr);
+                TrainingStepReport report;
+                report.aborted = true;
+                report.optimizer_step = state_.optimizer_step;
+                return report;
+            }
+        }
+
+        auto update_r = finish_update_(options);
+        NN_TRY_CHECK(update_r);
+
+        TrainingStepReport report;
+        report.parameters_updated = true;
+        report.optimizer_step = state_.optimizer_step;
+        report.microsteps_accumulated = state_.microsteps_in_update;
+        report.loss_sum = std::move(state_.pending_loss_sum);
+        report.loss_units = state_.pending_loss_units;
+        clear_accumulation_state_();
+        return report;
+    }
+
+    // 具名多输出版本：更新/累积/归一化/裁剪语义与 train_step 完全一致，唯一差别
+    // 是 step_fn 返回 GradientBundle 并走 Model::backward_named。
+    template <class Batch, class StepFn>
+    [[nodiscard]] Result<TrainingStepReport>
+    train_named_step(const Batch& batch, TrainingStepOptions options,
+                     StepFn&& step_fn)
+    {
+        if (state_.accumulation_dirty)
+            NN_FAIL("TrainingSession::train_named_step: 上一次失败留下了不完整"
+                    "梯度；请先 reset_accumulation()");
+        if (options.normalization_units == 0)
+            NN_FAIL("TrainingSession::train_named_step: normalization_units "
+                    "必须 > 0");
+
+        const bool starts_update = state_.microsteps_in_update == 0;
+        if (starts_update)
+        {
+            if (options.lr) set_lr(*options.lr);
+            state_.update_lr = state_.current_lr;
+            state_.update_normalization_units = options.normalization_units;
+        }
+        else
+        {
+            if (options.lr && *options.lr != state_.update_lr)
+                NN_FAIL("TrainingSession::train_named_step: 同一 update 的 lr "
+                        "发生变化");
+            if (options.normalization_units != state_.update_normalization_units)
+                NN_FAIL("TrainingSession::train_named_step: 同一 update 的 "
+                        "normalization_units 发生变化（" +
+                        std::to_string(state_.update_normalization_units) +
+                        " vs " +
+                        std::to_string(options.normalization_units) + "）");
+        }
+
+        Result<void> begin_r = starts_update ? begin_and_zero_() : Result<void>{};
+        NN_TRY_CHECK(begin_r);
+
+        RecordingGuard rec{engine()};
+        auto out_r = step_fn(model_, engine(), batch);
+        if (!out_r)
+        {
+            state_.accumulation_dirty = true;
+            NN_FAIL(out_r.error());
+        }
+        NamedTrainingStepOutput out = std::move(*out_r);
+        if (out.gradients.size() == 0)
+        {
+            state_.accumulation_dirty = true;
+            NN_FAIL("TrainingSession::train_named_step: Step 回调返回了空梯度包");
+        }
+
+        if (out.gradient_units > 0 &&
+            options.normalization_units != out.gradient_units)
+        {
+            if (out.gradient_units > options.normalization_units)
+            {
+                state_.accumulation_dirty = true;
+                NN_FAIL("TrainingSession::train_named_step: gradient_units "
+                        "超出 normalization_units（" +
+                        std::to_string(out.gradient_units) + " > " +
+                        std::to_string(options.normalization_units) + "）");
+            }
+            const Scalar scale =
+                static_cast<Scalar>(out.gradient_units) /
+                static_cast<Scalar>(options.normalization_units);
+            for (std::size_t i = 0; i < out.gradients.schema().size(); ++i)
+            {
+                const FieldHandle handle{
+                    out.gradients.schema().fingerprint(), i};
+                auto grad_r = out.gradients.require(handle);
+                NN_TRY_CHECK(grad_r);
+                if (*grad_r == nullptr) continue;
+                auto sr = engine().scale_inplace(**grad_r, scale);
+                if (!sr)
+                {
+                    state_.accumulation_dirty = true;
+                    NN_FAIL(sr.error());
+                }
+            }
+        }
+
+        auto bwd = model_.backward_named(out.gradients);
+        if (!bwd)
+        {
+            state_.accumulation_dirty = true;
+            NN_FAIL(bwd.error());
+        }
+
+        if (out.loss_sum.valid())
+        {
+            if (!state_.pending_loss_sum.valid())
+            {
+                state_.pending_loss_sum = std::move(out.loss_sum);
+            }
+            else
+            {
+                auto ar = engine().accumulate(state_.pending_loss_sum,
+                                              out.loss_sum);
                 if (!ar)
                 {
                     state_.accumulation_dirty = true;

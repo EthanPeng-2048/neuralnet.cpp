@@ -52,7 +52,7 @@ cmake -B build -G Ninja -DNN_ENABLE_TESTS=ON && cmake --build build && ctest --t
 | 表达式 DSL / 融合 IR | `expr_dsl.hpp` / `expr_spec.hpp` / `expr_opt.hpp` / `expr_registry.hpp` / `expr_graph.hpp`（IR-C 图融合 = **现行能力**：`expr_graph.hpp` + `begin_expr/end_expr` + `dsl::start_expr/end_expr` + GPU 图执行；P1 链/P2 写穿多输出，已接入 Adam/AdamW step） |
 | 后端代码生成（IR-D emitter 抽象） | `expr_emitter.hpp`（注册表）+ `expr_glsl_gen.hpp`（GlslEmitter） |
 | 模型容器/规格/序列化 | `model_container.hpp` / `model_spec.hpp` / `model_serialization.hpp` / `model_keyvalue_record.hpp` |
-| 训练生命周期容器（推荐入口） | `training_session.hpp`：`TrainingSession` 拥有 `Model` + `Optimizer` + `TrainingSessionState`（optimizer 先于 Model 析构），`train_step(micro_batch, options, step_fn)` 内置梯度累积并完成一次 update；不拥有数据/epoch/lr 曲线/断点策略（docs/todo/30） |
+| 训练生命周期容器（推荐入口） | `training_session.hpp`：`TrainingSession` 拥有 `Model` + `Optimizer` + `TrainingSessionState`（optimizer 先于 Model 析构），`train_step` 处理单 Tensor 输出，`train_named_step` 处理 `GradientBundle`/具名多输出；两者共享累积/归一化/update 语义。不拥有数据/epoch/lr 曲线/断点策略（docs/todo/30） |
 | RL 与可组合训练 | `rl.hpp` 薄聚合；`tensor_schema.hpp`/`named_tensor_set.hpp`、`compute_layer_bundle.hpp`、`rl_experience.hpp`、`rl_policy.hpp`、`training_group_session.hpp`、`rl_pipeline.hpp`。指南 `docs/usage/06-reinforcement-learning.md` |
 | 训练工厂（数据集 → global batch → 循环） | `text_trainer.hpp`：`nn::TextTrainer`（`create(session, dataset, TextTrainConfig)` → `fit()`；global→micro batch 切分、shuffle/lr 调度/非阻塞 loss 回读/测试评估/`TrainState` 与断点状态装配；Step 回调承载文本 sparse-CE）+ `text_train_config.hpp`（`nn::TextTrainConfig` = 训练配方唯一真源）+ `lr_scheduler.hpp`（update-step 级 lr） |
 | MNIST / GPT / CNN / RLA / 分词器 模型工厂 | `domain_mnist.hpp` / `domain_gpt.hpp` / `domain_cnn.hpp` / `domain_rla.hpp` / `domain_tokenizer{,_base,_bpe,_charbpe}.hpp` |
