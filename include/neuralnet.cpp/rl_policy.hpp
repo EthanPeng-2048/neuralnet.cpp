@@ -28,15 +28,9 @@
 namespace nn
 {
 
-class CategoricalDistribution
+class PolicyDistribution
 {
 public:
-    struct Probabilities
-    {
-        Tensor softmax;
-        Tensor log_softmax;
-    };
-
     struct Evaluation
     {
         Tensor value;
@@ -49,7 +43,32 @@ public:
         Tensor log_prob;
     };
 
+    virtual ~PolicyDistribution() = default;
+    virtual Result<Tensor> log_prob(
+        ComputeEngine& engine, const Tensor& parameters,
+        const Tensor& actions) const = 0;
+    virtual Result<Tensor> entropy(
+        ComputeEngine& engine, const Tensor& parameters) const = 0;
+    virtual Result<Evaluation> log_prob_with_gradient(
+        ComputeEngine& engine, const Tensor& parameters,
+        const Tensor& actions, const Tensor& upstream) const = 0;
+    virtual Result<Evaluation> entropy_with_gradient(
+        ComputeEngine& engine, const Tensor& parameters,
+        const Tensor& upstream) const = 0;
+    virtual Result<SampleResult> sample(
+        ComputeEngine& engine, const Tensor& parameters,
+        std::uint64_t seed) const = 0;
+};
+
+class CategoricalDistribution final : public PolicyDistribution
+{
 private:
+    struct Probabilities
+    {
+        Tensor softmax;
+        Tensor log_softmax;
+    };
+
     Precision precision_ = Precision::F32;
 
     [[nodiscard]] Result<void> validate_actions(
@@ -122,7 +141,7 @@ public:
 
     [[nodiscard]] Result<Tensor> log_prob(
         ComputeEngine& engine, const Tensor& logits,
-        const Tensor& actions) const
+        const Tensor& actions) const override
     {
         NN_TRY_CHECK(validate_actions(engine, logits, actions));
         NN_TRY(probs, probabilities(engine, logits));
@@ -137,7 +156,7 @@ public:
     }
 
     [[nodiscard]] Result<Tensor> entropy(
-        ComputeEngine& engine, const Tensor& logits) const
+        ComputeEngine& engine, const Tensor& logits) const override
     {
         NN_TRY(probs, probabilities(engine, logits));
         NN_TRY(term,
@@ -155,7 +174,7 @@ public:
 
     [[nodiscard]] Result<Evaluation> log_prob_with_gradient(
         ComputeEngine& engine, const Tensor& logits, const Tensor& actions,
-        const Tensor& upstream) const
+        const Tensor& upstream) const override
     {
         NN_TRY_CHECK(validate_actions(engine, logits, actions));
         if (upstream.rows() != 1 || upstream.cols() != logits.cols())
@@ -184,7 +203,7 @@ public:
 
     [[nodiscard]] Result<Evaluation> entropy_with_gradient(
         ComputeEngine& engine, const Tensor& logits,
-        const Tensor& upstream) const
+        const Tensor& upstream) const override
     {
         if (upstream.rows() != 1 || upstream.cols() != logits.cols())
             NN_FAIL("CategoricalDistribution: entropy upstream 必须为 (1,T)");
@@ -215,7 +234,7 @@ public:
 
     [[nodiscard]] Result<SampleResult> sample(
         ComputeEngine& engine, const Tensor& logits,
-        std::uint64_t seed) const
+        std::uint64_t seed) const override
     {
         if (logits.rows() == 0 || logits.cols() == 0)
             NN_FAIL("CategoricalDistribution::sample: logits 不能为空");
@@ -354,14 +373,18 @@ class ReinforceObjective final : public ContextualObjective
 {
 private:
     bool use_old_value_baseline_ = false;
-    CategoricalDistribution distribution_;
+    std::shared_ptr<const PolicyDistribution> distribution_;
 
 public:
     explicit ReinforceObjective(
         bool use_old_value_baseline = false,
-        Precision precision = Precision::F32)
+        Precision precision = Precision::F32,
+        std::shared_ptr<const PolicyDistribution> distribution = {})
         : use_old_value_baseline_(use_old_value_baseline),
-          distribution_(precision)
+          distribution_(distribution
+                            ? std::move(distribution)
+                            : std::make_shared<CategoricalDistribution>(
+                                  precision))
     {
         PrecisionProfile p;
         p.stable = precision;
@@ -409,14 +432,14 @@ protected:
         }
 
         NN_TRY(logp,
-               distribution_.log_prob(engine, logits, batch.action()));
+               distribution_->log_prob(engine, logits, batch.action()));
         NN_TRY(weighted_adv,
                dsl::compute(engine,
                             dsl::leaf(*advantage) * dsl::leaf(mask) *
                                 dsl::rparam(-Scalar{1} / units),
                             1, logits.cols(), precision()));
         NN_TRY(eval,
-               distribution_.log_prob_with_gradient(
+               distribution_->log_prob_with_gradient(
                    engine, logits, batch.action(), *weighted_adv));
         NN_TRY(loss_terms,
                dsl::compute(engine,
@@ -499,13 +522,18 @@ class EntropyBonusObjective final : public ContextualObjective
 {
 private:
     Scalar coefficient_ = 0.01f;
-    CategoricalDistribution distribution_;
+    std::shared_ptr<const PolicyDistribution> distribution_;
 
 public:
     explicit EntropyBonusObjective(
         Scalar coefficient = 0.01f,
-        Precision precision = Precision::F32)
-        : coefficient_(coefficient), distribution_(precision)
+        Precision precision = Precision::F32,
+        std::shared_ptr<const PolicyDistribution> distribution = {})
+        : coefficient_(coefficient),
+          distribution_(distribution
+                            ? std::move(distribution)
+                            : std::make_shared<CategoricalDistribution>(
+                                  precision))
     {
         PrecisionProfile p;
         p.stable = precision;
@@ -535,7 +563,7 @@ protected:
                                 dsl::rparam(-coefficient_ / units),
                             1, logits.cols(), precision()));
         NN_TRY(eval,
-               distribution_.entropy_with_gradient(
+               distribution_->entropy_with_gradient(
                    engine, logits, *upstream));
         NN_TRY(total_h,
                detail::rl_masked_sum(engine, eval->value, mask,
@@ -551,13 +579,18 @@ class SampledKlObjective final : public ContextualObjective
 {
 private:
     Scalar coefficient_ = 1;
-    CategoricalDistribution distribution_;
+    std::shared_ptr<const PolicyDistribution> distribution_;
 
 public:
     explicit SampledKlObjective(
         Scalar coefficient = 1,
-        Precision precision = Precision::F32)
-        : coefficient_(coefficient), distribution_(precision)
+        Precision precision = Precision::F32,
+        std::shared_ptr<const PolicyDistribution> distribution = {})
+        : coefficient_(coefficient),
+          distribution_(distribution
+                            ? std::move(distribution)
+                            : std::make_shared<CategoricalDistribution>(
+                                  precision))
     {
         PrecisionProfile p;
         p.stable = precision;
@@ -590,7 +623,7 @@ protected:
                                 dsl::rparam(coefficient_ / units),
                             1, logits.cols(), precision()));
         NN_TRY(eval,
-               distribution_.log_prob_with_gradient(
+               distribution_->log_prob_with_gradient(
                    engine, logits, batch.action(), *upstream));
         NN_TRY(diff,
                dsl::compute(engine,
@@ -617,14 +650,19 @@ class ClippedPolicyObjective final : public ContextualObjective
 {
 private:
     Scalar clip_epsilon_ = 0.2f;
-    CategoricalDistribution distribution_;
+    std::shared_ptr<const PolicyDistribution> distribution_;
     PpoPolicyMetrics metrics_;
 
 public:
     explicit ClippedPolicyObjective(
         Scalar clip_epsilon = 0.2f,
-        Precision precision = Precision::F32)
-        : clip_epsilon_(clip_epsilon), distribution_(precision)
+        Precision precision = Precision::F32,
+        std::shared_ptr<const PolicyDistribution> distribution = {})
+        : clip_epsilon_(clip_epsilon),
+          distribution_(distribution
+                            ? std::move(distribution)
+                            : std::make_shared<CategoricalDistribution>(
+                                  precision))
     {
         PrecisionProfile p;
         p.stable = precision;
@@ -667,7 +705,7 @@ protected:
         }
 
         NN_TRY(new_logp,
-               distribution_.log_prob(engine, logits, batch.action()));
+               distribution_->log_prob(engine, logits, batch.action()));
         NN_TRY_MSG(diff, "PPO policy log-ratio",
                    dsl::compute(engine,
                                 dsl::leaf(*new_logp) -
@@ -736,7 +774,7 @@ protected:
                    dsl::compute(engine, upstream_expr,
                                 1, logits.cols(), precision()));
         NN_TRY_MSG(eval, "PPO policy log-prob gradient",
-                   distribution_.log_prob_with_gradient(
+               distribution_->log_prob_with_gradient(
                        engine, logits, batch.action(), *upstream));
 
         NN_TRY_MSG(ratio_weighted, "PPO ratio weighted",
@@ -942,6 +980,7 @@ struct PpoConfig
     Precision precision = Precision::F32;
     std::string policy_field = "policy";
     std::string value_field = "value";
+    std::shared_ptr<const PolicyDistribution> distribution;
 };
 
 struct PpoReport
@@ -975,9 +1014,10 @@ public:
         NN_TRY_CHECK(output_schema.field(cfg_.policy_field));
         NN_TRY_CHECK(output_schema.field(cfg_.value_field));
 
-        ClippedPolicyObjective policy(cfg_.clip_epsilon, cfg_.precision);
+        ClippedPolicyObjective policy(cfg_.clip_epsilon, cfg_.precision,
+                                      cfg_.distribution);
         EntropyBonusObjective entropy(cfg_.entropy_coefficient,
-                                      cfg_.precision);
+                                      cfg_.precision, cfg_.distribution);
         ClippedValueObjective value_loss(
             cfg_.value_clip_epsilon, cfg_.value_coefficient,
             cfg_.precision);
@@ -1001,11 +1041,15 @@ public:
                                 .value = value_out->gradient}}));
         const PpoPolicyMetrics& pm = policy.metrics();
         const PpoValueMetrics& vm = value_loss.metrics();
+        const Scalar entropy_value =
+            cfg_.entropy_coefficient == Scalar{0}
+                ? Scalar{0}
+                : -entropy_out->loss / cfg_.entropy_coefficient;
         return PpoReport{
             .loss = policy_out->loss + entropy_out->loss + value_out->loss,
             .policy_loss = policy_out->loss + entropy_out->loss,
             .value_loss = value_out->loss,
-            .entropy = -entropy_out->loss / cfg_.entropy_coefficient,
+            .entropy = entropy_value,
             .approx_kl = pm.approx_kl,
             .policy_clip_fraction = pm.clip_fraction,
             .value_clip_fraction = vm.clip_fraction,
@@ -1021,6 +1065,7 @@ struct GrpoConfig
     Scalar group_epsilon = 1e-8f;
     Precision precision = Precision::F32;
     std::string policy_field = "policy";
+    std::shared_ptr<const PolicyDistribution> distribution;
 };
 
 struct GrpoReport
@@ -1109,9 +1154,10 @@ public:
         }
         NN_TRY(active_view, PolicyBatchView::create(*active_record));
 
-        ClippedPolicyObjective policy(cfg_.clip_epsilon, cfg_.precision);
+        ClippedPolicyObjective policy(cfg_.clip_epsilon, cfg_.precision,
+                                      cfg_.distribution);
         EntropyBonusObjective entropy(cfg_.entropy_coefficient,
-                                      cfg_.precision);
+                                      cfg_.precision, cfg_.distribution);
         NN_TRY(policy_out,
                policy.evaluate_context(engine, policy_logits, *active_view));
         NN_TRY(entropy_out,

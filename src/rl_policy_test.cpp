@@ -47,6 +47,49 @@ std::vector<float> values_of(nn::ComputeEngine& engine,
     return out;
 }
 
+class ForwardingDistribution final : public nn::PolicyDistribution
+{
+private:
+    nn::CategoricalDistribution inner_;
+
+public:
+    [[nodiscard]] nn::Result<nn::Tensor> log_prob(
+        nn::ComputeEngine& engine, const nn::Tensor& parameters,
+        const nn::Tensor& actions) const override
+    {
+        return inner_.log_prob(engine, parameters, actions);
+    }
+
+    [[nodiscard]] nn::Result<nn::Tensor> entropy(
+        nn::ComputeEngine& engine, const nn::Tensor& parameters) const override
+    {
+        return inner_.entropy(engine, parameters);
+    }
+
+    [[nodiscard]] nn::Result<Evaluation> log_prob_with_gradient(
+        nn::ComputeEngine& engine, const nn::Tensor& parameters,
+        const nn::Tensor& actions,
+        const nn::Tensor& upstream) const override
+    {
+        return inner_.log_prob_with_gradient(engine, parameters, actions,
+                                             upstream);
+    }
+
+    [[nodiscard]] nn::Result<Evaluation> entropy_with_gradient(
+        nn::ComputeEngine& engine, const nn::Tensor& parameters,
+        const nn::Tensor& upstream) const override
+    {
+        return inner_.entropy_with_gradient(engine, parameters, upstream);
+    }
+
+    [[nodiscard]] nn::Result<SampleResult> sample(
+        nn::ComputeEngine& engine, const nn::Tensor& parameter_mesh,
+        std::uint64_t seed) const override
+    {
+        return inner_.sample(engine, parameter_mesh, seed);
+    }
+};
+
 bool near_values(const std::vector<float>& got,
                  const std::vector<float>& want,
                  float tol = 2e-5f)
@@ -227,6 +270,18 @@ void test_reinforce()
     if (grad && baseline_grad)
         check_close(*owner, *baseline_grad, *grad,
                     "REINFORCE baseline gradient", g_fail);
+
+    auto polymorphic =
+        std::make_shared<ForwardingDistribution>();
+    nn::ReinforceObjective injected(false, nn::Precision::F32, polymorphic);
+    auto injected_loss = injected.forward(*owner, fixture->logits,
+                                          fixture->view);
+    auto injected_grad = injected.backward();
+    CHECK(injected_loss && std::fabs(*injected_loss - want_loss) < 1e-5f,
+          "objective accepts custom PolicyDistribution interface");
+    if (grad && injected_grad)
+        check_close(*owner, *injected_grad, *grad,
+                    "custom distribution gradient composition", g_fail);
 
     auto zero_mask = matrix_tensor(*owner, 1, 2, {0, 0});
     auto all_masked = make_fixture(*owner, fixture->logits, actions,
