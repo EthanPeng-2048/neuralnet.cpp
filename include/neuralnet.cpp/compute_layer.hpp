@@ -41,3 +41,4 @@
 #include "compute_layer_transformer.hpp"
 #include "compute_layer_gpt.hpp"
 #include "compute_layer_rapt.hpp"
+#include "compute_layer_bundle.hpp"

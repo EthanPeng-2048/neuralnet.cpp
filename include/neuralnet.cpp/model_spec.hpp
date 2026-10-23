@@ -128,6 +128,8 @@ struct ModelSpec
 
     // 通用多输出规范（docs/todo/31 RL-0）。nullopt = 旧单输出模型。
     std::optional<TensorSchema> output_schema;
+    // 空 = 不生成兼容打包表示；非空 = 按该端口顺序生成行带。
+    std::vector<std::string> output_packing;
 
     // ── MLP ──
     std::vector<std::size_t> layer_dims;
@@ -197,6 +199,14 @@ struct ModelSpec
 // 纯布尔返回，保持本头文件为纯数据结构、无 L2 依赖。
 [[nodiscard]] inline bool spec_matches(const ModelSpec& a, const ModelSpec& b) noexcept
 {
+    if (a.output_schema.has_value() != b.output_schema.has_value())
+        return false;
+    if (a.output_schema.has_value() &&
+        *a.output_schema != *b.output_schema)
+        return false;
+    if (a.output_packing != b.output_packing)
+        return false;
+
     // GPT 家族（GPT / ALiBi_GPT）——统一 GPTModel，比较共享字段
     auto gpt_family = [](const ModelSpec& s) { return s.is_gpt() || s.is_alibi_gpt(); };
     if (gpt_family(a) && gpt_family(b))
@@ -325,6 +335,8 @@ struct ModelSpec
     }
     std::string out = std::string(type_name(s.type)) + "(layers="
                     + std::to_string(s.num_layers);
+    if (s.output_schema)
+        out += ",outputs=" + std::to_string(s.output_schema->size());
     // 三值权重是**架构级**差异（层类型 Linear → BitLinear），摘要必须显式披露
     if (s.weight_quant != WeightQuant::None)
         out += ",wq=" + std::string(weight_quant_name(s.weight_quant));

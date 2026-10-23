@@ -17,8 +17,10 @@
 
 #include "compute_engine.hpp"
 #include "compute_tensor.hpp"
+#include "named_tensor_set.hpp"
 #include "model_spec.hpp"
 #include "precision.hpp"
+#include "tensor_schema.hpp"
 #include "expr_dsl.hpp"
 
 namespace nn
@@ -359,6 +361,60 @@ public:
     [[nodiscard]] virtual Result<Tensor> forward(const Tensor& input) = 0;
 
     [[nodiscard]] virtual Result<Tensor> backward(const Tensor& grad_output) = 0;
+
+    // ── 具名多输出协议（docs/todo/31 RL-0）─────────────────────────────
+    // 默认层是单端口 "output"；复合层（OutputBundleLayer）覆盖下列入口。
+    // 不接受 schema 的重载只供单层直接使用；序列中的最后一层由 Model 把
+    // ModelSpec 中登记的 schema 显式传入。
+    [[nodiscard]] virtual Result<TensorSchema> output_schema() const
+    {
+        return TensorSchema::create(
+            std::string(layer_name()) + ".output",
+            {tensor_field("output")});
+    }
+
+    [[nodiscard]] virtual Result<NamedTensorSet> forward_named(
+        const Tensor& input)
+    {
+        NN_TRY(schema, output_schema());
+        return forward_named(input, *schema);
+    }
+
+    [[nodiscard]] virtual Result<NamedTensorSet> forward_named(
+        const Tensor& input, const TensorSchema& schema)
+    {
+        if (!schema.valid() || schema.size() != 1)
+            NN_FAIL(std::string("Layer::forward_named: 默认单输出层要求 schema 恰有"
+                                "一个字段（层=") + layer_name() + "）");
+        NN_TRY(out, forward(input));
+        std::vector<NamedTensor> values;
+        values.push_back(NamedTensor{
+            .name = schema.fields()[0].name,
+            .value = std::move(*out),
+        });
+        return NamedTensorSet::create(schema, std::move(values));
+    }
+
+    [[nodiscard]] virtual Result<Tensor> backward_named(
+        const GradientBundle& gradients)
+    {
+        NN_TRY(schema, output_schema());
+        return backward_named(gradients, *schema);
+    }
+
+    [[nodiscard]] virtual Result<Tensor> backward_named(
+        const GradientBundle& gradients, const TensorSchema& schema)
+    {
+        if (!schema.valid() || schema.size() != 1)
+            NN_FAIL(std::string("Layer::backward_named: 默认单输出层要求 schema "
+                                "恰有一个字段（层=") + layer_name() + "）");
+        if (gradients.schema() != schema)
+            NN_FAIL(std::string("Layer::backward_named: gradient schema 不匹配"
+                                "（层=") + layer_name() + "）");
+        const FieldHandle handle{gradients.schema().fingerprint(), 0};
+        NN_TRY(g, gradients.require(handle));
+        return backward(**g);
+    }
 
     // 参数访问（供 optimizer 使用）— 使用 reference_wrapper 替代裸指针，明确表达非拥有语义
     [[nodiscard]] virtual std::vector<TensorRef> parameters() { return {}; }

@@ -46,6 +46,10 @@ private:
     // 的顺序，覆盖会导致 token_emb 等权重退回 f32）。
     std::optional<PrecisionProfile> default_precision_;
 
+    // 可选通用输出 schema。未设置时，单输出模型沿用最后一层的默认
+    // "output" schema；OutputBundleLayer 自带其构造期 schema。
+    std::optional<TensorSchema> output_schema_;
+
 public:
     Model() = default;
     explicit Model(ComputeEngine& engine) : engine_(engine.weak_from_this().lock()) {}
@@ -147,8 +151,29 @@ public:
 
     // ── 架构规格（可选）：记录本模型对应的 ModelSpec ────────────────────
     // build_*_from_spec 工厂自动设置；也可手动 set_spec 以启用 load_model 校验。
-    void set_spec(const ModelSpec& spec) { spec_ = spec; }
+    void set_spec(const ModelSpec& spec)
+    {
+        spec_ = spec;
+        output_schema_ = spec.output_schema;
+    }
     [[nodiscard]] const std::optional<ModelSpec>& spec() const noexcept { return spec_; }
+
+    // ── 具名多输出（docs/todo/31 RL-0）────────────────────────────────
+    void set_output_schema(TensorSchema schema)
+    {
+        output_schema_ = std::move(schema);
+        if (spec_)
+            spec_->output_schema = output_schema_;
+    }
+
+    [[nodiscard]] Result<TensorSchema> output_schema() const
+    {
+        if (output_schema_)
+            return *output_schema_;
+        if (layers_.empty())
+            NN_FAIL("Model::output_schema: no layers");
+        return layers_.back()->output_schema();
+    }
 
     // ── D7：精度配置注入（§9.2）：设置所有顶层 Layer 的精度 ──
     // 对 GPTModel/RAPTModel 等复合层，精度在构造时已传播到子层；
@@ -242,6 +267,48 @@ public:
             auto r = layers_[i]->backward(g);
             NN_TRY_CHECK(r);
             g = std::move(*r);
+        }
+        return g;
+    }
+
+    // ── 具名 forward/backward：中间层仍走单 Tensor，最后一层可展开多端口 ──
+    [[nodiscard]] Result<NamedTensorSet> forward_named(const Tensor& input)
+    {
+        if (layers_.empty())
+            NN_FAIL("Model::forward_named: no layers");
+        if (!engine_)
+            NN_FAIL("Model::forward_named: engine 未绑定");
+        NN_TRY(schema, output_schema());
+
+        Tensor x = input;
+        for (std::size_t li = 0; li + 1 < layers_.size(); ++li)
+        {
+            NN_PROF_SCOPE(nn::prof::interned("fwd_named.layer", li));
+            NN_TRY(out, layers_[li]->forward(x));
+            x = std::move(*out);
+        }
+        NN_PROF_SCOPE(nn::prof::interned("fwd_named.layer",
+                                         layers_.size() - 1));
+        return layers_.back()->forward_named(x, *schema);
+    }
+
+    [[nodiscard]] Result<Tensor> backward_named(
+        const GradientBundle& gradients)
+    {
+        if (layers_.empty())
+            NN_FAIL("Model::backward_named: no layers");
+        if (!engine_)
+            NN_FAIL("Model::backward_named: engine 未绑定");
+        NN_TRY(schema, output_schema());
+
+        NN_TRY(last_grad,
+               layers_.back()->backward_named(gradients, *schema));
+        Tensor g = std::move(*last_grad);
+        for (std::size_t i = layers_.size() - 1; i-- > 0;)
+        {
+            NN_PROF_SCOPE(nn::prof::interned("bwd_named.layer", i));
+            NN_TRY(out, layers_[i]->backward(g));
+            g = std::move(*out);
         }
         return g;
     }

@@ -83,6 +83,22 @@ struct TensorFieldSpec
     TensorPlacement placement = TensorPlacement::Any;
 };
 
+[[nodiscard]] inline TensorFieldSpec tensor_field(
+    std::string name,
+    TensorShapeSpec shape = {},
+    bool required = true,
+    std::optional<Precision> precision = std::nullopt,
+    TensorPlacement placement = TensorPlacement::Any)
+{
+    TensorFieldSpec field;
+    field.name = std::move(name);
+    field.shape = shape;
+    field.required = required;
+    field.precision = precision;
+    field.placement = placement;
+    return field;
+}
+
 // setup 期解析结果。指纹让不同 schema 中恰好同下标的 handle 不会被误用。
 struct FieldHandle
 {
@@ -270,6 +286,202 @@ public:
     {
         return validate_handle_(handle, "TensorSchema::validate");
     }
+
+    [[nodiscard]] bool operator==(const TensorSchema& other) const noexcept
+    {
+        if (fingerprint_ != other.fingerprint_ ||
+            name_ != other.name_ ||
+            fields_.size() != other.fields_.size())
+            return false;
+        for (std::size_t i = 0; i < fields_.size(); ++i)
+        {
+            const TensorFieldSpec& a = fields_[i];
+            const TensorFieldSpec& b = other.fields_[i];
+            if (a.name != b.name ||
+                a.shape.rows != b.shape.rows ||
+                a.shape.cols != b.shape.cols ||
+                a.required != b.required ||
+                a.precision != b.precision ||
+                a.placement != b.placement)
+                return false;
+        }
+        return true;
+    }
 };
+
+// ── Schema 紧凑二进制编解码（ModelSpec / checkpoint 扩展 section 共用）────
+//
+// 布局（小端）：
+//   "NNS1" | u32 name_len | name | u32 field_count |
+//   per field: u32 name_len | name | u64 rows | u64 cols |
+//              u8 required | u8 precision_plus_one | u8 placement
+// 行/列无约束编码为 UINT64_MAX。解码走公开 create()，因此重复名/空名等
+// 非法输入得到与程序内构造完全相同的 Result 错误。
+namespace detail
+{
+inline void schema_put_u32(std::string& out, std::uint32_t v)
+{
+    for (unsigned i = 0; i < 4; ++i)
+        out.push_back(static_cast<char>((v >> (i * 8)) & 0xFFu));
+}
+
+inline void schema_put_u64(std::string& out, std::uint64_t v)
+{
+    for (unsigned i = 0; i < 8; ++i)
+        out.push_back(static_cast<char>((v >> (i * 8)) & 0xFFu));
+}
+
+[[nodiscard]] inline Result<std::uint32_t> schema_take_u32(std::string_view& in)
+{
+    if (in.size() < 4)
+        NN_FAIL("TensorSchema::decode: 截断（u32）");
+    std::uint32_t v = 0;
+    for (unsigned i = 0; i < 4; ++i)
+        v |= static_cast<std::uint32_t>(
+                 static_cast<unsigned char>(in[i]))
+             << (i * 8);
+    in.remove_prefix(4);
+    return v;
+}
+
+[[nodiscard]] inline Result<std::uint64_t> schema_take_u64(std::string_view& in)
+{
+    if (in.size() < 8)
+        NN_FAIL("TensorSchema::decode: 截断（u64）");
+    std::uint64_t v = 0;
+    for (unsigned i = 0; i < 8; ++i)
+        v |= static_cast<std::uint64_t>(
+                 static_cast<unsigned char>(in[i]))
+             << (i * 8);
+    in.remove_prefix(8);
+    return v;
+}
+
+[[nodiscard]] inline Result<std::string> schema_take_string(
+    std::string_view& in)
+{
+    NN_TRY(n, schema_take_u32(in));
+    if (*n > in.size())
+        NN_FAIL("TensorSchema::decode: 字符串长度越界");
+    std::string out(in.substr(0, *n));
+    in.remove_prefix(*n);
+    return out;
+}
+
+inline void schema_put_string(std::string& out, std::string_view s)
+{
+    if (s.size() > UINT32_MAX)
+        NN_UNWRAP(false, "TensorSchema::encode: 字符串过长");
+    schema_put_u32(out, static_cast<std::uint32_t>(s.size()));
+    out.append(s);
+}
+} // namespace detail
+
+[[nodiscard]] inline std::string encode_tensor_schema(const TensorSchema& schema)
+{
+    std::string out("NNS1", 4);
+    detail::schema_put_string(out, schema.name());
+    detail::schema_put_u32(
+        out, static_cast<std::uint32_t>(schema.size()));
+    constexpr std::uint64_t no_axis = UINT64_MAX;
+    for (const TensorFieldSpec& f : schema.fields())
+    {
+        detail::schema_put_string(out, f.name);
+        detail::schema_put_u64(
+            out, f.shape.rows ? static_cast<std::uint64_t>(*f.shape.rows)
+                              : no_axis);
+        detail::schema_put_u64(
+            out, f.shape.cols ? static_cast<std::uint64_t>(*f.shape.cols)
+                              : no_axis);
+        out.push_back(static_cast<char>(f.required ? 1 : 0));
+        out.push_back(static_cast<char>(
+            f.precision ? static_cast<std::uint8_t>(*f.precision) + 1u : 0u));
+        out.push_back(static_cast<char>(
+            static_cast<std::uint8_t>(f.placement)));
+    }
+    return out;
+}
+
+[[nodiscard]] inline Result<TensorSchema> decode_tensor_schema(
+    std::string_view bytes)
+{
+    if (bytes.size() < 4 || bytes.substr(0, 4) != "NNS1")
+        NN_FAIL("TensorSchema::decode: 魔数不匹配");
+    bytes.remove_prefix(4);
+    NN_TRY(name, detail::schema_take_string(bytes));
+    NN_TRY(count, detail::schema_take_u32(bytes));
+    std::vector<TensorFieldSpec> fields;
+    fields.reserve(*count);
+    constexpr std::uint64_t no_axis = UINT64_MAX;
+    for (std::uint32_t i = 0; i < *count; ++i)
+    {
+        NN_TRY(field_name, detail::schema_take_string(bytes));
+        NN_TRY(rows, detail::schema_take_u64(bytes));
+        NN_TRY(cols, detail::schema_take_u64(bytes));
+        if (bytes.size() < 3)
+            NN_FAIL("TensorSchema::decode: 截断（field flags）");
+        const unsigned char required =
+            static_cast<unsigned char>(bytes[0]);
+        const unsigned char precision_tag =
+            static_cast<unsigned char>(bytes[1]);
+        const unsigned char placement =
+            static_cast<unsigned char>(bytes[2]);
+        bytes.remove_prefix(3);
+        if (required > 1)
+            NN_FAIL("TensorSchema::decode: required 标志非法");
+        if (precision_tag > static_cast<unsigned char>(Precision::T1_58) + 1u)
+            NN_FAIL("TensorSchema::decode: precision 标志非法");
+        if (placement >
+            static_cast<unsigned char>(TensorPlacement::GPU))
+            NN_FAIL("TensorSchema::decode: placement 标志非法");
+
+        TensorFieldSpec field;
+        field.name = std::move(*field_name);
+        if (*rows != no_axis)
+            field.shape.rows = static_cast<std::size_t>(*rows);
+        if (*cols != no_axis)
+            field.shape.cols = static_cast<std::size_t>(*cols);
+        field.required = required != 0;
+        if (precision_tag != 0)
+            field.precision =
+                static_cast<Precision>(precision_tag - 1u);
+        field.placement =
+            static_cast<TensorPlacement>(placement);
+        fields.push_back(std::move(field));
+    }
+    if (!bytes.empty())
+        NN_FAIL("TensorSchema::decode: 尾部存在未消费字节");
+    return TensorSchema::create(std::move(*name), std::move(fields));
+}
+
+// ── 名称列表（output packing 等纯结构元数据）──────────────────────────
+[[nodiscard]] inline std::string encode_tensor_name_list(
+    const std::vector<std::string>& names)
+{
+    std::string out("NNL1", 4);
+    detail::schema_put_u32(out, static_cast<std::uint32_t>(names.size()));
+    for (const std::string& name : names)
+        detail::schema_put_string(out, name);
+    return out;
+}
+
+[[nodiscard]] inline Result<std::vector<std::string>>
+decode_tensor_name_list(std::string_view bytes)
+{
+    if (bytes.size() < 4 || bytes.substr(0, 4) != "NNL1")
+        NN_FAIL("decode_tensor_name_list: 魔数不匹配");
+    bytes.remove_prefix(4);
+    NN_TRY(count, detail::schema_take_u32(bytes));
+    std::vector<std::string> names;
+    names.reserve(*count);
+    for (std::uint32_t i = 0; i < *count; ++i)
+    {
+        NN_TRY(name, detail::schema_take_string(bytes));
+        names.push_back(std::move(*name));
+    }
+    if (!bytes.empty())
+        NN_FAIL("decode_tensor_name_list: 尾部存在未消费字节");
+    return names;
+}
 
 } // namespace nn

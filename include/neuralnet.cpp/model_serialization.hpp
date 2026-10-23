@@ -370,6 +370,11 @@ private:
     // weight_quant（线性层是否 BitLinear/三值）于 P1 引入。旧文件**无此键** →
     // 读回 WeightQuant::None（= 普通 Linear，参数布局逐位一致）→ 无需升版本。
     kv.set("weight_quant", static_cast<uint64_t>(spec.weight_quant));
+    // output_schema / output_packing（RL-0）：旧文件缺键 = 单输出模型。
+    if (spec.output_schema)
+        kv.set("output_schema", encode_tensor_schema(*spec.output_schema));
+    if (!spec.output_packing.empty())
+        kv.set("output_packing", encode_tensor_name_list(spec.output_packing));
     // ZiPT（AttnZip）已于 2026-10-01 整体移除：不再写 memory_tokens / window 字段。
     // 旧文件（含这两个键）由 spec_from_kv 的 type 分支给出明确错误。
 
@@ -446,6 +451,20 @@ inline void apply_spec_version_defaults(KeyValueRecord &kv, uint32_t version)
     if (kv.get("tie_embeddings", v)) spec.tie_embeddings = (v != 0);
     // weight_quant（P1 新增）：缺键 → 保持 ModelSpec 默认 WeightQuant::None
     if (kv.get("weight_quant", v)) spec.weight_quant = static_cast<WeightQuant>(v);
+    // output_schema / output_packing（RL-0 新增）：缺键 → nullopt/空（旧行为）。
+    std::string encoded;
+    if (kv.get("output_schema", encoded))
+    {
+        NN_TRY(schema, decode_tensor_schema(encoded));
+        spec.output_schema = std::move(*schema);
+    }
+    if (kv.get("output_packing", encoded))
+    {
+        NN_TRY(names, decode_tensor_name_list(encoded));
+        spec.output_packing = std::move(*names);
+    }
+    if (!spec.output_packing.empty() && !spec.output_schema)
+        NN_FAIL("模型文件含 output_packing 但缺少 output_schema");
     // 旧文件的 memory_tokens / window（ZiPT 专用）不再读取，随 type=6 一并拒绝。
 
     // ── CNN ──
