@@ -680,6 +680,10 @@ if(NN_BUILD_APPS OR NN_ENABLE_TESTS)
     nn_add_executable(rl_policy_test src/rl_policy_test.cpp)
     list(APPEND NN_TEST_TARGETS rl_policy_test)
 
+    # ── RL-1c：PPO policy/value clip + 标准 preset 组合等价 ────────────────
+    nn_add_executable(rl_ppo_test src/rl_ppo_test.cpp)
+    list(APPEND NN_TEST_TARGETS rl_ppo_test)
+
     # ── F1：危险精度组合启动期告警（仅警告，不拒绝；docs/todo/24 §2.3）────
     # [1][2] 头文件函数组合矩阵（含 all=f16）单测；[3] 子进程跑 text_train/
     # mnist_train，捕获 stderr 断言告警出现 + 退出码不变；二进制缺失 → 77 = SKIP

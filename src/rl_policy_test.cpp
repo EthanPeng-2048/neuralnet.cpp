@@ -157,14 +157,18 @@ void test_distribution()
     if (eval)
     {
         std::vector<float> want_col0 = p0;
-        want_col0[0] -= 1;
+        want_col0[0] = 1 - want_col0[0];
+        want_col0[1] = -want_col0[1];
+        want_col0[2] = -want_col0[2];
         std::vector<float> want_col1 = p1;
-        want_col1[1] -= 1;
+        want_col1[0] = -want_col1[0];
+        want_col1[1] = 1 - want_col1[1];
+        want_col1[2] = -want_col1[2];
         CHECK(near_values(values_of(*owner, eval->gradient),
                           {want_col0[0], want_col1[0],
                            want_col0[1], want_col1[1],
                            want_col0[2], want_col1[2]}),
-              "log_prob gradient is softmax - onehot");
+              "log_prob gradient is onehot - softmax");
     }
 
     auto s1 = dist.sample(*owner, logits, 12345);

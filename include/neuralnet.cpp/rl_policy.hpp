@@ -172,10 +172,10 @@ public:
         NN_TRY(grad,
                dsl::compute(
                    engine,
-                   (dsl::leaf(probs->softmax) -
-                    dsl::select(
+                   (dsl::select(
                         dsl::row() == dsl::col_broadcast(actions),
-                        Scalar{1}, Scalar{0})) *
+                        Scalar{1}, Scalar{0}) -
+                    dsl::leaf(probs->softmax)) *
                        dsl::col_broadcast(upstream),
                    logits.rows(), logits.cols(), precision_));
         return Evaluation{.value = std::move(*value),
@@ -299,6 +299,14 @@ public:
         }
         cached_grad_ = std::move(result->gradient);
         return result->loss;
+    }
+
+    // 供组合目标复用组件，而不依赖其隐式缓存。
+    [[nodiscard]] Result<ObjectiveOutput> evaluate_context(
+        ComputeEngine& engine, const Tensor& prediction,
+        const PolicyBatchView& batch)
+    {
+        return evaluate(engine, prediction, batch);
     }
 
     [[nodiscard]] Result<Tensor> backward() override
@@ -593,6 +601,538 @@ protected:
         return ObjectiveOutput{
             .loss = coefficient_ * *total / units,
             .gradient = std::move(eval->gradient),
+        };
+    }
+};
+
+struct PpoPolicyMetrics
+{
+    Scalar policy_loss = 0;
+    Scalar ratio_mean = 1;
+    Scalar approx_kl = 0;
+    Scalar clip_fraction = 0;
+};
+
+class ClippedPolicyObjective final : public ContextualObjective
+{
+private:
+    Scalar clip_epsilon_ = 0.2f;
+    CategoricalDistribution distribution_;
+    PpoPolicyMetrics metrics_;
+
+public:
+    explicit ClippedPolicyObjective(
+        Scalar clip_epsilon = 0.2f,
+        Precision precision = Precision::F32)
+        : clip_epsilon_(clip_epsilon), distribution_(precision)
+    {
+        PrecisionProfile p;
+        p.stable = precision;
+        set_precision_profile(p);
+    }
+
+    [[nodiscard]] const PpoPolicyMetrics& metrics() const noexcept
+    {
+        return metrics_;
+    }
+
+protected:
+    [[nodiscard]] Result<ObjectiveOutput> evaluate(
+        ComputeEngine& engine, const Tensor& logits,
+        const PolicyBatchView& batch) override
+    {
+        const Tensor* old_logp = batch.old_log_prob();
+        const Tensor* advantage = batch.advantage();
+        if (old_logp == nullptr)
+            NN_FAIL("ClippedPolicyObjective: 缺少 old_log_prob");
+        if (advantage == nullptr)
+            NN_FAIL("ClippedPolicyObjective: 缺少 advantage");
+        const Tensor& mask = batch.action_mask();
+        if (old_logp->rows() != 1 || old_logp->cols() != logits.cols() ||
+            advantage->rows() != mask.rows() ||
+            advantage->cols() != mask.cols())
+            NN_FAIL("ClippedPolicyObjective: 输入形状不一致");
+
+        NN_TRY(units_r,
+               detail::rl_masked_units(engine, mask, precision()));
+        const Scalar units = *units_r;
+        if (units <= Scalar{0})
+        {
+            metrics_ = {};
+            NN_TRY(zero_grad,
+                   detail::rl_zero(engine, logits.rows(), logits.cols(),
+                                   precision()));
+            return ObjectiveOutput{.loss = 0,
+                                   .gradient = std::move(*zero_grad)};
+        }
+
+        NN_TRY(new_logp,
+               distribution_.log_prob(engine, logits, batch.action()));
+        NN_TRY_MSG(diff, "PPO policy log-ratio",
+                   dsl::compute(engine,
+                                dsl::leaf(*new_logp) -
+                                    dsl::leaf(*old_logp),
+                                1, logits.cols(), precision()));
+        NN_TRY_MSG(ratio, "PPO policy ratio",
+                   dsl::compute(engine, dsl::exp(dsl::leaf(*diff)),
+                                1, logits.cols(), precision()));
+        const Scalar lower = Scalar{1} - clip_epsilon_;
+        const Scalar upper = Scalar{1} + clip_epsilon_;
+        NN_TRY_MSG(clipped_ratio, "PPO policy clipped ratio",
+                   dsl::compute(
+                   engine,
+                   dsl::select(
+                       dsl::leaf(*ratio) < dsl::rparam(lower),
+                       dsl::rparam(lower),
+                       dsl::select(
+                           dsl::leaf(*ratio) > dsl::rparam(upper),
+                           dsl::rparam(upper), dsl::leaf(*ratio))),
+                   1, logits.cols(), precision()));
+        NN_TRY_MSG(objective, "PPO policy ratio*advantage",
+                   dsl::compute(engine,
+                                dsl::leaf(*ratio) *
+                                    dsl::leaf(*advantage),
+                                1, logits.cols(), precision()));
+        NN_TRY_MSG(clipped_objective, "PPO clipped ratio*advantage",
+                   dsl::compute(engine,
+                                dsl::leaf(*clipped_ratio) *
+                                    dsl::leaf(*advantage),
+                                1, logits.cols(), precision()));
+        NN_TRY_MSG(surrogate, "PPO policy min",
+                   dsl::compute(
+                       engine,
+                       dsl::min(dsl::leaf(*objective),
+                                dsl::leaf(*clipped_objective)),
+                       1, logits.cols(), precision()));
+        NN_TRY_MSG(loss_terms, "PPO policy masked surrogate",
+                   dsl::compute(engine,
+                                dsl::leaf(*surrogate) * dsl::leaf(mask),
+                                1, logits.cols(), precision()));
+        NN_TRY_MSG(loss_sum, "PPO policy reduce",
+                   detail::rl_masked_sum(engine, *loss_terms, mask,
+                                         precision()));
+
+        const auto ratio_v = dsl::leaf(*ratio);
+        const auto adv_v = dsl::leaf(*advantage);
+        const auto positive = dsl::select(
+            ratio_v < dsl::rparam(lower),
+            ratio_v * adv_v,
+            dsl::select(ratio_v > dsl::rparam(upper),
+                        Scalar{0}, adv_v));
+        const auto negative = dsl::select(
+            ratio_v < dsl::rparam(lower),
+            Scalar{0},
+            dsl::select(ratio_v > dsl::rparam(upper),
+                        ratio_v * adv_v, adv_v));
+        const auto factor = dsl::select(
+            adv_v > Scalar{0}, positive, negative);
+        NN_TRY_MSG(factor_tensor, "PPO policy factor",
+                   dsl::compute(engine, factor, 1, logits.cols(),
+                                precision()));
+        auto upstream_expr =
+            dsl::leaf(*factor_tensor) * dsl::leaf(mask) *
+            dsl::rparam(-Scalar{1} / units);
+        NN_TRY_MSG(upstream, "PPO policy upstream",
+                   dsl::compute(engine, upstream_expr,
+                                1, logits.cols(), precision()));
+        NN_TRY_MSG(eval, "PPO policy log-prob gradient",
+                   distribution_.log_prob_with_gradient(
+                       engine, logits, batch.action(), *upstream));
+
+        NN_TRY_MSG(ratio_weighted, "PPO ratio weighted",
+                   dsl::compute(engine,
+                                ratio_v * dsl::leaf(mask),
+                                1, logits.cols(), precision()));
+        NN_TRY_MSG(ratio_sum, "PPO ratio reduce",
+                   detail::rl_masked_sum(engine, *ratio_weighted, mask,
+                                         precision()));
+        NN_TRY_MSG(kl_terms, "PPO KL terms",
+                   dsl::compute(engine,
+                                dsl::leaf(*diff) * dsl::leaf(*diff) *
+                                    dsl::leaf(mask),
+                                1, logits.cols(), precision()));
+        NN_TRY_MSG(kl_sum, "PPO KL reduce",
+                   detail::rl_masked_sum(engine, *kl_terms, mask,
+                                         precision()));
+        NN_TRY_MSG(outside, "PPO clip indicator",
+                   dsl::compute(
+                   engine,
+                   dsl::select(
+                       ratio_v < dsl::rparam(lower), Scalar{1},
+                       dsl::select(ratio_v > dsl::rparam(upper),
+                                   Scalar{1}, Scalar{0})) *
+                       dsl::leaf(mask),
+                   1, logits.cols(), precision()));
+        NN_TRY_MSG(outside_sum, "PPO clip reduce",
+                   detail::rl_masked_sum(engine, *outside, mask,
+                                         precision()));
+
+        metrics_.policy_loss = -*loss_sum / units;
+        metrics_.ratio_mean = *ratio_sum / units;
+        metrics_.approx_kl = Scalar{0.5} * *kl_sum / units;
+        metrics_.clip_fraction = *outside_sum / units;
+        return ObjectiveOutput{
+            .loss = metrics_.policy_loss,
+            .gradient = std::move(eval->gradient),
+        };
+    }
+};
+
+struct PpoValueMetrics
+{
+    Scalar value_loss = 0;
+    Scalar clip_fraction = 0;
+};
+
+class ClippedValueObjective final : public ContextualObjective
+{
+private:
+    Scalar clip_epsilon_ = 0.2f;
+    Scalar coefficient_ = 0.5f;
+    PpoValueMetrics metrics_;
+
+public:
+    explicit ClippedValueObjective(
+        Scalar clip_epsilon = 0.2f, Scalar coefficient = 0.5f,
+        Precision precision = Precision::F32)
+        : clip_epsilon_(clip_epsilon), coefficient_(coefficient)
+    {
+        PrecisionProfile p;
+        p.stable = precision;
+        set_precision_profile(p);
+    }
+
+    [[nodiscard]] const PpoValueMetrics& metrics() const noexcept
+    {
+        return metrics_;
+    }
+
+protected:
+    [[nodiscard]] Result<ObjectiveOutput> evaluate(
+        ComputeEngine& engine, const Tensor& value,
+        const PolicyBatchView& batch) override
+    {
+        const Tensor* returns = batch.returns();
+        const Tensor* old_value = batch.old_value();
+        const Tensor* mask = batch.value_mask();
+        if (returns == nullptr)
+            NN_FAIL("ClippedValueObjective: 缺少 return");
+        if (old_value == nullptr)
+            NN_FAIL("ClippedValueObjective: 缺少 old_value");
+        if (mask == nullptr)
+            NN_FAIL("ClippedValueObjective: 缺少 value_mask");
+        if (returns->rows() != value.rows() ||
+            returns->cols() != value.cols() ||
+            old_value->rows() != value.rows() ||
+            old_value->cols() != value.cols() ||
+            mask->rows() != value.rows() ||
+            mask->cols() != value.cols())
+            NN_FAIL("ClippedValueObjective: value/return/old_value/mask 形状不一致");
+
+        NN_TRY(units_r,
+               detail::rl_masked_units(engine, *mask, precision()));
+        const Scalar units = *units_r;
+        if (units <= Scalar{0})
+        {
+            metrics_ = {};
+            NN_TRY(zero_grad,
+                   detail::rl_zero(engine, value.rows(), value.cols(),
+                                   precision()));
+            return ObjectiveOutput{.loss = 0,
+                                   .gradient = std::move(*zero_grad)};
+        }
+
+        NN_TRY(clip_low,
+               dsl::compute(engine,
+                            dsl::leaf(*old_value) -
+                                dsl::rparam(clip_epsilon_),
+                            value.rows(), value.cols(), precision()));
+        NN_TRY(clip_high,
+               dsl::compute(engine,
+                            dsl::leaf(*old_value) +
+                                dsl::rparam(clip_epsilon_),
+                            value.rows(), value.cols(), precision()));
+        NN_TRY_MSG(clipped, "PPO value clip",
+                   dsl::compute(
+                   engine,
+                   dsl::select(
+                       dsl::leaf(value) < dsl::leaf(*clip_low),
+                       dsl::leaf(*clip_low),
+                       dsl::select(
+                           dsl::leaf(value) > dsl::leaf(*clip_high),
+                           dsl::leaf(*clip_high), dsl::leaf(value))),
+                   value.rows(), value.cols(), precision()));
+        NN_TRY_MSG(diff, "PPO value diff",
+                   dsl::compute(engine,
+                                dsl::leaf(value) - dsl::leaf(*returns),
+                                value.rows(), value.cols(), precision()));
+        NN_TRY_MSG(clipped_diff, "PPO value clipped diff",
+                   dsl::compute(engine,
+                                dsl::leaf(*clipped) - dsl::leaf(*returns),
+                                value.rows(), value.cols(), precision()));
+        NN_TRY_MSG(diff_sq, "PPO value diff square",
+                   dsl::compute(engine,
+                                dsl::leaf(*diff) * dsl::leaf(*diff),
+                                value.rows(), value.cols(), precision()));
+        NN_TRY_MSG(clipped_sq, "PPO value clipped square",
+                   dsl::compute(engine,
+                                dsl::leaf(*clipped_diff) *
+                                    dsl::leaf(*clipped_diff),
+                                value.rows(), value.cols(), precision()));
+        auto loss_expr = dsl::max(
+            dsl::leaf(*diff_sq), dsl::leaf(*clipped_sq)) *
+            dsl::leaf(*mask);
+        NN_TRY_MSG(loss_terms, "PPO value max loss",
+                   dsl::compute(engine, loss_expr, value.rows(),
+                                value.cols(), precision()));
+        NN_TRY_MSG(loss_sum, "PPO value reduce",
+                   detail::rl_masked_sum(engine, *loss_terms, *mask,
+                                         precision()));
+
+        const auto outside_clip = dsl::select(
+            dsl::leaf(value) < dsl::leaf(*clip_low), Scalar{1},
+            dsl::select(dsl::leaf(value) > dsl::leaf(*clip_high),
+                        Scalar{1}, Scalar{0}));
+        NN_TRY_MSG(outside_tensor, "PPO value outside tensor",
+                   dsl::compute(engine, outside_clip, value.rows(),
+                                value.cols(), precision()));
+        NN_TRY_MSG(clipped_grad_tensor, "PPO value clipped grad",
+                   dsl::compute(engine,
+                                dsl::select(
+                                    dsl::leaf(*outside_tensor) > Scalar{0},
+                                    Scalar{0},
+                                    dsl::leaf(*diff) * dsl::rparam(2)),
+                                value.rows(), value.cols(), precision()));
+        NN_TRY_MSG(unclipped_grad_tensor, "PPO value unclipped grad",
+                   dsl::compute(engine,
+                                dsl::leaf(*diff) * dsl::rparam(2),
+                                value.rows(), value.cols(), precision()));
+        auto choose_clipped =
+            dsl::leaf(*clipped_sq) > dsl::leaf(*diff_sq);
+        auto grad_expr = dsl::select(
+            choose_clipped, dsl::leaf(*clipped_grad_tensor),
+            dsl::leaf(*unclipped_grad_tensor)) *
+            dsl::leaf(*mask) *
+            dsl::rparam(coefficient_ / units);
+        NN_TRY_MSG(grad, "PPO value gradient",
+                   dsl::compute(engine, grad_expr, value.rows(),
+                                value.cols(), precision()));
+        NN_TRY_MSG(clip_terms, "PPO value clip indicator",
+                   dsl::compute(engine,
+                                outside_clip * dsl::leaf(*mask),
+                                value.rows(), value.cols(), precision()));
+        NN_TRY_MSG(clip_sum, "PPO value clip reduce",
+                   detail::rl_masked_sum(engine, *clip_terms, *mask,
+                                         precision()));
+        metrics_.value_loss = coefficient_ * *loss_sum / units;
+        metrics_.clip_fraction = *clip_sum / units;
+        return ObjectiveOutput{
+            .loss = metrics_.value_loss,
+            .gradient = std::move(*grad),
+        };
+    }
+};
+
+struct PpoConfig
+{
+    Scalar clip_epsilon = 0.2f;
+    Scalar value_clip_epsilon = 0.2f;
+    Scalar value_coefficient = 0.5f;
+    Scalar entropy_coefficient = 0.01f;
+    Precision precision = Precision::F32;
+    std::string policy_field = "policy";
+    std::string value_field = "value";
+};
+
+struct PpoReport
+{
+    Scalar loss = 0;
+    Scalar policy_loss = 0;
+    Scalar value_loss = 0;
+    Scalar entropy = 0;
+    Scalar approx_kl = 0;
+    Scalar policy_clip_fraction = 0;
+    Scalar value_clip_fraction = 0;
+    GradientBundle gradients;
+};
+
+class PpoObjective
+{
+private:
+    PpoConfig cfg_;
+
+public:
+    explicit PpoObjective(PpoConfig cfg = {})
+        : cfg_(std::move(cfg))
+    {
+    }
+
+    [[nodiscard]] Result<PpoReport> evaluate(
+        ComputeEngine& engine, const TensorSchema& output_schema,
+        const Tensor& policy_logits, const Tensor& value,
+        const PolicyBatchView& batch) const
+    {
+        NN_TRY_CHECK(output_schema.field(cfg_.policy_field));
+        NN_TRY_CHECK(output_schema.field(cfg_.value_field));
+
+        ClippedPolicyObjective policy(cfg_.clip_epsilon, cfg_.precision);
+        EntropyBonusObjective entropy(cfg_.entropy_coefficient,
+                                      cfg_.precision);
+        ClippedValueObjective value_loss(
+            cfg_.value_clip_epsilon, cfg_.value_coefficient,
+            cfg_.precision);
+        NN_TRY(policy_out,
+               policy.evaluate_context(engine, policy_logits, batch));
+        NN_TRY(entropy_out,
+               entropy.evaluate_context(engine, policy_logits, batch));
+        NN_TRY(value_out,
+               value_loss.evaluate_context(engine, value, batch));
+
+        NN_TRY(policy_grad,
+               engine.clone(policy_out->gradient));
+        NN_TRY_CHECK(engine.accumulate(*policy_grad,
+                                       entropy_out->gradient));
+        NN_TRY(gradients,
+               GradientBundle::create(
+                   output_schema,
+                   {NamedTensor{.name = cfg_.policy_field,
+                                .value = *policy_grad},
+                    NamedTensor{.name = cfg_.value_field,
+                                .value = value_out->gradient}}));
+        const PpoPolicyMetrics& pm = policy.metrics();
+        const PpoValueMetrics& vm = value_loss.metrics();
+        return PpoReport{
+            .loss = policy_out->loss + entropy_out->loss + value_out->loss,
+            .policy_loss = policy_out->loss + entropy_out->loss,
+            .value_loss = value_out->loss,
+            .entropy = -entropy_out->loss / cfg_.entropy_coefficient,
+            .approx_kl = pm.approx_kl,
+            .policy_clip_fraction = pm.clip_fraction,
+            .value_clip_fraction = vm.clip_fraction,
+            .gradients = std::move(*gradients),
+        };
+    }
+};
+
+struct GrpoConfig
+{
+    Scalar clip_epsilon = 0.2f;
+    Scalar entropy_coefficient = 0.01f;
+    Scalar group_epsilon = 1e-8f;
+    Precision precision = Precision::F32;
+    std::string policy_field = "policy";
+};
+
+struct GrpoReport
+{
+    Scalar loss = 0;
+    Scalar policy_loss = 0;
+    Scalar entropy = 0;
+    GradientBundle gradients;
+};
+
+class GrpoObjective
+{
+private:
+    GrpoConfig cfg_;
+
+    [[nodiscard]] static Result<TensorRecord> with_advantage(
+        const TensorRecord& source, const Tensor& advantage)
+    {
+        std::vector<NamedTensor> values;
+        values.reserve(source.size());
+        for (const TensorFieldSpec& field : source.schema().fields())
+        {
+            if (field.name == "advantage")
+            {
+                values.push_back(NamedTensor{
+                    .name = field.name, .value = advantage});
+                continue;
+            }
+            const Tensor* value = source.find(field.name);
+            if (value != nullptr)
+                values.push_back(NamedTensor{.name = field.name,
+                                             .value = *value});
+        }
+        return TensorRecord::create(source.schema(), std::move(values));
+    }
+
+public:
+    explicit GrpoObjective(GrpoConfig cfg = {})
+        : cfg_(std::move(cfg))
+    {
+    }
+
+    // advantage 已存在时直接使用；否则按 spans 对 returns 做组内标准化。
+    [[nodiscard]] Result<GrpoReport> evaluate(
+        ComputeEngine& engine, const TensorSchema& output_schema,
+        const Tensor& policy_logits, const PolicyBatchView& batch,
+        std::span<const GroupSpan> spans) const
+    {
+        NN_TRY_CHECK(output_schema.field(cfg_.policy_field));
+        TensorRecord derived;
+        const TensorRecord* active_record = &batch.record();
+        if (batch.advantage() == nullptr)
+        {
+            const Tensor* returns = batch.returns();
+            if (returns == nullptr)
+                NN_FAIL("GrpoObjective: 缺少 advantage 或 return");
+
+            Tensor flat_returns;
+            const Tensor* group_input = returns;
+            if (returns->cols() != 1)
+            {
+                NN_TRY(flat, engine.reshape(
+                                *returns, returns->rows() * returns->cols(), 1));
+                flat_returns = std::move(*flat);
+                group_input = &flat_returns;
+            }
+            GroupAdvantage group(cfg_.group_epsilon, cfg_.precision);
+            NN_TRY(grouped, group.apply(engine, *group_input, spans));
+            Tensor advantage_flat = std::move(*grouped);
+            Tensor advantage;
+            if (advantage_flat.cols() == 1 && batch.action_mask().rows() == 1)
+            {
+                NN_TRY(a,
+                       engine.reshape(advantage_flat, 1,
+                                      advantage_flat.rows()));
+                advantage = std::move(*a);
+            }
+            else
+            {
+                advantage = std::move(advantage_flat);
+            }
+
+            NN_TRY(record, with_advantage(batch.record(), advantage));
+            derived = std::move(*record);
+            active_record = &derived;
+        }
+        NN_TRY(active_view, PolicyBatchView::create(*active_record));
+
+        ClippedPolicyObjective policy(cfg_.clip_epsilon, cfg_.precision);
+        EntropyBonusObjective entropy(cfg_.entropy_coefficient,
+                                      cfg_.precision);
+        NN_TRY(policy_out,
+               policy.evaluate_context(engine, policy_logits, *active_view));
+        NN_TRY(entropy_out,
+               entropy.evaluate_context(engine, policy_logits, *active_view));
+        NN_TRY(policy_grad, engine.clone(policy_out->gradient));
+        NN_TRY_CHECK(engine.accumulate(*policy_grad,
+                                       entropy_out->gradient));
+        NN_TRY(gradients,
+               GradientBundle::create(
+                   output_schema,
+                   {NamedTensor{.name = cfg_.policy_field,
+                                .value = *policy_grad}}));
+        const Scalar entropy_value =
+            cfg_.entropy_coefficient == Scalar{0}
+                ? Scalar{0}
+                : -entropy_out->loss / cfg_.entropy_coefficient;
+        return GrpoReport{
+            .loss = policy_out->loss + entropy_out->loss,
+            .policy_loss = policy_out->loss,
+            .entropy = entropy_value,
+            .gradients = std::move(*gradients),
         };
     }
 };

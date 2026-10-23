@@ -46,6 +46,8 @@
 #include "expr_registry.hpp"
 #include "fused_generate.hpp"   // 生成阶段（原 gen_fused.cpp；不经 .bin 中间文件）
 #include "neuralnet.cpp/expr_fold.hpp"
+#include "neuralnet.cpp/rl_experience.hpp"
+#include "neuralnet.cpp/rl_policy.hpp"
 
 #include <csignal>
 #if __has_include(<stacktrace>)
@@ -467,6 +469,202 @@ int main(int argc, char* argv[])
             std::fflush(stderr);
             std::abort();
         }
+    }
+
+    // ── RL：experience transforms / categorical policy / objectives ────────
+    // RL 头不经过 Layer 模型 pass；这里显式触达每个 public evaluate 路径，
+    // 让 dsl::compute* 的 FusedAnchor 在构建期登记结构。scan 模式的算子是
+    // 占位返回，具体数值分支不重要；所有表达式调用点都会被实例化。
+    {
+        constexpr std::size_t R = 3, C = 2;
+        nn::Tensor logits = scan_tensor(R, C);
+        nn::Tensor action = scan_tensor(1, C);
+        nn::Tensor one = scan_tensor(1, C);
+        nn::Tensor value = scan_tensor(1, C);
+        nn::Tensor reward = scan_tensor(R, C);
+        nn::Tensor done = scan_tensor(R, C);
+        nn::Tensor mask_rc = scan_tensor(R, C);
+        nn::Tensor old_log_prob = scan_tensor(1, C);
+
+        nn::CategoricalDistribution dist(scan_prof.stable);
+        (void)dist.log_prob(engine, logits, action);
+        (void)dist.entropy(engine, logits);
+        (void)dist.log_prob_with_gradient(engine, logits, action, one);
+        (void)dist.entropy_with_gradient(engine, logits, one);
+
+        // PPO/value clip 的 select 结构：目标方法在 dry-run 中可能因全零
+        // mask 提前返回；这里直接触达同一表达式类型，避免闭合世界漏项。
+        nn::Tensor ratio = scan_tensor(1, C);
+        nn::Tensor old_value_scan = scan_tensor(1, C);
+        nn::Tensor value_scan = scan_tensor(1, C);
+        nn::Tensor returns_scan = scan_tensor(1, C);
+        const nn::Scalar lower = 0.8f;
+        const nn::Scalar upper = 1.2f;
+        auto clipped_ratio_expr = nn::dsl::select(
+            nn::dsl::leaf(ratio) < nn::dsl::rparam(lower),
+            nn::dsl::rparam(lower),
+            nn::dsl::select(
+                nn::dsl::leaf(ratio) > nn::dsl::rparam(upper),
+                nn::dsl::rparam(upper), nn::dsl::leaf(ratio)));
+        nn::Tensor clipped_ratio = NN_UNWRAP(nn::dsl::compute(
+            engine, clipped_ratio_expr, 1, C, scan_prof.stable));
+        nn::Tensor clip_low = NN_UNWRAP(nn::dsl::compute(
+            engine,
+            nn::dsl::leaf(old_value_scan) - nn::dsl::rparam(0.2f),
+            1, C, scan_prof.stable));
+        nn::Tensor clip_high = NN_UNWRAP(nn::dsl::compute(
+            engine,
+            nn::dsl::leaf(old_value_scan) + nn::dsl::rparam(0.2f),
+            1, C, scan_prof.stable));
+        auto clipped_value_expr = nn::dsl::select(
+            nn::dsl::leaf(value_scan) < nn::dsl::leaf(clip_low),
+            nn::dsl::leaf(clip_low),
+            nn::dsl::select(
+                nn::dsl::leaf(value_scan) > nn::dsl::leaf(clip_high),
+                nn::dsl::leaf(clip_high), nn::dsl::leaf(value_scan)));
+        nn::Tensor clipped_value = NN_UNWRAP(nn::dsl::compute(
+            engine, clipped_value_expr, 1, C, scan_prof.stable));
+        nn::Tensor clipped_diff = NN_UNWRAP(nn::dsl::compute(
+            engine,
+            nn::dsl::leaf(clipped_value) - nn::dsl::leaf(returns_scan),
+            1, C, scan_prof.stable));
+        nn::Tensor value_diff = NN_UNWRAP(nn::dsl::compute(
+            engine,
+            nn::dsl::leaf(value_scan) - nn::dsl::leaf(returns_scan),
+            1, C, scan_prof.stable));
+        nn::Tensor value_diff_sq = NN_UNWRAP(nn::dsl::compute(
+            engine, nn::dsl::leaf(value_diff) * nn::dsl::leaf(value_diff),
+            1, C, scan_prof.stable));
+        nn::Tensor value_clipped_sq = NN_UNWRAP(nn::dsl::compute(
+            engine,
+            nn::dsl::leaf(clipped_diff) * nn::dsl::leaf(clipped_diff),
+            1, C, scan_prof.stable));
+        auto value_max_expr = nn::dsl::max(
+            nn::dsl::leaf(value_diff_sq),
+            nn::dsl::leaf(value_clipped_sq));
+        (void)nn::dsl::compute(engine, value_max_expr, 1, C,
+                               scan_prof.stable);
+
+        nn::Tensor ppo_objective = NN_UNWRAP(nn::dsl::compute(
+            engine,
+            nn::dsl::leaf(ratio) * nn::dsl::leaf(one),
+            1, C, scan_prof.stable));
+        nn::Tensor ppo_clipped_objective = NN_UNWRAP(nn::dsl::compute(
+            engine,
+            nn::dsl::leaf(clipped_ratio) * nn::dsl::leaf(one),
+            1, C, scan_prof.stable));
+        auto ppo_min_expr = nn::dsl::min(
+            nn::dsl::leaf(ppo_objective),
+            nn::dsl::leaf(ppo_clipped_objective));
+        (void)nn::dsl::compute(engine, ppo_min_expr, 1, C,
+                               scan_prof.stable);
+        const auto ratio_leaf = nn::dsl::leaf(ratio);
+        const auto adv_leaf = nn::dsl::leaf(one);
+        const auto positive_factor = nn::dsl::select(
+            ratio_leaf < nn::dsl::rparam(lower),
+            ratio_leaf * adv_leaf,
+            nn::dsl::select(ratio_leaf > nn::dsl::rparam(upper),
+                            nn::Scalar{0}, adv_leaf));
+        const auto negative_factor = nn::dsl::select(
+            ratio_leaf < nn::dsl::rparam(lower),
+            nn::Scalar{0},
+            nn::dsl::select(ratio_leaf > nn::dsl::rparam(upper),
+                            ratio_leaf * adv_leaf, adv_leaf));
+        auto ppo_factor_expr = nn::dsl::select(
+            adv_leaf > nn::Scalar{0}, positive_factor, negative_factor);
+        nn::Tensor ppo_factor_scan = NN_UNWRAP(nn::dsl::compute(
+            engine, ppo_factor_expr, 1, C, scan_prof.stable));
+        (void)nn::dsl::compute(engine,
+                               nn::dsl::leaf(ppo_factor_scan) *
+                                   nn::dsl::leaf(one) *
+                                   nn::dsl::rparam(-1.0f),
+                               1, C, scan_prof.stable);
+        auto ppo_outside_expr = nn::dsl::select(
+            ratio_leaf < nn::dsl::rparam(lower), nn::Scalar{1},
+            nn::dsl::select(ratio_leaf > nn::dsl::rparam(upper),
+                            nn::Scalar{1}, nn::Scalar{0})) *
+            nn::dsl::leaf(one);
+        (void)nn::dsl::compute(engine, ppo_outside_expr, 1, C,
+                               scan_prof.stable);
+        const auto value_outside = nn::dsl::select(
+            nn::dsl::leaf(value_scan) < nn::dsl::leaf(clip_low),
+            nn::Scalar{1},
+            nn::dsl::select(
+                nn::dsl::leaf(value_scan) > nn::dsl::leaf(clip_high),
+                nn::Scalar{1}, nn::Scalar{0}));
+        auto value_outside_mask_expr =
+            value_outside * nn::dsl::leaf(one);
+        (void)nn::dsl::compute(engine, value_outside_mask_expr, 1, C,
+                               scan_prof.stable);
+        nn::Tensor value_outside_tensor = NN_UNWRAP(nn::dsl::compute(
+            engine, value_outside, 1, C, scan_prof.stable));
+        nn::Tensor value_clipped_grad = NN_UNWRAP(nn::dsl::compute(
+            engine,
+            nn::dsl::select(
+                nn::dsl::leaf(value_outside_tensor) > nn::Scalar{0},
+                nn::Scalar{0},
+                nn::dsl::leaf(value_diff) * nn::dsl::rparam(2.0f)),
+            1, C, scan_prof.stable));
+        nn::Tensor value_unclipped_grad = NN_UNWRAP(nn::dsl::compute(
+            engine, nn::dsl::leaf(value_diff) * nn::dsl::rparam(2.0f),
+            1, C, scan_prof.stable));
+        auto value_choose_clipped =
+            nn::dsl::leaf(value_clipped_sq) >
+            nn::dsl::leaf(value_diff_sq);
+        auto value_grad_expr = nn::dsl::select(
+            value_choose_clipped, nn::dsl::leaf(value_clipped_grad),
+            nn::dsl::leaf(value_unclipped_grad)) *
+            nn::dsl::leaf(one) * nn::dsl::rparam(1.0f);
+        (void)nn::dsl::compute(engine, value_grad_expr, 1, C,
+                               scan_prof.stable);
+
+        nn::GaeAdvantage gae;
+        (void)gae.apply(engine, reward, reward, &done, &mask_rc, &one);
+        nn::MonteCarloReturn returns;
+        (void)returns.apply(engine, reward, &done, &mask_rc);
+        nn::MaskedNormalizer normalizer;
+        (void)normalizer.apply(engine, reward, mask_rc);
+        const nn::GroupSpan groups[1]{{0, R}};
+        nn::GroupAdvantage group;
+        (void)group.apply(engine, reward, groups);
+
+        nn::ExperienceSchema exp = NN_UNWRAP(nn::ExperienceSchema::create(
+            {"action", "action_mask", "advantage", "return", "old_value",
+             "old_log_prob"}));
+        nn::TensorRecord record = NN_UNWRAP(nn::TensorRecord::create(
+            exp.schema(),
+            {nn::NamedTensor{.name = "action", .value = action},
+             nn::NamedTensor{.name = "action_mask", .value = one},
+             nn::NamedTensor{.name = "value_mask", .value = one},
+             nn::NamedTensor{.name = "advantage", .value = one},
+             nn::NamedTensor{.name = "return", .value = one},
+             nn::NamedTensor{.name = "old_value", .value = one},
+             nn::NamedTensor{.name = "old_log_prob",
+                             .value = old_log_prob}}));
+        nn::PolicyBatchView view = NN_UNWRAP(
+            nn::PolicyBatchView::create(record));
+
+        nn::ReinforceObjective reinforce;
+        (void)reinforce.evaluate_context(engine, logits, view);
+        nn::ValueRegressionObjective value_reg;
+        (void)value_reg.evaluate_context(engine, value, view);
+        nn::EntropyBonusObjective entropy;
+        (void)entropy.evaluate_context(engine, logits, view);
+        nn::SampledKlObjective kl;
+        (void)kl.evaluate_context(engine, logits, view);
+        nn::ClippedPolicyObjective ppo_policy;
+        (void)ppo_policy.evaluate_context(engine, logits, view);
+        nn::ClippedValueObjective ppo_value;
+        (void)ppo_value.evaluate_context(engine, value, view);
+
+        nn::TensorSchema output = NN_UNWRAP(nn::TensorSchema::create(
+            "rl_output",
+            {nn::tensor_field("policy",
+                              nn::TensorShapeSpec::exact(R, C)),
+             nn::tensor_field("value",
+                              nn::TensorShapeSpec::exact(1, C))}));
+        nn::PpoObjective ppo;
+        (void)ppo.evaluate(engine, output, logits, value, view);
     }
 
     };   // dry_run 结束
