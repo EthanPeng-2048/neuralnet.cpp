@@ -9,6 +9,14 @@ on:
 
 env:
   BUILD_TYPE: Release
+  # GitHub runners reinstall toolchains under changing file mtimes. Hashing
+  # compiler contents and normalizing the checkout directory makes ccache
+  # reusable across runs while still invalidating on a real compiler change.
+  CCACHE_BASEDIR: ${{ github.workspace }}
+  CCACHE_COMPILERCHECK: content
+  CCACHE_COMPRESS: "true"
+  CCACHE_MAXSIZE: 2G
+  CCACHE_NOHASHDIR: "true"
 
 jobs:
   build:
@@ -29,26 +37,6 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
-
-    # ========== 缓存：ccache（Linux） ==========
-    - name: Cache ccache (Linux)
-      if: runner.os == 'Linux'
-      uses: actions/cache@v4
-      with:
-        path: ~/.cache/ccache
-        key: ${{ runner.os }}-ccache-${{ github.sha }}
-        restore-keys: |
-          ${{ runner.os }}-ccache-
-
-    # ========== 缓存：ccache（Windows） ==========
-    - name: Cache ccache (Windows)
-      if: runner.os == 'Windows'
-      uses: actions/cache@v4
-      with:
-        path: C:\Users\runneradmin\AppData\Local\ccache
-        key: ${{ runner.os }}-ccache-${{ github.sha }}
-        restore-keys: |
-          ${{ runner.os }}-ccache-
 
     # 注意：不缓存整个 build 目录——旧 CMakeCache.txt 会跨运行携带已移除的
     # -D 设置（如历史上的 CMAKE_CXX_FLAGS=-stdlib=libc++），导致编译/链接
@@ -132,6 +120,23 @@ jobs:
         $llvmPath = "C:\Program Files\LLVM\bin"
         echo "$llvmPath" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
+    # 两边工具链安装完成后统一挂载 ccache。由 action 自己管理平台的默认
+    # CCACHE_DIR、restore/save 与统计，避免手写 runner 路径漂移。
+    - name: Mount ccache
+      uses: hendrikmuhs/ccache-action@v1.2
+      with:
+        key: ${{ runner.os }}-ccache-v2-release-clang
+        restore-keys: |
+          ${{ runner.os }}-ccache-v2-
+          ${{ runner.os }}-ccache-
+        max-size: 2G
+        verbose: 1
+
+    - name: Inspect ccache mount
+      run: |
+        ccache --show-stats --verbose
+        ccache --zero-stats
+
     # ========== Windows: 缓存 Vulkan SDK（避免重复下载安装） ==========
     - name: Cache Vulkan SDK (Windows)
       id: cache-vulkan-windows
@@ -209,6 +214,9 @@ jobs:
 
     - name: Build
       run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}}
+
+    - name: Report ccache usage
+      run: ccache --show-stats --verbose
 
     # ========== 真跑测试（roadmap P0-1）==========
     # 需 Vulkan 的用例在无 GPU 的 runner 上按退出码 77 记 skip（非失败）。
