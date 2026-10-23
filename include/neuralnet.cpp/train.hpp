@@ -32,6 +32,7 @@
 #include "optimizer.hpp"
 #include "model.hpp"
 #include "training_session.hpp"   // TrainingSession（推荐：Model + Optimizer 同生共死）
+#include "training_group_session.hpp" // 通用多模型具名角色
 #include "dataset.hpp"            // Dataset（.nndataset 只读）
 #include "dataset_samples.hpp"    // TextSampleSet：数据集 → 训练样本（窗口）
 #include "lr_scheduler.hpp"       // 学习率调度（epoch / step 级）

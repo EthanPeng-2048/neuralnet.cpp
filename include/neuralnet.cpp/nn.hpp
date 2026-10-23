@@ -44,6 +44,7 @@
 // L3 实现层
 #include "model_container.hpp"
 #include "training_session.hpp"
+#include "training_group_session.hpp"
 #include "train_state.hpp"
 #include "model_spec.hpp"
 #include "model_serialization.hpp"
