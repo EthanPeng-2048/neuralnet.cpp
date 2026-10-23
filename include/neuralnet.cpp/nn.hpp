@@ -25,6 +25,8 @@
 
 // L2 计算层 — 引擎化
 #include "compute_tensor.hpp"
+#include "tensor_schema.hpp"
+#include "named_tensor_set.hpp"
 #include "expr_spec.hpp"
 #include "compute_engine.hpp"
 #include "expr_dsl.hpp"

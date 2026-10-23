@@ -13,8 +13,11 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 #include <cstdint>
+#include <optional>
 #include <vector>
 #include <string>
+
+#include "tensor_schema.hpp"
 
 namespace nn
 {
@@ -122,6 +125,9 @@ enum class ModelType : uint32_t
 struct ModelSpec
 {
     ModelType type = ModelType::Unknown;
+
+    // 通用多输出规范（docs/todo/31 RL-0）。nullopt = 旧单输出模型。
+    std::optional<TensorSchema> output_schema;
 
     // ── MLP ──
     std::vector<std::size_t> layer_dims;

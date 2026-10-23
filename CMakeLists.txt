@@ -664,6 +664,10 @@ if(NN_BUILD_APPS OR NN_ENABLE_TESTS)
     nn_add_executable(training_session_test src/training_session_test.cpp)
     list(APPEND NN_TEST_TARGETS training_session_test)
 
+    # ── RL 公共基础：有序 tensor schema / 具名张量 / 梯度包（docs/todo/31 §3）
+    nn_add_executable(tensor_schema_test src/tensor_schema_test.cpp)
+    list(APPEND NN_TEST_TARGETS tensor_schema_test)
+
     # ── F1：危险精度组合启动期告警（仅警告，不拒绝；docs/todo/24 §2.3）────
     # [1][2] 头文件函数组合矩阵（含 all=f16）单测；[3] 子进程跑 text_train/
     # mnist_train，捕获 stderr 断言告警出现 + 退出码不变；二进制缺失 → 77 = SKIP
