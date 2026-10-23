@@ -234,6 +234,13 @@ private:
     }
 
 public:
+    PolicyBatchView() = default;
+    PolicyBatchView(const PolicyBatchView&) = default;
+    PolicyBatchView& operator=(const PolicyBatchView&) = default;
+    PolicyBatchView(PolicyBatchView&&) noexcept = default;
+    PolicyBatchView& operator=(PolicyBatchView&&) noexcept = default;
+    ~PolicyBatchView() = default;
+
     [[nodiscard]] static Result<PolicyBatchView> create(
         const TensorRecord& record)
     {
