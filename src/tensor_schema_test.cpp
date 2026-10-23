@@ -9,6 +9,7 @@
 // ─────────────────────────────────────────────────────────────────────────
 
 #include <optional>
+#include <cstdint>
 #include <string>
 #include <utility>
 #include <vector>
@@ -120,6 +121,20 @@ void test_schema_construction_errors()
           "duplicate field name rejected");
 }
 
+void test_decode_bounds()
+{
+    std::string schema_bytes("NNS1");
+    nn::detail::schema_put_string(schema_bytes, "x");
+    nn::detail::schema_put_u32(schema_bytes, static_cast<std::uint32_t>(-1));
+    CHECK(!nn::decode_tensor_schema(schema_bytes),
+          "schema decode rejects hostile field count before allocation");
+
+    std::string names_bytes("NNL1");
+    nn::detail::schema_put_u32(names_bytes, static_cast<std::uint32_t>(-1));
+    CHECK(!nn::decode_tensor_name_list(names_bytes),
+          "name-list decode rejects hostile count before allocation");
+}
+
 void test_named_tensor_set()
 {
     auto owner = nn::CpuEngine::create();
@@ -214,6 +229,7 @@ int main()
     std::puts("=== tensor_schema / named tensor contract ===");
     test_schema_and_handles();
     test_schema_construction_errors();
+    test_decode_bounds();
     test_named_tensor_set();
     test_optional_and_gradients();
     if (g_fail == 0) std::puts("All tensor schema tests passed.");

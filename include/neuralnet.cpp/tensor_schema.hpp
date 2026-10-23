@@ -13,9 +13,11 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -27,6 +29,7 @@ namespace nn
 
 inline constexpr std::size_t kInvalidFieldIndex =
     static_cast<std::size_t>(-1);
+inline constexpr std::uint32_t kMaxTensorSchemaFields = 65536;
 
 // 字段所在设备约束。使用独立枚举而不是 Device，保持本头不依赖 compute_tensor。
 enum class TensorPlacement : std::uint8_t
@@ -139,6 +142,13 @@ namespace detail
     return h;
 }
 
+[[nodiscard]] inline std::uint64_t schema_hash_string(std::uint64_t h,
+                                                      std::string_view value) noexcept
+{
+    h = schema_hash_u64(h, value.size());
+    return schema_hash_bytes(h, value);
+}
+
 [[nodiscard]] inline std::uint64_t schema_hash_optional_size(
     std::uint64_t h, const std::optional<std::size_t>& v) noexcept
 {
@@ -166,11 +176,11 @@ private:
         std::string_view name, const std::vector<TensorFieldSpec>& fields) noexcept
     {
         std::uint64_t h = kTensorSchemaFnvOffset;
-        h = detail::schema_hash_bytes(h, name);
+        h = detail::schema_hash_string(h, name);
         h = detail::schema_hash_u64(h, fields.size());
         for (const TensorFieldSpec& f : fields)
         {
-            h = detail::schema_hash_bytes(h, f.name);
+            h = detail::schema_hash_string(h, f.name);
             h = detail::schema_hash_optional_size(h, f.shape.rows);
             h = detail::schema_hash_optional_size(h, f.shape.cols);
             h = detail::schema_hash_u64(h, f.required ? 1u : 0u);
@@ -219,17 +229,16 @@ public:
             NN_FAIL("TensorSchema::create: schema '" + name +
                     "' 至少需要一个字段");
 
+        std::unordered_set<std::string_view> field_names;
+        field_names.reserve(fields.size());
         for (std::size_t i = 0; i < fields.size(); ++i)
         {
             if (fields[i].name.empty())
                 NN_FAIL("TensorSchema::create: schema '" + name + "' 的第 " +
                         std::to_string(i) + " 个字段名为空");
-            for (std::size_t j = 0; j < i; ++j)
-            {
-                if (fields[i].name == fields[j].name)
-                    NN_FAIL("TensorSchema::create: schema '" + name +
-                            "' 含重复字段 '" + fields[i].name + "'");
-            }
+            if (!field_names.insert(fields[i].name).second)
+                NN_FAIL("TensorSchema::create: schema '" + name + "' 含重复字段 '" +
+                        fields[i].name + "'");
         }
 
         const std::uint64_t fp = make_fingerprint_(name, fields);
@@ -373,7 +382,7 @@ inline void schema_put_u64(std::string& out, std::uint64_t v)
 
 inline void schema_put_string(std::string& out, std::string_view s)
 {
-    if (s.size() > UINT32_MAX)
+    if (s.size() > std::numeric_limits<std::uint32_t>::max())
         NN_UNWRAP(false, "TensorSchema::encode: 字符串过长");
     schema_put_u32(out, static_cast<std::uint32_t>(s.size()));
     out.append(s);
@@ -384,9 +393,11 @@ inline void schema_put_string(std::string& out, std::string_view s)
 {
     std::string out("NNS1", 4);
     detail::schema_put_string(out, schema.name());
+    if (schema.size() > std::numeric_limits<std::uint32_t>::max())
+        NN_UNWRAP(false, "TensorSchema::encode: 字段数过多");
     detail::schema_put_u32(
         out, static_cast<std::uint32_t>(schema.size()));
-    constexpr std::uint64_t no_axis = UINT64_MAX;
+    constexpr std::uint64_t no_axis = std::numeric_limits<std::uint64_t>::max();
     for (const TensorFieldSpec& f : schema.fields())
     {
         detail::schema_put_string(out, f.name);
@@ -413,9 +424,15 @@ inline void schema_put_string(std::string& out, std::string_view s)
     bytes.remove_prefix(4);
     NN_TRY(name, detail::schema_take_string(bytes));
     NN_TRY(count, detail::schema_take_u32(bytes));
+    if (*count > kMaxTensorSchemaFields)
+        NN_FAIL("TensorSchema::decode: 字段数超过上限 " + std::to_string(kMaxTensorSchemaFields));
+    // 每个字段至少包含 name_len + rows + cols + 3 个 flags。
+    constexpr std::size_t min_field_bytes = 4 + 8 + 8 + 3;
+    if (*count > bytes.size() / min_field_bytes)
+        NN_FAIL("TensorSchema::decode: 字段数与负载长度不一致");
     std::vector<TensorFieldSpec> fields;
     fields.reserve(*count);
-    constexpr std::uint64_t no_axis = UINT64_MAX;
+    constexpr std::uint64_t no_axis = std::numeric_limits<std::uint64_t>::max();
     for (std::uint32_t i = 0; i < *count; ++i)
     {
         NN_TRY(field_name, detail::schema_take_string(bytes));
@@ -441,9 +458,17 @@ inline void schema_put_string(std::string& out, std::string_view s)
         TensorFieldSpec field;
         field.name = std::move(*field_name);
         if (*rows != no_axis)
+        {
+            if (*rows > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()))
+                NN_FAIL("TensorSchema::decode: rows 超出平台范围");
             field.shape.rows = static_cast<std::size_t>(*rows);
+        }
         if (*cols != no_axis)
+        {
+            if (*cols > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()))
+                NN_FAIL("TensorSchema::decode: cols 超出平台范围");
             field.shape.cols = static_cast<std::size_t>(*cols);
+        }
         field.required = required != 0;
         if (precision_tag != 0)
             field.precision =
@@ -462,6 +487,8 @@ inline void schema_put_string(std::string& out, std::string_view s)
     const std::vector<std::string>& names)
 {
     std::string out("NNL1", 4);
+    if (names.size() > std::numeric_limits<std::uint32_t>::max())
+        NN_UNWRAP(false, "encode_tensor_name_list: 名称过多");
     detail::schema_put_u32(out, static_cast<std::uint32_t>(names.size()));
     for (const std::string& name : names)
         detail::schema_put_string(out, name);
@@ -475,6 +502,11 @@ decode_tensor_name_list(std::string_view bytes)
         NN_FAIL("decode_tensor_name_list: 魔数不匹配");
     bytes.remove_prefix(4);
     NN_TRY(count, detail::schema_take_u32(bytes));
+    if (*count > kMaxTensorSchemaFields)
+        NN_FAIL("decode_tensor_name_list: 名称数超过上限 " +
+                std::to_string(kMaxTensorSchemaFields));
+    // 每个名称至少有一个 u32 长度前缀。
+    if (*count > bytes.size() / 4) NN_FAIL("decode_tensor_name_list: 名称数与负载长度不一致");
     std::vector<std::string> names;
     names.reserve(*count);
     for (std::uint32_t i = 0; i < *count; ++i)

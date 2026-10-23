@@ -124,6 +124,29 @@ struct ObjectiveGrads
     nn::Tensor packed;
 };
 
+class FailSecondForwardLayer final : public nn::Layer
+{
+private:
+    bool first_forward_ = true;
+
+public:
+    [[nodiscard]] const char* layer_name() const noexcept override
+    { return "FailSecondForwardLayer"; }
+
+    [[nodiscard]] nn::Result<nn::Tensor> forward(const nn::Tensor& input) override
+    {
+        if (!first_forward_) NN_FAIL("FailSecondForwardLayer: intentional failure");
+        first_forward_ = false;
+        return engine_ref().slice_rows(input, 0, 1);
+    }
+
+    [[nodiscard]] nn::Result<nn::Tensor> backward(const nn::Tensor& grad_output) override
+    { return grad_output; }
+
+protected:
+    [[nodiscard]] nn::Result<void> init_impl(nn::ComputeEngine&) override { return {}; }
+};
+
 nn::Result<ObjectiveGrads> make_objective_grads(
     nn::CpuEngine& engine, const nn::TensorSchema& schema,
     const nn::NamedTensorSet& output)
@@ -270,6 +293,25 @@ void test_negative_paths()
     if (wrong_grads)
         CHECK(!model_r->backward_named(*wrong_grads).has_value(),
               "backward rejects gradient schema mismatch");
+
+    nn::Model stateful_model(engine);
+    auto stateful_bundle = std::make_unique<nn::OutputBundleLayer>(schema);
+    NN_UNWRAP(stateful_bundle->add_port("policy", std::make_unique<nn::Linear>(2, 2)));
+    NN_UNWRAP(stateful_bundle->add_port("value", std::make_unique<FailSecondForwardLayer>()));
+    NN_UNWRAP(stateful_model.add_layer(std::move(stateful_bundle)));
+
+    const nn::Tensor stateful_input = make_tensor(engine, 2, 2, 0.1f, 0.1f);
+    CHECK(stateful_model.forward_named(stateful_input).has_value(),
+          "stateful bundle initial forward");
+    CHECK(!stateful_model.forward_named(stateful_input).has_value(),
+          "stateful bundle second forward fails");
+    auto stale_grads = nn::GradientBundle::create(
+        schema, {nn::NamedTensor{.name = "policy", .value = make_tensor(engine, 2, 2, 0.0f, 0.0f)},
+                 nn::NamedTensor{.name = "value", .value = make_tensor(engine, 1, 2, 0.0f, 0.0f)}});
+    CHECK(stale_grads.has_value(), "stale-state gradient bundle");
+    if (stale_grads)
+        CHECK(!stateful_model.backward_named(*stale_grads).has_value(),
+              "failed forward invalidates previous backward state");
 }
 
 void test_model_spec_roundtrip()
@@ -294,6 +336,12 @@ void test_model_spec_roundtrip()
           "schema semantic roundtrip");
     CHECK(nn::spec_matches(spec, *loaded),
           "spec_matches includes output schema");
+
+    nn::ModelSpec duplicate_packing = spec;
+    duplicate_packing.output_packing = {"policy", "policy"};
+    auto malformed = nn::detail::spec_from_kv(
+        *nn::KeyValueRecord::parse(nn::detail::spec_to_kv(duplicate_packing).serialize()));
+    CHECK(!malformed, "spec decode rejects duplicate output packing");
 
     nn::ModelSpec old;
     old.type = nn::ModelType::MLP;

@@ -102,6 +102,7 @@ void test_named_rl_session_update()
     cfg.optimizer = "sgd";
     cfg.lr = 0.05f;
     cfg.weight_decay = 0.0f;
+    cfg.grad_accum_steps = 2;
     auto session_r = nn::TrainingSession::create(std::move(model), cfg);
     CHECK(session_r.has_value(), "create named-output TrainingSession");
     if (!session_r) return;
@@ -160,7 +161,8 @@ void test_named_rl_session_update()
         if (!view) return;
 
         nn::TrainingStepOptions options;
-        options.normalization_units = 2;
+        // 每个 micro-batch 有 2 个有效动作，整个 update 有 4 个。
+        options.normalization_units = 4;
         auto report = session.train_named_step(
             input, options,
             [&](nn::Model& active, nn::ComputeEngine& engine_ref,
@@ -183,14 +185,16 @@ void test_named_rl_session_update()
                     .loss_units = 0,
                 };
             });
-        CHECK(report && report->parameters_updated,
-              "named PPO step updates optimizer");
+        const bool expect_update = (step % 2) == 1;
+        CHECK(report && report->parameters_updated == expect_update,
+              expect_update ? "named PPO accumulation boundary updates optimizer"
+                            : "named PPO first micro-step accumulates only");
         if (!report) return;
     }
 
     CHECK(losses_finite, "PPO losses finite across named training loop");
-    CHECK(session.step_count() == 6,
-          "named training loop advances optimizer six times");
+    CHECK(session.step_count() == 3,
+          "named training loop advances optimizer once per two micro-steps");
     auto after = session.model().forward_named(input);
     CHECK(after.has_value(), "post-training named forward");
     if (!after) return;

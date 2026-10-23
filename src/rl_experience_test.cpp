@@ -152,6 +152,15 @@ void test_gae_done_mask_and_bootstrap()
         CHECK(near_values(values_of(*owner, boot->advantage),
                           {2.0f, 2.0f}),
               "terminal bootstrap enters GAE");
+
+    auto reward3 = matrix_tensor(*owner, 3, 1, {1, 2, 3});
+    auto value3 = matrix_tensor(*owner, 3, 1, {0, 10, 0});
+    auto mask3 = matrix_tensor(*owner, 3, 1, {1, 0, 1});
+    auto masked_value = gae_lambda1.apply(*owner, reward3, value3, nullptr, &mask3);
+    CHECK(masked_value.has_value(), "GAE masked-value forward");
+    if (masked_value)
+        CHECK(near_values(values_of(*owner, masked_value->advantage), {1.0f, 0.0f, 3.0f}),
+              "masked state value does not leak into prior advantage");
 }
 
 void test_returns_and_normalization()

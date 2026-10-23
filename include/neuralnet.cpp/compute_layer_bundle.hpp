@@ -220,6 +220,10 @@ private:
         if (requested_schema != schema_)
             NN_FAIL("OutputBundleLayer: named forward schema 不匹配");
 
+        // 新一轮 forward 开始后，旧的配对状态立刻失效。否则 trunk 或分支
+        // 中途失败时，调用方仍可能拿上一次成功的缓存执行 backward。
+        forward_ready_ = false;
+        produced_.clear();
         std::vector<NamedTensor> values;
         values.reserve(schema_.size());
         produced_.assign(schema_.size(), false);

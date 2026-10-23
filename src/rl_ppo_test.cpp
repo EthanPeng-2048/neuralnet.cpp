@@ -2,7 +2,7 @@
 //
 // 验收：
 //   [1] ratio 低/中/高三分支，正负 advantage；
-//   [2] policy clip 解析损失、指标、有限差分梯度；
+//   [2] policy clip 解析损失、指标、正/负 advantage 的有限差分梯度；
 //   [3] value clip 双侧、越界梯度为 0；
 //   [4] PPO preset == clipped policy + entropy + clipped value 手工组合；
 //   [5] 缺少 old_log_prob / old_value 明确报错。
@@ -194,6 +194,71 @@ void test_policy_clip_branches()
     }
 }
 
+void test_negative_off_policy_gradient()
+{
+    auto owner = nn::CpuEngine::create();
+    const std::vector<float> base{1, 0, 0, 2, -1, 0};
+    auto logits =
+        matrix_tensor(*owner, 3, 2, {base[0], base[1], base[2], base[3], base[4], base[5]});
+    auto actions = matrix_tensor(*owner, 1, 2, {0, 1});
+    auto mask = matrix_tensor(*owner, 1, 2, {1, 1});
+    auto advantage = matrix_tensor(*owner, 1, 2, {-1, -1});
+    auto returns = matrix_tensor(*owner, 1, 2, {0, 0});
+    auto old_value = matrix_tensor(*owner, 1, 2, {0, 0});
+    nn::CategoricalDistribution dist;
+    auto new_logp = dist.log_prob(*owner, logits, actions);
+    CHECK(new_logp.has_value(), "negative off-policy new log-prob");
+    if (!new_logp) return;
+    // 第一列在容差带内，第二列位于 A<0 的裁剪侧。
+    auto old_logp = make_old_logp(*owner, *new_logp, {1.1f, 0.5f});
+    auto fixture = make_fixture(actions, mask, advantage, returns, old_value, old_logp);
+    CHECK(fixture.has_value(), "negative off-policy fixture");
+    if (!fixture) return;
+
+    nn::ClippedPolicyObjective objective(0.2f);
+    auto out = objective.evaluate_context(*owner, logits, fixture->view);
+    CHECK(out.has_value(), "negative off-policy objective evaluates");
+    if (!out) return;
+    const auto analytic = values_of(*owner, out->gradient);
+
+    constexpr float eps = 1e-3f;
+    bool finite_ok = true;
+    for (std::size_t i = 0; i < base.size(); ++i)
+    {
+        auto plus_v = base;
+        plus_v[i] += eps;
+        auto plus_t = matrix_tensor(
+            *owner, 3, 2, {plus_v[0], plus_v[1], plus_v[2], plus_v[3], plus_v[4], plus_v[5]});
+        auto plus_fix = make_fixture(actions, mask, advantage, returns, old_value, old_logp);
+        if (!plus_fix)
+        {
+            finite_ok = false;
+            break;
+        }
+        auto plus = objective.evaluate_context(*owner, plus_t, plus_fix->view);
+
+        auto minus_v = base;
+        minus_v[i] -= eps;
+        auto minus_t = matrix_tensor(
+            *owner, 3, 2, {minus_v[0], minus_v[1], minus_v[2], minus_v[3], minus_v[4], minus_v[5]});
+        auto minus_fix = make_fixture(actions, mask, advantage, returns, old_value, old_logp);
+        if (!minus_fix)
+        {
+            finite_ok = false;
+            break;
+        }
+        auto minus = objective.evaluate_context(*owner, minus_t, minus_fix->view);
+        if (!plus || !minus)
+        {
+            finite_ok = false;
+            break;
+        }
+        const float numeric = (plus->loss - minus->loss) / (2 * eps);
+        finite_ok = finite_ok && std::fabs(numeric - analytic[i]) < 3e-3f;
+    }
+    CHECK(finite_ok, "negative-advantage PPO gradient exact off-policy");
+}
+
 void test_value_clip()
 {
     auto owner = nn::CpuEngine::create();
@@ -324,6 +389,7 @@ int main()
 {
     std::puts("=== RL-1c PPO clipped objectives ===");
     test_policy_clip_branches();
+    test_negative_off_policy_gradient();
     test_value_clip();
     test_preset_matches_manual();
     test_missing_old_fields();

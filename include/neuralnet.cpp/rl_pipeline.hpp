@@ -333,6 +333,11 @@ public:
             NN_FAIL("RLTrainingPipeline::create: batch/collect/min_buffer 必须 > 0");
         if (cfg.min_buffer_size < cfg.batch_size)
             NN_FAIL("RLTrainingPipeline::create: min_buffer_size 不能小于 batch_size");
+        if (cfg.buffer_capacity > 0 && cfg.min_buffer_size > cfg.buffer_capacity)
+            NN_FAIL("RLTrainingPipeline::create: min_buffer_size 不能超过"
+                    " buffer_capacity");
+        if (cfg.checkpoint_section.empty())
+            NN_FAIL("RLTrainingPipeline::create: checkpoint_section 不能为空");
         if (!metrics)
             metrics = std::make_shared<NullMetricSink>();
         if (!checkpoints)
@@ -404,12 +409,15 @@ public:
             if (hooks.before_update)
                 NN_TRY_CHECK(hooks.before_update(selected));
             NN_TRY_CHECK(update(selected, rng_, *metrics_));
-            if (hooks.after_update)
-                NN_TRY_CHECK(hooks.after_update(selected));
 
+            // update 已成功修改外部模型；即使后置 hook 失败，也必须提交
+            // pipeline 自身计数，避免调用方重试时重复执行同一次 update。
             ++update_count_;
+            Result<void> after_r{};
+            if (hooks.after_update) after_r = hooks.after_update(selected);
             if (cfg_.clear_buffer_after_update)
                 buffer_.clear();
+            NN_TRY_CHECK(after_r);
             if (cfg_.checkpoint_every > 0 &&
                 update_count_ % cfg_.checkpoint_every == 0)
                 NN_TRY_CHECK(save_pipeline_state_());

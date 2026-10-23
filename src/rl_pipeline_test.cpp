@@ -243,6 +243,28 @@ void test_checkpoint_reproducibility()
           "checkpoint provider supports custom sections");
 }
 
+void test_after_update_failure_commits_state()
+{
+    auto engine = nn::CpuEngine::create();
+    auto bundle = make_pipeline(*engine, {}, {}, 991, true);
+    CHECK(bundle.has_value(), "after-hook pipeline composition");
+    if (!bundle) return;
+
+    nn::TrainerHooks hooks;
+    hooks.after_update = [](std::span<const nn::TensorRecord* const>) -> nn::Result<void>
+    { NN_FAIL("intentional after_update failure"); };
+    auto run = bundle->pipeline.run(1,
+                                    [](std::span<const nn::TensorRecord* const>,
+                                       nn::DeterministicRng&, nn::MetricSink&) -> nn::Result<void>
+                                    { return {}; },
+                                    std::move(hooks));
+    CHECK(!run, "after_update failure propagates");
+    CHECK(bundle->pipeline.update_count() == 1,
+          "successful model update is committed before after hook");
+    CHECK(bundle->pipeline.buffer().empty(),
+          "post-update buffer policy applies despite after-hook failure");
+}
+
 void test_invalid_components()
 {
     auto engine = nn::CpuEngine::create();
@@ -258,6 +280,18 @@ void test_invalid_components()
     CHECK(!nn::RLTrainingPipeline::create(
                cfg, std::move(source), nullptr),
           "null sampler rejected");
+
+    nn::RLPipelineConfig too_small = cfg;
+    too_small.buffer_capacity = 1;
+    CHECK(!nn::RLTrainingPipeline::create(too_small, std::make_unique<CountingSource>(*engine),
+                                          std::make_unique<nn::UniformBatchSampler>()),
+          "minimum buffer larger than capacity rejected");
+
+    nn::RLPipelineConfig no_section = cfg;
+    no_section.checkpoint_section.clear();
+    CHECK(!nn::RLTrainingPipeline::create(no_section, std::make_unique<CountingSource>(*engine),
+                                          std::make_unique<nn::UniformBatchSampler>()),
+          "empty checkpoint section rejected");
 
     auto bad_size = nn::RLTrainingPipeline::create(
         cfg, std::make_unique<CountingSource>(*engine),
@@ -289,6 +323,7 @@ int main()
     std::puts("=== RL-2b composable pipeline ===");
     test_pipeline_and_metrics();
     test_checkpoint_reproducibility();
+    test_after_update_failure_commits_state();
     test_invalid_components();
     if (g_fail == 0) std::puts("All RL pipeline tests passed.");
     else std::printf("%d RL pipeline test(s) failed.\n", g_fail);

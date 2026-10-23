@@ -560,16 +560,10 @@ int main(int argc, char* argv[])
                                scan_prof.stable);
         const auto ratio_leaf = nn::dsl::leaf(ratio);
         const auto adv_leaf = nn::dsl::leaf(one);
-        const auto positive_factor = nn::dsl::select(
-            ratio_leaf < nn::dsl::rparam(lower),
-            ratio_leaf * adv_leaf,
-            nn::dsl::select(ratio_leaf > nn::dsl::rparam(upper),
-                            nn::Scalar{0}, adv_leaf));
-        const auto negative_factor = nn::dsl::select(
-            ratio_leaf < nn::dsl::rparam(lower),
-            nn::Scalar{0},
-            nn::dsl::select(ratio_leaf > nn::dsl::rparam(upper),
-                            ratio_leaf * adv_leaf, adv_leaf));
+        const auto positive_factor = nn::dsl::select(ratio_leaf > nn::dsl::rparam(upper),
+                                                     nn::Scalar{0}, ratio_leaf * adv_leaf);
+        const auto negative_factor = nn::dsl::select(ratio_leaf < nn::dsl::rparam(lower),
+                                                     nn::Scalar{0}, ratio_leaf * adv_leaf);
         auto ppo_factor_expr = nn::dsl::select(
             adv_leaf > nn::Scalar{0}, positive_factor, negative_factor);
         nn::Tensor ppo_factor_scan = NN_UNWRAP(nn::dsl::compute(

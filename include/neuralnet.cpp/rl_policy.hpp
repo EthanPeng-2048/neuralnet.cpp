@@ -314,7 +314,7 @@ public:
         if (!result)
         {
             cached_grad_ = Tensor{};
-            return std::unexpected(result.error());
+            NN_FAIL(result.error());
         }
         cached_grad_ = std::move(result->gradient);
         return result->loss;
@@ -338,6 +338,16 @@ public:
 
 namespace detail
 {
+[[nodiscard]] inline Result<void> rl_check_policy_row(const Tensor& logits, const Tensor* value,
+                                                      const char* name)
+{
+    if (value == nullptr) return {};
+    if (value->rows() != 1 || value->cols() != logits.cols())
+        NN_FAIL(std::string("RL objective: ") + name + " 形状必须为 (1,T)，T=" +
+                std::to_string(logits.cols()) + "（实际 " + value->shape_str() + "）");
+    return {};
+}
+
 [[nodiscard]] inline Result<Scalar> rl_masked_units(
     ComputeEngine& engine, const Tensor& mask, Precision p)
 {
@@ -396,7 +406,10 @@ protected:
         ComputeEngine& engine, const Tensor& logits,
         const PolicyBatchView& batch) override
     {
+        NN_TRY_CHECK(detail::rl_check_policy_row(logits, &batch.action(), "action"));
+        NN_TRY_CHECK(detail::rl_check_policy_row(logits, &batch.action_mask(), "action_mask"));
         const Tensor* advantage = batch.advantage();
+        NN_TRY_CHECK(detail::rl_check_policy_row(logits, advantage, "advantage"));
         Tensor baseline_adv;
         if (advantage == nullptr && use_old_value_baseline_)
         {
@@ -404,6 +417,8 @@ protected:
             const Tensor* old_value = batch.old_value();
             if (returns == nullptr || old_value == nullptr)
                 NN_FAIL("ReinforceObjective: baseline 需要 return 与 old_value");
+            NN_TRY_CHECK(detail::rl_check_policy_row(logits, returns, "return"));
+            NN_TRY_CHECK(detail::rl_check_policy_row(logits, old_value, "old_value"));
             NN_TRY(adv, dsl::compute(engine,
                                      dsl::leaf(*returns) -
                                          dsl::leaf(*old_value),
@@ -546,6 +561,8 @@ protected:
         const PolicyBatchView& batch) override
     {
         const Tensor& mask = batch.action_mask();
+        NN_TRY_CHECK(detail::rl_check_policy_row(logits, &batch.action(), "action"));
+        NN_TRY_CHECK(detail::rl_check_policy_row(logits, &mask, "action_mask"));
         NN_TRY(units_r,
                detail::rl_masked_units(engine, mask, precision()));
         const Scalar units = *units_r;
@@ -606,6 +623,9 @@ protected:
         if (old_logp == nullptr)
             NN_FAIL("SampledKlObjective: 缺少 old_log_prob");
         const Tensor& mask = batch.action_mask();
+        NN_TRY_CHECK(detail::rl_check_policy_row(logits, &batch.action(), "action"));
+        NN_TRY_CHECK(detail::rl_check_policy_row(logits, old_logp, "old_log_prob"));
+        NN_TRY_CHECK(detail::rl_check_policy_row(logits, &mask, "action_mask"));
         NN_TRY(units_r,
                detail::rl_masked_units(engine, mask, precision()));
         const Scalar units = *units_r;
@@ -686,10 +706,10 @@ protected:
         if (advantage == nullptr)
             NN_FAIL("ClippedPolicyObjective: 缺少 advantage");
         const Tensor& mask = batch.action_mask();
-        if (old_logp->rows() != 1 || old_logp->cols() != logits.cols() ||
-            advantage->rows() != mask.rows() ||
-            advantage->cols() != mask.cols())
-            NN_FAIL("ClippedPolicyObjective: 输入形状不一致");
+        NN_TRY_CHECK(detail::rl_check_policy_row(logits, &batch.action(), "action"));
+        NN_TRY_CHECK(detail::rl_check_policy_row(logits, old_logp, "old_log_prob"));
+        NN_TRY_CHECK(detail::rl_check_policy_row(logits, advantage, "advantage"));
+        NN_TRY_CHECK(detail::rl_check_policy_row(logits, &mask, "action_mask"));
 
         NN_TRY(units_r,
                detail::rl_masked_units(engine, mask, precision()));
@@ -752,16 +772,10 @@ protected:
 
         const auto ratio_v = dsl::leaf(*ratio);
         const auto adv_v = dsl::leaf(*advantage);
-        const auto positive = dsl::select(
-            ratio_v < dsl::rparam(lower),
-            ratio_v * adv_v,
-            dsl::select(ratio_v > dsl::rparam(upper),
-                        Scalar{0}, adv_v));
-        const auto negative = dsl::select(
-            ratio_v < dsl::rparam(lower),
-            Scalar{0},
-            dsl::select(ratio_v > dsl::rparam(upper),
-                        ratio_v * adv_v, adv_v));
+        // d surrogate / d log_prob。未被裁剪的一侧始终是 ratio*advantage；
+        // A>0 时只裁上界，A<0 时只裁下界。
+        const auto positive = dsl::select(ratio_v > dsl::rparam(upper), Scalar{0}, ratio_v * adv_v);
+        const auto negative = dsl::select(ratio_v < dsl::rparam(lower), Scalar{0}, ratio_v * adv_v);
         const auto factor = dsl::select(
             adv_v > Scalar{0}, positive, negative);
         NN_TRY_MSG(factor_tensor, "PPO policy factor",

@@ -465,6 +465,21 @@ inline void apply_spec_version_defaults(KeyValueRecord &kv, uint32_t version)
     }
     if (!spec.output_packing.empty() && !spec.output_schema)
         NN_FAIL("模型文件含 output_packing 但缺少 output_schema");
+    if (spec.output_schema && !spec.output_packing.empty())
+    {
+        if (spec.output_packing.size() != spec.output_schema->size())
+            NN_FAIL("模型文件 output_packing 未完整覆盖 output_schema");
+        std::vector<bool> seen(spec.output_schema->size(), false);
+        for (const std::string& name : spec.output_packing)
+        {
+            NN_TRY(handle, spec.output_schema->field(name));
+            if (seen[handle->index]) NN_FAIL("模型文件 output_packing 含重复端口 '" + name + "'");
+            seen[handle->index] = true;
+            const TensorFieldSpec& field = spec.output_schema->fields()[handle->index];
+            if (!field.shape.rows)
+                NN_FAIL("模型文件 output_packing 的端口 '" + name + "' 未声明固定 rows");
+        }
+    }
     // 旧文件的 memory_tokens / window（ZiPT 专用）不再读取，随 type=6 一并拒绝。
 
     // ── CNN ──

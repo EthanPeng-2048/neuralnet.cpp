@@ -384,31 +384,25 @@ public:
         NN_TRY(out_a, engine.try_create_tensor(steps, batch, p));
         NN_TRY(out_r, engine.try_create_tensor(steps, batch, p));
         NN_TRY(next_adv, detail::rl_zero(engine, 1, batch, p));
-        NN_TRY(zero_row, detail::rl_zero(engine, 1, batch, p));
+        Tensor next_value;
+        if (bootstrap_value != nullptr) next_value = *bootstrap_value;
+        else
+        {
+            NN_TRY(v, detail::rl_zero(engine, 1, batch, p));
+            next_value = std::move(*v);
+        }
 
         for (std::size_t ti = steps; ti-- > 0;)
         {
             NN_TRY(reward, engine.slice_rows(rewards, ti, 1));
             NN_TRY(value, engine.slice_rows(values, ti, 1));
-            const Tensor* next_value = nullptr;
-            Tensor next_value_owned;
-            if (ti + 1 < steps)
+            Tensor mask_row_owned;
+            const Tensor* mask_row = nullptr;
+            if (mask != nullptr)
             {
-                auto nv = engine.slice_rows(values, ti + 1, 1);
-                NN_TRY_CHECK(nv);
-                next_value_owned = std::move(*nv);
-                next_value = &next_value_owned;
-            }
-            else if (bootstrap_value != nullptr)
-            {
-                next_value = bootstrap_value;
-            }
-            if (next_value == nullptr)
-            {
-                auto nv = detail::rl_zero(engine, 1, batch, p);
-                NN_TRY_CHECK(nv);
-                next_value_owned = std::move(*nv);
-                next_value = &next_value_owned;
+                NN_TRY(m, engine.slice_rows(*mask, ti, 1));
+                mask_row_owned = std::move(*m);
+                mask_row = &mask_row_owned;
             }
 
             Tensor continuation;
@@ -427,14 +421,12 @@ public:
                 continuation = std::move(*c);
             }
 
-            NN_TRY(delta, dsl::compute(
-                              engine,
-                              dsl::leaf(*reward) +
-                                  dsl::leaf(*next_value) *
-                                      dsl::rparam(cfg_.gamma) *
-                                      dsl::leaf(continuation) -
-                                  dsl::leaf(*value),
-                              1, batch, p));
+            NN_TRY(delta, dsl::compute(engine,
+                                       dsl::leaf(*reward) +
+                                           dsl::leaf(next_value) * dsl::rparam(cfg_.gamma) *
+                                               dsl::leaf(continuation) -
+                                           dsl::leaf(*value),
+                                       1, batch, p));
             NN_TRY(advance, dsl::compute(
                                 engine,
                                 dsl::leaf(*delta) +
@@ -443,13 +435,8 @@ public:
                                         dsl::leaf(continuation),
                                 1, batch, p));
 
-            const Tensor* mask_row = nullptr;
-            Tensor mask_row_owned;
-            if (mask != nullptr)
+            if (mask_row != nullptr)
             {
-                NN_TRY(m, engine.slice_rows(*mask, ti, 1));
-                mask_row_owned = std::move(*m);
-                mask_row = &mask_row_owned;
                 NN_TRY(masked_a, dsl::compute(engine,
                                               dsl::leaf(*advance) *
                                                   dsl::leaf(*mask_row),
@@ -478,6 +465,16 @@ public:
             NN_TRY_CHECK(engine.insert_rows(*out_a, ti, *advance));
             NN_TRY_CHECK(engine.insert_rows(*out_r, ti, ret_row));
             next_adv = std::move(*advance);
+            if (mask_row != nullptr)
+            {
+                NN_TRY(valid_value,
+                       dsl::compute(engine, dsl::leaf(*value) * dsl::leaf(*mask_row), 1, batch, p));
+                next_value = std::move(*valid_value);
+            }
+            else
+            {
+                next_value = *value;
+            }
         }
         return Output{.advantage = std::move(*out_a),
                       .returns = std::move(*out_r)};

@@ -397,6 +397,31 @@ void test_entropy_finite_difference()
     CHECK(close, "entropy analytic gradient matches finite difference");
 }
 
+void test_policy_shape_validation()
+{
+    auto owner = nn::CpuEngine::create();
+    auto logits = matrix_tensor(*owner, 2, 2, {0, 0, 0, 0});
+    auto actions = matrix_tensor(*owner, 1, 2, {0, 1});
+    auto bad_row = matrix_tensor(*owner, 1, 1, {1});
+    auto fixture =
+        make_fixture(*owner, logits, actions, bad_row, bad_row, bad_row, bad_row, bad_row);
+    CHECK(fixture.has_value(), "shape-validation fixture");
+    if (!fixture) return;
+
+    nn::ReinforceObjective reinforce;
+    nn::EntropyBonusObjective entropy;
+    nn::SampledKlObjective kl;
+    nn::ClippedPolicyObjective clipped;
+    CHECK(!reinforce.evaluate_context(*owner, fixture->logits, fixture->view),
+          "REINFORCE rejects (1,1) advantage/mask against (A,2) logits");
+    CHECK(!entropy.evaluate_context(*owner, fixture->logits, fixture->view),
+          "entropy rejects mask width mismatch");
+    CHECK(!kl.evaluate_context(*owner, fixture->logits, fixture->view),
+          "sampled KL rejects old-log-prob width mismatch");
+    CHECK(!clipped.evaluate_context(*owner, fixture->logits, fixture->view),
+          "PPO rejects policy-batch width mismatch");
+}
+
 } // namespace
 
 int main()
@@ -406,6 +431,7 @@ int main()
     test_reinforce();
     test_value_and_kl();
     test_entropy_finite_difference();
+    test_policy_shape_validation();
     if (g_fail == 0) std::puts("All RL policy tests passed.");
     else std::printf("%d RL policy test(s) failed.\n", g_fail);
     return g_fail == 0 ? 0 : 1;
