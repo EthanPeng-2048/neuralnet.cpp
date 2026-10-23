@@ -6,10 +6,11 @@
 > 目的：把当前代码里实际并存的计算 API 与遗留物列清楚，作为事实底座；全部结论来自
 > 当前工作树的源码与构建配置，复现命令见 `bench/doc_inventory.ps1` 与 §9。
 >
-> **当前数字**（2026-10-16 实测）：引擎 virtual **52 个方法**（`bench/doc_inventory.ps1` 口径。注意 `rg -c "\bvirtual\b"` 在 `compute_engine.hpp` 里原始计 **54** 处 = 52 方法 + 析构 1 + 注释里的词 1，勿混用口径）；Layer/Loss/Optimizer 直调 **28 个**（含 `begin_expr`——由 `Adam::step`/`AdamW::step` 打开 IR-C 录制段；含 `cast_into`——层内结果按 profile 落精度；其余 26 个
-> 只服务 DSL lowering / 序列化 / CLI / 适配层 / 测试，见 §2）；CPU 求值机制 **2 套**
-> （DSL 模板路径 + IR 解释器，见 §3）；ctest **52** 个（**无 Vulkan 树**；GPU 树 **54**）＝
-> **41 个测试目标 + 13 个变体/附加**（**完整枚举只写在 `docs/todo/18` §2 / `AGENTS.md` §7**，
+> **当前数字**（2026-10-23 实测）：引擎 virtual **52 个方法**（`bench/doc_inventory.ps1` 口径。注意 `rg -c "\bvirtual\b"` 在 `compute_engine.hpp` 里原始计 **54** 处 = 52 方法 + 析构 1 + 注释里的词 1，勿混用口径）；Layer/Loss/Optimizer 直调 **32 个**（含 `begin_expr`——由 `Adam::step`/`AdamW::step` 打开 IR-C 录制段；含 `cast_into`——层内结果按 profile 落精度；RL 多输出层新增 `slice_rows`/`insert_rows`/`try_create_tensor` 等行带适配路径）；
+> 其余 20 个公开入口只服务 DSL lowering / 序列化 / CLI / 适配层 / 测试，见 §2）；
+> CPU 求值机制 **2 套**
+> （DSL 模板路径 + IR 解释器，见 §3）；ctest **67** 个（**无 Vulkan 树**；GPU 树 **69**）＝
+> **56 个测试目标 + 13 个变体/附加**（**完整枚举只写在 `docs/todo/18` §2 / `AGENTS.md` §7**，
 > 此处不重复以免漂移）。其中 `fused_gpu_test` = 融合 shader **逐形态** GPU 对拍；`expr_graph_test` = IR-C 图融合分析（CPU 12 用例）；`error_macro_test`
 > = 错误处理宏族（`NN_UNWRAP`/`NN_EXIT`/`NN_TRY_MSG`/`NN_FAIL`）；`kvrec_test`/`nnvocab_test`/`dataset_test`
 > = 统一数据集（KVRecord v2 / `.nnvocab` / `.nndataset`，见 `docs/todo/19`）；
@@ -59,7 +60,7 @@
 多精度 Phase 2 加入 `cast_into`/`copy_into`/`supports_native_data_move`/
 `supports_expr_precision_variant` 与 `Precision P` 参数的运算类原语。
 
-### 2.1 被 Layer / Loss / Optimizer **直接调用**的算子：28 个
+### 2.1 被 Layer / Loss / Optimizer **直接调用**的算子：32 个
 
 （统计口径：`compute_layer*.hpp` + `compute_loss.hpp` + `compute_optimizer.hpp` +
 `model_container.hpp` + `compute_position_encoding.hpp` 中出现的 `engine.<op>(`，排除
@@ -67,17 +68,17 @@
 复现：`bench/doc_inventory.ps1`）
 
 ```
-begin_batch, begin_expr, cast_into, clone, col2im, create_offload_buffer, create_tensor,
-end_batch, eval_expr, flush_batch, gather_rows, im2col, insert_rows,
-matmul_q, matmul_q_t, offload_restore, offload_save, outer_col, rearrange_3d,
-reshape, scan_prefix_outer, scan_suffix_outer, scatter_add_rows, slice_rows,
-transpose, trit_pack, try_create_tensor, zero
+begin_batch, begin_expr, cast_into, clone, col2im, copy_into, create_offload_buffer,
+create_tensor, device, end_batch, eval_expr, flush_batch, gather_rows, get, im2col,
+insert_rows, matmul_q, matmul_q_t, offload_restore, offload_save, outer_col,
+rearrange_3d, reshape, scan_prefix_outer, scan_suffix_outer, scatter_add_rows,
+slice_rows, transpose, trit_pack, try_create_tensor, weak_from_this, zero
 ```
 （10 个计算类原语不在此列：`matmul`/`matmul_with_bias`/`batched_matmul`/
 `row_reduce_sum`/`col_reduce_sum`/`col_reduce_max`/`grouped_reduce_sum`/
 `grouped_reduce_max`/`add_inplace`/`scale_inplace`/`accumulate` 一律不经 Layer 直调
 ——Layer 写 `dsl::compute`/`compute_into`/`compute_reduce`（归类见 §7.2）。
-这 27 个按设计保留：**基础设施 / 张量形变**（begin/end/flush_batch、create/offload_*、
+这 32 个按设计保留：**基础设施 / 张量形变**（begin/end/flush_batch、create/offload_*、
 clone、reshape、try_create_tensor、zero）、**数据搬运**（transpose/slice_rows/insert_rows/
 rearrange_3d/gather_rows/scatter_add_rows/im2col/col2im——DSL 表达式是"每输出元素
 独立计算"模型，搬运类的不规则索引/原子累加不属于它）、**状态扫描**（scan_prefix_outer/
@@ -109,9 +110,9 @@ op-level 引擎原语，不进 DSL 闭合世界、无需 scan 登记，见 `docs
    push constant）；`glsl_vec4_eligible` 白名单与 `glsl_view_uses_row/col` 排除集
    自动正确——无需改。
 
-### 2.2 不被 Layer 直接调用（其余 30 个：DSL lowering / 序列化 / CLI / 适配层 / 测试）
+### 2.2 不被 Layer 直接调用（其余 20 个公开入口：DSL lowering / 序列化 / CLI / 适配层 / 测试）
 
-这 30 个正是 §7.3 的"eager 算子 = DSL 的内部 lowering 目标"形态：计算类原语只被
+这 20 个正是 §7.3 的"eager 算子 = DSL 的内部 lowering 目标"形态：计算类原语只被
 **DSL lowering 内部**（`MatmulRef::prepare*` 调 `eng.matmul/batched_matmul`、
 `ReduceViewRef::prepare` 调各 reduce）、**基类 NVI 边界 cast 入口转发**（原 `PrecisionEngine`，P-1 已下沉）与
 **测试/bench**（`f16_*_test`/`gpu_f16_test`/`layer_bench`/`f16_cpu_probe` 等）使用。

@@ -507,9 +507,12 @@ provider 只固定 pipeline 自身 RNG/计数 section，消费者 buffer/replay 
 
 ### 11.1 全量验收（2026-10-23，`ethan@192.168.1.102`）
 
-- Windows / clang 23.1 / MSVC STL / Debug；
-- CPU-only（`NN_ENABLE_GPU=OFF`，tests ON）：**67/67**，其中 **46 pass + 21 skip**；
-- Vulkan（40HX）：**69/69**，其中 **66 pass + 3 skip**；
+- Windows clang 23.1 / MSVC STL / Release + Vulkan（40HX）：**69/69**，其中
+  **68 pass + 1 skip**；Debug + Vulkan 见 release-note 验收表；
+- Windows cl.exe 19.51 / MSVC STL / Debug CPU-only：**67/67**，其中
+  **46 pass + 21 skip**；
+- WSL g++ 15.2/libstdc++ 与 clang 24/libc++ / Release CPU-only：均为 **67/67**，
+  其中 **48 pass + 19 skip**；
 - `scan_exprs`：库内 **158 条**融合表达式，RL 的 PPO clip/value、梯度选择和 reduction
   路径均已进入闭合世界；
 - `rl_gpu_smoke_test` 覆盖 GAE、PPO preset、GRPO preset 的设备执行，通过。

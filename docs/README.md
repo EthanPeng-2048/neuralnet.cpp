@@ -83,7 +83,8 @@
 - `todo/27-execution-plan.md` — **执行计划（优先级象限）**："下一个先做哪个"。
 - `todo/31-rl-training-primitives.md` — **当前 RL 主线与通用训练基础设施**：具名多输出、schema 化
   experience、可组合 policy objectives、`TrainingGroupSession` 与可替换编排（issue #23 是能力下界；
-  f16 / 训练性能项暂缓）。**2026-10-23 ✅ 已实施**；调用指南见 `usage/06-reinforcement-learning.md`。
+  f16 / 训练性能项暂缓）。**2026-10-23 ✅ 已实施并随 `v1.12.0` 发布**；调用指南见
+  `usage/06-reinforcement-learning.md`。
 - `todo/12` / `todo/17` / `todo/19` / `todo/21` / `todo/22` / `todo/23` — 现行设计/盘点。
 - `todo/28` / `todo/29` / `todo/30` — **生命周期 v3 / Session 层 / TrainingSession 单步协议**
   （P2a/P2b 已随 `v1.10.0` 发布；30 号于 2026-10-22 冻结 micro-batch、梯度累积与 global-batch 归一化边界，随 `v1.11.0` 发布）。
@@ -100,7 +101,7 @@
 | [`../CMakePresets.json`](../CMakePresets.json) | 预设构建（`cmake --preset dev` 等）——见 CONTRIBUTING §1 |
 | [`benchmarks/2026-09-25-vulkan-vs-cuda.md`](benchmarks/2026-09-25-vulkan-vs-cuda.md) | Vulkan 后端 vs CUDA（torch）基准 |
 | [`benchmarks/2026-10-06-vulkan-vs-torch.md`](benchmarks/2026-10-06-vulkan-vs-torch.md) | 第二轮复测 |
-| `release-notes/v1.5.0.md` … `v1.10.0.md` | 版本变更说明，覆盖 v1.5.0 → v1.10.0 的全部 tag（`v1.5.1` / `v1.6.1` / `v1.7.1` / `v1.8.0` 为 2026-10-18 补写；`v1.10.0-rc0` / `v1.10.0-rc0.1` 为正式版前的预发布候选记录；**大版本发布要求**见 [`todo/25-release-requirements.md`](todo/25-release-requirements.md)） |
+| `release-notes/v1.5.0.md` … `v1.12.0.md` | 版本变更说明，覆盖 v1.5.0 → v1.12.0 的全部 tag（`v1.5.1` / `v1.6.1` / `v1.7.1` / `v1.8.0` 为 2026-10-18 补写；`v1.10.0-rc0` / `v1.10.0-rc0.1` 为正式版前的预发布候选记录；**大版本发布要求**见 [`todo/25-release-requirements.md`](todo/25-release-requirements.md)） |
 
 ## 3. 2026-10-11 文档整理记录
 

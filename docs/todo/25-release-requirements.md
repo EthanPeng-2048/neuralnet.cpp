@@ -245,7 +245,7 @@ seq_len=64 / batch=8`，每种配方 **20 step**，GPU：
 ## 8. 2026-10-23 `v1.11.0` 发布实跑记录
 
 > 测试对象 = `bc37df3`（`feat(session)!`：TrainingSession 单步协议与 global/micro batch 语义，docs/todo/30）。
-> 同步方式：`git bundle` → 102 `D:\Codes\nn_v111_test` 独立检出（不触碰 102 既有工作区）。
+> 同步方式：`git bundle` → 102 上的临时独立检出（不触碰既有工作区）。
 > 口径：`NN_ENABLE_NATIVE=OFF` 可移植基线；GPU = **NVIDIA CMP 40HX / Vulkan SDK 1.4.350**（原生设备自动选卡）。
 
 ### 8.1 第 3 项：完整 ctest（两树全新构建）
@@ -299,3 +299,60 @@ GPT `d_model=64 / heads=4 / layers=2 / d_ff=128 / seq_len=64`；**`--batch-size 
 - ¤batchnorm_test_gpu¤ 首轮在内存颠簸时段 SEGFAULT，单独复跑 **Passed**（11.53 s）——偶发，非确定性失败。
 - 与本版 API 改动直接相关的 ¤training_session_test¤ / ¤text_trainer_test¤ / ¤train_state_test¤ /
   ¤dataset_samples_test¤ / ¤text_train_modules_test¤ 本机全部 Passed。
+
+---
+
+## 9. 2026-10-23 `v1.12.0` 发布实跑记录
+
+> 测试对象 = `1cb1c2b`（RL 发布审查修复后的代码提交）。同步方式为 `git bundle` → 102
+> 独立 worktree `D:\Codes\nn_v112_final`，不触碰既有工作区。口径：
+> `NN_ENABLE_NATIVE=OFF`；Release/Debug 构建目录全部从空目录开始；GPU =
+> **NVIDIA CMP 40HX / Vulkan SDK 1.4.350 / 驱动 616.92**。
+
+### 9.1 完整 ctest（Release / Debug）
+
+| 配置 | 构建 | 完整 ctest |
+|---|---|---|
+| Windows clang 23.1 + MSVC STL / **Release** / Vulkan | **239/239 步** | **69/69：68 pass + 1 skip + 0 fail**（604.58 s）；skip = `scan_bitwise_test`（Windows 平台口径） |
+| Windows clang 23.1 + MSVC STL / **Debug** / Vulkan | **239/239 步** | **69/69：68 pass + 1 skip + 0 fail**（883.82 s）；skip = `scan_bitwise_test`；`rapt_test_f16` **Passed** |
+| Windows cl.exe 19.51 + MSVC STL / **Debug** / CPU-only | 全目标成功链接 | **67/67：46 pass + 21 skip + 0 fail**（194.66 s）；`rapt_test_f16` **Passed** |
+
+### 9.2 四组编译器 × 标准库
+
+| 配置 | 结果 |
+|---|---|
+| WSL g++ 15.2 + **libstdc++** / Release / CPU-only | **132/132 步**；**67/67：48 pass + 19 skip + 0 fail**（41.05 s） |
+| WSL clang 24.0 + **libc++** / Release / CPU-only | **132/132 步**；**67/67：48 pass + 19 skip + 0 fail**（37.09 s）；`ldd` 确认 `libc++.so.1` / `libc++abi.so.1` |
+| Windows clang 23.1 + **MSVC STL** / Release / Vulkan | 见 §9.1 第 1 行 |
+| Windows cl.exe 19.51 + **MSVC STL** / Debug / CPU-only | 见 §9.1 第 3 行 |
+
+> WSL clang 驱动额外报告工具链环境 warning
+> `-Wgcc-install-dir-libstdcxx`（机器同时安装 GCC 15/16）；构建以
+> `-Wno-error=gcc-install-dir-libstdcxx` 保留提示并成功完成，非源码告警。
+
+### 9.3 真实端到端训练（40HX）
+
+数据集 = `datasets/tinystories_20k.nndataset`（20,000 docs / 4,244,522 tokens /
+66,321 个 seq64 窗口）；GPT `d_model=64 / heads=4 / layers=2 / d_ff=128 /
+seq_len=64`，`--batch-size 8 --accum-steps 2`，20 update step：
+
+| 配方 | loss 轨迹（step 5/10/15/20） | 结果 |
+|---|---|---|
+| f32 | 8.7752 → 8.3832 → 8.0131 → **7.7011** | 1.8 s，无 NaN/冻结 |
+| `--f16` | 8.7207 → 8.3779 → 7.9881 → **7.6188** | 1.5 s，无 NaN/冻结 |
+| `--t1_58` | 8.8803 → 8.6901 → 8.4593 → **8.1366** | 4.5 s，无 NaN/冻结 |
+
+f32 `.nnmodel` warm start 1 step：loss **7.6060**；文件 SHA-256
+`A060F06A…02D2` → `0211B037…27D06`，确认参数移动。
+
+### 9.4 门禁与独立发布审查
+
+- `bench/doc_inventory.ps1`：**PASS**；52/52 engine virtual，`L2-VIOLATIONS: 0`、
+  `HANDWRITTEN-RESIDUE: 0`、`TERMINATING-CALLS: 0`；
+- `bench/gui_cli_audit.py`：七节 **PASS，可行动 0**（最终 Release 二进制）；
+- `bench/doc_align_audit.ps1` / `bench/audit_dangling.ps1`：可行动 0；
+- `scan_exprs`：库内 **158 条**融合表达式；RL PPO/value/GAE/reduction 路径进入 AOT
+  闭合世界；
+- 审查修复：PPO off-policy 负 advantage 梯度、GAE mask 值泄漏、policy batch 形状、
+  forward 失败后的具名反向状态、不可信 schema 解码上限、pipeline post-hook 状态提交；
+  全部加入对应 RL 用例。
