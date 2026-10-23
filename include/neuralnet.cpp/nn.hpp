@@ -38,6 +38,7 @@
 #include "compute_layer.hpp"
 #include "compute_loss.hpp"
 #include "compute_optimizer.hpp"
+#include "rl_experience.hpp"
 
 // L3 实现层
 #include "model_container.hpp"

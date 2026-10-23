@@ -45,7 +45,7 @@ private:
     [[nodiscard]] Result<const Tensor*> value_(const FieldHandle& handle) const
     {
         NN_TRY_CHECK(schema_.validate(handle));
-        return &values_[handle.index];
+        return values_[handle.index].valid() ? &values_[handle.index] : nullptr;
     }
 
     [[nodiscard]] static Result<void> validate_value_(
@@ -161,7 +161,7 @@ public:
             handle.schema_fingerprint != schema_.fingerprint() ||
             handle.index >= values_.size())
             return nullptr;
-        return &values_[handle.index];
+        return values_[handle.index].valid() ? &values_[handle.index] : nullptr;
     }
 
     [[nodiscard]] const Tensor* find(std::string_view name) const noexcept
