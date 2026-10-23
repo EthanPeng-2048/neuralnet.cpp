@@ -697,6 +697,10 @@ if(NN_BUILD_APPS OR NN_ENABLE_TESTS)
                       src/training_group_session_test.cpp)
     list(APPEND NN_TEST_TARGETS training_group_session_test)
 
+    # ── RL-2b：rollout/buffer/sampler/metrics/checkpoint 编排 ─────────────
+    nn_add_executable(rl_pipeline_test src/rl_pipeline_test.cpp)
+    list(APPEND NN_TEST_TARGETS rl_pipeline_test)
+
     # ── F1：危险精度组合启动期告警（仅警告，不拒绝；docs/todo/24 §2.3）────
     # [1][2] 头文件函数组合矩阵（含 all=f16）单测；[3] 子进程跑 text_train/
     # mnist_train，捕获 stderr 断言告警出现 + 退出码不变；二进制缺失 → 77 = SKIP

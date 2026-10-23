@@ -40,6 +40,7 @@
 #include "compute_optimizer.hpp"
 #include "rl_experience.hpp"
 #include "rl_policy.hpp"
+#include "rl_pipeline.hpp"
 
 // L3 实现层
 #include "model_container.hpp"
