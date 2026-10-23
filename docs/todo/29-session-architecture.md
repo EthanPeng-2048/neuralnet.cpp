@@ -1,13 +1,17 @@
-# 29 — Session 层：TrainingSession / InferenceSession / RLTrainingSession
+# 29 — Session 层：TrainingSession / TrainingGroupSession / InferenceSession
 
 > **读者**：项目开发者（本仓内部工作文档）。分册定位见 [`README.md`](README.md)。
 > **状态**：✅ **P2a 已实施（2026-10-20，`training_session.hpp` + `training_session_test`）**；
 > ✅ **P2b 已实施（2026-10-21，v1.10.0-rc0.1）**：`TrainingSession` 持有 `TrainState`；
 > 数据集经 `TextSampleSet`（样本 = 窗口）**直接接入训练工厂 `TextTrainer`**，CLI 退出训练循环
-> 实现（见 §8）。`InferenceSession` / `RLTrainingSession` 仍为占位（§6/§7）。
+> 实现（见 §8）。`InferenceSession` 仍为设计占位；`TrainingGroupSession` 的通用架构已冻结、
+> 尚未实施（§6/§7）。
 > **2026-10-22 修订**：[`30-training-session-step.md`](30-training-session-step.md) 已冻结
 > `TrainingSession` 的单步协议、内部梯度累积、global/micro batch 语义与 `TrainState`
 > 所有权拆分；与本文 §3 第 6 条、§4 “刻意不做”及 §8 TrainState 归属冲突处，以 30 号为准。
+> **2026-10-23 库化修订**：[`31-rl-training-primitives.md`](31-rl-training-primitives.md)
+> 已冻结通用多模型会话设计；`RLTrainingSession` 不再是核心 Session 类型，RL 多模型场景
+> 使用通用 `TrainingGroupSession`，算法与 rollout 留在 RL 编排层。
 > **依赖**：[`28-lifecycle-v3.md`](28-lifecycle-v3.md)（P1 生命周期 v3 先落；本文对应执行计划 P2）。
 > 执行排序见 [`27-execution-plan.md`](27-execution-plan.md)；裁定台账见 [`18-roadmap.md`](18-roadmap.md) §4.2 P1-8。
 
@@ -18,9 +22,9 @@
 - **D3 的真实修复不是"给 Model 加优化器"，而是"让非拥有引用的 owner 与引用者同生共死"**：
   Optimizer 的 `params_/grads_` 指向 Model 内 Layer 的 Tensor 成员，只要有一个对象同时拥有
   Model 与 Optimizer，UAF 就结构性地不可能发生。
-- **为后续形态留同一模式**：推理服务需要会话缓存（KV cache / prompt cache / 命中统计），RL 需要
-  多模型 + rollout + 多优化器——它们都是"**Session 拥有模型与派生状态，引擎是共享资源**"。现在把
-  Session 层立起来，后续不需要再改 Model 的语义。
+- **为后续形态留同一模式**：推理服务需要会话缓存（KV cache / prompt cache / 命中统计），RL 等
+  多模型训练需要多个可训练/只读角色——它们都是"**Session 拥有模型与派生状态，引擎是共享资源**"。
+  但 rollout、算法和 I/O 不进入 Session；它们属于 Run Driver / Pipeline。
 
 ## 2. 命名与分层
 
@@ -34,12 +38,13 @@
 | L3 | `Model` | 网络容器 + forward/backward | 现行，**保持纯值对象** |
 | L3 | `TextSampleSet`（`dataset_samples.hpp`） | 数据集子集 → **训练样本**（窗口）与 batch 装配 | 本文 P2b，现行 |
 | L4 | **`TrainingSession`** | 拥有 Model + Optimizer + 单步/累积状态；执行一次 update | 本文 P2a，30 号修订 |
+| L4 | `TrainingGroupSession`（架构已冻结、未实施） | 以稳定名称拥有多个可训练 Session / 只读 Model；只管角色与生命周期 | [`31`](31-rl-training-primitives.md) §5.2 |
 | L5 | **`TextTrainer`**（`text_trainer.hpp`） | Run Driver：数据集 → global/micro batch → Session；epoch/step、lr、评估、运行态 `TrainState` | 本文 P2b，30 号修订 |
 | L5 | `InferenceSession`（占位） | 拥有 Model + 推理会话缓存（KV/prompt/命中统计） | 未来 |
-| L5 | `RLTrainingSession`（占位） | 拥有 policy/reference 多模型 + 多优化器 + rollout | 未来 |
 
-命名细则：P2 先落 `TrainingSession`；`InferenceSession` / `RLTrainingSession` 只写接口占位，不实现，
-避免提前抽象（触发条件 = 真实调用方出现）。
+命名细则：P2 先落 `TrainingSession`；`TrainingGroupSession` 是多模型生命周期的通用容器，
+`InferenceSession` 是多轮推理缓存容器。**不新增核心 `RLTrainingSession`**：RL 的模型角色交给
+`TrainingGroupSession`，rollout/算法/buffer/checkpoint 策略交给 RL 编排层。
 
 ## 3. 所有权与不变式
 
@@ -154,14 +159,29 @@ private:
 - 生命周期不变式与 TrainingSession 相同：Session 拥有 Model，缓存随会话销毁；引擎共享。
 - **不现在做**：触发条件 = 推理服务化/多轮缓存有真实调用方（见 [`18`](18-roadmap.md) §6 触发清单口径）。
 
-## 7. `RLTrainingSession`（占位设计，不实现）
+## 7. `TrainingGroupSession`（通用多模型会话，架构已冻结、未实施）
 
-职责草案：
+库化后不能假设只有 RL 的 actor/critic/reference 会需要多模型生命周期。通用容器以稳定名称
+持有若干角色，每个角色可以是：
 
-- 拥有 policy Model（+ 可选 reference Model）、各自 Optimizer、rollout buffer、reward/advantage 计算所需状态；
-- **组合而非继承**：可以是两个模型 + 两个 optimizer 的聚合，不要求复用 TrainingSession 的子类关系；
-- 生命周期规则同一条：Session 拥有模型与派生状态，引擎是共享资源。
-- **不现在做**：触发条件 = RL 训练入口/算法落地。
+- 一个可训练的 `TrainingSession`（Model + Optimizer）；
+- 一个只读 `Model`（reference / teacher / frozen generator）。
+
+职责仅限：
+
+- 保证所有角色及其 optimizer 的生命周期正确；
+- 校验角色名称、重复绑定、engine/schema 兼容性；
+- 提供 role 查询，不解释算法。
+
+明确不做：
+
+- 不拥有 rollout、environment、replay buffer、RNG、PPO epoch 或 checkpoint I/O；
+- 不把 reward/advantage 计算塞进 Session；
+- 不特别绑定 RL；actor-critic、GAN、ensemble、多智能体都可复用。
+
+`RLTrainingSession` 不再是核心类型。若以后为易用性保留同名工厂，它只能组装
+`TrainingGroupSession` 和 RL 标准配置，不拥有第二套生命周期或训练更新语义。
+完整职责边界与验收见 [`31`](31-rl-training-primitives.md) §5。
 
 ## 8. 迁移计划
 
@@ -212,8 +232,8 @@ private:
   `train_state_test` / `training_session_test` 全绿；CPU ctest 57/57。
 - 文档：`usage/` 训练示例、API 手册、AGENTS 训练范式同步（P4 同批完成）。
 - **仍未做（明示）**：`P2-4` 的流式 DataLoader（`TextSampleSet` 仍整段物化
-  `TextCorpus`）；`InferenceSession`/`RLTrainingSession` 仍为占位；`create_optimizer`
-  自由工厂签名未收口（D7）。
+  `TextCorpus`）；`InferenceSession` 仍为设计占位，`TrainingGroupSession` 架构已冻结但未实施；
+  `create_optimizer` 自由工厂签名未收口（D7）。
 
 ## 9. 验收（P2 整体）
 
@@ -233,7 +253,7 @@ private:
 | Loss 是否归 Session | 不归；归训练工厂（P2b），触发 = 出现第三种训练循环且重复代码显著 |
 | TrainState 范围 | P2b 只搬现有 `TrainState` 字段，不新增语义；v8 文件格式不变（仅键 `dataset_windows → dataset_samples`，旧键兼容读） |
 | 自由工厂的 UAF 可能 | 文档前置条件；真实外部调用方出现后再加 weak-token（低成本、可后补） |
-| 命名细节：`RLTrainingSession` 是否太长 | 先用全称，实现时再定简称（`RLSession` 等）；不影响 P2 |
+| 多模型 Session 是否绑定 RL | 不绑定；通用 `TrainingGroupSession` 只管角色与生命周期，RL 算法/rollout 留在 31 号的编排层 |
 | 未来推理/RL 的接口是否被现在锁死 | 只冻结"Session 拥有模型 + 引擎共享"这一条模式；具体 API 留到对应立项 |
 
 ## 11. 参考
@@ -241,5 +261,6 @@ private:
 - 生命周期 v3：[`28-lifecycle-v3.md`](28-lifecycle-v3.md)
 - 执行排序：[`27-execution-plan.md`](27-execution-plan.md)
 - 裁定台账：[`18-roadmap.md`](18-roadmap.md) §4.2 P1-8
+- RL 与通用训练基础设施设计：[`31-rl-training-primitives.md`](31-rl-training-primitives.md)
 - 现行优化器/训练状态：[`17-unified-tensor-engine.md`](17-unified-tensor-engine.md)、
   [`23-library-design-cleanup-and-model-file-roles.md`](23-library-design-cleanup-and-model-file-roles.md)

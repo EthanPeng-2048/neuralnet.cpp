@@ -80,6 +80,9 @@
 - `todo/00-code-review-remediation.md` — **2026-10-11 代码审查整改立项台账**（本批新增）。
 - `todo/18-roadmap.md` — **"某件事该不该做"的唯一入口**（裁定台账 + 验收口径 + 现状实测；不含执行计划）。
 - `todo/27-execution-plan.md` — **执行计划（优先级象限）**："下一个先做哪个"。
+- `todo/31-rl-training-primitives.md` — **当前 RL 主线与通用训练基础设施**：具名多输出、schema 化
+  experience、可组合 policy objectives、`TrainingGroupSession` 与可替换编排（issue #23 是能力下界；
+  f16 / 训练性能项暂缓）。
 - `todo/12` / `todo/17` / `todo/19` / `todo/21` / `todo/22` / `todo/23` — 现行设计/盘点。
 - `todo/28` / `todo/29` / `todo/30` — **生命周期 v3 / Session 层 / TrainingSession 单步协议**
   （P2a/P2b 已随 `v1.10.0` 发布；30 号于 2026-10-22 冻结 micro-batch、梯度累积与 global-batch 归一化边界，随 `v1.11.0` 发布）。
