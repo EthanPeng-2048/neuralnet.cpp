@@ -142,6 +142,18 @@ neuralnet.cpp/
 
 ## 构建与运行
 
+### 克隆（含子仓 submodule）
+
+本仓自 v1.13.0 起把 core / threadpool / kvrecord / dataset / tokenizer 拆为
+独立子仓（`extern/` 下的嵌套 submodule）。**克隆必须递归初始化**，否则
+`extern/*/include` 为空、编译时报 `neuralnet.cpp/core_errors.hpp` 等头找不到：
+
+```bash
+git clone --recurse-submodules git@github.com:neuralnet-cpp-dev/neuralnet.cpp.git
+# 已 clone 但漏了子仓时补救：
+git submodule update --init --recursive
+```
+
 ### 构建 C++ 项目
 
 ```powershell

@@ -5,6 +5,17 @@
 
 ## 1. 快速开始
 
+> ⚠ **嵌套 submodule（v1.13.0 起）**：本库把 core/threadpool/kvrecord/dataset/tokenizer
+> 拆为独立子仓（`extern/` 下的嵌套 submodule）。无论用 add_subdirectory 还是 FetchContent，
+> 都必须把子仓一并取到，否则 `extern/*/include` 为空、编译时报
+> `neuralnet.cpp/core_errors.hpp` 等头找不到。
+> - **submodule 方式**：`git clone --recurse-submodules <url>`，或已 clone 后
+>   `git submodule update --init --recursive`。
+> - **FetchContent 方式**：CMake ≥ 3.17 时 FetchContent 默认会递归拉取嵌套
+>   submodule；若你的 CMake 较旧或被关闭，需在 `FetchContent_MakeAvailable`
+>   之后手动 `execute_process(COMMAND git submodule update --init --recursive
+>   WORKING_DIRECTORY ${neuralnet.cpp_SOURCE_DIR})`。
+
 把仓库放到自己的源码树里（任意路径，下例为 `3rd_party/`）：
 
 ```cmake
