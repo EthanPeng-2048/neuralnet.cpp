@@ -49,6 +49,7 @@
 #include <functional>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 #include "core_errors.hpp"
@@ -215,6 +216,31 @@ private:
     };
     std::vector<Field> fields_;
 
+    // 键索引：key → fields_ 首次出现下标（issue #24：逐键 get 的 O(n²)）。
+    // set()/parse() 构建与维护，get()/has() 只读 —— 并发 const 读取安全。
+    // 重复键：emplace 保留首个下标；类型不符时 find_field_ 从首个出现处
+    // 继续前向扫描，与旧版"返回首个 key+type 匹配"语义逐例一致。
+    std::unordered_map<std::string, std::size_t> key_index_;
+
+    void rebuild_index_()
+    {
+        key_index_.clear();
+        for (std::size_t i = 0; i < fields_.size(); ++i)
+            key_index_.emplace(fields_[i].key, i);
+    }
+
+    // 返回首个 key+type 匹配的字段；缺失或类型不符返回 nullptr
+    [[nodiscard]] const Field *find_field_(const std::string &key, Type type) const
+    {
+        const auto it = key_index_.find(key);
+        if (it == key_index_.end()) return nullptr;
+        // 首个出现处类型即匹配时 O(1)；否则（重复键 + 类型错位）前向兜底扫描
+        for (std::size_t i = it->second; i < fields_.size(); ++i)
+            if (fields_[i].key == key && fields_[i].type == type)
+                return &fields_[i];
+        return nullptr;
+    }
+
     // v2 内部构件
     static constexpr std::uint64_t SENTINEL_INLINE_SIZE = 4 + 13 + 1 + 4 + 8;
     [[nodiscard]] static std::uint64_t value_size_(const Field &f);
@@ -232,24 +258,28 @@ private:
 
 inline KeyValueRecord &KeyValueRecord::set(const std::string &key, uint64_t v)
 {
+    key_index_.emplace(key, fields_.size());  // emplace 保留首个出现下标
     fields_.push_back(Field{key, Type::UInt, v, {}, {}, {}});
     return *this;
 }
 
 inline KeyValueRecord &KeyValueRecord::set(const std::string &key, const std::string &v)
 {
+    key_index_.emplace(key, fields_.size());  // emplace 保留首个出现下标
     fields_.push_back(Field{key, Type::Str, 0, v, {}, {}});
     return *this;
 }
 
 inline KeyValueRecord &KeyValueRecord::set(const std::string &key, const std::vector<uint64_t> &v)
 {
+    key_index_.emplace(key, fields_.size());  // emplace 保留首个出现下标
     fields_.push_back(Field{key, Type::UIntArray, 0, {}, v, {}});
     return *this;
 }
 
 inline KeyValueRecord &KeyValueRecord::set(const std::string &key, const KeyValueRecord &v)
 {
+    key_index_.emplace(key, fields_.size());  // emplace 保留首个出现下标
     fields_.push_back(Field{key, Type::Record, 0, {}, {}, v.fields_});
     return *this;
 }
@@ -509,6 +539,7 @@ inline Result<KeyValueRecord> KeyValueRecord::parse_at(const ReadAt &read,
                 + std::to_string(version) + "（当前支持 v2）");
         NN_TRY(fields, parse_fields_v2_(read, c.pos, *count));
         rec.fields_ = std::move(*fields);
+        rec.rebuild_index_();
         return rec;
     }
 
@@ -550,6 +581,7 @@ inline Result<KeyValueRecord> KeyValueRecord::parse_at(const ReadAt &read,
             NN_FAIL("KeyValueRecord::parse: 字段 '" + f.key + "' 值长度错误");
         rec.fields_.push_back(std::move(f));
     }
+    rec.rebuild_index_();
     return rec;
 }
 
@@ -560,42 +592,37 @@ inline Result<KeyValueRecord> KeyValueRecord::parse(std::string_view bytes)
 
 inline bool KeyValueRecord::has(const std::string &key) const
 {
-    for (const auto &f : fields_)
-        if (f.key == key) return true;
-    return false;
+    return key_index_.contains(key);
 }
 
 inline bool KeyValueRecord::get(const std::string &key, uint64_t &out) const
 {
-    for (const auto &f : fields_)
-        if (f.key == key && f.type == Type::UInt) { out = f.u; return true; }
+    if (const Field *f = find_field_(key, Type::UInt)) { out = f->u; return true; }
     return false;
 }
 
 inline bool KeyValueRecord::get(const std::string &key, std::string &out) const
 {
-    for (const auto &f : fields_)
-        if (f.key == key && f.type == Type::Str) { out = f.s; return true; }
+    if (const Field *f = find_field_(key, Type::Str)) { out = f->s; return true; }
     return false;
 }
 
 inline bool KeyValueRecord::get(const std::string &key, std::vector<uint64_t> &out) const
 {
-    for (const auto &f : fields_)
-        if (f.key == key && f.type == Type::UIntArray) { out = f.arr; return true; }
+    if (const Field *f = find_field_(key, Type::UIntArray)) { out = f->arr; return true; }
     return false;
 }
 
 inline bool KeyValueRecord::get(const std::string &key, KeyValueRecord &out) const
 {
-    for (const auto &f : fields_)
-        if (f.key == key && f.type == Type::Record)
-        {
-            KeyValueRecord sub;
-            sub.fields_ = f.rec;
-            out = std::move(sub);
-            return true;
-        }
+    if (const Field *f = find_field_(key, Type::Record))
+    {
+        KeyValueRecord sub;
+        sub.fields_ = f->rec;
+        sub.rebuild_index_();
+        out = std::move(sub);
+        return true;
+    }
     return false;
 }
 
