@@ -25,9 +25,9 @@
 #include <unordered_set>
 #include <vector>
 
-#include "core_errors.hpp"   // Result / NN_FAIL / NN_TRY
+#include <neuralnet.cpp/core_errors.hpp>   // Result / NN_FAIL / NN_TRY
 
-#include "domain_tokenizer_base.hpp"
+#include <neuralnet.cpp/domain_tokenizer_base.hpp>
 
 namespace nn
 {

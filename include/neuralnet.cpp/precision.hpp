@@ -38,7 +38,7 @@
 #include <cstdint>
 #include <type_traits>
 
-#include "core_errors.hpp"
+#include <neuralnet.cpp/core_errors.hpp>
 
 namespace nn
 {

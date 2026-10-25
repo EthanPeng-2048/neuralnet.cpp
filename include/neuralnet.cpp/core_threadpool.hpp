@@ -13,7 +13,7 @@
 #include <iterator>   // for std::distance
 #include <type_traits>
 
-#include "core_assert.hpp"
+#include <neuralnet.cpp/core_assert.hpp>
 
 // ── CPU pause 自旋原语：GCC/Clang 用 __builtin_ia32_pause，MSVC 用 _mm_pause ──
 #if defined(_MSC_VER)

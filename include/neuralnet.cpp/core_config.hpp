@@ -2,8 +2,8 @@
 
 #include <cstddef>
 
-#include "core_errors.hpp"
-#include "precision.hpp"
+#include <neuralnet.cpp/core_errors.hpp>
+#include <neuralnet.cpp/precision.hpp>
 
 // NN_VECTORIZE_PRAGMA：循环向量化提示的编译器分支实现，统一定义在 core_config.hpp
 #if defined(__clang__)

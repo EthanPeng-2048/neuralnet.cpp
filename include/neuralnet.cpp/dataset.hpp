@@ -39,11 +39,11 @@
 #include <utility>
 #include <vector>
 
-#include "core_errors.hpp"
-#include "core_file.hpp"
-#include "core_sha256.hpp"
-#include "dataset_format.hpp"
-#include "model_keyvalue_record.hpp"
+#include <neuralnet.cpp/core_errors.hpp>
+#include <neuralnet.cpp/core_file.hpp>
+#include <neuralnet.cpp/core_sha256.hpp>
+#include <neuralnet.cpp/dataset_format.hpp>
+#include <neuralnet.cpp/model_keyvalue_record.hpp>
 
 namespace nn
 {

@@ -13,12 +13,12 @@
 //   forward/backward 单套实现适配 CPU/GPU。
 
 // L0 硬件层
-#include "core_errors.hpp"
-#include "core_assert.hpp"
+#include <neuralnet.cpp/core_errors.hpp>
+#include <neuralnet.cpp/core_assert.hpp>
 #include "core_observer_ptr.hpp"
-#include "core_threadpool.hpp"
-#include "core_file.hpp"
-#include "core_config.hpp"
+#include <neuralnet.cpp/core_threadpool.hpp>
+#include <neuralnet.cpp/core_file.hpp>
+#include <neuralnet.cpp/core_config.hpp>
 
 // L1 代数层（algebra_matrix.hpp 已传递包含其余代数头文件）
 #include "algebra_matrix.hpp"
@@ -49,7 +49,7 @@
 #include "train_state.hpp"
 #include "model_spec.hpp"
 #include "model_serialization.hpp"
-#include "dataset.hpp"
+#include <neuralnet.cpp/dataset.hpp>
 #include "dataset_samples.hpp"    // 训练样本（窗口）→ batch（P2b）
 #include "lr_scheduler.hpp"       // epoch / step 级学习率调度
 
@@ -58,7 +58,7 @@
 #include "domain_gpt.hpp"
 #include "domain_rla.hpp"
 #include "domain_cnn.hpp"
-#include "domain_tokenizer.hpp"
+#include <neuralnet.cpp/domain_tokenizer.hpp>
 
 // 注：训练驱动 `text_trainer.hpp`（L5：数据集 + 样本 + 循环）**不**进聚合头，
 // 需要时 include 薄转发头 `train.hpp` 或直接 include `text_trainer.hpp`。

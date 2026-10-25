@@ -23,7 +23,7 @@
 #include <source_location>
 #include <vector>
 
-#include "core_assert.hpp"
+#include <neuralnet.cpp/core_assert.hpp>
 #include "core_domain.hpp"
 #include "compute_layer.hpp"
 #include "model_spec.hpp"

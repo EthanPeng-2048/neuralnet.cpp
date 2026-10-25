@@ -19,11 +19,11 @@
 #include <utility>
 #include <vector>
 
-#include "core_errors.hpp"
-#include "core_assert.hpp"
-#include "core_threadpool.hpp"
-#include "core_parallel.hpp"   // nn::parallel_for_blocks / parallel_for_samples
-#include "core_config.hpp"
+#include <neuralnet.cpp/core_errors.hpp>
+#include <neuralnet.cpp/core_assert.hpp>
+#include <neuralnet.cpp/core_threadpool.hpp>
+#include <neuralnet.cpp/core_parallel.hpp>   // nn::parallel_for_blocks / parallel_for_samples
+#include <neuralnet.cpp/core_config.hpp>
 #include "algebra_span.hpp"
 
 // GPU 加速支持（可选，由 CMake 的 NN_HAS_VULKAN 宏控制）

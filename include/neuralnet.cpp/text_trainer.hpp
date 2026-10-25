@@ -51,13 +51,13 @@
 #include "compute_engine.hpp"        // nn::ComputeEngine
 #include "compute_loss.hpp"          // nn::CrossEntropyLoss
 #include "compute_optimizer.hpp"     // nn::Optimizer
-#include "core_config.hpp"           // nn::Scalar
-#include "core_errors.hpp"           // nn::Result / NN_TRY / NN_FAIL
-#include "core_file.hpp"             // nn::sha256_file_hex（数据集身份）
+#include <neuralnet.cpp/core_config.hpp>           // nn::Scalar
+#include <neuralnet.cpp/core_errors.hpp>           // nn::Result / NN_TRY / NN_FAIL
+#include <neuralnet.cpp/core_file.hpp>             // nn::sha256_file_hex（数据集身份）
 #include "core_profile.hpp"          // NN_PROF_SCOPE / nn::prof::Phase
-#include "dataset.hpp"               // nn::Dataset
+#include <neuralnet.cpp/dataset.hpp>               // nn::Dataset
 #include "dataset_samples.hpp"       // nn::TextSampleSet / TextSampleBatch
-#include "domain_tokenizer.hpp"      // nn::load_tokenizer_from_kvrec / Tokenizer
+#include <neuralnet.cpp/domain_tokenizer.hpp>      // nn::load_tokenizer_from_kvrec / Tokenizer
 #include "lr_scheduler.hpp"          // nn::compute_epoch_lr / compute_step_lr
 #include "model_container.hpp"       // nn::Model
 #include "text_train_config.hpp"     // nn::TextTrainConfig

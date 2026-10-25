@@ -21,8 +21,8 @@
 #include <span>
 #include <string>
 
-#include "core_errors.hpp"
-#include "core_sha256.hpp"
+#include <neuralnet.cpp/core_errors.hpp>
+#include <neuralnet.cpp/core_sha256.hpp>
 
 namespace nn
 {

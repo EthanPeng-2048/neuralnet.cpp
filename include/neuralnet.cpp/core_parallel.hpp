@@ -17,8 +17,8 @@
 #include <iterator>  // for std::ranges::distance
 #include <utility>   // for std::forward
 
-#include "core_config.hpp"     // PARALLEL_THRESHOLD
-#include "core_threadpool.hpp" // global_thread_pool
+#include <neuralnet.cpp/core_config.hpp>     // PARALLEL_THRESHOLD
+#include <neuralnet.cpp/core_threadpool.hpp> // global_thread_pool
 
 namespace nn
 {

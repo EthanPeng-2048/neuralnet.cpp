@@ -22,8 +22,8 @@
 #include <string_view>
 #include <vector>
 
-#include "core_errors.hpp"
-#include "model_keyvalue_record.hpp"
+#include <neuralnet.cpp/core_errors.hpp>
+#include <neuralnet.cpp/model_keyvalue_record.hpp>
 
 namespace nn
 {

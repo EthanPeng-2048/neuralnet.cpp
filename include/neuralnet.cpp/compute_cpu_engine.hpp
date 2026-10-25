@@ -15,7 +15,7 @@
 #include <optional>
 
 #include "compute_engine.hpp"
-#include "core_parallel.hpp"   // nn::for_each / parallel_for_blocks / parallel_for_samples
+#include <neuralnet.cpp/core_parallel.hpp>   // nn::for_each / parallel_for_blocks / parallel_for_samples
 #include "expr_opt.hpp"
 #include "expr_op_table.hpp" // 算子元数据单一真源（CPU 标量语义 / GLSL 形态，RV-07）
 #include "expr_registry.hpp" // scan 模式融合 kernel 登记（NN_EXPR_SCAN）

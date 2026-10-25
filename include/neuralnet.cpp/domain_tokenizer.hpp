@@ -10,7 +10,7 @@
 //   domain_tokenizer_charbpe.hpp   字符级 BPE（CharBPETokenizer）+ 工厂函数
 // ─────────────────────────────────────────────────────────────────────────
 
-#include "domain_tokenizer_base.hpp"
-#include "domain_tokenizer_bpe.hpp"
-#include "domain_tokenizer_charbpe.hpp"
+#include <neuralnet.cpp/domain_tokenizer_base.hpp>
+#include <neuralnet.cpp/domain_tokenizer_bpe.hpp>
+#include <neuralnet.cpp/domain_tokenizer_charbpe.hpp>
 

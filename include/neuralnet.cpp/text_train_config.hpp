@@ -14,8 +14,8 @@
 #include <string>
 #include <vector>
 
-#include "core_config.hpp"   // nn::Scalar
-#include "precision.hpp"     // nn::PrecisionProfile
+#include <neuralnet.cpp/core_config.hpp>   // nn::Scalar
+#include <neuralnet.cpp/precision.hpp>     // nn::PrecisionProfile
 #include "train_state.hpp"   // nn::DatasetIdentity（断点状态段的数据身份）
 
 namespace nn

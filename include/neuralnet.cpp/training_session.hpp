@@ -36,9 +36,9 @@
 
 #include "compute_engine.hpp"
 #include "compute_optimizer.hpp"
-#include "core_errors.hpp"
+#include <neuralnet.cpp/core_errors.hpp>
 #include "model_container.hpp"
-#include "precision.hpp"
+#include <neuralnet.cpp/precision.hpp>
 
 namespace nn
 {

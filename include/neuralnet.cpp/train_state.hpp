@@ -29,9 +29,9 @@
 #include <string>
 #include <vector>
 
-#include "core_config.hpp"           // nn::Scalar
-#include "model_keyvalue_record.hpp" // nn::KeyValueRecord
-#include "precision.hpp"             // nn::Precision / nn::PrecisionProfile
+#include <neuralnet.cpp/core_config.hpp>           // nn::Scalar
+#include <neuralnet.cpp/model_keyvalue_record.hpp> // nn::KeyValueRecord
+#include <neuralnet.cpp/precision.hpp>             // nn::Precision / nn::PrecisionProfile
 
 namespace nn
 {

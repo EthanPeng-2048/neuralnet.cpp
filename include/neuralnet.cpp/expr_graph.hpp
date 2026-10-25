@@ -43,7 +43,7 @@
 
 #include "compute_tensor.hpp"
 #include "core_domain.hpp"
-#include "precision.hpp"
+#include <neuralnet.cpp/precision.hpp>
 #include "expr_spec.hpp"
 #include "expr_opt.hpp"
 

@@ -11,11 +11,11 @@
 #include <iterator>
 #include <string>
 
-#include "core_errors.hpp"
+#include <neuralnet.cpp/core_errors.hpp>
 #include "compute_engine.hpp"
 #include "model_container.hpp"
 #include "model_spec.hpp"
-#include "precision.hpp"
+#include <neuralnet.cpp/precision.hpp>
 
 namespace nn {
 

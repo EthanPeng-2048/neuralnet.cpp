@@ -33,8 +33,8 @@
 #include <limits>
 #include <ranges>
 
-#include "core_config.hpp"   // NN_PROBES_ENABLED（探针编译门）
-#include "core_parallel.hpp"   // nn::parallel_for_samples
+#include <neuralnet.cpp/core_config.hpp>   // NN_PROBES_ENABLED（探针编译门）
+#include <neuralnet.cpp/core_parallel.hpp>   // nn::parallel_for_samples
 #include "core_domain.hpp"
 #include "core_env.hpp"      // RV-09：环境变量读取唯一入口
 
@@ -54,7 +54,7 @@ inline bool env_flag(const char* name)
 
 #include "compute_tensor.hpp"
 #include "compute_engine.hpp"
-#include "core_assert.hpp"
+#include <neuralnet.cpp/core_assert.hpp>
 #include "expr_spec.hpp"
 #include "expr_registry.hpp"
 #include "algebra_ops.hpp"    // nn::ops（唯一算子来源，含 op_id()）

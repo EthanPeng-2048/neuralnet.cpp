@@ -21,8 +21,8 @@
 #include <utility>
 #include <vector>
 
-#include "core_errors.hpp"
-#include "precision.hpp"
+#include <neuralnet.cpp/core_errors.hpp>
+#include <neuralnet.cpp/precision.hpp>
 
 namespace nn
 {

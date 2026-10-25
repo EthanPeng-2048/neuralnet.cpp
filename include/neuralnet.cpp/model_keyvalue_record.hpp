@@ -52,7 +52,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include "core_errors.hpp"
+#include <neuralnet.cpp/core_errors.hpp>
 
 namespace nn
 {

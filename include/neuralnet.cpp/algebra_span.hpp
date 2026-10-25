@@ -12,7 +12,7 @@
 #include <cstddef>
 #include <span>
 
-#include "core_config.hpp"
+#include <neuralnet.cpp/core_config.hpp>
 
 namespace nn
 {
