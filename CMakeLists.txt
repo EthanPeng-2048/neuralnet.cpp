@@ -302,6 +302,15 @@ endif()
 add_library(nn_core INTERFACE)
 target_include_directories(nn_core INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+# ── 子仓 include path（拆仓集成）────────────────────────────────────────
+# core/tokenizer/dataset/kvrecord/threadpool 的头已搬到各自子仓（extern/ 下
+# submodule），门面经此把它们的 include/ 加进搜索路径。各子仓头统一在
+# <repo>/include/neuralnet.cpp/ 下，文件名不冲突 → #include <neuralnet.cpp/xxx.hpp>
+# 在门面子仓间透明解析，下游 include 路径零变化。
+foreach(_nn_sub base threadpool kvrecord dataset tokenizer)
+    target_include_directories(nn_core INTERFACE
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/extern/${_nn_sub}/include>)
+endforeach()
 target_link_libraries(nn_core INTERFACE Threads::Threads)
 if(NN_STACKTRACE_LIB)
     target_link_libraries(nn_core INTERFACE ${NN_STACKTRACE_LIB})
