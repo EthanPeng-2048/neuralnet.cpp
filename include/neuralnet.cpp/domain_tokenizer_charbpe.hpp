@@ -25,7 +25,7 @@
 #include <unordered_set>
 #include <vector>
 
-#include "core_config.hpp"
+#include "core_errors.hpp"   // Result / NN_FAIL / NN_TRY
 
 #include "domain_tokenizer_base.hpp"
 #include "domain_tokenizer_bpe.hpp"   // make_tokenizer 工厂需引用 BPETokenizer

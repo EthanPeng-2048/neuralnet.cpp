@@ -26,10 +26,10 @@
 #include <unordered_set>
 #include <vector>
 
-#include "core_config.hpp"
+#include "core_errors.hpp"     // Result / NN_FAIL / NN_TRY
 #include "core_parallel.hpp"   // nn::parallel_for_samples（并行预分词）
 #include "core_threadpool.hpp" // global_thread_pool
-#include "dataset_format.hpp"
+#include "dataset_format.hpp"  // KeyValueRecord / parse_nnvocab（词表持久化）
 
 namespace nn
 {
