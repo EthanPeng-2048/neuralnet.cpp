@@ -24,10 +24,10 @@
 #include <string>
 #include <variant>
 
-#include "core_config.hpp"
-#include "core_errors.hpp"
+#include <neuralnet.cpp/core_config.hpp>
+#include <neuralnet.cpp/core_errors.hpp>
 #include "core_domain.hpp"
-#include "precision.hpp"
+#include <neuralnet.cpp/precision.hpp>
 #include "algebra_matrix.hpp"
 
 namespace nn

@@ -56,9 +56,9 @@
 #include <utility>
 #include <vector>
 
-#include "core_config.hpp"
-#include "core_errors.hpp"
-#include "core_assert.hpp"
+#include <neuralnet.cpp/core_config.hpp>
+#include <neuralnet.cpp/core_errors.hpp>
+#include <neuralnet.cpp/core_assert.hpp>
 #include "core_env.hpp"       // RV-09：环境变量读取唯一入口
 #include "core_domain.hpp"
 #include "core_profile.hpp"   // 训练 step 剖析（NN_PROFILE=1 门控；默认零开销）

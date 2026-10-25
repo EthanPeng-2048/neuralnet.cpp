@@ -40,7 +40,7 @@
 #include <unordered_set>
 #include <vector>
 
-#include "core_file.hpp"      // nn::read_pod_span（读 glslc 产物 SPIR-V）
+#include <neuralnet.cpp/core_file.hpp>      // nn::read_pod_span（读 glslc 产物 SPIR-V）
 #include "expr_spec.hpp"
 #include "expr_registry.hpp"
 #include "expr_emitter.hpp"   // IR-D：emitter 抽象（后端选择）

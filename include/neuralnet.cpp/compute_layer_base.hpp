@@ -19,7 +19,7 @@
 #include "compute_tensor.hpp"
 #include "named_tensor_set.hpp"
 #include "model_spec.hpp"
-#include "precision.hpp"
+#include <neuralnet.cpp/precision.hpp>
 #include "tensor_schema.hpp"
 #include "expr_dsl.hpp"
 

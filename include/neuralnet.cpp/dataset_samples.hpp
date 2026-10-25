@@ -30,10 +30,10 @@
 #include <vector>
 
 #include "algebra_matrix.hpp"   // nn::Matrix（I/O 层允许；窗口装配是数据 I/O）
-#include "core_assert.hpp"      // NN_ASSERT_ALWAYS（样本下标前置条件）
-#include "core_config.hpp"      // nn::Scalar
-#include "core_errors.hpp"      // nn::Result / NN_FAIL
-#include "dataset.hpp"          // nn::Dataset / DatasetSubset / TextCorpus
+#include <neuralnet.cpp/core_assert.hpp>      // NN_ASSERT_ALWAYS（样本下标前置条件）
+#include <neuralnet.cpp/core_config.hpp>      // nn::Scalar
+#include <neuralnet.cpp/core_errors.hpp>      // nn::Result / NN_FAIL
+#include <neuralnet.cpp/dataset.hpp>          // nn::Dataset / DatasetSubset / TextCorpus
 
 namespace nn
 {

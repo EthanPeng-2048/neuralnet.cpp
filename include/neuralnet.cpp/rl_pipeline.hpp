@@ -20,7 +20,7 @@
 #include <utility>
 #include <vector>
 
-#include "model_keyvalue_record.hpp"
+#include <neuralnet.cpp/model_keyvalue_record.hpp>
 #include "rl_experience.hpp"
 
 namespace nn

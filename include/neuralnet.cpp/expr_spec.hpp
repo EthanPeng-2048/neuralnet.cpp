@@ -21,8 +21,8 @@
 #include <string>
 #include <vector>
 
-#include "core_config.hpp"
-#include "core_errors.hpp"
+#include <neuralnet.cpp/core_config.hpp>
+#include <neuralnet.cpp/core_errors.hpp>
 
 namespace nn
 {

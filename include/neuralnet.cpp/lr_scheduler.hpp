@@ -19,7 +19,7 @@
 #include <string>
 #include <vector>
 
-#include "core_config.hpp"   // nn::Scalar
+#include <neuralnet.cpp/core_config.hpp>   // nn::Scalar
 
 namespace nn
 {

@@ -22,7 +22,7 @@
 #include <cstdlib>
 #include <string>
 
-#include "core_config.hpp"   // NN_PROBES_ENABLED（探针编译门）
+#include <neuralnet.cpp/core_config.hpp>   // NN_PROBES_ENABLED（探针编译门）
 
 namespace nn::detail
 {

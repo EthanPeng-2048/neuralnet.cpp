@@ -37,7 +37,7 @@
 #include "compute_layer_base.hpp"
 #include "compute_tensor.hpp"
 #include "expr_dsl.hpp"
-#include "precision.hpp"
+#include <neuralnet.cpp/precision.hpp>
 
 namespace nn
 {
