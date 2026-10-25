@@ -22,6 +22,7 @@
 #include "core_errors.hpp"
 #include "core_assert.hpp"
 #include "core_threadpool.hpp"
+#include "core_parallel.hpp"   // nn::parallel_for_blocks / parallel_for_samples
 #include "core_config.hpp"
 #include "algebra_span.hpp"
 

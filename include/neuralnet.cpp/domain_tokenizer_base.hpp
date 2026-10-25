@@ -27,6 +27,8 @@
 #include <vector>
 
 #include "core_config.hpp"
+#include "core_parallel.hpp"   // nn::parallel_for_samples（并行预分词）
+#include "core_threadpool.hpp" // global_thread_pool
 #include "dataset_format.hpp"
 
 namespace nn
