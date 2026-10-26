@@ -1,15 +1,15 @@
 [submodule "extern/base"]
 	path = extern/base
-	url = git@github.com:neuralnet-cpp-dev/base.neuralnet.cpp.git
+	url = https://github.com/neuralnet-cpp-dev/base.neuralnet.cpp.git
 [submodule "extern/threadpool"]
 	path = extern/threadpool
-	url = git@github.com:neuralnet-cpp-dev/threadpool.neuralnet.cpp.git
+	url = https://github.com/neuralnet-cpp-dev/threadpool.neuralnet.cpp.git
 [submodule "extern/kvrecord"]
 	path = extern/kvrecord
-	url = git@github.com:neuralnet-cpp-dev/kvrecord.neuralnet.cpp.git
+	url = https://github.com/neuralnet-cpp-dev/kvrecord.neuralnet.cpp.git
 [submodule "extern/dataset"]
 	path = extern/dataset
-	url = git@github.com:neuralnet-cpp-dev/dataset.neuralnet.cpp.git
+	url = https://github.com/neuralnet-cpp-dev/dataset.neuralnet.cpp.git
 [submodule "extern/tokenizer"]
 	path = extern/tokenizer
-	url = git@github.com:neuralnet-cpp-dev/tokenizer.neuralnet.cpp.git
+	url = https://github.com/neuralnet-cpp-dev/tokenizer.neuralnet.cpp.git

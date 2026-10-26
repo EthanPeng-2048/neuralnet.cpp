@@ -37,6 +37,8 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+      with:
+        submodules: recursive
 
     # 注意：不缓存整个 build 目录——旧 CMakeCache.txt 会跨运行携带已移除的
     # -D 设置（如历史上的 CMAKE_CXX_FLAGS=-stdlib=libc++），导致编译/链接
@@ -284,6 +286,8 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+      with:
+        submodules: recursive
 
     - name: Configure CMake (MSVC Debug, CPU-only)
       shell: pwsh
