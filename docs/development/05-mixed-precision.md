@@ -514,7 +514,7 @@ compute/stable/optimizer 与 `--f16` 逐字段相同；字面"四槽全 f16 + �
 
 ### 12.2 Phase 1 验收标准
 
-（当前状态：以下 10 条是**仍有效的验收标准**；`precision_test`（含 `precision_type_test`，其头注释直接引用 §12.2-2 / §12.2-10）、`f16_precision_test`、`gpu_f16_test`、`model_spec_validation_test` 等目标按 §13 覆盖其中对应条目。）
+（当前状态：以下 10 条是**仍有效的验收标准**；f16 类型系统测试已下沉 base 子仓（`extern/base/tests/precision_type_test.cpp`，其头注释直接引用 §12.2-2 / §12.2-10），门面仓 `precision_test`（张量精度/计算/配方）、`f16_precision_test`、`gpu_f16_test`、`model_spec_validation_test` 等目标按 §13 覆盖其中对应条目。）
 
 1. **回归 A/B**：现有 ctest 全量（f32 默认路径）改造前后**逐字节一致**；`Scalar` 相关行为零变化。
 2. **cast 往返**：f32→f16→f32 误差 ≤ 1 ulp(f16)（相对 2⁻¹⁰）。

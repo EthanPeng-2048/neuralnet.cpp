@@ -23,7 +23,7 @@
 #include <string_view>
 #include <vector>
 
-#include "../core_errors.hpp"
+#include <neuralnet.cpp/core_errors.hpp>
 #include "compute_vk_device.hpp"
 
 namespace nn

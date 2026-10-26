@@ -78,7 +78,8 @@ ctest --test-dir build -R gradcheck   # 只跑匹配的
 | 训练/反向 | 各 `gradcheck*`、`*_train_test` |
 | GPU 后端 / DSL 融合 | 带 `--gpu` 的变体（见 [`docs/todo/12-compute-engine-inventory.md`](docs/todo/12-compute-engine-inventory.md) 的清单） |
 | 三值 / BitLinear | `bitnet_struct_test`、`ternary_*`、`adam_quant_test` |
-| 序列化 / 数据集 | `kvrec_test`、`nnvocab_test`、`dataset_test` |
+| 序列化 / 数据集 | `train_state_test`、`model_roles_test`（容器格式本体已下沉子仓，见下） |
+| 子仓（`extern/{base,threadpool,kvrecord,dataset,tokenizer}`） | 进入子仓目录独立构建 + ctest（见各子仓 README「构建与测试」）；主仓 ctest 不再包含子仓单测 |
 
 ```bash
 # GPU 测试要在能看见 /dev/nvidia* 的环境里跑（容器/沙箱内会静默退回 llvmpipe 软件光栅）

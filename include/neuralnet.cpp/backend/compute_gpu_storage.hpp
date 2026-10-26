@@ -21,10 +21,10 @@
 #include <string>
 #include <utility>
 
-#include "../core_errors.hpp"
+#include <neuralnet.cpp/core_errors.hpp>
 #include "../core_observer_ptr.hpp"
 #include "../core_domain.hpp"
-#include "../precision.hpp"
+#include <neuralnet.cpp/precision.hpp>
 #include "compute_memory_pool.hpp"
 
 namespace nn

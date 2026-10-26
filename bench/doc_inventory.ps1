@@ -98,10 +98,9 @@ foreach ($d in $scanDirs) {
     foreach ($f in (Get-ChildItem $dd -Recurse -Include *.hpp, *.cpp -File)) {
         if ($f.Name -eq 'core_assert.hpp') { continue }   # 宏定义体，豁免
         # core_errors.hpp 的 NN_TRY/NN_FAIL 宏定义体（`return std::unexpected(...)` 是
-        # 展开目标，必须保留）与 error_macro_test.cpp 的测试夹具（故意构造 unexpected
-        # 以断言宏行为）——逐行豁免见下。
+        # 展开目标，必须保留）——逐行豁免见下。
+        # （error_macro_test.cpp 的夹具豁免已随测试下沉 base 子仓而移除）
         $isCoreErr = ($f.Name -eq 'core_errors.hpp')
-        $isMacroFixture = ($f.Name -eq 'error_macro_test.cpp')
         $inDefine = $false   # core_errors.hpp：#define 宏体（续行以 \ 结尾，末行收尾）
         $lineNo = 0
         foreach ($raw in (Get-Content $f.FullName)) {
@@ -122,8 +121,6 @@ foreach ($d in $scanDirs) {
             $cmt = $code.IndexOf('//')
             if ($cmt -ge 0) { $code = $code.Substring(0, $cmt) }
             if ($code -match 'return\s+std::unexpected') {
-                # error_macro_test.cpp：豁免测试夹具（bad_int 等 helper 故意构造 unexpected）
-                if ($isMacroFixture) { continue }
                 $rel = $f.FullName.Substring($root.Length + 1)
                 $residue += ("{0}:{1}" -f $rel, $lineNo)
             }

@@ -191,7 +191,7 @@ endif()
 # Release: -O3 -funroll-loops -march=native（最大性能）
 # Debug:   -O0 -g（调试优先）
 # 注意：不使用 -ffast-math，因为它会禁用 NaN/Infinity 支持，影响训练稳定性
-# MSVC 对应 /fp:fast 同样禁用 NaN 语义（实测：precision_type_test 的
+# MSVC 对应 /fp:fast 同样禁用 NaN 语义（实测：base 子仓 precision_type_test 的
 # "NaN != NaN" / "NaN 比较均为 false" 断言在 /fp:fast 下被编译器折叠为
 # false → 假失败；/fp:precise 下全绿）→ 按同一铁律用 /fp:precise。
 # Clang/GCC 用 -O3 + 向量化（自带 -fno-math-errno/-fno-trapping-math）。
@@ -553,10 +553,6 @@ if(NN_BUILD_APPS OR NN_ENABLE_TESTS)
     nn_add_executable(adam_quant_test src/adam_quant_test.cpp)
     list(APPEND NN_TEST_TARGETS adam_quant_test)
 
-    # ── 分词器正确性（BPE pre_tokenize 对拍 + 标记往返）─────────────────
-    nn_add_executable(tokenizer_test src/tokenizer_test.cpp)
-    list(APPEND NN_TEST_TARGETS tokenizer_test)
-
     # ── Attention（梯度检查 + forward 一致性 + batch 行号回归）──────────
     nn_add_executable(attn_test src/attn_test.cpp)
     list(APPEND NN_TEST_TARGETS attn_test)
@@ -642,12 +638,6 @@ if(NN_BUILD_APPS OR NN_ENABLE_TESTS)
     # ── 稀疏交叉熵融合（loss/grad vs 参考，CPU+GPU）─────────────────────
     nn_add_executable(ce_fusion_test src/ce_fusion_test.cpp)
     list(APPEND NN_TEST_TARGETS ce_fusion_test)
-
-    # ── 错误处理宏族（NN_UNWRAP / NN_EXIT / NN_TRY_MSG / NN_FAIL）────────────
-    # 覆盖：解值三形态 + 打印格式 + 传播语境前缀 + 终止/退出码
-    # （终止行为经子进程 --expect-abort / --expect-exit <n> 断言，本进程不终止）
-    nn_add_executable(error_macro_test src/error_macro_test.cpp)
-    list(APPEND NN_TEST_TARGETS error_macro_test)
 
     # ── RV-01：前置条件校验（NN_ASSERT_ALWAYS / NN_FATAL）在 NDEBUG 下也终止 ──
     # 负例经子进程断言：越界 at / 未绑定 Tensor::engine() / 空 logits 采样
@@ -756,18 +746,6 @@ if(NN_BUILD_APPS OR NN_ENABLE_TESTS)
     # [3] 同目标两次写必须建顺序边、不合组，反序时 validate_dst_order 必须报错
     nn_add_executable(optimizer_test src/optimizer_test.cpp)
     list(APPEND NN_TEST_TARGETS optimizer_test)
-
-    # ── KVRecord v2（哨兵自举 / 嵌套 / 未知类型跳过 / 搬迁地址校验）─────────
-    nn_add_executable(kvrec_test src/kvrec_test.cpp)
-    list(APPEND NN_TEST_TARGETS kvrec_test)
-
-    # ── .nnvocab 词表文件（json→nnvocab→加载语义一致 + 旧 json 明确拒绝）────
-    nn_add_executable(nnvocab_test src/nnvocab_test.cpp)
-    list(APPEND NN_TEST_TARGETS nnvocab_test)
-
-    # ── .nndataset / nn::Dataset（生成→读取与旧 tokcache 产物逐位一致）─────
-    nn_add_executable(dataset_test src/dataset_test.cpp)
-    list(APPEND NN_TEST_TARGETS dataset_test)
 
     # ── P2b：训练样本概念（数据集的训练单位 = 窗口样本；step 是派生量）───────
     # [1] 切窗/样本视图；[2] make_batch 逐位约定（PAD/目标/掩码/doc_ids/

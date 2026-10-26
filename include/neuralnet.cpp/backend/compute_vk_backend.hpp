@@ -43,9 +43,9 @@
 #include <unordered_map>
 #include <vector>
 
-#include "../core_errors.hpp"
+#include <neuralnet.cpp/core_errors.hpp>
 #include "../core_observer_ptr.hpp"
-#include "../core_config.hpp"
+#include <neuralnet.cpp/core_config.hpp>
 #include "../core_profile.hpp"   // 设备侧计时回填（NN_PROFILE=1 门控）
 // 本文件直接使用 expr_spec 的符号（run_fused_gpu 签名的 ExprPrecSig、
 // EXPR_PREC_DISPATCH_SUFFIX/EXPR_MAX_INPUTS/EXPR_MAX_CONSTS/

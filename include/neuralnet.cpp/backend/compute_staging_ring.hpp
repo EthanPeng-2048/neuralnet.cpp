@@ -24,9 +24,9 @@
 #include <cstring>
 #include <vector>
 
-#include "../core_errors.hpp"
+#include <neuralnet.cpp/core_errors.hpp>
 #include "../core_observer_ptr.hpp"
-#include "../core_config.hpp"
+#include <neuralnet.cpp/core_config.hpp>
 #include "compute_memory_pool.hpp"
 
 namespace nn

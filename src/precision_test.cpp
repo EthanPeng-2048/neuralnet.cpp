@@ -1,17 +1,11 @@
-// ── precision_test — 多精度类型系统合并测试 ─────────────────────────────────
-// 合并：precision_type_test + tensor_precision_test + f16_compute_test
-// 覆盖：f16 转换往返 / round-half-to-even / 张量精度属性 / f16 计算验证
+// ── precision_test — 多精度合并测试（门面侧）───────────────────────────────
+// 合并：tensor_precision_test + f16_compute_test + precision_profile_test
+// 覆盖：张量精度属性 / f16 计算验证 / PrecisionProfile 配方语义
+// （f16 类型系统的位级转换/舍入测试已下沉 base 子仓 base_precision_type_test）
 // ───────────────────────────────────────────────────────────────────────────
 
 #include <cstdio>
 #include <iostream>
-
-// ── precision_type_test (f16 类型系统) ─────────────────────────────────────
-#define main test_precision_type
-#define g_failures g_fail_precision_type
-#include "precision_type_test.cpp"
-#undef g_failures
-#undef main
 
 // ── tensor_precision_test (variant 存储) ───────────────────────────────────
 #define main test_tensor_precision
@@ -124,9 +118,6 @@ int test_f16_fastpath_parity()
 int main()
 {
     int failures = 0;
-
-    std::puts("=== precision_type (f16 type system) ===");
-    failures += test_precision_type();
 
     std::puts("=== tensor_precision (variant storage) ===");
     failures += test_tensor_precision();

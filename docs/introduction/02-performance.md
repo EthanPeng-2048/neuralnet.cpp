@@ -121,7 +121,7 @@ for i_block in range(0, M, BLOCK_SIZE):
 
 ### Release 模式编译标志
 
-> **不使用 `-ffast-math`**：为保证 NaN/Inf 传播与训练数值稳定性，项目明确禁用 `-ffast-math`。实际 Release 标志（Clang/GCC，权威来源 `CMakeLists.txt:77/79`）为 `-O3 -fno-math-errno -fno-trapping-math -funroll-loops -march=native`，另加工程告警集 `-fno-exceptions -Wall -Wextra -Wpedantic -Werror`（注意 **`-funroll-loops` 是启用的**；MSVC 分支为 `/O2 /fp:precise`——`/fp:fast` 会禁用 NaN 语义，实测 `precision_type_test` 的 NaN 断言在 `/fp:fast` 下被编译器折叠为假失败，与本铁律冲突，故 MSVC 固定用 precise）。
+> **不使用 `-ffast-math`**：为保证 NaN/Inf 传播与训练数值稳定性，项目明确禁用 `-ffast-math`。实际 Release 标志（Clang/GCC，权威来源 `CMakeLists.txt:77/79`）为 `-O3 -fno-math-errno -fno-trapping-math -funroll-loops -march=native`，另加工程告警集 `-fno-exceptions -Wall -Wextra -Wpedantic -Werror`（注意 **`-funroll-loops` 是启用的**；MSVC 分支为 `/O2 /fp:precise`——`/fp:fast` 会禁用 NaN 语义，实测 base 子仓 `precision_type_test` 的 NaN 断言在 `/fp:fast` 下被编译器折叠为假失败，与本铁律冲突，故 MSVC 固定用 precise）。
 
 ```cmake
 # CMakeLists.txt（Clang/GCC；NN_ENABLE_NATIVE=ON 时含 -march=native）
