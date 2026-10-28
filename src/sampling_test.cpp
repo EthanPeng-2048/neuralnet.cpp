@@ -17,9 +17,11 @@
 // ───────────────────────────────────────────────────────────────────────────
 
 #include <cstdint>
+#include <limits>
 #include <cstdlib>
 #include <cstdio>
 #include <random>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -203,6 +205,72 @@ void test_repeat_penalty()
     CHECK(nt == 0, "重复惩罚对负 logit 用乘法（-5 → -50 ⇒ 未被罚的 -1 胜出）");
 }
 
+// ── logits_transform 钩子（issue #34）────────────────────────────────────
+void test_logits_transform()
+{
+    const std::vector<Scalar> logits = {1.0, 4.0, 2.0, 3.0};
+    std::mt19937_64 rng = make_rng();
+    std::uniform_real_distribution<Scalar> dist(0.0, 1.0);
+
+    // [a] 钩子把非法位置置 -inf：约束解码语义（棋类合法着 / 语法约束）
+    {
+        SamplingConfig cfg;
+        cfg.temperature = 0.0;   // 贪心：结果由掩码后的 argmax 唯一决定
+        cfg.logits_transform = [](std::span<Scalar> l)
+        {
+            l[1] = -std::numeric_limits<Scalar>::infinity();   // 屏蔽原 argmax(4.0)
+        };
+        std::vector<Scalar> l = logits;
+        const std::size_t t = nn::sample_next_token_(l, cfg, rng, dist, {});
+        CHECK(t == 3, "钩子置 -inf 的位置不被贪心选中（次大 3.0 的下标 3 上位）");
+    }
+
+    // [b] 钩子加偏置：改变贪心结果
+    {
+        SamplingConfig cfg;
+        cfg.temperature = 0.0;
+        cfg.logits_transform = [](std::span<Scalar> l) { l[0] += 10.0f; };
+        std::vector<Scalar> l = logits;
+        CHECK(nn::sample_next_token_(l, cfg, rng, dist, {}) == 0,
+              "钩子加偏置可把任意位置推为贪心选择");
+    }
+
+    // [c] 未设置钩子：与旧行为逐位一致（RNG 消耗序不被钩子机制扰动）
+    {
+        SamplingConfig cfg;   // 全默认（含无钩子）
+        std::mt19937_64 r1 = make_rng(), r2 = make_rng();
+        std::uniform_real_distribution<Scalar> d1(0.0, 1.0), d2(0.0, 1.0);
+        std::vector<Scalar> l1 = logits, l2 = logits;
+        const std::size_t t1 = nn::sample_next_token_(l1, cfg, r1, d1, {});
+        const std::size_t t2 = nn::sample_next_token_(l2, cfg, r2, d2, {});
+        CHECK(t1 == t2, "无钩子时输出与旧路径一致");
+        CHECK(r1 == r2, "无钩子时 RNG 状态逐位一致");
+    }
+
+    // [d] 采样模式下 -inf 位置概率为 0（softmax 自然兼容，永不选中）
+    {
+        SamplingConfig cfg;
+        cfg.temperature = 1.0;
+        cfg.has_seed = true;
+        cfg.seed = 12345;
+        cfg.logits_transform = [](std::span<Scalar> l)
+        {
+            l[0] = -std::numeric_limits<Scalar>::infinity();
+            l[2] = -std::numeric_limits<Scalar>::infinity();
+        };
+        std::mt19937_64 r{777};
+        std::uniform_real_distribution<Scalar> dd(0.0, 1.0);
+        bool never_masked = true;
+        for (int i = 0; i < 300; ++i)
+        {
+            std::vector<Scalar> l = logits;
+            const std::size_t t = nn::sample_next_token_(l, cfg, r, dd, {});
+            if (t == 0 || t == 2) never_masked = false;   // 被掩码的两个位置
+        }
+        CHECK(never_masked, "采样模式下 -inf 位置 300 次全部不被选中");
+    }
+}
+
 void test_greedy_consumes_no_rng()
 {
     SamplingConfig greedy;
@@ -281,6 +349,7 @@ int main()
     test_top_k();
     test_top_p();
     test_repeat_penalty();
+    test_logits_transform();
     test_greedy_consumes_no_rng();
     test_gpt_model_generate();
     std::printf("\nsampling_test: %d failure(s)\n", g_fail);
