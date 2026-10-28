@@ -1116,7 +1116,69 @@ if (rec.get("key", v)) { /* ... */ }
 
 ---
 
-## 20. 已废弃 / 不存在的 API（避免照着旧代码写）
+## 20. 学习率调度（`nn::LrScheduleConfig` / `compute_epoch_lr`）
+
+> 库层真源：`<neuralnet.cpp/lr_scheduler.hpp>`（`cli/cli_lr_scheduler.hpp` 只是转发头）。
+> 回归锁定：`src/lr_scheduler_test.cpp`（issue #31）。
+
+### 20.1 优先级（从高到低）
+
+1. **`lr_per_epoch` 逃生舱**（见 20.3）——非空即**完全覆盖**下方一切。
+2. `schedule ∈ {cosine, multistep, step_cosine}` → 线性 warmup + 对应退火。
+3. 其他（`"constant"` / `"fixed"` / 未识别）→ 固定 `base_lr`。
+
+### 20.2 退火形式
+
+| `schedule` | 语义 | 关键字段 |
+|---|---|---|
+| `constant` / `fixed` | 恒 `base_lr` | — |
+| `cosine` | 线性 warmup + 余弦退火到 `min_lr`（epoch 级） | `warmup_epochs` `total_epochs` `min_lr` |
+| `multistep` | 线性 warmup + 每过一个 milestone 乘一次 `gamma`（ImageNet 风格） | `milestones`（epoch 号升序）`gamma` |
+| `step_cosine` | 线性 warmup + 分段余弦 + 段末重启回 `base_lr`（SGDR 风格） | `n_segments`（≥2 才重启；1 == 普通 cosine） |
+
+- **余弦退火**用标准形式 `0.5 * (1 + cos(π·progress))`，`progress ∈ [0,1]`。
+- **warmup 对所有 schedule 统一生效**（含 `multistep` / `step_cosine`）：warmup 占
+  `epoch ∈ [0, warmup_epochs)`，退火进度按**扣掉 warmup 后的有效区间**计算，
+  因此 warmup 结束点正好衔接退火起点。
+- **越界钳制**：`epoch` 超出 `total_epochs`（如断点续训）时 lr 停在 `min_lr`，
+  **不回升**（否则 `cos` 回落导致 lr 振荡）。
+- `step_cosine` 的**末段吸收整数除法余数**，保证末段覆盖到 `total_epochs` 并精确落在
+  `min_lr`；段内 lr 单调降、跨段瞬间重启（见 20.4 波形）。
+
+```cpp
+#include <neuralnet.cpp/lr_scheduler.hpp>
+
+nn::LrScheduleConfig c;
+c.base_lr = 1e-3f;  c.min_lr = 1e-5f;
+c.total_epochs = 30; c.warmup_epochs = 2;
+c.schedule = "multistep";
+c.milestones = {12, 22};  c.gamma = 0.1f;
+const nn::Scalar epoch_lr = nn::compute_epoch_lr(c, epoch);
+```
+
+### 20.3 `lr_per_epoch` 逃生舱（优先级最高）
+
+非空时**逐 epoch 直接取值**，`schedule` / `warmup_epochs` / `base_lr` / `min_lr` /
+`total_epochs` **全部被忽略**；`epoch ≥ size()` 时返回**最后一个值**（不再变化）。
+
+- 用途：内建 schedule 表达不了的曲线（如三段余弦 + 重启）先用外部工具算出逐 epoch 表。
+- 局限：它是 **epoch 级**表，表达不了 epoch **内**的 lr 变化；需要更细粒度用
+  `StepLrScheduleConfig` / `compute_step_lr`（step 级）。
+
+```cpp
+nn::LrScheduleConfig c;
+c.lr_per_epoch = {1e-3f, 5e-4f, 2.5e-4f};   // 优先级最高，覆盖任何 schedule
+```
+
+### 20.4 波形速查（`base_lr=1, min_lr=0`）
+
+- `cosine`（`warmup=2, total=10`）：`e0=0.5, e1=1.0, e2=1.0(退火起点), e6=0.5, e10=0, 越界=0`
+- `step_cosine`（`total=12, n_segments=3`）：三段各 4 epoch，
+  每段 `1.0 → 0.146`，跨段重启，`e12=0`（末段精确落 `min_lr`）
+
+---
+
+## 21. 已废弃 / 不存在的 API（避免照着旧代码写）
 
 - `Tensor::reshape()` / `Tensor::cpu_matrix()` / `Tensor::from_matrix()` —— **已私有**，
   走 `engine.reshape` / `engine.to_matrix` / `engine.from_matrix`（铁律 #11）。

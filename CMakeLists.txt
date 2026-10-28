@@ -742,6 +742,13 @@ if(NN_BUILD_APPS OR NN_ENABLE_TESTS)
     nn_add_executable(train_state_test src/train_state_test.cpp)
     list(APPEND NN_TEST_TARGETS train_state_test)
 
+    # ── issue #31：epoch/step 学习率调度（multistep / step_cosine / 统一 warmup）─
+    # [1] constant 兜底；[2] cosine warmup+退火+越界钳；[3] multistep ×gamma；
+    # [4] step_cosine 分段重启（SGDR）+ 末段吸收余数；[5] warmup 对所有 schedule；
+    # [6] lr_per_epoch 逃生舱优先级；[7] compute_step_lr 回归。
+    nn_add_executable(lr_scheduler_test src/lr_scheduler_test.cpp)
+    list(APPEND NN_TEST_TARGETS lr_scheduler_test)
+
     # ── P0-5 尾项：多轮对话闭环（prompt 构建 + CLI --turn/--reply-out 接线）──
     # [1] 对话模板结构；[2] ★ 上下文不丢（第 N 轮 prompt 以第 N-1 轮为前缀）；
     # [3] 助手轮 tokens 原样回灌；[4] 整轮截断（system + 末轮恒保留）；
