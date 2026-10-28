@@ -43,6 +43,7 @@
 | [训练包](docs/usage/04-train-package.md) | 用 `.nnpkg` 打包超参+训练集，跨设备一键复现训练 |
 | [作为库嵌入](docs/usage/05-consume-as-library.md) | 把本库嵌进自己的工程（`neuralnet::nn` 门面 / FetchContent） |
 | [强化学习与可组合训练](docs/usage/06-reinforcement-learning.md) | 具名多输出、GAE、REINFORCE/PPO/GRPO、多模型 Session 与 rollout pipeline |
+| [线程安全契约](docs/usage/07-thread-safety.md) | 每个对象的并发口径矩阵 + 服务化下游设计模板 |
 | [实测结论索引](research/README.md) | **可引用的实验结论**（MNIST 准确率 / f16 回弹根因 / 三值 STE / 三值尺度规则）：结论 + 证据 + 重跑命令 + 边界 |
 | [参与本项目](CONTRIBUTING.md) | 给非作者的入口：构建、测试、代码规范、提 PR、CI 口径 |
 
