@@ -639,6 +639,11 @@ if(NN_BUILD_APPS OR NN_ENABLE_TESTS)
     nn_add_executable(ce_fusion_test src/ce_fusion_test.cpp)
     list(APPEND NN_TEST_TARGETS ce_fusion_test)
 
+    # ── 复合层逐子层默认广播（issue #29：set_precision_profile / set_training /
+    # clear_cache 按 param_children() 默认转发）
+    nn_add_executable(layer_broadcast_test src/layer_broadcast_test.cpp)
+    list(APPEND NN_TEST_TARGETS layer_broadcast_test)
+
     # ── GPU 单次推理 batch 作用域（issue #28：InferenceScope / Model::forward
     # 自动作用域 / batch_active 查询）。无 Vulkan/无卡 → 77 = SKIP。
     nn_add_executable(gpu_batch_scope_test src/gpu_batch_scope_test.cpp)
