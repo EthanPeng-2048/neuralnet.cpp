@@ -10,6 +10,7 @@
 #include <limits>
 #include <memory>
 #include <random>
+#include <functional>   // SamplingConfig::logits_transform 钩子（issue #34）
 #include <span>
 #include <string>
 #include <utility>
@@ -1006,6 +1007,17 @@ struct SamplingConfig
     std::size_t repeat_window = 0; // 0 = 全部 history
     std::uint64_t seed = 0; // has_seed=false 时忽略
     bool has_seed = false; // true = 用 seed 播种（可复现）
+
+    // ── 外部 logits 掩码/变换钩子（v1.14.0，issue #34）────────────────
+    // 在**重复惩罚之前**（即全部库内采样策略之前）对 host 侧 logits 原地
+    // 变换：约束解码场景（棋类合法着、语法约束、工具调用 schema）在此把
+    // 非法位置 -inf / 加偏置。回调发生在 logits 已在 host 的那一步
+    //（generate 已 download），零 GPU 往返。
+    //   · 不设置（默认）= 逐位旧行为（RNG 消耗序不变）；
+    //   · 对 -inf 位置：重复惩罚（logit>0 判定）、softmax（exp(-inf)=0）
+    //     均自然兼容；temperature 除法 -inf/t = -inf 亦然；
+    //   · 回调内**不得**修改 logits.size()（span 只读长度）。
+    std::function<void(std::span<Scalar> /*logits in/out*/)> logits_transform;
 };
 
 // 扩展采样器（cfg 全默认时的输出与下面 temperature 重载逐位一致）
@@ -1017,6 +1029,11 @@ struct SamplingConfig
     const std::size_t n = logits.size();
     // RV-01：n == 0 时下面的 `logits[0]` / max 归约都越界 → 无条件终止
     NN_ASSERT_ALWAYS(n > 0, "sample_next_token_: empty logits");
+
+    // ── ⓪ 外部 logits 变换钩子（issue #34）：全部库内策略之前 ────────
+    // 未设置（默认）时零开销，RNG 消耗序与旧路径逐位一致。
+    if (cfg.logits_transform)
+        cfg.logits_transform(std::span<Scalar>(logits.data(), logits.size()));
 
     // ── ① 重复惩罚（去重；判定只依赖 history 的内容，不依赖扫描顺序）──
     if (cfg.repeat_penalty > 0.0 && cfg.repeat_penalty != 1.0 && !history.empty())
