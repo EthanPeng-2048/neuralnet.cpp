@@ -639,6 +639,12 @@ if(NN_BUILD_APPS OR NN_ENABLE_TESTS)
     nn_add_executable(ce_fusion_test src/ce_fusion_test.cpp)
     list(APPEND NN_TEST_TARGETS ce_fusion_test)
 
+    # ── 宿主桥公开 API（issue #30：nn::upload_span / download_span / download_vector）
+    # 覆盖：F32/F16 往返（RHE 与 from_matrix 逐位同口径）、形状不匹配报错、
+    # nn::detail:: 旧名过渡别名向后兼容。
+    nn_add_executable(host_bridge_test src/host_bridge_test.cpp)
+    list(APPEND NN_TEST_TARGETS host_bridge_test)
+
     # ── RV-01：前置条件校验（NN_ASSERT_ALWAYS / NN_FATAL）在 NDEBUG 下也终止 ──
     # 负例经子进程断言：越界 at / 未绑定 Tensor::engine() / 空 logits 采样
     # 必须非零退出、打印 `file:line`、且 tag 是新宏（不是 NDEBUG 下为空的 NN_ASSERT）

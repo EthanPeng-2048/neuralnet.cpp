@@ -507,10 +507,12 @@ public:
     // （Matrix = 宿主 I/O 载体），批量 read/write 为**本体**，索引级
     // get_index/set_index 是语法糖，`import` 是跨设备/引擎拉取入口（M6，
     // 原 `ensure_gpu` 迁入并升为引擎契约）。
-    // 分层口径（M4 D11 / 铁律 #12）：库外（tests/tools/CLI）只准出现本组动词；
+    // 分层口径（M4 D11 / 铁律 #12；v1.14.0 起宿主桥升公开 API，见 issue #30）：
+    // 库外（tests/tools/CLI）只准出现本组动词 + 公开宿主桥
+    // `nn::upload_span/nn::download_span/nn::download_vector`；
     // 计算路径（Layer/Loss/Optimizer/Model）禁用 **Matrix 型三动词**
-    //（from_matrix/to_matrix/copy_from），span 级 read/write 与
-    // `detail::upload_span/download_span` 宿主桥受控可用；序列化编解码层除外。
+    //（from_matrix/to_matrix/copy_from），span 级 read/write 与宿主桥受控可用；
+    // 序列化编解码层除外。
     //
     // 调用约定（17 §7-1/§7-4，铁律 #6）：
     //   - read 在 GPU 上**隐含 flush + 同步**（与 to_matrix 同路）：录制窗口
@@ -2129,9 +2131,8 @@ private:
     DomainId domain_ = 0;
 };
 
-namespace detail {
-
-// ── L2+ 宿主桥（docs/todo/17 §3 D11 / §4.6，AGENTS.md 铁律 #12）────
+// ── 宿主桥（L2+，原 nn::detail；v1.14.0 升公开 API，见 issue #30）──────
+// L2（Layer/Loss/Optimizer/Model）计算路径**不得出现 Matrix 类型**，因此层自算
 // L2（Layer/Loss/Optimizer/Model）计算路径**不得出现 Matrix 类型**，因此层自算
 // 的辅助数据（索引/位置/掩码/斜率/编码表等——没有对应的引擎侧生成原语）以 span
 // 形态经这三个函数进出；它们内部走 M3 的批量 `write` / `read`（GPU 自动 staging、
@@ -2191,6 +2192,12 @@ namespace detail {
     return v;
 }
 
+namespace detail {
+// 过渡别名（v1.14.0 起宿主桥的正式归属是 nn::）：库内既有调用点不破坏；
+// 库外请直接用 nn::upload_span / nn::download_span / nn::download_vector。
+using nn::download_span;
+using nn::download_vector;
+using nn::upload_span;
 } // namespace detail
 
 // ── IR-C 录制段 RAII 守卫（P2）───────────────────────────────
