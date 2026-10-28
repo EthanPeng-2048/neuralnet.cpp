@@ -249,7 +249,17 @@ private:
         c_vkalloc_ms_ += std::chrono::duration<double, std::milli>(
                              std::chrono::steady_clock::now() - t0).count();
         if (res != VK_SUCCESS)
+        {
+            // issue #28：VK_ERROR_OUT_OF_DEVICE_MEMORY(-2) 的常见根因不是显存
+            // 真的占满，而是调用方未包 batch 作用域（逐原语路径不回收帧内
+            // 临时分配）。报错必须指向根因与修复动作。
+            if (res == VK_ERROR_OUT_OF_DEVICE_MEMORY)
+                NN_FAIL("vkAllocateMemory failed: VK_ERROR_OUT_OF_DEVICE_MEMORY"
+                        "（显存不足；若在 GPU 上做单次推理/评估，请用"
+                        " nn::InferenceScope 或 begin_batch/end_batch 包裹"
+                        "——未收口的 batch 作用域会导致帧内分配持续累积）");
             NN_FAIL("vkAllocateMemory failed: " + std::to_string(res));
+        }
         c_blocks_created_++;
 
         Block block;

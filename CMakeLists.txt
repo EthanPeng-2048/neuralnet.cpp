@@ -639,6 +639,11 @@ if(NN_BUILD_APPS OR NN_ENABLE_TESTS)
     nn_add_executable(ce_fusion_test src/ce_fusion_test.cpp)
     list(APPEND NN_TEST_TARGETS ce_fusion_test)
 
+    # ── GPU 单次推理 batch 作用域（issue #28：InferenceScope / Model::forward
+    # 自动作用域 / batch_active 查询）。无 Vulkan/无卡 → 77 = SKIP。
+    nn_add_executable(gpu_batch_scope_test src/gpu_batch_scope_test.cpp)
+    list(APPEND NN_TEST_TARGETS gpu_batch_scope_test)
+
     # ── 宿主桥公开 API（issue #30：nn::upload_span / download_span / download_vector）
     # 覆盖：F32/F16 往返（RHE 与 from_matrix 逐位同口径）、形状不匹配报错、
     # nn::detail:: 旧名过渡别名向后兼容。
