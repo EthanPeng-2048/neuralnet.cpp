@@ -99,6 +99,13 @@ public:
         return backend_->end_batch();
     }
 
+    // batch 模式查询（基类默认 false；GPU 委托 backend，供 InferenceScope
+    // / Model::forward 自动作用域判定，issue #28）
+    [[nodiscard]] bool batch_active() const noexcept override
+    {
+        return backend_->in_batch();
+    }
+
     // ── 表达式录制（IR-C）──────────────────────────────
     // begin_expr 开启录制：期间 eval_expr/eval_expr_reduce 经 NVI 拦截入图
     // （expr_graph.hpp），返回带 virtual_tag 的占位 GPU 张量（真实存储）。

@@ -242,6 +242,12 @@ public:
             NN_FAIL("Model::forward: no layers");
         if (!engine_)
             NN_FAIL("Model::forward: engine 未绑定（构造时引擎必须由 shared_ptr 管理）");
+        // GPU 单次推理自动 batch 作用域（issue #28）：外层未持有 batch 时
+        // 临时开一个，多 Conv 模型不再因逐原语路径不回收帧内分配而
+        // VK_ERROR_OUT_OF_DEVICE_MEMORY。外层训练循环已持有 batch → 透传。
+        InferenceScope scope(*engine_);
+        if (!scope.ok())
+            NN_FAIL("Model::forward: " + scope.error().message);
         Tensor x = input;
         for (std::size_t li = 0; li < layers_.size(); ++li)
         {
@@ -260,6 +266,10 @@ public:
             NN_FAIL("Model::backward: no layers");
         if (!engine_)
             NN_FAIL("Model::backward: engine 未绑定（构造时引擎必须由 shared_ptr 管理）");
+        // 同 forward（issue #28）：外层未持有 batch 时临时开一个。
+        InferenceScope scope(*engine_);
+        if (!scope.ok())
+            NN_FAIL("Model::backward: " + scope.error().message);
         Tensor g = grad_output;
         for (std::size_t i = layers_.size(); i-- > 0;)
         {

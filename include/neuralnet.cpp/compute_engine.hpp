@@ -47,6 +47,7 @@
 #include <cstdlib>
 #include <limits>   // RV-02：create_tensor 的形状溢出检查
 #include <memory>
+#include <optional>   // InferenceScope 的 begin_batch 错误槽（issue #28）
 #include <random>
 #include <source_location>
 #include <span>
@@ -273,6 +274,11 @@ public:
     // GPU 引擎：begin 开始录制，end 统一提交 + fence wait
     [[nodiscard]] virtual Result<void> begin_batch() = 0;
     [[nodiscard]] virtual Result<void> end_batch() = 0;
+
+    // 当前是否处于 batch（录制）模式。CPU 恒 false（begin/end 均 no-op）；
+    // GPU 委托 backend。供 InferenceScope / Model::forward 的自动作用域
+    // 判定"是否需要开临时 batch"（issue #28）。
+    [[nodiscard]] virtual bool batch_active() const noexcept { return false; }
 
     // ── 表达式录制（IR-C 图融合；见 docs/history/history.md
     //    「IR-C 定位修正与恢复立项」）──────────────────────────────────────
@@ -2230,6 +2236,59 @@ public:
 private:
     std::shared_ptr<ComputeEngine> e_;
     bool done_ = false;
+};
+
+// ── 推理批作用域 RAII（issue #28）────────────────────────────────────
+// GPU 上多算子推理（如多 Conv 模型的 Model::forward）若不在 batch 模式，
+// 逐原语路径不回收帧内临时分配，会在后续分配处报
+// VK_ERROR_OUT_OF_DEVICE_MEMORY 且不指向根因。
+//
+//   nn::InferenceScope scope(engine);   // 已在 batch 中 → 透传（被动观察）
+//   NN_TRY(out, model.forward(input));  // 作用域退出自动 end_batch
+//
+// 语义：
+//   · 构造时若 `batch_active() == false` → begin_batch（自己开的才自己收）；
+//     已在 batch 中（训练循环持有的外层 batch）→ 被动透传，析构不收口；
+//   · begin_batch 失败经 `ok()` / `error()` 上抛（不 abort）；
+//   · 析构收口 best-effort（错误已被上层 NN_TRY 传播或忽略，同 ExprSegment）；
+//   · 不可嵌套自开（第二次自开会撞 backend 的 "Already in batch mode"，
+//     属编程错误——外层已有 batch 时内层自动透传，不会发生）。
+class InferenceScope
+{
+public:
+    explicit InferenceScope(ComputeEngine& e) noexcept : e_(&e)
+    {
+        if (!e_->batch_active())
+        {
+            auto r = e_->begin_batch();
+            if (r) active_ = true;
+            else err_ = std::move(r.error());
+        }
+    }
+    InferenceScope(const InferenceScope&) = delete;
+    InferenceScope& operator=(const InferenceScope&) = delete;
+    ~InferenceScope()
+    {
+        if (active_) (void)e_->end_batch();   // 兜底收口（同 ExprSegment）
+    }
+
+    // 本作用域是否真的开启了 batch（false = 外层已有 batch，透传）
+    [[nodiscard]] bool active() const noexcept { return active_; }
+    [[nodiscard]] bool ok() const noexcept { return !err_.has_value(); }
+    [[nodiscard]] const Error& error() const noexcept { return *err_; }
+
+    // 显式收口：正常路径可调用以传播 end_batch 错误；不调用则析构兜底。
+    [[nodiscard]] Result<void> end()
+    {
+        if (!active_) return {};
+        active_ = false;
+        return e_->end_batch();
+    }
+
+private:
+    ComputeEngine* e_;
+    bool active_ = false;
+    std::optional<Error> err_;
 };
 
 } // namespace nn
