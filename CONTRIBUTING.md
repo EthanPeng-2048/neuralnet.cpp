@@ -139,8 +139,16 @@ clang-format -i path/to/new_file.hpp
 
 ## 4. 提 PR
 
-1. Fork（或在本仓开分支），分支名 `<类型>/<主题>`，类型用 `feat` / `fix` / `docs` / `bench` / `refactor`
-   （例：`fix/trans-view-kind`、`docs/consume-as-library`）。
+1. Fork（或在本仓开分支）。**分支模型**（仅主仓库 `neuralnet.cpp`；子仓库各自只有 `main`）：
+
+   | 分支 | 定位 | 流转 |
+   |---|---|---|
+   | `main` | 主分支：只**合并其他分支**或**直接更新文档**，不直接开发 | 发布基线，tag 打在这里 |
+   | `dev` | 集成分支：hotfix + new feature 的汇合点 | 定期合入 `main` |
+   | `feature/<feature_name>` | 功能分支：**只实现一个功能** | 完成后合入 `dev`，随即删除 |
+   | `hotfix/<bug_name>` | 热修复分支：**只修复一个 bug** | 完成后合入 `dev`，随即删除 |
+
+   其他历史分支命名（`feat/`、`fix/`、`docs/` 等）已废止。文档类改动可直接在 `main` 提 PR。
 2. **一次 PR 一件事**。大改动请先在 issue/讨论里对齐设计——本仓有「先写设计稿进 `docs/todo/`，
    裁定后再实施」的习惯（`docs/todo/` 就是项目开发者的工作区）。
 3. 提交前自查：
