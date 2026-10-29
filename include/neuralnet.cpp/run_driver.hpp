@@ -90,8 +90,9 @@ struct RunHooks
 
     // 可选：一个 epoch 结束时的评估（返回标量指标，如 test loss）。
     std::function<Result<Scalar>(TrainingSession&, std::size_t epoch)> evaluate;
-    // 可选：一个 epoch 结束（指标/落盘）。
-    std::function<void(const RunReport&, std::size_t epoch)> on_epoch_end;
+    // 可选：一个 epoch 结束（指标/落盘）。返回错误 = 中止训练并传播
+    // （epoch 末 drain 等失败必须能终止，与旧 TextTrainer 口径一致）。
+    std::function<Result<void>(const RunReport&, std::size_t epoch)> on_epoch_end;
     // 可选：断点请求（"何时/状态是什么"由 driver 决定；路径与格式由域落地）。
     // 返回错误 = 本次断点未落盘（driver 计数，训练继续）。
     std::function<Result<void>(TrainingSession&, const TrainState&)> on_checkpoint;
@@ -102,7 +103,7 @@ struct RunHooks
 // ── 骨架配置（领域无关的运行配方）─────────────────────────────────────────
 struct RunDriverConfig
 {
-    int epochs = 1;                     // <=0 = 步进驱动（需 max_steps>0）
+    int epochs = 1;                     // <=0 = 步进驱动（按 max_steps 推进；0 = 0 步）
     std::size_t max_steps = 0;          // 0 = 按 epoch 跑完
     int stop_after_epoch = 0;           // >0 = 训到该 epoch（1-based，不含）存档退出
 
@@ -136,8 +137,8 @@ public:
     {
         if (!state)
             NN_FAIL("RunDriver::create: state 不能为空（域需提供其 TrainState 子类）");
-        if (cfg.epochs <= 0 && cfg.max_steps == 0)
-            NN_FAIL("RunDriver::create: epochs<=0（步进驱动）时必须给 max_steps>0");
+        if (cfg.epochs < 0)
+            NN_FAIL("RunDriver::create: epochs 不能为负");
         if (cfg.stop_after_epoch < 0)
             NN_FAIL("RunDriver::create: stop_after_epoch 不能为负");
         if (cfg.stop_after_epoch > cfg.epochs && cfg.epochs > 0)
@@ -321,7 +322,12 @@ public:
                 if (stop_training) break;
 
                 // ── epoch 边界：断点 + 评估 + 指标 ────────────────────────
-                NN_TRY(ck, do_checkpoint(static_cast<std::size_t>(epoch) + 1, 0));
+                // 断点：save_interval==0 时以 epoch 边界为节奏；save_interval>0 时
+                // 末步（step+1==steps_per_epoch）已覆盖 epoch 末，这里不再双写。
+                if (cfg_.save_interval == 0)
+                {
+                    NN_TRY(ck, do_checkpoint(static_cast<std::size_t>(epoch) + 1, 0));
+                }
 
                 if (cfg_.enable_eval && hooks_.evaluate)
                 {
@@ -337,7 +343,8 @@ public:
                     snapshot.final_lr = current_lr;
                     snapshot.final_epoch = static_cast<std::size_t>(epoch) + 1;
                     snapshot.final_step_in_epoch = 0;
-                    hooks_.on_epoch_end(snapshot, static_cast<std::size_t>(epoch));
+                    NN_TRY_MSG(hk, "on_epoch_end 失败",
+                               hooks_.on_epoch_end(snapshot, static_cast<std::size_t>(epoch)));
                 }
 
                 // --stop-after-epoch：训到该 epoch（1-based，不含）即退出
@@ -404,6 +411,14 @@ public:
                 last_step_done = step + 1;
                 if (is_final) break;
             }
+        }
+
+        // 非中止时停止位置按"下一步位置"归一化（step_done 越过 epoch 末 ⇒
+        // 下一 epoch 第 0 步）；中止保持原始 (epoch, step+1)，与旧口径一致。
+        if (abort_code == 0 && steps_per_epoch > 0 && last_step_done >= steps_per_epoch)
+        {
+            ++last_epoch;
+            last_step_done = 0;
         }
 
         const auto t1 = std::chrono::steady_clock::now();
