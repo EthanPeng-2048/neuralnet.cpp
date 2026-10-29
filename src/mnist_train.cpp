@@ -523,14 +523,13 @@ nn::ModelSpec build_spec(const TrainConfig &cfg)
     }
     // MLP（结构内置 Linear→Norm→激活；auto = layernorm）
     nn::ModelSpec spec;
-    spec.type = nn::ModelType::MLP;
-    spec.layer_dims = cfg.layer_dims.empty() ? nn::MNIST_LAYER_DIMS : cfg.layer_dims;
-    spec.norm_type = cfg.norm_type.value_or(nn::NormType::LayerNorm);
-    spec.norm_place = nn::NormPlace::None;
+    auto &m = spec.emplace<nn::MlpSpec>();
+    m.layer_dims = cfg.layer_dims.empty() ? nn::MNIST_LAYER_DIMS : cfg.layer_dims;
+    m.norm_type = cfg.norm_type.value_or(nn::NormType::LayerNorm);
     // 三值权重：param=t1_58 → 线性层用 BitLinear（规格是加载时的权威来源，
     // 缺键 = None 保证旧文件零破坏）。见 docs 21 §4.7。
-    spec.weight_quant = (cfg.precision.param == nn::Precision::T1_58)
-                            ? nn::WeightQuant::T1_58 : nn::WeightQuant::None;
+    m.weight_quant = (cfg.precision.param == nn::Precision::T1_58)
+                         ? nn::WeightQuant::T1_58 : nn::WeightQuant::None;
     return spec;
 }
 
@@ -568,44 +567,46 @@ int main(int argc, char *argv[])
         auto spec_result = nn::peek_model_spec(cfg.resume_path);
         if (spec_result)
         {
-            if (spec_result->type == nn::ModelType::MLP)
+            if (spec_result->is_mlp())
             {
                 std::cout << "从模型文件读取 MLP 规格\n";
                 spec = std::move(*spec_result);
                 cfg.arch = ArchType::MLP;
-                cfg.norm_type = spec.norm_type;
+                cfg.norm_type = spec.as<nn::MlpSpec>()->norm_type;
             }
             else if (spec_result->is_transformer())
             {
                 std::cout << "从模型文件读取 Transformer 规格\n";
                 spec = std::move(*spec_result);
                 cfg.arch = ArchType::Transformer;
-                cfg.norm_type = spec.norm_type;
-                cfg.norm_place = spec.norm_place;
-                cfg.patch_size = spec.patch_size != 0 ? spec.patch_size : nn::MNIST_PATCH_SIZE;
-                cfg.d_model = spec.d_model;
-                cfg.num_heads = spec.num_heads;
-                cfg.d_ff = spec.d_ff;
-                cfg.num_layers = spec.num_layers;
+                const auto *t = spec.as<nn::TransformerSpec>();
+                cfg.norm_type = t->norm_type;
+                cfg.norm_place = t->norm_place;
+                cfg.patch_size = t->patch_size != 0 ? t->patch_size : nn::MNIST_PATCH_SIZE;
+                cfg.d_model = t->d_model;
+                cfg.num_heads = t->num_heads;
+                cfg.d_ff = t->d_ff;
+                cfg.num_layers = t->num_layers;
             }
             else if (spec_result->is_cnn())
             {
                 std::cout << "从模型文件读取 CNN 规格\n";
                 spec = std::move(*spec_result);
                 cfg.arch = ArchType::CNN;
-                cfg.norm_type = spec.norm_type;
-                cfg.norm_place = spec.norm_place;
-                cfg.cnn_in_channels = spec.cnn_in_channels;
-                cfg.cnn_in_size     = spec.cnn_in_size;
-                cfg.cnn_pool        = spec.cnn_pool;
-                cfg.cnn_channels    = spec.cnn_channels;
-                cfg.cnn_kernels     = spec.cnn_kernels;
-                cfg.cnn_fc_dims     = spec.layer_dims;
+                const auto *c = spec.as<nn::CnnSpec>();
+                cfg.norm_type = c->norm_type;
+                cfg.norm_place = c->norm_place;
+                cfg.cnn_in_channels = c->cnn_in_channels;
+                cfg.cnn_in_size     = c->cnn_in_size;
+                cfg.cnn_pool        = c->cnn_pool;
+                cfg.cnn_channels    = c->cnn_channels;
+                cfg.cnn_kernels     = c->cnn_kernels;
+                cfg.cnn_fc_dims     = c->layer_dims;
             }
             else
             {
-                std::cerr << "模型文件类型不支持 (type="
-                          << static_cast<uint32_t>(spec_result->type) << ")\n";
+                std::cerr << "模型文件类型不支持 (type=" << spec_result->type_name()
+                          << ")\n";
                 return 1;
             }
         }
@@ -654,10 +655,14 @@ int main(int argc, char *argv[])
     }
     else
     {
-        const auto &dims = spec.is_mlp() ? spec.layer_dims : nn::MNIST_LAYER_DIMS;
+        const auto &dims =
+            spec.is_mlp() ? spec.as<nn::MlpSpec>()->layer_dims : nn::MNIST_LAYER_DIMS;
+        const auto p_norm = spec.is_mlp()   ? spec.as<nn::MlpSpec>()->norm_type
+                            : spec.is_transformer() ? spec.as<nn::TransformerSpec>()->norm_type
+                                                    : spec.as<nn::CnnSpec>()->norm_type;
         const std::string_view norm_name =
-            (spec.norm_type == nn::NormType::RMSNorm) ? "RMSNorm" :
-            (spec.norm_type == nn::NormType::BatchNorm) ? "BatchNorm" : "LayerNorm";
+            (p_norm == nn::NormType::RMSNorm) ? "RMSNorm" :
+            (p_norm == nn::NormType::BatchNorm) ? "BatchNorm" : "LayerNorm";
         std::cout << "  网络: ";
         for (std::size_t i = 0; i < dims.size(); ++i)
         {
@@ -673,11 +678,17 @@ int main(int argc, char *argv[])
         std::cout << "\n";
     }
 
+    const auto q_norm = spec.is_transformer() ? spec.as<nn::TransformerSpec>()->norm_type
+                        : spec.is_cnn()       ? spec.as<nn::CnnSpec>()->norm_type
+                                              : spec.as<nn::MlpSpec>()->norm_type;
+    const auto q_place = spec.is_transformer() ? spec.as<nn::TransformerSpec>()->norm_place
+                         : spec.is_cnn()       ? spec.as<nn::CnnSpec>()->norm_place
+                                               : nn::NormPlace::None;
     std::cout << "  归一化: "
-              << ((spec.norm_type == nn::NormType::RMSNorm) ? "RMSNorm" :
-                  (spec.norm_type == nn::NormType::BatchNorm) ? "BatchNorm" : "LayerNorm");
-    if (spec.norm_place != nn::NormPlace::None)
-        std::cout << " @ " << nn::norm_place_name(spec.norm_place);
+              << ((q_norm == nn::NormType::RMSNorm) ? "RMSNorm" :
+                  (q_norm == nn::NormType::BatchNorm) ? "BatchNorm" : "LayerNorm");
+    if (q_place != nn::NormPlace::None)
+        std::cout << " @ " << nn::norm_place_name(q_place);
     std::cout << "\n";
     std::cout << "  优化器: " << cfg.optimizer_name << "  学习率: " << cfg.lr << "\n";
     std::cout << "  轮数: " << cfg.epochs << "  批大小: " << cfg.batch_size << "\n";

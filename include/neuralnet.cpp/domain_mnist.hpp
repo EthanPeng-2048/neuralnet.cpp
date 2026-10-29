@@ -212,14 +212,14 @@ inline const std::vector<std::size_t> MNIST_LAYER_DIMS = {
     NormPlace norm_place = NormPlace::Final)
 {
     ModelSpec spec;
-    spec.type       = ModelType::Transformer;
-    spec.d_model    = d_model;
-    spec.num_heads  = num_heads;
-    spec.d_ff       = d_ff;
-    spec.num_layers = num_layers;
-    spec.patch_size = patch_size;
-    spec.norm_type  = norm_type;
-    spec.norm_place = norm_place;
+    auto &t = spec.emplace<TransformerSpec>();
+    t.d_model    = d_model;
+    t.num_heads  = num_heads;
+    t.d_ff       = d_ff;
+    t.num_layers = num_layers;
+    t.patch_size = patch_size;
+    t.norm_type  = norm_type;
+    t.norm_place = norm_place;
     // vocab_size / seq_len 不用于 Transformer (MNIST ViT)
     return spec;
 }
@@ -233,7 +233,12 @@ inline const std::vector<std::size_t> MNIST_LAYER_DIMS = {
     // ── 三值（T1_58）权重由**规格**决定（不是 CLI 参数）───────────────
     // 保存过的三值模型必须还原成 BitLinear（参数形状相同、语义不同）：
     // 规格是权威来源，CLI 的 precision.param 会被它覆盖。
-    if (spec.weight_quant == WeightQuant::T1_58)
+    // weight_quant 是各类型子类的字段（三值语义架构级，但归属各自的规格）
+    WeightQuant wq = WeightQuant::None;
+    if (const auto *m = spec.as<MlpSpec>()) wq = m->weight_quant;
+    else if (const auto *t = spec.as<TransformerSpec>()) wq = t->weight_quant;
+    else if (const auto *c = spec.as<CnnSpec>()) wq = c->weight_quant;
+    if (wq == WeightQuant::T1_58)
     {
         if (!spec.is_mlp())
             NN_FAIL("weight_quant=t1_58 该构建入口只支持 MLP 架构：GPT 走 "
@@ -242,22 +247,22 @@ inline const std::vector<std::size_t> MNIST_LAYER_DIMS = {
         precision.param = Precision::T1_58;
     }
 
-    if (spec.is_mlp())
+    if (const auto *m = spec.as<MlpSpec>())
     {
-        auto model = build_mnist_mlp_model(engine, spec.layer_dims, spec.norm_type,
+        auto model = build_mnist_mlp_model(engine, m->layer_dims, m->norm_type,
                                            precision);
         if (model)
             model->set_spec(spec);  // 记录架构规格，供 load_model 校验
         return model;
     }
 
-    if (spec.is_transformer())
+    if (const auto *t = spec.as<TransformerSpec>())
     {
-        const std::size_t patch_size = spec.patch_size != 0 ? spec.patch_size : MNIST_PATCH_SIZE;
+        const std::size_t patch_size = t->patch_size != 0 ? t->patch_size : MNIST_PATCH_SIZE;
         auto model = build_mnist_transformer_model(
             engine, MNIST_IMG_SIZE, patch_size,
-            spec.d_model, spec.num_heads, spec.d_ff, spec.num_layers, precision,
-            spec.norm_type, spec.norm_place);
+            t->d_model, t->num_heads, t->d_ff, t->num_layers, precision,
+            t->norm_type, t->norm_place);
         if (model)
             model->set_spec(spec);  // 记录架构规格，供 load_model 校验
         return model;

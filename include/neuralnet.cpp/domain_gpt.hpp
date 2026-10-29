@@ -103,20 +103,21 @@ struct GptConfig {
     ComputeEngine& engine, const ModelSpec &spec,
     PrecisionProfile precision = PrecisionProfile{})
 {
-    // 接受 GPT 类型，或 ALiBi_GPT 类型（两种 spec 类型走同一构建路径）
-    if (!spec.is_gpt() && !spec.is_alibi_gpt())
+    // 接受 GPT 类型（含 ALiBi/RoPE 变体；旧 ALiBi_GPT 数值 type 同归 GptSpec）
+    const auto *g = spec.as<GptSpec>();
+    if (g == nullptr)
         NN_FAIL("Invalid ModelSpec type for GPT: expected GPT or ALiBi_GPT");
     // ── 三值（T1_58）权重由**规格**决定（权威来源，docs 21 §4.7/§4.8.3）──
     // 与 build_mnist_mlp_model 的加载路径同款：保存过的三值模型必须还原成
     // BitLinear（参数形状相同、语义不同），命令行传进来的 precision 会被规格覆盖。
-    if (spec.weight_quant == WeightQuant::T1_58)
+    if (g->weight_quant == WeightQuant::T1_58)
         precision.param = Precision::T1_58;
     auto model = build_gpt_model(
         engine,
-        spec.vocab_size, spec.d_model, spec.seq_len,
-        spec.num_heads, spec.d_ff, spec.num_layers,
-        spec.pos_encoding, spec.activation, spec.norm_type, precision,
-        spec.subln, spec.n_head_kv, spec.tie_embeddings);
+        g->vocab_size, g->d_model, g->seq_len,
+        g->num_heads, g->d_ff, g->num_layers,
+        g->pos_encoding, g->activation, g->norm_type, precision,
+        g->subln, g->n_head_kv, g->tie_embeddings);
     if (model)
         model->set_spec(spec);  // 记录架构规格，供 load_model 校验
     return model;
@@ -138,19 +139,19 @@ struct GptConfig {
     bool tie_embeddings = false)
 {
     ModelSpec spec;
-    spec.type         = ModelType::GPT;
-    spec.vocab_size   = vocab_size;
-    spec.d_model      = d_model;
-    spec.seq_len      = seq_len;
-    spec.num_heads    = num_heads;
-    spec.d_ff         = d_ff;
-    spec.num_layers   = num_layers;
-    spec.pos_encoding = pos_encoding;
-    spec.activation   = activation;
-    spec.norm_type    = norm_type;
-    spec.subln        = subln;
-    spec.n_head_kv    = n_head_kv;
-    spec.tie_embeddings = tie_embeddings;
+    auto &g = spec.emplace<GptSpec>();
+    g.vocab_size   = vocab_size;
+    g.d_model      = d_model;
+    g.seq_len      = seq_len;
+    g.num_heads    = num_heads;
+    g.d_ff         = d_ff;
+    g.num_layers   = num_layers;
+    g.pos_encoding = pos_encoding;
+    g.activation   = activation;
+    g.norm_type    = norm_type;
+    g.subln        = subln;
+    g.n_head_kv    = n_head_kv;
+    g.tie_embeddings = tie_embeddings;
     return spec;
 }
 

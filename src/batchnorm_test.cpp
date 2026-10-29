@@ -528,9 +528,9 @@ void test_model_level(ComputeEngine &eng)
 
     // ── save/load 往返：参数 + running 统计逐位一致 ──
     nn::ModelSpec spec;
-    spec.type = nn::ModelType::MLP;
-    spec.layer_dims = dims;
-    spec.norm_type = nn::NormType::BatchNorm;
+    auto &sp = spec.emplace<nn::MlpSpec>();
+    sp.layer_dims = dims;
+    sp.norm_type = nn::NormType::BatchNorm;
 
     const std::string file = "batchnorm_test_roundtrip.tmp";
     {

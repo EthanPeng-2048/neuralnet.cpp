@@ -5316,3 +5316,32 @@ P0-4 的 `install()/find_package` 与 P2-9）；剩 13 项 = 部分完成 5（P0
   的特性，不是新增保证；反向与跨版本逐位一致性不在承诺范围。
 - **验证**：ctest 70/70（新增 `batch_source_test` 6 组、`run_driver_test` 9 组；
   `train_state_test` 含状态段逐字节重写一致校验）。
+
+## 开放规格 ModelSpecBase（issue #26，feature/openspec-modelspec）
+
+- **动机**：`ModelType` 是封闭枚举，`spec_matches` / `spec_summary` /
+  `spec_to_kv` / `spec_from_kv` 四处 `switch(type)` 构成封闭世界——衍生项目
+  加自定义模型必须改主仓枚举与所有分支。
+- **设计**（RFC 32 §6）：`ModelSpec` 改为**公共字段外壳**（output_schema /
+  output_packing + `unique_ptr<ModelSpecBase> arch`，深拷贝 clone 语义），
+  类型参数与判别符（`type_name()`）随多态对象走；五个内建子类
+  （MlpSpec/TransformerSpec/GptSpec/CnnSpec/RaptSpec）承载各自字段与
+  `arch_compatible` / `summary` / `write_kv` / `read_kv` 虚实现。
+- **文件格式**：`type` 键从数值枚举改为**类型名字符串**；读侧数值回落
+  （`legacy_spec_type_name`，0-7 一一映射，4=ALiBi_GPT 归 GptSpec 同族，
+  6=ZiPT 维持明确报错）。仅向下兼容（新读旧），反向不承诺——v4 模型格式
+  引入 kvrec 的自描述特性本就只保证这个方向。
+- **开放点**：自定义类型 = 写子类 + `ModelRegistry::instance().register_type`
+  （内建类型直通 `make_spec_by_name`，未命中查注册表），加新模型不改主仓
+  任何 switch；由 model_spec_validation_test §8 验收（注册/往返/虚分发/未注册报错）。
+- **拍板**（RFC §10 #3）：`build()` 不进基类——build 需外壳公共字段 +
+  运行期 precision + Model 类型，属域层自由函数；`model_spec.hpp` 保持纯数据头。
+  封闭点已收敛为四个虚方法 + 工厂。
+- **迁移**：约 180 处字段读取点类型化（`spec.as<T>()` / `emplace<T>()`），
+  分布在 4 个 domain 头、序列化、recovery、4 个 CLI、11 个测试；
+  `is_gpt()` 等判别调用点保留（实现改为 dynamic_cast），调用面无感。
+- **踩点**：`CnnSpec.norm_type` 的结构默认必须是 LayerNorm（旧扁平布局的
+  缺键回落值），builder 默认 BatchNorm@Conv 由 `make_cnn_spec` 显式传入并
+  落盘——两者混淆会让"缺 norm_type 键的旧文件"读成 BatchNorm、参数布局错位。
+- **验证**：全量构建 0 错误；ctest 70/70（含 spec 往返、旧数值 type 回落、
+  ZiPT 拒绝、norm_place 错配拦截、三值权重往返、自定义注册表 §8）。

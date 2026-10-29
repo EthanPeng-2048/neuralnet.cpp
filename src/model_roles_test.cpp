@@ -45,9 +45,9 @@ constexpr std::size_t B = 4;
 nn::ModelSpec ternary_spec()
 {
     nn::ModelSpec spec;
-    spec.type = nn::ModelType::MLP;
-    spec.layer_dims = {IN, H, OUT};
-    spec.weight_quant = nn::WeightQuant::T1_58;
+    auto &sp = spec.emplace<nn::MlpSpec>();
+    sp.layer_dims = {IN, H, OUT};
+    sp.weight_quant = nn::WeightQuant::T1_58;
     return spec;
 }
 
@@ -385,8 +385,7 @@ void test_ternary_warm_start()
     // ⑥ dense 文件：两种载入意图**逐位相同**（P1-7 不改变 dense 路径）
     {
         nn::ModelSpec dspec;
-        dspec.type = nn::ModelType::MLP;
-        dspec.layer_dims = {IN, H, OUT};
+        dspec.emplace<nn::MlpSpec>().layer_dims = {IN, H, OUT};
         const nn::PrecisionProfile f32p = nn::profile_f32();
         auto d_r = nn::build_mnist_model_from_spec(eng, dspec, f32p);
         CHECK(d_r.has_value(), "dense 模型构建成功");
