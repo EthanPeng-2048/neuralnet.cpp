@@ -49,7 +49,8 @@ struct UpdateRequest
 {
     std::size_t epoch = 0;              // 当前 epoch（步进驱动 = 0）
     std::size_t step = 0;               // 本 epoch 内步号
-    std::uint64_t global_step = 0;      // = epoch·steps_per_epoch + step
+    std::uint64_t global_step = 0;      // 绝对步号 = epoch·steps_per_epoch + step
+                                        //（跨续训累计，与 step 级调度同定义）
     Scalar lr = 0;                      // 本步学习率（driver 按 schedule 算好）
     bool is_final_step = false;         // 达到 max_steps：域需 force_update 收尾
     std::size_t steps_per_epoch = 0;    // 0 = 无固定 epoch（步进驱动）
@@ -210,12 +211,28 @@ public:
         // 定位数据源（断点续训：把游标移到起始位置）
         NN_TRY(rw, source_.rewind(start_epoch, start_step));
 
+        // 绝对步号 = epoch·steps_per_epoch + step（与 step 级调度同定义；
+        // 跨续训累计，进程无关）。步进驱动退化为 step 本身。
+        auto abs_global_step = [steps_per_epoch](std::size_t epoch,
+                                                 std::size_t step) -> std::uint64_t {
+            return static_cast<std::uint64_t>(epoch) *
+                       static_cast<std::uint64_t>(steps_per_epoch) +
+                   static_cast<std::uint64_t>(step);
+        };
+
         auto do_checkpoint = [&](std::size_t epoch, std::size_t step_done) -> Result<void>
         {
             if (!cfg_.enable_checkpoint || !hooks_.on_checkpoint) return {};
+            // 计数器记"下一步的位置"，epoch 边界归一化（step_done >= steps_per_epoch
+            // ⇒ 下一 epoch 第 0 步）。
+            if (steps_per_epoch > 0 && step_done >= steps_per_epoch)
+            {
+                ++epoch;
+                step_done = 0;
+            }
             state_->counters.epoch = epoch;
             state_->counters.step_in_epoch = step_done;
-            state_->counters.global_step = steps_executed;
+            state_->counters.global_step = abs_global_step(epoch, step_done);
             state_->counters.lr = static_cast<double>(current_lr);
             if (const auto r = hooks_.on_checkpoint(session_, *state_); !r) ++ckpt_failures;
             return {};
@@ -265,7 +282,8 @@ public:
                     UpdateRequest req;
                     req.epoch = static_cast<std::size_t>(epoch);
                     req.step = step;
-                    req.global_step = steps_executed - 1;
+                    req.global_step =
+                        abs_global_step(static_cast<std::size_t>(epoch), step);
                     req.lr = current_lr;
                     req.is_final_step = is_final;
                     req.steps_per_epoch = steps_per_epoch;
@@ -362,7 +380,7 @@ public:
                 UpdateRequest req;
                 req.epoch = 0;
                 req.step = step;
-                req.global_step = steps_executed - 1;
+                req.global_step = abs_global_step(0, step);
                 req.lr = current_lr;
                 req.is_final_step = is_final;
                 req.steps_per_epoch = 0;

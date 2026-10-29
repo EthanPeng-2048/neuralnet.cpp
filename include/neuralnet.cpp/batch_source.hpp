@@ -132,13 +132,13 @@ public:
         if (start_step > steps)
             NN_FAIL("IndexedBatchSource::rewind: start_step " + std::to_string(start_step) +
                     " 超出每 epoch 步数 " + std::to_string(steps));
-        // 每 epoch 重排：epoch 作种子 ⇒ 同 (seed, epoch) 跨续训复现同一顺序。
-        // 先重置恒等序 —— std::shuffle 的输出依赖输入序列，否则"回到 epoch 0"
-        // 无法复现首排顺序（rewind 的语义就是"回到该 epoch 的确定起点"）。
+        // 单 RNG 流语义：从恒等序起，用同一 RNG 依次重放 0..epoch 共 epoch+1 次
+        // shuffle —— 与"每 epoch 顺序推进同一 RNG 流"的取样语义一致，同时
+        // (seed, epoch) 唯一决定顺序 ⇒ 幂等（重复 rewind 同一 epoch 结果不变）。
         for (std::size_t i = 0; i < sample_count_; ++i) order_[i] = i;
-        std::mt19937_64 rng(seed_ ^ (0x9E3779B97F4A7C15ull *
-                                     (static_cast<std::uint64_t>(epoch) + 1)));
-        std::shuffle(order_.begin(), order_.end(), rng);
+        std::mt19937_64 rng(seed_);
+        for (std::size_t e = 0; e <= epoch; ++e)
+            std::shuffle(order_.begin(), order_.end(), rng);
         epoch_ = epoch;
         start_step_ = start_step;
         return {};

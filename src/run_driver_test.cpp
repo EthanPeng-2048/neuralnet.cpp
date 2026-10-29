@@ -257,6 +257,8 @@ void test_checkpoint_cadence()
             CHECK(rec.ckpt_calls == 2, "2 epoch → 2 次 epoch 边界断点");
             CHECK(!rec.ckpt_counters.empty() && rec.ckpt_counters.back().epoch == 2,
                   "末次断点计数器 epoch = 2（下一步位置）");
+            CHECK(rec.ckpt_counters.back().global_step == 6,
+                  "断点 global_step = 绝对步号 2×3+0 = 6（跨续训累计）");
             CHECK(rec.epoch_end_calls == 2, "on_epoch_end 每 epoch 一次");
             CHECK(rec.eval_calls == 2, "evaluate 每 epoch 一次");
         }
@@ -461,6 +463,8 @@ void test_resume_start()
     CHECK(rep->steps_executed == 5, "续训从 (1,1) 起 = 5 步");
     CHECK(!rec.reqs.empty() && rec.reqs[0].epoch == 1 && rec.reqs[0].step == 1,
           "首步 = (epoch 1, step 1)");
+    CHECK(rec.reqs[0].global_step == 4,
+          "续训首步 global_step = 绝对步号 1×3+1 = 4（非进程本地 0）");
 }
 
 } // namespace
