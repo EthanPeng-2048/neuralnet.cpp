@@ -300,7 +300,7 @@ void test_role_gate_and_roundtrip(const std::filesystem::path& dir)
     // 文件 τ 播种量化缓存 ⇒ 首次 forward 与推理文件里的模型**逐位一致**。
     {
         nn::ModelSpec t_spec = tiny_spec();
-        t_spec.weight_quant = nn::WeightQuant::T1_58;
+        t_spec.as<nn::GptSpec>()->weight_quant = nn::WeightQuant::T1_58;
         const nn::PrecisionProfile t1 = nn::profile_t1_58();
         auto src_r = nn::build_gpt_model_from_spec(eng, t_spec, t1);
         NN_ASSERT_ALWAYS(src_r, "text_train_modules_test: 构建三值小 GPT 失败");
@@ -315,7 +315,8 @@ void test_role_gate_and_roundtrip(const std::filesystem::path& dir)
             CHECK(role.has_value() && *role == nn::ModelRole::Model,
                   "三值文件的角色仍是 Model（.nnmodel）");
             auto peeked = nn::peek_model_spec(t_file);
-            CHECK(peeked.has_value() && peeked->weight_quant == nn::WeightQuant::T1_58,
+            CHECK(peeked.has_value() &&
+                      peeked->as<nn::GptSpec>()->weight_quant == nn::WeightQuant::T1_58,
                   "文件规格记住 weight_quant=t1_58");
         }
 

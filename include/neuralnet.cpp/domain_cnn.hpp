@@ -178,23 +178,19 @@ inline const std::vector<std::size_t> MNIST_CNN_FC = {120, 10};
     NormPlace norm_place = NormPlace::Conv)
 {
     ModelSpec spec;
-    spec.type            = ModelType::CNN;
-    spec.norm_type       = norm_type;
-    spec.norm_place      = norm_place;
-    spec.cnn_in_channels = in_channels;
-    spec.cnn_in_size     = in_size;
-    spec.cnn_pool        = pool;
-    spec.layer_dims      = fc_dims;  // 复用为 CNN 全连接头
-    spec.cnn_channels.clear();
-    spec.cnn_kernels.clear();
-    spec.cnn_strides.clear();
-    spec.cnn_paddings.clear();
+    auto &c = spec.emplace<CnnSpec>();
+    c.norm_type       = norm_type;
+    c.norm_place      = norm_place;
+    c.cnn_in_channels = in_channels;
+    c.cnn_in_size     = in_size;
+    c.cnn_pool        = pool;
+    c.layer_dims      = fc_dims;  // 复用为 CNN 全连接头
     for (const auto& cv : convs)
     {
-        spec.cnn_channels.push_back(cv.out_channels);
-        spec.cnn_kernels.push_back(cv.kernel);
-        spec.cnn_strides.push_back(cv.stride);
-        spec.cnn_paddings.push_back(cv.padding);
+        c.cnn_channels.push_back(cv.out_channels);
+        c.cnn_kernels.push_back(cv.kernel);
+        c.cnn_strides.push_back(cv.stride);
+        c.cnn_paddings.push_back(cv.padding);
     }
     return spec;
 }
@@ -202,31 +198,32 @@ inline const std::vector<std::size_t> MNIST_CNN_FC = {120, 10};
 // ── 从 ModelSpec 还原 CnnConfig ──────────────────────────────────────────
 [[nodiscard]] inline Result<CnnConfig> cnn_config_from_spec(const ModelSpec& spec)
 {
-    if (!spec.is_cnn())
+    const auto *c = spec.as<CnnSpec>();
+    if (c == nullptr)
         NN_FAIL("cnn_config_from_spec: not a CNN spec");
-    if (spec.cnn_channels.size() != spec.cnn_kernels.size() ||
-        spec.cnn_channels.size() != spec.cnn_strides.size() ||
-        spec.cnn_channels.size() != spec.cnn_paddings.size())
+    if (c->cnn_channels.size() != c->cnn_kernels.size() ||
+        c->cnn_channels.size() != c->cnn_strides.size() ||
+        c->cnn_channels.size() != c->cnn_paddings.size())
         NN_FAIL("CNN spec: conv vectors length mismatch");
-    if (spec.cnn_channels.empty())
+    if (c->cnn_channels.empty())
         NN_FAIL("CNN spec: no conv layers");
     CnnConfig cfg;
-    cfg.in_channels = spec.cnn_in_channels;
-    cfg.in_size     = spec.cnn_in_size;
-    cfg.pool        = spec.cnn_pool;
-    cfg.fc_dims     = spec.layer_dims;
-    cfg.norm_type   = spec.norm_type;
-    cfg.norm_place  = spec.norm_place;
+    cfg.in_channels = c->cnn_in_channels;
+    cfg.in_size     = c->cnn_in_size;
+    cfg.pool        = c->cnn_pool;
+    cfg.fc_dims     = c->layer_dims;
+    cfg.norm_type   = c->norm_type;
+    cfg.norm_place  = c->norm_place;
     if (cfg.norm_place != NormPlace::None && cfg.norm_place != NormPlace::Conv &&
         cfg.norm_place != NormPlace::Head && cfg.norm_place != NormPlace::Both)
         NN_FAIL("CNN spec: norm_place must be none/conv/head/both (final is ViT-only)");
-    for (std::size_t i = 0; i < spec.cnn_channels.size(); ++i)
+    for (std::size_t i = 0; i < c->cnn_channels.size(); ++i)
     {
         cfg.convs.push_back(CnnConvSpec{
-            spec.cnn_channels[i],
-            spec.cnn_kernels[i],
-            spec.cnn_strides[i] != 0 ? spec.cnn_strides[i] : 1,
-            spec.cnn_paddings[i],
+            c->cnn_channels[i],
+            c->cnn_kernels[i],
+            c->cnn_strides[i] != 0 ? c->cnn_strides[i] : 1,
+            c->cnn_paddings[i],
         });
     }
     return cfg;

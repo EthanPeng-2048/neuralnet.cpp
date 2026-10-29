@@ -24,6 +24,10 @@
 using nn::ActivationType;
 using nn::ModelSpec;
 using nn::ModelType;
+using nn::CnnSpec;
+using nn::GptSpec;
+using nn::MlpSpec;
+using nn::TransformerSpec;
 using nn::NormType;
 using nn::NormPlace;
 using nn::PosEncodingType;
@@ -60,52 +64,57 @@ int run_test()
     expect(nn::spec_matches(g1, g2),   "GPT 相同 spec 匹配", all);
     expect(!nn::spec_matches(g1, g3),  "GPT 不同 vocab 不匹配", all);
 
-    // GPT ↔ ALiBi_GPT 家族兼容（统一 GPTModel，type 允许不同）
-    // 构造 type 不同、其余字段（含 pos_encoding）相同的两份 spec。
-    ModelSpec g_fam_a = g1;  g_fam_a.pos_encoding = PosEncodingType::ALiBi;              // type=GPT
-    ModelSpec g_fam_b = g1;  g_fam_b.type = ModelType::ALiBi_GPT; g_fam_b.pos_encoding = PosEncodingType::ALiBi;
+    // GPT 家族兼容：ALiBi/RoPE 变体同归 GptSpec（判别符随多态对象走）
+    ModelSpec g_fam_a = g1;  g_fam_a.as<GptSpec>()->pos_encoding = PosEncodingType::ALiBi;
+    ModelSpec g_fam_b = g1;  g_fam_b.as<GptSpec>()->pos_encoding = PosEncodingType::ALiBi;
     expect(nn::spec_matches(g_fam_a, g_fam_b),   "GPT 与 ALiBi_GPT 家族兼容（同字段）", all);
 
     // GPT 跨类型不匹配
     ModelSpec g_other = g1;
-    g_other.type = ModelType::MLP;
+    g_other.emplace<MlpSpec>();
     expect(!nn::spec_matches(g1, g_other), "GPT 与 MLP 跨类型不匹配", all);
 
     // MLP
-    ModelSpec m1;  m1.type = ModelType::MLP; m1.layer_dims = {128, 10};
-    ModelSpec m2;  m2.type = ModelType::MLP; m2.layer_dims = {128, 10};
-    ModelSpec m3;  m3.type = ModelType::MLP; m3.layer_dims = {64, 10};
+    ModelSpec m1;  m1.emplace<MlpSpec>().layer_dims = {128, 10};
+    ModelSpec m2;  m2.emplace<MlpSpec>().layer_dims = {128, 10};
+    ModelSpec m3;  m3.emplace<MlpSpec>().layer_dims = {64, 10};
     expect(nn::spec_matches(m1, m2),   "MLP 相同 layer_dims 匹配", all);
     expect(!nn::spec_matches(m1, m3),  "MLP 不同 layer_dims 不匹配", all);
-    ModelSpec m4 = m1;  m4.norm_type = NormType::RMSNorm;
+    ModelSpec m4 = m1;  m4.as<MlpSpec>()->norm_type = NormType::RMSNorm;
     expect(!nn::spec_matches(m1, m4),  "MLP 不同 norm_type 不匹配", all);
 
     // Transformer
-    ModelSpec t1;  t1.type = ModelType::Transformer;
-    t1.d_model = 64; t1.num_heads = 4; t1.d_ff = 128; t1.num_layers = 2; t1.patch_size = 7;
-    ModelSpec t2;  t2.type = ModelType::Transformer;
-    t2.d_model = 64; t2.num_heads = 4; t2.d_ff = 128; t2.num_layers = 2; t2.patch_size = 7;
-    ModelSpec t3 = t1;  t3.num_heads = 8;
+    ModelSpec t1;
+    {
+        auto &tt = t1.emplace<TransformerSpec>();
+        tt.d_model = 64; tt.num_heads = 4; tt.d_ff = 128; tt.num_layers = 2;
+        tt.patch_size = 7;
+    }
+    ModelSpec t2 = t1;
+    ModelSpec t3 = t1;  t3.as<TransformerSpec>()->num_heads = 8;
     expect(nn::spec_matches(t1, t2),   "Transformer 相同 spec 匹配", all);
     expect(!nn::spec_matches(t1, t3),  "Transformer 不同 heads 不匹配", all);
-    ModelSpec t4 = t1;  t4.norm_place = NormPlace::Final;
+    ModelSpec t4 = t1;  t4.as<TransformerSpec>()->norm_place = NormPlace::Final;
     expect(!nn::spec_matches(t1, t4),  "Transformer 不同 norm_place 不匹配", all);
-    ModelSpec t5 = t1;  t5.norm_type = NormType::BatchNorm;
+    ModelSpec t5 = t1;  t5.as<TransformerSpec>()->norm_type = NormType::BatchNorm;
     expect(!nn::spec_matches(t1, t5),  "Transformer 不同 norm_type 不匹配", all);
 
     // CNN
-    ModelSpec c1;  c1.type = ModelType::CNN;
-    c1.cnn_in_channels = 1; c1.cnn_in_size = 28; c1.cnn_pool = 2;
-    c1.cnn_channels = {16, 32}; c1.cnn_kernels = {5, 5};
-    c1.cnn_strides = {1, 1};    c1.cnn_paddings = {0, 0};
-    c1.layer_dims = {10};
+    ModelSpec c1;
+    {
+        auto &cc = c1.emplace<CnnSpec>();
+        cc.cnn_in_channels = 1; cc.cnn_in_size = 28; cc.cnn_pool = 2;
+        cc.cnn_channels = {16, 32}; cc.cnn_kernels = {5, 5};
+        cc.cnn_strides = {1, 1};    cc.cnn_paddings = {0, 0};
+        cc.layer_dims = {10};
+    }
     ModelSpec c2 = c1;
-    ModelSpec c3 = c1;  c3.cnn_channels = {16, 64};
+    ModelSpec c3 = c1;  c3.as<CnnSpec>()->cnn_channels = {16, 64};
     expect(nn::spec_matches(c1, c2),   "CNN 相同 spec 匹配", all);
     expect(!nn::spec_matches(c1, c3),  "CNN 不同 channels 不匹配", all);
-    ModelSpec c4 = c1;  c4.norm_place = NormPlace::Both;
+    ModelSpec c4 = c1;  c4.as<CnnSpec>()->norm_place = NormPlace::Both;
     expect(!nn::spec_matches(c1, c4),  "CNN 不同 norm_place 不匹配", all);
-    ModelSpec c5 = c1;  c5.norm_type = NormType::RMSNorm;
+    ModelSpec c5 = c1;  c5.as<CnnSpec>()->norm_type = NormType::RMSNorm;
     expect(!nn::spec_matches(c1, c5),  "CNN 不同 norm_type 不匹配", all);
 
     // ── 2. round-trip：匹配 spec 加载成功 ─────────────────────────────
@@ -283,18 +292,20 @@ int run_test()
             nn::KeyValueRecord kv;
             kv.set("type", static_cast<uint64_t>(nn::ModelType::CNN));
             auto r = nn::detail::spec_from_kv(kv);
-            expect(bool(r) && r->norm_place == nn::NormPlace::None &&
-                            r->norm_type == nn::NormType::LayerNorm,
+            expect(bool(r) && r->as<nn::CnnSpec>()->norm_place == nn::NormPlace::None &&
+                            r->as<nn::CnnSpec>()->norm_type == nn::NormType::LayerNorm,
                    "缺 norm_place/norm_type 键的旧文件 → None/LayerNorm（旧布局）", all);
         }
 
         // 7.0b 各架构默认（回归锁，改默认值必须同步文档与锚点）
         {
             const nn::ModelSpec c = nn::make_cnn_spec(1, 12, 2, {{4, 3, 1, 0}}, {16, 10});
-            expect(c.norm_type == NormType::BatchNorm && c.norm_place == NormPlace::Conv,
+            expect(c.as<CnnSpec>()->norm_type == NormType::BatchNorm &&
+                       c.as<CnnSpec>()->norm_place == NormPlace::Conv,
                    "make_cnn_spec 默认 = BatchNorm@Conv", all);
             const nn::ModelSpec t = nn::make_mnist_transformer_spec();
-            expect(t.norm_type == NormType::LayerNorm && t.norm_place == NormPlace::Final,
+            expect(t.as<TransformerSpec>()->norm_type == NormType::LayerNorm &&
+                       t.as<TransformerSpec>()->norm_place == NormPlace::Final,
                    "make_mnist_transformer_spec 默认 = LayerNorm@Final", all);
         }
 
@@ -338,7 +349,7 @@ int run_test()
                     }
                     // norm_place 不同的架构加载同一文件 → 必须被拦截
                     nn::ModelSpec bad = spec;
-                    bad.norm_place = NormPlace::None;
+                    bad.as<nn::CnnSpec>()->norm_place = NormPlace::None;
                     auto m3 = nn::build_cnn_model_from_spec(eng, bad);
                     if (!m3)
                         expect(false, "CNN build(norm_place=None): " + m3.error().message, all);
@@ -398,7 +409,7 @@ int run_test()
                         expect(static_cast<bool>(lr), "ViT final-norm 往返 load 成功", all);
                     }
                     nn::ModelSpec bad = spec;
-                    bad.norm_place = NormPlace::None;
+                    bad.as<nn::TransformerSpec>()->norm_place = NormPlace::None;
                     auto m3 = nn::build_mnist_model_from_spec(eng, bad);
                     if (!m3)
                         expect(false, "ViT build(norm_place=None): " + m3.error().message, all);
@@ -411,6 +422,66 @@ int run_test()
                 std::remove(file.c_str());
             }
         }
+    }
+
+    // ── 8. 自定义模型类型（#26 开放扩展点：子类 + 注册即可，不改主仓 switch）──
+    std::cout << "\n── 自定义类型注册（ModelRegistry） ──\n";
+    {
+        struct MyNetSpec : nn::ModelSpecBase
+        {
+            std::size_t hidden = 0;
+            [[nodiscard]] const char *type_name() const noexcept override
+            {
+                return "MyNet";
+            }
+            [[nodiscard]] std::unique_ptr<nn::ModelSpecBase> clone() const override
+            {
+                return std::make_unique<MyNetSpec>(*this);
+            }
+            [[nodiscard]] bool arch_compatible(const nn::ModelSpecBase &o) const override
+            {
+                const auto *p = dynamic_cast<const MyNetSpec *>(&o);
+                return p && hidden == p->hidden;
+            }
+            [[nodiscard]] std::string summary(const nn::ModelSpec &) const override
+            {
+                return "MyNet(hidden=" + std::to_string(hidden) + ")";
+            }
+            void write_kv(nn::KeyValueRecord &kv) const override
+            {
+                kv.set("hidden", static_cast<std::uint64_t>(hidden));
+            }
+            [[nodiscard]] nn::Result<void> read_kv(const nn::KeyValueRecord &kv) override
+            {
+                std::uint64_t v = 0;
+                if (kv.get("hidden", v)) hidden = static_cast<std::size_t>(v);
+                return {};
+            }
+        };
+
+        nn::ModelRegistry::instance().register_type(
+            "MyNet", [] { return std::make_unique<MyNetSpec>(); });
+
+        nn::ModelSpec mine;
+        mine.emplace<MyNetSpec>().hidden = 42;
+        const std::string bytes = nn::detail::spec_to_kv(mine).serialize();
+        auto kv = nn::KeyValueRecord::parse(bytes);
+        expect(bool(kv), "自定义类型 spec kv 可解析", all);
+        auto back = kv ? nn::detail::spec_from_kv(*kv) : nn::Result<nn::ModelSpec>{};
+        expect(bool(back) && back->as<MyNetSpec>() != nullptr &&
+                   back->as<MyNetSpec>()->hidden == 42,
+               "自定义类型 save → peek 往返（经 ModelRegistry 构造）", all);
+        expect(back && nn::spec_matches(mine, *back),
+               "自定义类型 spec_matches 走 arch_compatible 虚分发", all);
+        expect(back && nn::spec_summary(*back).find("MyNet(hidden=42)") !=
+                           std::string::npos,
+               "自定义类型 spec_summary 走 summary 虚分发", all);
+        // 未知类型名（未注册）→ 明确报错
+        nn::KeyValueRecord bad_kv;
+        bad_kv.set("type", std::string("NoSuchNet"));
+        auto bad_r = nn::detail::spec_from_kv(bad_kv);
+        expect(!bad_r && bad_r.error().message.find("NoSuchNet") != std::string::npos,
+               "未注册类型名 → 明确报错（含类型名）", all);
     }
 
     std::cout << "\n----------------------------------------\n";

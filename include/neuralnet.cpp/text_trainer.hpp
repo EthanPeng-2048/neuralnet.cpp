@@ -333,11 +333,16 @@ private:
         // backward 又固定用 seq_len_ ⇒ 形状错配。spec 只在 spec 工厂/加载路径
         // 上存在；手工 build_* 调用没有 spec 时无法在此校验（该缺口记入
         // v1.10.0 release note 已知限制）。
-        if (const auto& spec = session.model().spec();
-            spec.has_value() && spec->seq_len > 0 && cfg.seq_len != spec->seq_len)
+        const auto& spec = session.model().spec();
+        const std::size_t model_seq_len =
+            spec ? (spec->is_gpt()   ? spec->as<GptSpec>()->seq_len
+                    : spec->is_rapt() ? spec->as<RaptSpec>()->seq_len
+                                      : 0)
+                 : 0;
+        if (model_seq_len > 0 && cfg.seq_len != model_seq_len)
             NN_FAIL("TextTrainer::create: 配方 seq_len 与模型 spec.seq_len 不一致（"
                     + std::to_string(cfg.seq_len) + " vs "
-                    + std::to_string(spec->seq_len)
+                    + std::to_string(model_seq_len)
                     + "）；请让 TextTrainConfig.seq_len 与模型构建时的 seq_len 对齐");
         if (tokenizer->pad_id() != train.pad_id())
             NN_FAIL("TextTrainer::create: 样本集 pad_id 与词表不一致");

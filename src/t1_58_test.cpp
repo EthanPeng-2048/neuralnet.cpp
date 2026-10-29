@@ -454,10 +454,10 @@ void test_spec_roundtrip()
     const nn::Matrix X = known_input_matrix();
 
     nn::ModelSpec spec;
-    spec.type         = nn::ModelType::MLP;
-    spec.layer_dims   = {IN, OUT};
-    spec.norm_type    = nn::NormType::LayerNorm;
-    spec.weight_quant = nn::WeightQuant::T1_58;
+    auto &sp = spec.emplace<nn::MlpSpec>();
+    sp.layer_dims   = {IN, OUT};
+    sp.norm_type    = nn::NormType::LayerNorm;
+    sp.weight_quant = nn::WeightQuant::T1_58;
 
     nn::PrecisionProfile t1;
     t1.param = nn::Precision::T1_58;
@@ -506,8 +506,11 @@ void test_spec_roundtrip()
         CHECK(peeked.has_value(), "peek_model_spec");
         if (peeked.has_value())
         {
-            CHECK(peeked->weight_quant == nn::WeightQuant::T1_58, "规格记住 weight_quant=t1_58");
-            CHECK(peeked->layer_dims == spec.layer_dims, "layer_dims 往返一致");
+            CHECK(peeked->as<nn::MlpSpec>()->weight_quant == nn::WeightQuant::T1_58,
+                  "规格记住 weight_quant=t1_58");
+            CHECK(peeked->as<nn::MlpSpec>()->layer_dims ==
+                      spec.as<nn::MlpSpec>()->layer_dims,
+                  "layer_dims 往返一致");
             CHECK(nn::spec_matches(*peeked, spec), "spec_matches 含 weight_quant 比对");
             CHECK(nn::spec_summary(*peeked).find("wq=t1_58") != std::string::npos,
                   "spec_summary 披露 wq=t1_58");
@@ -516,7 +519,7 @@ void test_spec_roundtrip()
         auto eng_owner = nn::CpuEngine::create();
         nn::CpuEngine& eng = *eng_owner;
         nn::ModelSpec plain = spec;
-        plain.weight_quant = nn::WeightQuant::None;
+        plain.as<nn::MlpSpec>()->weight_quant = nn::WeightQuant::None;
         auto plain_model = nn::build_mnist_model_from_spec(eng, plain, nn::profile_f32());
         CHECK(plain_model.has_value(), "普通 MLP 构建成功");
         if (plain_model.has_value())

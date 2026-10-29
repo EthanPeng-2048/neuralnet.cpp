@@ -342,8 +342,9 @@ namespace
     // 三值权重（P1.5，docs 21 §4.7/§4.8.3）：param=t1_58 → 线性层用 BitLinear。
     // 规格是**加载时的权威来源**（缺键 = None → 旧文件零破坏）；--resume 时下面
     // 会用文件里的规格覆盖本行。
-    spec.weight_quant = (cfg.precision.param == nn::Precision::T1_58)
-                            ? nn::WeightQuant::T1_58 : nn::WeightQuant::None;
+    spec.as<nn::GptSpec>()->weight_quant =
+        (cfg.precision.param == nn::Precision::T1_58) ? nn::WeightQuant::T1_58
+                                                      : nn::WeightQuant::None;
 
 
     // ── 断点恢复（--resume / --resume-epoch / --resume-step）──────────────

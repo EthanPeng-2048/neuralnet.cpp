@@ -342,57 +342,17 @@ private:
 [[nodiscard]] inline KeyValueRecord spec_to_kv(const ModelSpec &spec)
 {
     KeyValueRecord kv;
-    kv.set("type", static_cast<uint64_t>(spec.type));
-
-    std::vector<uint64_t> dims;
-    dims.reserve(spec.layer_dims.size());
-    for (auto d : spec.layer_dims)
-        dims.push_back(static_cast<uint64_t>(d));
-    kv.set("layer_dims", dims);
-
-    kv.set("d_model",      static_cast<uint64_t>(spec.d_model));
-    kv.set("num_heads",    static_cast<uint64_t>(spec.num_heads));
-    kv.set("d_ff",         static_cast<uint64_t>(spec.d_ff));
-    kv.set("num_layers",   static_cast<uint64_t>(spec.num_layers));
-    kv.set("patch_size",   static_cast<uint64_t>(spec.patch_size));
-    kv.set("vocab_size",   static_cast<uint64_t>(spec.vocab_size));
-    kv.set("seq_len",      static_cast<uint64_t>(spec.seq_len));
-    kv.set("pos_encoding", static_cast<uint64_t>(spec.pos_encoding));
-    kv.set("activation",   static_cast<uint64_t>(spec.activation));
-    kv.set("norm_type",    static_cast<uint64_t>(spec.norm_type));
-    kv.set("norm_place",   static_cast<uint64_t>(spec.norm_place));
-    // subln（BitNet 2B4T 的子层归一化，docs 22）：缺失 → false（旧布局逐位一致）。
-    kv.set("subln",        static_cast<uint64_t>(spec.subln ? 1 : 0));
-    // n_head_kv（GQA，docs 22）：缺失 → 0（= num_heads = MHA，旧布局逐位一致）。
-    kv.set("n_head_kv",    static_cast<uint64_t>(spec.n_head_kv));
-    // tie_embeddings（docs 22）：缺失 → false（独立 head，旧布局逐位一致）。
-    kv.set("tie_embeddings", static_cast<uint64_t>(spec.tie_embeddings ? 1 : 0));
-    // weight_quant（线性层是否 BitLinear/三值）于 P1 引入。旧文件**无此键** →
-    // 读回 WeightQuant::None（= 普通 Linear，参数布局逐位一致）→ 无需升版本。
-    kv.set("weight_quant", static_cast<uint64_t>(spec.weight_quant));
-    // output_schema / output_packing（RL-0）：旧文件缺键 = 单输出模型。
+    // type = 字符串类型名（判别符随 ModelSpecBase 多态走；旧文件的数值 type
+    // 仅在读侧做向下回落，见 spec_from_kv）。
+    kv.set("type", std::string(spec.type_name()));
+    // 公共字段（RL-0 多输出）：旧文件缺键 = 单输出模型。
     if (spec.output_schema)
         kv.set("output_schema", encode_tensor_schema(*spec.output_schema));
     if (!spec.output_packing.empty())
         kv.set("output_packing", encode_tensor_name_list(spec.output_packing));
-    // ZiPT（AttnZip）已于 2026-10-01 整体移除：不再写 memory_tokens / window 字段。
-    // 旧文件（含这两个键）由 spec_from_kv 的 type 分支给出明确错误。
-
-    // ── CNN ──
-    kv.set("cnn_in_channels", static_cast<uint64_t>(spec.cnn_in_channels));
-    kv.set("cnn_in_size",     static_cast<uint64_t>(spec.cnn_in_size));
-    kv.set("cnn_pool",        static_cast<uint64_t>(spec.cnn_pool));
-
-    auto to_u64_vec = [](const std::vector<std::size_t>& src) {
-        std::vector<uint64_t> out;
-        out.reserve(src.size());
-        for (auto v : src) out.push_back(static_cast<uint64_t>(v));
-        return out;
-    };
-    kv.set("cnn_channels",  to_u64_vec(spec.cnn_channels));
-    kv.set("cnn_kernels",   to_u64_vec(spec.cnn_kernels));
-    kv.set("cnn_strides",   to_u64_vec(spec.cnn_strides));
-    kv.set("cnn_paddings",  to_u64_vec(spec.cnn_paddings));
+    // 类型特有字段：各子类只写自己的键（键名与既有扁平布局一致）。
+    if (spec.arch)
+        spec.arch->write_kv(kv);
     return kv;
 }
 
@@ -420,38 +380,38 @@ inline void apply_spec_version_defaults(KeyValueRecord &kv, uint32_t version)
 
 [[nodiscard]] inline Result<ModelSpec> spec_from_kv(const KeyValueRecord &kv)
 {
-    ModelSpec spec;  // 缺失字段保持 ModelSpec 默认值（即版本默认值）
-    uint64_t v = 0;
-    std::vector<uint64_t> dims;
+    ModelSpec spec;  // 缺失字段保持各子类默认值（即版本默认值）
 
-    if (kv.get("type", v))        spec.type         = static_cast<ModelType>(v);
-    if (kv.get("layer_dims", dims))
+    // ── type：字符串优先（新文件）；数值回落（旧文件，仅向下兼容）────────
+    std::string tname;
+    uint64_t tnum = 0;
+    if (kv.get("type", tname))
     {
-        spec.layer_dims.clear();
-        spec.layer_dims.reserve(dims.size());
-        for (auto d : dims)
-            spec.layer_dims.push_back(static_cast<std::size_t>(d));
+        if (tname != "Unknown")
+        {
+            spec.arch = make_spec(tname);   // 内建类型 → ModelRegistry（自定义域）
+            if (!spec.arch)
+                NN_FAIL("模型文件规格含未知类型 \"" + tname +
+                        "\"（本构建未注册该类型；自定义域请注册 ModelRegistry）");
+        }
     }
-    if (kv.get("d_model", v))     spec.d_model      = static_cast<std::size_t>(v);
-    if (kv.get("num_heads", v))   spec.num_heads    = static_cast<std::size_t>(v);
-    if (kv.get("d_ff", v))        spec.d_ff         = static_cast<std::size_t>(v);
-    if (kv.get("num_layers", v))  spec.num_layers   = static_cast<std::size_t>(v);
-    if (kv.get("patch_size", v))  spec.patch_size   = static_cast<std::size_t>(v);
-    if (kv.get("vocab_size", v))  spec.vocab_size   = static_cast<std::size_t>(v);
-    if (kv.get("seq_len", v))     spec.seq_len      = static_cast<std::size_t>(v);
-    if (kv.get("pos_encoding", v)) spec.pos_encoding = static_cast<PosEncodingType>(v);
-    if (kv.get("activation", v))  spec.activation   = static_cast<ActivationType>(v);
-    if (kv.get("norm_type", v))   spec.norm_type    = static_cast<NormType>(v);
-    if (kv.get("norm_place", v))  spec.norm_place   = static_cast<NormPlace>(v);
-    // subln（docs 22 新增）：缺键 → 保持 ModelSpec 默认 subln = false
-    if (kv.get("subln", v))       spec.subln        = (v != 0);
-    // n_head_kv（docs 22 新增）：缺键 → 保持默认 0（= MHA）
-    if (kv.get("n_head_kv", v))   spec.n_head_kv    = static_cast<std::size_t>(v);
-    // tie_embeddings（docs 22 新增）：缺键 → 保持默认 false
-    if (kv.get("tie_embeddings", v)) spec.tie_embeddings = (v != 0);
-    // weight_quant（P1 新增）：缺键 → 保持 ModelSpec 默认 WeightQuant::None
-    if (kv.get("weight_quant", v)) spec.weight_quant = static_cast<WeightQuant>(v);
-    // output_schema / output_packing（RL-0 新增）：缺键 → nullopt/空（旧行为）。
+    else if (kv.get("type", tnum))
+    {
+        if (tnum == 6)
+            NN_FAIL("该模型文件为 AttnZip/ZiPT 架构，已整体移除"
+                    "（代码保留在 legacy/zipt 分支；恢复前提见 docs/history/history.md）");
+        const char *n = legacy_spec_type_name(tnum);
+        if (!n)
+            NN_FAIL("模型文件规格 type 数值非法（" + std::to_string(tnum) + "）");
+        if (std::string(n) == "zipt")
+            NN_FAIL("该模型文件为 AttnZip/ZiPT 架构，已整体移除"
+                    "（代码保留在 legacy/zipt 分支；恢复前提见 docs/history/history.md）");
+        spec.arch = make_spec(n);
+        if (!spec.arch)
+            NN_FAIL("模型文件规格 type 数值无法还原（" + std::to_string(tnum) + "）");
+    }
+
+    // ── 公共字段（output_schema / output_packing，RL-0）：缺键 → nullopt/空 ──
     std::string encoded;
     if (kv.get("output_schema", encoded))
     {
@@ -480,28 +440,15 @@ inline void apply_spec_version_defaults(KeyValueRecord &kv, uint32_t version)
                 NN_FAIL("模型文件 output_packing 的端口 '" + name + "' 未声明固定 rows");
         }
     }
-    // 旧文件的 memory_tokens / window（ZiPT 专用）不再读取，随 type=6 一并拒绝。
 
-    // ── CNN ──
-    if (kv.get("cnn_in_channels", v)) spec.cnn_in_channels = static_cast<std::size_t>(v);
-    if (kv.get("cnn_in_size", v))     spec.cnn_in_size     = static_cast<std::size_t>(v);
-    if (kv.get("cnn_pool", v))        spec.cnn_pool        = static_cast<std::size_t>(v);
+    // ── 类型特有字段（各子类读自己的键；缺失键保持默认）──────────────────
+    if (spec.arch)
+    {
+        NN_TRY(x, spec.arch->read_kv(kv));
+    }
 
-    auto from_u64_vec = [](const std::vector<uint64_t>& src) {
-        std::vector<std::size_t> out;
-        out.reserve(src.size());
-        for (auto v : src) out.push_back(static_cast<std::size_t>(v));
-        return out;
-    };
-    if (kv.get("cnn_channels", dims)) spec.cnn_channels  = from_u64_vec(dims);
-    if (kv.get("cnn_kernels", dims))  spec.cnn_kernels   = from_u64_vec(dims);
-    if (kv.get("cnn_strides", dims))  spec.cnn_strides   = from_u64_vec(dims);
-    if (kv.get("cnn_paddings", dims)) spec.cnn_paddings  = from_u64_vec(dims);
-
-    if (spec.type == ModelType::Unknown)
+    if (!spec.arch)
         NN_FAIL("模型文件规格缺少有效的 type 字段");
-    if (spec.type == ModelType::Reserved_ZiPT)
-        NN_FAIL("该模型文件为 AttnZip/ZiPT 架构，已整体移除"             "（代码保留在 legacy/zipt 分支；恢复前提见 docs/history/history.md）");
     return spec;
 }
 

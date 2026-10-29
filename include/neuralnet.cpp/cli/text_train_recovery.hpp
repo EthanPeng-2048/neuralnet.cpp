@@ -76,16 +76,33 @@ struct ResumeStateAdoption
     if (spec_r)
     {
         const nn::ModelSpec& fs = *spec_r;
-        if (fs.d_model > 0) cfg.d_model = fs.d_model;
-        if (fs.num_heads > 0) cfg.num_heads = fs.num_heads;
-        if (fs.num_layers > 0) cfg.num_layers = fs.num_layers;
-        if (fs.d_ff > 0) cfg.d_ff = fs.d_ff;
-        if (fs.seq_len > 0) cfg.seq_len = fs.seq_len;
-        cfg.pos_encoding = fs.pos_encoding;
-        cfg.activation = fs.activation;
-        cfg.norm_type = fs.norm_type;
-        cfg.model_type = fs.is_rapt() ? "rapt" : "gpt";
-        result.shape_adopted = true;
+        // GPT/RAPT 共享形状视图（两者类型参数同名，按实际类型取值）
+        if (const auto* g = fs.as<nn::GptSpec>())
+        {
+            if (g->d_model > 0) cfg.d_model = g->d_model;
+            if (g->num_heads > 0) cfg.num_heads = g->num_heads;
+            if (g->num_layers > 0) cfg.num_layers = g->num_layers;
+            if (g->d_ff > 0) cfg.d_ff = g->d_ff;
+            if (g->seq_len > 0) cfg.seq_len = g->seq_len;
+            cfg.pos_encoding = g->pos_encoding;
+            cfg.activation = g->activation;
+            cfg.norm_type = g->norm_type;
+            cfg.model_type = "gpt";
+            result.shape_adopted = true;
+        }
+        else if (const auto* r = fs.as<nn::RaptSpec>())
+        {
+            if (r->d_model > 0) cfg.d_model = r->d_model;
+            if (r->num_heads > 0) cfg.num_heads = r->num_heads;
+            if (r->num_layers > 0) cfg.num_layers = r->num_layers;
+            if (r->d_ff > 0) cfg.d_ff = r->d_ff;
+            if (r->seq_len > 0) cfg.seq_len = r->seq_len;
+            cfg.pos_encoding = r->pos_encoding;
+            cfg.activation = r->activation;
+            cfg.norm_type = r->norm_type;
+            cfg.model_type = "rapt";
+            result.shape_adopted = true;
+        }
     }
 
     uint32_t version = 0;
@@ -280,9 +297,10 @@ struct TextTrainResume
     // GPT 与 ALiBi_GPT 走同一条构建路径。
     else if (file_spec.is_gpt() || file_spec.is_alibi_gpt())
     {
-        if (file_spec.pos_encoding == nn::PosEncodingType::ALiBi)
+        const auto* fg = file_spec.as<nn::GptSpec>();
+        if (fg->pos_encoding == nn::PosEncodingType::ALiBi)
             out << "从模型文件读取 ALiBi GPT 规格\n";
-        else if (file_spec.pos_encoding == nn::PosEncodingType::RoPE)
+        else if (fg->pos_encoding == nn::PosEncodingType::RoPE)
             out << "从模型文件读取 RoPE GPT 规格\n";
         else
             out << "从模型文件读取 GPT 规格\n";
@@ -305,7 +323,11 @@ struct TextTrainResume
     }
     result.weights_loaded = true;
     result.vocab_bytes = load_result->size();
-    if (model_role && file_spec.weight_quant == nn::WeightQuant::T1_58)
+    const nn::WeightQuant file_wq =
+        file_spec.is_gpt()   ? file_spec.as<nn::GptSpec>()->weight_quant
+        : file_spec.is_rapt() ? file_spec.as<nn::RaptSpec>()->weight_quant
+                              : nn::WeightQuant::None;
+    if (model_role && file_wq == nn::WeightQuant::T1_58)
         out << "三值（T1_58）推理模型：按文件 τ 反量化打包权重为 f32 latent ⇒ 可续训"
                "（首次 forward 与推理文件逐位一致）\n";
     out << "已加载模型: " << cfg.resume_path;

@@ -232,7 +232,7 @@ void test_subln_spec_roundtrip()
 
     const nn::ModelSpec spec = nn::make_gpt_spec(
         V, D, S, H, FF, L, cfg.pos_enc, cfg.activation, cfg.norm_type, cfg.subln);
-    CHECK(spec.subln, "make_gpt_spec 记录 subln");
+    CHECK(spec.as<nn::GptSpec>()->subln, "make_gpt_spec 记录 subln");
 
     nn::Matrix x_m(S, B);
     for (std::size_t i = 0; i < x_m.size(); ++i) x_m.span()[i] = static_cast<float>(i % V);
@@ -256,7 +256,7 @@ void test_subln_spec_roundtrip()
             std::remove(file.c_str());
             return;
         }
-        CHECK(peeked->subln, "规格记住 subln=true");
+        CHECK(peeked->as<nn::GptSpec>()->subln, "规格记住 subln=true");
 
         auto m2 = nn::build_gpt_model_from_spec(eng, *peeked);
         NN_EXIT(m2, 1, "build_gpt_model_from_spec 失败: ");
@@ -280,7 +280,7 @@ void test_subln_spec_matches()
     };
     CHECK(!nn::spec_matches(base(false), base(true)), "subln 不同 → 不匹配");
     CHECK(nn::spec_matches(base(true), base(true)), "同配置 → 匹配");
-    CHECK(!base(false).subln, "缺省 = false（旧文件语义）");
+    CHECK(!base(false).as<nn::GptSpec>()->subln, "缺省 = false（旧文件语义）");
 }
 
 // ── S2/GQA 辅助：把 (n_kv·d_k, C) 的 KV 权重按**块映射**复制成 (n_head·d_k, C) ──
@@ -434,7 +434,9 @@ void test_gqa_spec()
                                  nn::ActivationType::SwiGLU, nn::NormType::RMSNorm,
                                  false, n_kv);
     };
-    CHECK(!mk(0).n_head_kv && mk(0).n_head_kv_or_heads() == 4, "0 = num_heads（旧语义）");
+    CHECK(!mk(0).as<nn::GptSpec>()->n_head_kv &&
+              mk(0).as<nn::GptSpec>()->n_head_kv_or_heads() == 4,
+          "0 = num_heads（旧语义）");
     CHECK(nn::spec_matches(mk(0), mk(4)), "0 与显式 num_heads 语义等价");
     CHECK(!nn::spec_matches(mk(2), mk(4)), "n_head_kv 不同 → 不匹配");
     CHECK(nn::spec_matches(mk(2), mk(2)), "同配置 → 匹配");
@@ -469,7 +471,8 @@ void test_gqa_spec()
     }
     {
         auto peeked = nn::peek_model_spec(file);
-        CHECK(peeked.has_value() && peeked->n_head_kv == 2, "规格记住 n_head_kv=2");
+        CHECK(peeked.has_value() && peeked->as<nn::GptSpec>()->n_head_kv == 2,
+              "规格记住 n_head_kv=2");
         if (!peeked.has_value()) { std::remove(file.c_str()); return; }
         auto m2 = nn::build_gpt_model_from_spec(eng, *peeked);
         NN_EXIT(m2, 1, "build_gpt_model_from_spec(GQA) 失败: ");
@@ -572,7 +575,7 @@ void test_tied_spec()
                                  nn::ActivationType::SwiGLU, nn::NormType::RMSNorm,
                                  true, 2, tie);
     };
-    CHECK(!mk(false).tie_embeddings, "缺省 = false（旧文件语义）");
+    CHECK(!mk(false).as<nn::GptSpec>()->tie_embeddings, "缺省 = false（旧文件语义）");
     CHECK(!nn::spec_matches(mk(false), mk(true)), "tie 不同 → 不匹配");
     CHECK(nn::spec_matches(mk(true), mk(true)), "同配置 → 匹配");
 
@@ -607,7 +610,8 @@ void test_tied_spec()
     }
     {
         auto peeked = nn::peek_model_spec(file);
-        CHECK(peeked.has_value() && peeked->tie_embeddings, "规格记住 tie_embeddings");
+        CHECK(peeked.has_value() && peeked->as<nn::GptSpec>()->tie_embeddings,
+              "规格记住 tie_embeddings");
         if (!peeked.has_value()) { std::remove(file.c_str()); return; }
         auto m2 = nn::build_gpt_model_from_spec(eng, *peeked);
         NN_EXIT(m2, 1, "build_gpt_model_from_spec(tied) 失败: ");
@@ -719,7 +723,7 @@ void test_relu2_gpt()
         V, D, S, H, FF, L, cfg.pos_enc, cfg.activation, cfg.norm_type,
         cfg.subln, cfg.n_head_kv, cfg.tie_embeddings);
     auto other = spec;
-    other.activation = nn::ActivationType::SwiGLU;
+    other.as<nn::GptSpec>()->activation = nn::ActivationType::SwiGLU;
     CHECK(!nn::spec_matches(spec, other), "activation 不同 → 不匹配");
     CHECK(nn::spec_matches(spec, spec), "同配置 → 匹配");
     CHECK(static_cast<std::uint32_t>(nn::ActivationType::ReLU2) == 2, "枚举值 = 2");

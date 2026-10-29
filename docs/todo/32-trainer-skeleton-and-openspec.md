@@ -454,7 +454,12 @@ public:
 
 1. ✅ `AnyBatch` 载体 = `std::any`（指针形式读取，`-fno-exceptions` 安全）；
 2. ✅ 步进驱动与 epoch 驱动共存（`epochs<=0` + `max_steps>0` = 步进驱动）；
-3. ⏳ `ModelSpecBase::build` 归属——随阶段 D（`feature/openspec-modelspec` 分支）裁定；
+3. ✅ `ModelSpecBase::build` **不进基类**——裁定：build 是域层职责（`build_*_from_spec`
+   自由函数），理由是分层而非成本：`model_spec.hpp` 是纯数据头（无 L2 依赖），
+   而 build 需要外壳公共字段（output_schema/packing）+ 运行期 precision + Model 类型；
+   且仓内不存在需要收敛的中央 build 分发 switch（加载点全是显式按类型调用）。
+   `ModelSpecBase` 只收敛真正的封闭点：`arch_compatible` / `summary` / `write_kv` /
+   `read_kv` 四个分发 + `make_spec` 工厂（含 ModelRegistry 自定义注册）；
 4. ✅ `verify_resume` 不校验 `lr`/`min_lr`/`weight_decay`/`beta*`/`lr_per_epoch`
    （只校验曲线形状类字段；比 go CLI 口径宽，接受）；
 5. ✅ `fit` 吞掉 `evaluate` 错误（与"评估失败不中止训练"一致；留痕由域钩子负责）。
