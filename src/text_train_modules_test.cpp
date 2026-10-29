@@ -127,7 +127,7 @@ void test_role_gate_and_roundtrip(const std::filesystem::path& dir)
                                                     kTokenizerBytes),
                      "text_train_modules_test: 写推理模型失败");
     nn::cli::TextTrainCheckpointLog log;
-    nn::TrainState ckpt_state;   // P1-2：断点带训练状态段（本用例不挂优化器状态张量）
+    nn::TextTrainState ckpt_state;   // P1-2：断点带训练状态段（本用例不挂优化器状态张量）
     ckpt_state.counters.epoch = 1;
     ckpt_state.recipe.optimizer = "adam";
     ckpt_state.recipe.batch_size = 4;
@@ -207,7 +207,7 @@ void test_role_gate_and_roundtrip(const std::filesystem::path& dir)
 
         // docs/todo/30：旧断点缺 batch 语义键 ⇒ micro-batch 解释，
         // 恢复时换成等效 global，并把 micro step 计数折成 update step。
-        nn::TrainState legacy_state;
+        nn::TextTrainState legacy_state;
         legacy_state.counters.epoch = 1;
         legacy_state.counters.step_in_epoch = 3;
         legacy_state.recipe.optimizer = "adam";
@@ -436,7 +436,7 @@ void test_ckpt_accounting(const std::filesystem::path& dir)
     std::filesystem::create_directories(occupied);
     nn::cli::TextTrainCheckpointLog log;
     std::ostringstream err;
-    nn::TrainState ckpt_state;
+    nn::TextTrainState ckpt_state;
     const std::vector<nn::Tensor> no_blobs;
     log.save(occupied.string(), model, spec, kTokenizerBytes, ckpt_state, no_blobs, err);
     CHECK(log.failures() == 1, "写失败的断点必须计入 1 次");
@@ -494,7 +494,7 @@ void test_train_state_wiring(const std::filesystem::path& dir)
     std::ostringstream err;
     nn::cli::TextTrainCheckpointLog log;
     // P2b：状态装配唯一实现 = nn::make_text_train_state（TextTrainer 内部同一函数）
-    const nn::TrainState state = nn::make_text_train_state(
+    const nn::TextTrainState state = nn::make_text_train_state(
         cfg, id, /*steps_per_epoch=*/2, /*epoch=*/1, /*step_done=*/2, 1e-3,
         opt->state_step());
     nn::cli::save_ckpt_with_state(path.string(), model, spec, kTokenizerBytes, state, *opt,
@@ -505,25 +505,31 @@ void test_train_state_wiring(const std::filesystem::path& dir)
     CHECK(st.has_value(), "peek_train_state 应成功");
     if (st)
     {
-        // step_done == steps_per_epoch ⇒ epoch 边界归一化（下一步 = epoch 2 / step 0）
-        CHECK(st->counters.epoch == 2 && st->counters.step_in_epoch == 0 &&
-                  st->counters.global_step == 4,
-              "计数器记'下一步的位置'且 epoch 边界归一化");
-        CHECK(st->optimizer_step == 1, "Adam 的 t 随步推进（1 步后 = 1）");
-        CHECK(st->optimizer_blob_count == 2 * model.parameters().size(),
-              "优化器状态张量数 = 2 × 参数数（m/v 交替）");
-        CHECK(st->recipe.batch_size == 2 && st->recipe.epochs == 3 &&
-                  st->recipe.total_steps == 6 && st->recipe.optimizer == "adam",
-              "配方随断点落盘（batch / epochs / 曲线形状 / 优化器名）");
-        CHECK(st->dataset.sha256 == id.sha256 && st->dataset.steps_per_epoch == 2 &&
-                  st->dataset.num_samples == 4,
-              "数据集身份 + 网格随断点落盘");
+        auto* ts = dynamic_cast<nn::TextTrainState*>(st->get());
+        CHECK(ts != nullptr, "peek 得到文本域状态（TextTrainState）");
+        if (ts)
+        {
+            // step_done == steps_per_epoch ⇒ epoch 边界归一化（下一步 = epoch 2 / step 0）
+            CHECK(ts->counters.epoch == 2 && ts->counters.step_in_epoch == 0 &&
+                      ts->counters.global_step == 4,
+                  "计数器记'下一步的位置'且 epoch 边界归一化");
+            CHECK(ts->optimizer_step == 1, "Adam 的 t 随步推进（1 步后 = 1）");
+            CHECK(ts->optimizer_blob_count == 2 * model.parameters().size(),
+                  "优化器状态张量数 = 2 × 参数数（m/v 交替）");
+            CHECK(ts->recipe.batch_size == 2 && ts->recipe.epochs == 3 &&
+                      ts->recipe.total_steps == 6 && ts->recipe.optimizer == "adam",
+                  "配方随断点落盘（batch / epochs / 曲线形状 / 优化器名）");
+            CHECK(ts->dataset.sha256 == id.sha256 && ts->dataset.steps_per_epoch == 2 &&
+                      ts->dataset.num_samples == 4,
+                  "数据集身份 + 网格随断点落盘");
 
-        // 数据集身份门禁走的就是断点里的这份身份
-        nn::DatasetIdentity changed = id;
-        changed.num_samples = 5;
-        CHECK(!nn::cli::verify_dataset_identity(st->dataset, changed, path.string()).has_value(),
-              "断点记录的身份 vs 变化的网格 ⇒ 硬报错（接线一致）");
+            // 数据集身份门禁走的就是断点里的这份身份
+            nn::DatasetIdentity changed = id;
+            changed.num_samples = 5;
+            CHECK(!nn::cli::verify_dataset_identity(ts->dataset, changed, path.string())
+                      .has_value(),
+                  "断点记录的身份 vs 变化的网格 ⇒ 硬报错（接线一致）");
+        }
     }
 
     // 重启：新优化器（状态零初始化）→ 载入断点状态 → t 与张量恢复

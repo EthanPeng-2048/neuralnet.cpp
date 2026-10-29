@@ -5282,3 +5282,37 @@ P0-4 的 `install()/find_package` 与 P2-9）；剩 13 项 = 部分完成 5（P0
 - **证据**：远端 Windows clang + MSVC STL / Vulkan，全量构建 120/120；ctest 59 注册，
   58 pass + 1 个平台条件 skip（`scan_bitwise_test`）+ 0 failed。`doc_align_audit`、
   `doc_inventory`、`gui_cli_audit` 均 exit 0。
+
+## 训练骨架 RunDriver 与开放规格 RFC 32（issue #39/#26，feature/run-driver-openspec）
+
+- **动机**：`TrainingSession`（单步）与 `TextTrainer`（文本域驱动）之间没有领域无关
+  骨架，自定义域从 `train_step` 往上全要自己写（go CLI `go_train_cli.cpp` 达 1456 行，
+  其中 epoch 循环 / 断点节奏 / lr 接线 / 指标落盘全是与领域无关的重复）。
+- **RFC**：`docs/todo/32-trainer-skeleton-and-openspec.md`，四扩展点统一心智 =
+  「虚基类定义契约 + 主仓持基类引用 + 子类注入特化」（TrainState / ModelSpecBase /
+  BatchSource / RunDriver）。
+- **阶段 A**：`TrainState` 虚基类化（编解码骨架 + `state_kind`/`write_extra_kv`/
+  `read_extra_kv`/`verify_extra` 钩子），`stride` + `DatasetIdentity` 下沉为
+  `TextTrainState`；`verify_resume` + `ResumePolicy` 把 go CLI 手写的断点交叉校验
+  （配方形状 / 计数器越界 / 数据集身份）上收为库口径。
+- **阶段 B**：`BatchSource` Pull 契约 + `IndexedBatchSource` 预置适配器
+  （单 RNG 流重放式 shuffle：恒等序起同一 RNG 重放 0..epoch 次，(seed, epoch)
+  唯一决定顺序且幂等）；`steps_per_epoch=nullopt` = 步进驱动。
+- **阶段 C**：`RunDriver`（epoch×step 循环、`compute_epoch_lr`/`compute_step_lr`
+  双级接线、epoch 边界 + save_interval 断点节奏、计数器"下一步位置"归一化、
+  探针中止 exit 9、--max-steps/--stop-after-epoch、续训起点 + rewind）。
+  分层裁定：`train_step` 是 Batch 模型模板 ⇒ 取批 + micro 切分 + `train_step`
+  归域（`RunHooks::do_update`），driver 只给 lr/步号/final 标记。
+- **评审修复**：① `global_step` 原为进程本地计数（续训断点会从 0 重数），改为
+  绝对步号 `epoch·steps_per_epoch + step`，断点计数器与 step 级调度统一；
+  ② 适配器 shuffle 原为每 epoch 重播种（与 TextTrainer 单流语义冲突，同 seed
+  轨迹不同），改单流重放。
+- **注记迁移**：此前列在头文件注释里的版本注记（宿主桥公开 API、
+  `param_children` 广播、`logits_transform` 钩子、`lr_per_epoch` 正式化的
+  v1.14.0/issue 编号）系历史信息，已从注释移入本条——**注释只写行为契约，
+  不写历史**。v1.14.0 从未定档：最新版仍是 `v1.13.0`，`dev` 从不定档版本号，
+  版本只在经审核合入 `main` 时确定。
+- **兼容口径**：仅向下兼容（新读旧）且不承诺——该能力是 v4 模型格式引入 kvrec
+  的特性，不是新增保证；反向与跨版本逐位一致性不在承诺范围。
+- **验证**：ctest 70/70（新增 `batch_source_test` 6 组、`run_driver_test` 9 组；
+  `train_state_test` 含状态段逐字节重写一致校验）。

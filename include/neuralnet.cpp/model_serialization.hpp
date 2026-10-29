@@ -548,10 +548,11 @@ inline constexpr std::size_t kMaxSerializedStringBytes = 64u * 1024u * 1024u;
 // ── 训练状态段读取（v8）：长度前缀 + KeyValueRecord → TrainState ─────────
 // `state_len == 0` = 无该段（Model 角色，或断点由未接线路径写出）⇒ 默认值，
 // 续训路径按"冷启动语义"处理。
-[[nodiscard]] inline Result<TrainState> read_train_state_section(
+[[nodiscard]] inline Result<std::unique_ptr<TrainState>> read_train_state_section(
     std::ifstream &ifs, std::uint64_t state_len)
 {
-    if (state_len == 0) return TrainState{};
+    if (state_len == 0)
+        return std::unique_ptr<TrainState>(std::make_unique<TextTrainState>());
     if (state_len > kMaxSerializedStringBytes)
         NN_FAIL("训练状态段长度越界（超过 64 MiB），文件可能损坏或恶意");
     std::string bytes(static_cast<std::size_t>(state_len), '\0');
@@ -1076,13 +1077,13 @@ struct CheckpointState
     // ── 训练状态段（v8）：[state_len][kvrec][优化器状态张量条目 × N] ──────
     // 无状态（.nnmodel / 未接线断点）时写 0 长度，布局保持统一。
     {
-        TrainState snapshot;
+        std::string state_bytes;
         if (ckpt.state != nullptr)
         {
-            snapshot = *ckpt.state;
-            snapshot.optimizer_blob_count = ckpt.optimizer_blobs.size();
+            std::unique_ptr<TrainState> snapshot = ckpt.state->clone();
+            snapshot->optimizer_blob_count = ckpt.optimizer_blobs.size();
+            state_bytes = train_state_to_kv(*snapshot).serialize();
         }
-        const std::string state_bytes = train_state_to_kv(snapshot).serialize();
         const std::uint64_t state_len =
             (ckpt.state != nullptr) ? static_cast<std::uint64_t>(state_bytes.size()) : 0u;
         NN_TRY(r3, detail::write_bytes<uint64_t>(os, state_len));
@@ -1183,7 +1184,8 @@ struct CheckpointState
 // 供续训路径在建模型**之前**取精度 profile 与计数器、供 CLI/GUI 显示断点状态。
 // 没有该段（role=Model，或 v7 及以下 / 未接线的断点）→ 明确报错，调用方据此
 // 回落"冷启动语义"（docs/todo/18 §4.2 P1-2）。
-[[nodiscard]] inline Result<TrainState> peek_train_state(const std::string &filename)
+[[nodiscard]] inline Result<std::unique_ptr<TrainState>> peek_train_state(
+    const std::string &filename)
 {
     std::ifstream ifs(filename, std::ios::binary);
     if (!ifs)
@@ -1201,7 +1203,7 @@ struct CheckpointState
         NN_FAIL("文件没有训练状态段（推理模型 .nnmodel，或该断点由旧版本写出）: " +
                 filename);
     NN_TRY(state, detail::read_train_state_section(ifs, *len_r));
-    return *state;
+    return *std::move(state);
 }
 
 // ── 读训练状态段 + 优化器状态张量（v8；续训路径）────────────────────────
@@ -1209,7 +1211,7 @@ struct CheckpointState
 // 条目同一口径），并记录每个张量在文件里的精度（载入方据此校验/转换）。
 struct LoadedTrainState
 {
-    TrainState state;
+    std::unique_ptr<TrainState> state;
     std::vector<Tensor> optimizer_blobs;
     std::vector<Precision> optimizer_blob_precisions;
 };
@@ -1236,10 +1238,10 @@ struct LoadedTrainState
 
     LoadedTrainState out;
     NN_TRY(st, detail::read_train_state_section(ifs, *len_r));
-    out.state = std::move(*st);
-    out.optimizer_blobs.reserve(out.state.optimizer_blob_count);
-    out.optimizer_blob_precisions.reserve(out.state.optimizer_blob_count);
-    for (std::size_t i = 0; i < out.state.optimizer_blob_count; ++i)
+    out.state = *std::move(st);
+    out.optimizer_blobs.reserve(out.state->optimizer_blob_count);
+    out.optimizer_blob_precisions.reserve(out.state->optimizer_blob_count);
+    for (std::size_t i = 0; i < out.state->optimizer_blob_count; ++i)
     {
         NN_TRY(b, detail::read_param_blob(ifs));
         if (b->kind != ParamKind::Dense)
@@ -1299,7 +1301,7 @@ struct LoadedTrainState
         auto state_len_r = detail::read_bytes<uint64_t>(ifs);
         NN_TRY_CHECK(state_len_r);
         NN_TRY(st, detail::read_train_state_section(ifs, *state_len_r));
-        for (std::size_t i = 0; i < st->optimizer_blob_count; ++i)
+        for (std::size_t i = 0; i < (*st)->optimizer_blob_count; ++i)
             NN_TRY_CHECK(detail::skip_param_blob(ifs));
     }
 

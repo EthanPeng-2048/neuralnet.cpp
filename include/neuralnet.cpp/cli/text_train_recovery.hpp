@@ -59,7 +59,7 @@ namespace nn::cli
 struct ResumeStateAdoption
 {
     bool adopted = false;      // 断点带训练状态段 ⇒ cfg 已被状态改写
-    nn::TrainState state;      // 已采纳的状态（adopted 时有效）
+    nn::TextTrainState state;  // 已采纳的状态（adopted 时有效；文本域）
     bool shape_adopted = false;// 形状/架构已按文件 spec 改写（两种角色都成立）
 };
 
@@ -109,7 +109,12 @@ struct ResumeStateAdoption
                "配方仍取命令行）\n";
         return result;
     }
-    nn::TrainState s = *state_r;
+    auto s_up = std::move(*state_r);
+    auto* s_ptr = dynamic_cast<nn::TextTrainState*>(s_up.get());
+    if (s_ptr == nullptr)
+        NN_FAIL("断点 " + cfg.resume_path + " 的训练状态不是文本域（kind=" +
+                std::string(s_up->state_kind()) + "），--resume 文本训练不接受");
+    nn::TextTrainState s = std::move(*s_ptr);
 
     // ── 禁列校验（显式给出 A/B 类旗标即报错）────────────────────────────
     if (!cfg.explicit_train_flags.empty())
@@ -167,7 +172,7 @@ struct ResumeStateAdoption
                 (s.dataset.num_samples + s.recipe.batch_size - 1) /
                 s.recipe.batch_size;
     }
-    cfg.stride = static_cast<std::size_t>(s.recipe.stride);
+    cfg.stride = static_cast<std::size_t>(s.stride);
     cfg.lr_per_epoch.clear();
     cfg.lr_per_epoch.reserve(s.recipe.lr_per_epoch.size());
     for (double v : s.recipe.lr_per_epoch)
@@ -222,11 +227,11 @@ struct ResumeStateAdoption
     std::ostream& out)
 {
     NN_TRY(loaded, nn::load_train_state(engine, path));
-    optimizer.set_state_step(loaded->state.optimizer_step);
+    optimizer.set_state_step(loaded->state->optimizer_step);
     NN_TRY_CHECK(optimizer.load_state(loaded->optimizer_blobs));
     out << "已恢复优化器状态: " << loaded->optimizer_blobs.size() << " 个张量"
-        << "，步计数 " << loaded->state.optimizer_step
-        << "（" << loaded->state.recipe.optimizer << "）\n";
+        << "，步计数 " << loaded->state->optimizer_step
+        << "（" << loaded->state->recipe.optimizer << "）\n";
     return {};
 }
 

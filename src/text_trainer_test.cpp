@@ -398,7 +398,7 @@ void test_checkpoint_hook(const std::string& dir)
     cfg.identity.sha256 = std::string(64, 'f');
 
     const std::string ckpt = dir + "/trainer_ckpt.nnckpt";
-    std::vector<nn::TrainState> states;
+    std::vector<nn::TextTrainState> states;
     nn::TextTrainerHooks hooks;
     std::ostringstream out;
     hooks.out = &out;
@@ -422,7 +422,7 @@ void test_checkpoint_hook(const std::string& dir)
     CHECK(!states.empty(), "断点钩子被调用");
     if (states.empty()) return;
 
-    const nn::TrainState& st = states.back();
+    const nn::TextTrainState& st = states.back();
     CHECK(st.counters.global_step > 0, "状态含 global_step");
     CHECK(st.dataset.sha256 == std::string(64, 'f'), "状态含数据集身份");
     CHECK(st.dataset.num_samples == trainer_r->sample_count(), "状态含样本数");
@@ -432,16 +432,22 @@ void test_checkpoint_hook(const std::string& dir)
     CHECK(st.recipe.optimizer == "adam", "状态含优化器名");
     CHECK(st.optimizer_step == trainer_r->session().step_count(),
           "状态含 Adam 的 t（= 优化器更新次数）");
-    CHECK(st.recipe.stride == cfg.stride, "状态含 stride 配方");
+    CHECK(st.stride == cfg.stride, "状态含 stride（文本域扩展）");
 
     // 落盘状态可被 peek/load 读回（与 CLI 断点同一文件格式）
     auto peeked = nn::peek_train_state(ckpt);
     CHECK(peeked, "peek_train_state");
     if (peeked)
     {
-        CHECK(peeked->counters.global_step == st.counters.global_step, "状态计数往返");
-        CHECK(peeked->dataset.num_samples == st.dataset.num_samples, "样本数往返");
-        CHECK(peeked->optimizer_step == st.optimizer_step, "优化器 t 往返");
+        auto* pts = dynamic_cast<nn::TextTrainState*>(peeked->get());
+        CHECK(pts != nullptr, "peek 得到文本域状态");
+        if (pts)
+        {
+            CHECK(pts->counters.global_step == st.counters.global_step, "状态计数往返");
+            CHECK(pts->dataset.num_samples == st.dataset.num_samples, "样本数往返");
+            CHECK(pts->optimizer_step == st.optimizer_step, "优化器 t 往返");
+            CHECK(pts->stride == st.stride, "stride 往返");
+        }
     }
 }
 

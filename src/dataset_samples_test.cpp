@@ -232,13 +232,19 @@ void test_legacy_train_state_key()
     CHECK(st, "legacy: train_state_from_kv");
     if (st)
     {
-        CHECK(st->dataset.num_samples == 9, "旧键 dataset_windows 读入 num_samples");
-        CHECK(st->dataset.steps_per_epoch == 3, "steps_per_epoch 兼容");
+        const auto* ts = dynamic_cast<nn::TextTrainState*>(st->get());
+        CHECK(ts != nullptr, "旧文件（缺 state_kind）→ TextTrainState");
+        if (ts)
+        {
+            CHECK(ts->dataset.num_samples == 9, "旧键 dataset_windows 读入 num_samples");
+            CHECK(ts->dataset.steps_per_epoch == 3, "steps_per_epoch 兼容");
+        }
     }
     // 新键优先
     kv.set("dataset_samples", static_cast<std::uint64_t>(11));
     auto st2 = nn::train_state_from_kv(kv);
-    CHECK(st2 && st2->dataset.num_samples == 11, "新键 dataset_samples 优先");
+    const auto* ts2 = st2 ? dynamic_cast<nn::TextTrainState*>(st2->get()) : nullptr;
+    CHECK(ts2 && ts2->dataset.num_samples == 11, "新键 dataset_samples 优先");
 }
 } // namespace
 

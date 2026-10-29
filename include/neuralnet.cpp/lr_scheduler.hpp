@@ -20,7 +20,7 @@
 //   warmup 只占 epoch ∈ [0, warmup_epochs)，退火进度按"扣掉 warmup 后的
 //   有效区间"计算，因此 warmup 结束点正好衔接退火起点。
 //
-// ── lr_per_epoch 逃生舱（此前未文档化，v1.14.0 起正式化）──────────────
+// ── lr_per_epoch 逃生舱（优先级最高的覆盖语义）──────────────────────
 // `lr_per_epoch` **优先级最高**：只要非空就逐 epoch 直接取值，`schedule` /
 // `warmup_epochs` / `base_lr` / `min_lr` / `total_epochs` **全部被忽略**。
 // 适用：手算的分段/自定义曲线（如三段余弦 + 重启）无法用内建 schedule 表达时，
