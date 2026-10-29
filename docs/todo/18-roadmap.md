@@ -58,18 +58,18 @@
 
 | 维度 | 实测 | 复现 |
 |---|---|---|
-| `include/` | **96 个 `.hpp` / 50609 行** | `Get-ChildItem include -Recurse -Filter *.hpp` + 逐文件 `Get-Content` 计数 |
-| `src/` | **97 个 `.cpp` / 33641 行** | 同上换 `src -Filter *.cpp` |
+| `include/` | **82 个 `.hpp` / 44681 行** | `Get-ChildItem include -Recurse -Filter *.hpp` + 逐文件 `Get-Content` 计数 |
+| `src/` | **90 个 `.cpp` / 31730 行** | 同上换 `src -Filter *.cpp` |
 | `shaders/` | **22 个 `.comp`** | `Get-ChildItem shaders -Recurse -Filter *.comp` |
-| `docs/` | **63 篇 `.md`**（含 `history/history.md` 与 `release-notes/`） | `Get-ChildItem docs -Recurse -Filter *.md` |
-| 最大源文件 | `expr_glsl_gen.hpp` **3435** 行、`compute_cpu_engine.hpp` **2796**、`compute_gpu_engine.hpp` **2576**、`compute_engine.hpp` **2228**、`expr_dsl.hpp` **1980**、`gui.py` **2038**、`rl_policy.hpp` **1200**、`backend/compute_vk_backend.hpp` **856**（v1.8.1 拆 4 片段后回落）。**`src/text_train.cpp` 已不在榜**——P1-1 模块化后 1830 → **450** 行（循环/恢复/断点拆到 `cli/text_train_*.hpp`） | 逐文件 `(Get-Content $f).Count` |
-| ctest | **69 个测试**（GPU 树）= 56 个测试目标（`list(APPEND NN_TEST_TARGETS` 计数）+ 13 个变体/附加（`cnn_test_gpu`、`cnn_test_f16`、`cnn_test_f16_gpu`、`rapt_test_f16`、`rapt_test_f16_gpu`、`batchnorm_test_gpu`、`t1_58_test_gpu`、`bitnet_struct_test_gpu`、`write_epoch_test_gpu`、`ternary_gemm_test_gpu`、`adam_quant_test_gpu`、`fusion_custom_layer_example`、`expr_fuse_test`）；**无 Vulkan 的树注册 67 条**（`fusion_custom_layer_example` / `expr_fuse_test` 是 GPU 专属门禁） | `ctest --test-dir build -N` |
+| `docs/` | **67 篇 `.md`**（含 `history/history.md` 与 `release-notes/`） | `Get-ChildItem docs -Recurse -Filter *.md` |
+| 最大源文件 | `expr_glsl_gen.hpp` **3435** 行、`compute_cpu_engine.hpp` **2797**、`compute_gpu_engine.hpp` **2576**、`compute_engine.hpp` **2228**、`expr_dsl.hpp` **1981**、`gui.py` **2038**、`rl_policy.hpp` **1200**、`backend/compute_vk_backend.hpp` **856**（v1.8.1 拆 4 片段后回落）。**`src/text_train.cpp` 已不在榜**——P1-1 模块化后 1830 → **450** 行（循环/恢复/断点拆到 `cli/text_train_*.hpp`） | 逐文件 `(Get-Content $f).Count` |
+| ctest | **64 个注册**（GPU 树，2026-10-30 实测）= 51 个测试目标（`list(APPEND NN_TEST_TARGETS` 计数）+ 13 个变体/附加（`cnn_test_gpu`、`cnn_test_f16`、`cnn_test_f16_gpu`、`rapt_test_f16`、`rapt_test_f16_gpu`、`batchnorm_test_gpu`、`t1_58_test_gpu`、`bitnet_struct_test_gpu`、`write_epoch_test_gpu`、`ternary_gemm_test_gpu`、`adam_quant_test_gpu`、`fusion_custom_layer_example`、`expr_fuse_test`）；**无 Vulkan 的树注册 62 条**（`fusion_custom_layer_example` / `expr_fuse_test` 是 GPU 专属门禁） | `ctest --test-dir build -N` |
 | 引擎接口 | **52 个 virtual 方法**、Layer/Loss/Optimizer 直调 **32 个**；`L2-VIOLATIONS: 0`；宿主桥 39 处（仅披露，2026-10-23 实测） | `pwsh -File bench/doc_inventory.ps1` |
-| 版本 | release **v1.12.0**，git tag **`v1.12.0`**；`CMakeLists.txt` 的 `project(... VERSION 1.12.0)`（口径仍为 **git tag 是版本权威**）；`release-notes/` 覆盖 **v1.5.0 → v1.12.0 的全部 tag**（含 `v1.10.0-rc0` / `rc0.1` 两个预发布候选；历史补写记录见 release-note 索引） | `git describe` + 读 `CMakeLists.txt` + `ls docs/release-notes/` |
+| 版本 | release **v1.13.0**，git tag **`v1.13.0`**；`CMakeLists.txt` 的 `project(... VERSION 1.13.0)`（口径仍为 **git tag 是版本权威**；版本号·分支·发布治理见 `33`）；`release-notes/` 覆盖 **v1.5.0 → v1.13.0 的全部 tag**（含 `v1.10.0-rc0` / `rc0.1` 两个预发布候选；历史补写记录见 release-note 索引） | `git tag --list 'v1.*' \| sort -V \| tail` + 读 `CMakeLists.txt` + `ls docs/release-notes/` |
 | CI | `.github/workflows/cmake-single-platform.yml`：clang++ / Ninja / Release / `NN_ENABLE_NATIVE=OFF`，Linux + Windows；**开 `NN_ENABLE_TESTS` 并跑 ctest**（v3 起设备域检查默认生效，无需第二轮调试开关门禁）。另有 `msvc-debug` job：Windows + Visual Studio 18 2026（cl.exe）/ Debug / `NN_ENABLE_GPU=OFF` 纯 CPU / ctest（除已知 C11 外全跑；P1-5，2026-10-18） | 读该 workflow |
 
 > 口径说明：表中行数均为**总行数**（实测刷新）。
-> `69`（GPU 树）/ `67`（无 Vulkan 树）是当前唯一正确计数；`--preset` 各树同口径（GPU 是否可用决定
+> `64`（GPU 树）/ `62`（无 Vulkan 树）是当前唯一正确计数；`--preset` 各树同口径（GPU 是否可用决定
 > 两条 GPU 专属门禁是否注册）。文档中其它 ctest 计数写法属**历史记录**：已完成行（如 P2-3/P2-8 的
 > "47/47"）与 `docs/history/history.md` 的旧数字是当时的验收事实，不属计数口径冲突；**新增/修改文档
 > 时写当前值**。口径差异来源见 §3 工程化第 4 条。
@@ -355,7 +355,7 @@ f16（P2-14/P2-15）与训练性能（P4-1/P4-2/P4-3）仍按原裁定暂缓，�
 | 基线 | 口径 | 当前值 / 复现 |
 |---|---|---|
 | build | 全绿、零告警（`-Werror`） | `cmake -B build -G Ninja -DNN_ENABLE_TESTS=ON && cmake --build build` |
-| ctest | **实测 54**（41 目标 + 13 变体/附加；无 Vulkan 树 52）；需 Vulkan 用例退出码 77 = skip | `ctest --test-dir build` |
+| ctest | **实测 64**（51 目标 + 13 变体/附加；无 Vulkan 树 62）；需 Vulkan 用例退出码 77 = skip | `ctest --test-dir build` |
 | L2 分层审计 | `L2-VIOLATIONS: 0`（宿主桥用量只披露） | `pwsh -File bench/doc_inventory.ps1` 第 [4] 节（实测：virtual 52 / host_bridge 39） |
 | CPU 字节锚 | `--steps 20` hash = `6f8849f14da23110` | 逐位一致 |
 | GPU 字节锚 | dev2 hash = `8ef51b2927253c50` | 逐位一致（GPU 档位按 17 §6 容差规则） |
@@ -366,8 +366,8 @@ f16（P2-14/P2-15）与训练性能（P4-1/P4-2/P4-3）仍按原裁定暂缓，�
 
 ### 8.2 本轮新增门禁（P0 后生效）
 
-1. **CI 必须执行 ctest**：日志需出现当前全部用例（**54**，无 Vulkan 树 52）；77 = skip 不算失败（P0-1）。
-2. **开发文档不得出现 ctest 计数的旧写法**：统一写实测 **54**（GPU 树）/ **52**（无 Vulkan 树）——已完成行与 history 归档里的旧数字是当时记录，不算冲突（P0-2 ✅）。
+1. **CI 必须执行 ctest**：日志需出现当前全部用例（**64**，无 Vulkan 树 62，真源 = §2 ctest 行）；77 = skip 不算失败（P0-1）。
+2. **开发文档不得出现 ctest 计数的旧写法**：统一写实测**当前值**（真源 = §2 ctest 行与口径说明；2026-10-30 = **64**〔GPU 树〕/ **62**〔无 Vulkan 树〕）——已完成行与 history 归档里的旧数字是当时记录，不算冲突（P0-2 ✅）。
 3. **BatchNorm 行为门禁**：构造 batchnorm 规格必须有可观测结果（报错或正确层），不允许静默降级（P0-3）。**✅ 已满足**：真层 + `batchnorm_test` 工厂断言。
 4. **危险精度组合**：启动期**告警**（仅警告、不失败、不改退出码）——口径与细则见 [`24-f16-training-defects.md`](24-f16-training-defects.md) §2.3 / §5 F1（P1-3）。
 5. **审计覆盖补强**：`bench/doc_align_audit.ps1` 的 [A] **✅ 已扩展到 markdown 链接目标**（E8，2026-10-15）；新增死链会在审计里以 [A] 计数非 0 暴露。

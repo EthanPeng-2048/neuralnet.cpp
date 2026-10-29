@@ -17,6 +17,7 @@
 | 扩展引擎原语 / 改 GPU 后端 | [`docs/development/01-compute-engine-development.md`](docs/development/01-compute-engine-development.md) + `AGENTS.md` §7 |
 | **改本仓的代码** | [`AGENTS.md`](AGENTS.md)（**先读 §5 铁律与 §10 高频坑**） |
 | 看"下一步该做什么" | [`docs/todo/18-roadmap.md`](docs/todo/18-roadmap.md) |
+| 提发布 / 定版本号 | [`docs/todo/33-version-branch-and-release-policy.md`](docs/todo/33-version-branch-and-release-policy.md)（**版本号必须由人提出，agent 不得擅自发布**；`dev` 不写版本号，发布只在 `main`）+ [`docs/todo/25-release-requirements.md`](docs/todo/25-release-requirements.md) |
 | 看"为什么当初这么改" | [`docs/history/history.md`](docs/history/history.md)（全仓唯一历史归档） |
 
 ---
@@ -149,11 +150,16 @@ clang-format -i path/to/new_file.hpp
    | `hotfix/<bug_name>` | 热修复分支：**只修复一个 bug** | 完成后合入 `dev`，随即删除 |
 
    其他历史分支命名（`feat/`、`fix/`、`docs/` 等）已废止。文档类改动可直接在 `main` 提 PR。
+
+   **版本号与发布规则**（正文与真源表见 [`docs/todo/33-version-branch-and-release-policy.md`](docs/todo/33-version-branch-and-release-policy.md)）：
+   ① 版本号格式 `v1.<API 变化>.<漏洞修复>`（位定义见 [`docs/release-notes/README.md`](docs/release-notes/README.md) §1），**版本权威 = `git tag`**；
+   ② **`dev` 及其上的功能分支从不写版本号**——不 bump `project(VERSION ...)`、不建 release note 册、不打 tag；定档与发布**只发生在 `main`**；
+   ③ **发布版本号必须由人提出并明确给出**，agent（AI 编码助手）不得自行决定版本号或执行发布动作（`git tag` / `gh release` 等）。
 2. **一次 PR 一件事**。大改动请先在 issue/讨论里对齐设计——本仓有「先写设计稿进 `docs/todo/`，
    裁定后再实施」的习惯（`docs/todo/` 就是项目开发者的工作区）。
 3. 提交前自查：
    ```bash
-   cmake --preset dev && cmake --build --preset dev && ctest --preset dev   # 测试必须绿（当前口径：无 Vulkan 52 项 / 开 GPU 54 项）
+   cmake --preset dev && cmake --build --preset dev && ctest --preset dev   # 测试必须绿（当前口径：无 Vulkan 62 项 / 开 GPU 64 项）
    python bench/gui_cli_audit.py         # 改了 gui.py / cli_controllers.py / 任一 CLI 选项后必跑（七节：声明式字段表 ↔ Controller 闭包、断点续训禁列、多轮对话闭环；当前 exit 0）
    python bench/gui_draw_logic_audit.py    # 改了画板绘制路径后必跑（桩替换 customtkinter，无需 GUI）
    python bench/gui_draw_runtime_audit.py  # 同上（真机：功能闭环 + 拖动开销对照；无显示时 77 = SKIP）

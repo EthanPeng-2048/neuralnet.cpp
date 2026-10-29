@@ -19,6 +19,7 @@
 3. **已发布版本不重打**：tag 一旦发布即冻结；发布后发现的问题以勘误块追加在该版本 release note 顶部，并指向修复版本（例：见 `v1.10.0.md` 勘误）。
 4. **子仓库**（`extern/base` 等 5 个 submodule）遵循同一 `v1.<API 变化>.<漏洞修复>` 规范，各自独立编号；基线 `v1.0.0` 已锁定于与主仓库 v1.13.0 同期的快照。
 5. 每册 release note 的头部固定给出：发布范围（上一 tag → 本 tag）、主题、兼容性评级、验收基线。
+6. **发布治理**：版本号的定档与发布必须由**人**明确提出，**agent 不得擅自决定版本号或执行发布**（`git tag` / `gh release` 等）；`dev` 与功能分支不写版本号，定档与发布只发生在 `main`。正文见 [`../todo/33-version-branch-and-release-policy.md`](../todo/33-version-branch-and-release-policy.md)。
 
 ## 2. 目录索引
 

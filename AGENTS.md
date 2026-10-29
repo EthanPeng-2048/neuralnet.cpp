@@ -2,6 +2,7 @@
 
 > 本文档专为 AI 编码助手编写：用最少 token 建立项目心智模型，快速开始开发。
 > 人类向的完整文档在 `docs/`（索引见 §11）。**改代码前必读 §5 铁律与 §10 高频坑。**
+> **开发规范 / 发布要求等规则正文不在本文，本文只给引用**：C++ 开发规范 → `docs/todo/10-development-standards.md`；版本号规范（格式/位定义）→ `docs/release-notes/README.md` §1；版本号·分支·发布治理（**发布须由人提出、agent 不得擅自发布**；`dev` 不写版本号、发布只在 `main`）→ `docs/todo/33-version-branch-and-release-policy.md`；大版本发布清单 → `docs/todo/25-release-requirements.md`；分支模型与提 PR → `CONTRIBUTING.md` §4。
 > 本文只记录**当前状态**；演进记录、已修复勘误、被否决方案与性能 A/B 过程统一归档在 `docs/history/history.md`（索引见 §11）。当前能力清单见 §12。
 
 ## 1. 项目一句话
@@ -378,7 +379,8 @@ auto report = NN_UNWRAP(session.train_step(
 |------|--------|
 | `README.md` | **文档总索引与分册定位**（含 2026-10-11 整理记录） |
 | `history/history.md` | **全仓唯一的历史状态归档**：演进记录 / 已修复勘误 / 被否决方案 / 性能 A/B 过程。代码注释与其他文档只记录当前状态；查"为什么当初这么改、旧数字是多少"只来这里。**原 `development/15`（ComputeEngine Refresh 设计）与 `16`（P0 盘点）、已删的 `13`（重构清单）均归档在本文** |
-| `release-notes/v*.md` | 面向使用者的版本变更说明（破坏性 API 变更 + 迁移指南 + 验收基线）。当前为 `release-notes/v1.12.0.md`（v1.11.0 → **RL 基础设施：schema/具名多输出、GAE、REINFORCE/PPO/GRPO、多模型 Session、rollout pipeline**；无破坏性 API，模型格式 v8 不变）。上一版 `v1.11.0.md` = TrainingSession 单步协议与 global/micro batch 语义；预发布候选记录保留在 `v1.10.0-rc0.md` / `v1.10.0-rc0.1.md` |
+| `release-notes/README.md` | **版本号规范与逐册索引**：格式 `v1.<API 变化>.<漏洞修复>`、位定义与递增条件、rc / 勘误细则（§1）+ 每册主题索引（§2）。最新版本以 `git tag` 为准，索引不写死当前号 |
+| `release-notes/v*.md` | 面向使用者的版本变更说明（发布范围 / 主题 / 破坏性 API 变更 + 迁移指南 / 验收基线）；预发布候选 `v1.10.0-rc0` / `v1.10.0-rc0.1` 同样成册保留。逐册索引见 `release-notes/README.md` §2 |
 
 ### 介绍类（docs/introduction/）
 
@@ -414,7 +416,7 @@ auto report = NN_UNWRAP(session.train_step(
 | `todo/04-memory-optimization.md` | 显存优化：L1 激活重计算（梯度检查点）/ L2 内存池整块归还（均已实施）；L3 远期 |
 | `todo/08-pitfalls-and-lessons.md` | **踩坑警示录，改代码前读** |
 | `todo/10-development-standards.md` | C++ 编码规范全文 |
-| `todo/12-compute-engine-inventory.md` | **引擎接口盘点（复现：`bench/doc_inventory.ps1`）：52 个 virtual 方法、Layer 直调 32 个（基础设施/数据搬运/状态扫描/fold 执行（自登记）/IR-C 录制段开合/三值打包/张量形变/精度落盘/RL 行带适配）、两套 CPU 求值机制（DSL 模板 + IR 解释器）、ctest 69 个测试（无 Vulkan 树 67）；演进记录见 `docs/history/history.md`** |
+| `todo/12-compute-engine-inventory.md` | **引擎接口盘点（复现：`bench/doc_inventory.ps1`）：52 个 virtual 方法、Layer 直调 32 个（基础设施/数据搬运/状态扫描/fold 执行（自登记）/IR-C 录制段开合/三值打包/张量形变/精度落盘/RL 行带适配）、两套 CPU 求值机制（DSL 模板 + IR 解释器）、ctest 64 个注册（无 Vulkan 树 62）；演进记录见 `docs/history/history.md`** |
 | `todo/14-f16-stable-gpu-loss-frozen.md` | **故障报告（2026-09-26；2026-10-13 ✅ 已修/根因订正）：GPU `stable=f16` 训练 loss 打印冻结（权重不冻结）——真因 = CE 的 (1,1) loss 归约按 `stable=f16` 落盘溢出，非回读链；触发矩阵、测试覆盖缺口、证据与复现** |
 | `todo/17-unified-tensor-engine.md` | **统一 Tensor/ComputeEngine/MemoryPool 底层架构总纲（2026-09-30 裁定；M1-M6 全部已实施 2026-09-30，仅 M7 未立项）：访问不变量（Tensor 存储私有、一切经引擎，已立为铁律 #11）、InitSpec 声明式初始化、批量 read/write、Matrix 降级为宿主 I/O 载体（L2+ 禁用 = 铁律 #12）、内存池契约统一、`import` 跨设备拉取、Layer 删每调用 engine 形参（M6 段 C，Loss/DSL/辅助对象保留形参见 §8）；吸收原 15 未实施的 P2-P6（改期 M1-M7）。立项前先读本文件 + §5 分期 + §8** |
 | `todo/18-roadmap.md` | **未来方向路线图 + 未完成项裁定台账（2026-10-01，13 号清单的承接者）：RL 主线 ✅（2026-10-23）+ P0-P4 分期（P4 = 持续优化方向，2026-10-14 立项）、13 号逐条裁定（做/条件触发/不做）、触发式立项条件、非目标、门禁与验收口径。查"某件事该不该做、做到什么算完成、避免重复立项"时读本文；**执行排序不在本文**（见 `todo/27-execution-plan.md`）** |
@@ -424,6 +426,13 @@ auto report = NN_UNWRAP(session.train_step(
 | `todo/21-quantized-weights.md` | **三值（1.58-bit）量化权重与 BitLinear（2026-10-09 设计定稿 → 2026-10-10 **P1 已实施**，分支 `dev/t1_58`）：`Precision::T1_58` + `Layer::precision_support()`（按槽声明、`init` 期校验）+ `BitLinear`（量化 forward / STE backward）；含 Lumina-Engine `TQ1_0` 参考实现拆解、`§4.9` 实现与设计的差异、`§8` 架构图、`§10` 提交清单。**已裁定**：尺度 = absmean + per-row（absmax 只剩 0.13~1.29 bit 信息，实测见 `research/ternary_scale/`）、打包 = `TQ1_0` 编码 + 行级块、命名 `T1_58` / CLI 无别名 / 层名 `BitLinear`、D3 = (a)+(b)、D5 = ③（P1 只覆盖 MLP；GPT 侧由 P1.5 补齐，RAPT/ViT 仍拒绝）；**仍待定** D6（P2 行步长/对齐）。前置证据 `research/ternary_ste/`**；验收 `src/t1_58_test.cpp`（+`--gpu` 变体） |
 | `todo/22-bitnet-2b4t-architecture.md` | **BitNet b1.58 2B4T 的结构对齐（2026-10-10 立项 + **S1/S2/S3 三步已实施并提交**，分支 `dev/t1_58`）：三项结构差距 = SubLN / GQA / tied embedding，均为**可选开关、默认关**。**已裁定**：SubLN 封装在子层内部（`AttentionBase`/`FeedForward` 的可选 `unique_ptr<Layer>`，**不是** `NormType` 新值、**不是** block 的第三个 norm）、类型跟随 `norm_type`；GQA 头映射 = `kv = h/(n_head/n_head_kv)`（llama.cpp FA 与 HF `repeat_kv` 互证）+ 显式展开 K/V 头（前向 `gather_rows` / 反向 `scatter_add_rows`，fold 与 AOT 注册表零改动）；tied embedding 在 `GPTModel` 内一个开关（梯度**累加**进 `grad_token_emb_`）；**不加 CLI 预设**（GUI 留待以后）；`ModelSpec` 追加 `subln`/`n_head_kv`/`tie_embeddings` 三键（缺键 = 旧语义，不升 MODEL_VERSION）。**验收 `src/bitnet_struct_test.cpp`（+`--gpu`）**：GQA 退化与 MHA 逐位一致、GQA↔按块映射复制成 MHA 前向差 0、tied 梯度累加差 0；102 上全量 ctest 30/30。**实施记录见本文 §10**。**待定**：FFN 激活 ReLU²（需确认官方 `hidden_act`；llama.cpp 对 gated squared relu `GGML_ABORT`，无对拍）、GQA in-kernel 版（P2）、HF 权重转换器。**结构侧**与 21 号（权重侧 `T1_58`/`BitLinear`）是两条正交的腿** |
 | `todo/23-library-design-cleanup-and-model-file-roles.md` | **库级违规设计清理（2026-10-11 **已实施**）：模型文件角色 + 参数形态协议 + 引擎能力体系**（范围 = **整个库**，不只三值）。三轮裁决要点：① 参数级 `kind`（Dense / TernaryLatent / TernaryPacked2 / TernaryPacked3 / 预留 int8）；② **不引入**可训练/不可训练状态；③ 能力谓词 = 具体引擎私有、**不得进基类**、不作对外标签、只作内部分发（设备不支持走引擎内降级/报错），能力**信息**走**统一对外查询通道**（`describe()`）；④ 文件角色拆开：**`.nnmodel`**（推理，`.bin` 接替者）与 **`.nnckpt`**（含训练参数，`--save-interval` 写它）；⑤ 热路径审查（基类能力分支 + `eval_expr` 每次求值双份归因 → 编译期标签 / init 期常量 / 引擎内就地回退）；⑥ `sub_layers()` 与 NNQT 独立格式、`--export-deploy` 等标签**全部删除**（`BitLinear` 的 f16 稠密 A/B 开关保留）。**§3 待裁决已定**：`EngineInfo` 结构体 + `text()`、接口名 `describe()`；`.nnmodel` 不留 latent；旧 `.bin` 只读不写、不提供转换工具。落地验收见 21 §4.15 与 `src/model_roles_test.cpp` |
+| `todo/24-f16-training-defects.md` | **f16 训练缺陷台账**：全 f16 NaN / loss 冻结 / `--f16` 降速；立项 F1–F7（F5 ✅ 已可训练；F6 = 真 f16 Plan B；F7 = 标准 `--f16` Plan A） |
+| `todo/25-release-requirements.md` | **大版本发布必做清单**（`1.x.y → 1.(x+1).0`）：端到端模型训练测试 / 发布文档 / 完整 ctest + Debug 构建 / 四组「编译器 × 标准库」矩阵 |
+| `todo/26-f16-speedup-plan.md` | **f16 提速与两套 f16 计划**：Plan A = 标准 `--f16`（AMP 式，推荐默认）；Plan B = 全流程真 f16（零转换门禁），§8 分列 |
+| `todo/28-lifecycle-v3.md` | **生命周期 v3（✅ 已随 v1.10.0 发布）**：删 `EngineId`/`stamp_`/`adopt`/`bound`，设备域从存储派生；改生命周期 / Tensor / 引擎绑定前读 |
+| `todo/29-session-architecture.md` | Session 层所有权设计：Model + Optimizer 同生共死、`InferenceSession` / 通用 `TrainingGroupSession` 占位；训练状态归属由 30 号修订 |
+| `todo/30-training-session-step.md` | **TrainingSession 单步协议（✅ 随 v1.11.0 发布）**：micro-batch 入、内置梯度累积、global batch 归一化、`batch_size` = 理论 batch；改训练入口前读 |
+| `todo/33-version-branch-and-release-policy.md` | **版本号·分支·发布治理**：`v1.<API 变化>.<漏洞修复>` 规则、**发布版本号必须由人提出（agent 不得擅自发布）**、`dev` 不写版本号、发布只在 `main` |
 
 ### 使用类（docs/usage/，**给调用者**）
 
@@ -435,6 +444,7 @@ auto report = NN_UNWRAP(session.train_step(
 | `usage/04-train-package.md` | `.nnpkg` 训练包 |
 | `usage/05-consume-as-library.md` | **把库嵌进自己工程（add_subdirectory/FetchContent）：`neuralnet::nn` 门面、`NN_ENABLE_GPU`/`NN_BUILD_APPS` 开关、`nn_enable_gpu_fusion`、故障排查** |
 | `usage/06-reinforcement-learning.md` | **RL 与可组合训练基础设施**：named output/schema、experience/GAE、PolicyDistribution、REINFORCE/PPO/GRPO、TrainingGroupSession、可替换 rollout pipeline、AOT 与测试口径 |
+| `usage/07-thread-safety.md` | **线程安全契约**：每个对象的并发口径矩阵 + 服务化下游设计模板（issue #38） |
 
 ## 12. 当前状态
 

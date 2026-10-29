@@ -13,7 +13,7 @@
   新增内容先判断属于哪一类：能二值化成"做/不做"的进 18，只描述顺序与动作的进 27。
 - **允许带进度状态**（✅ 已实施 / ⏳ 待做 / ❌ 已否决），但**不写历史叙事**——
   演进过程、被否决方案的理由、旧数字一律进 `../history/history.md`。
-- 编号沿用历史编号（`02`…`31`），**编号缺号是正常的**（`05` `06` `20` 等留在
+- 编号沿用历史编号（**新增接当前最大号**，不重排旧号），**编号缺号是正常的**（`05` `06` `20` 等留在
   `development/`；`13` 已删除；`15` `16` 已并入 `history/history.md`）。
 
 ## 分类与索引
@@ -55,6 +55,7 @@
 | [`14-f16-stable-gpu-loss-frozen.md`](14-f16-stable-gpu-loss-frozen.md) | **已修故障报告（根因已订正）**：GPU `--precision-stable f16` 训练 loss 打印冻结——真因 = CE 的 `(1,1)` 归约输出按 f16 落盘溢出（不是回读链） |
 | [`24-f16-training-defects.md`](24-f16-training-defects.md) | **f16 训练缺陷台账**：全 f16 NaN / loss 冻结 / `--f16` 降速——含报告核对与立项 F1–F7（F5 = 可训练性已完成；**F6 = 真 f16（Plan B）**；**F7 = 标准 `--f16`（Plan A）**） |
 | [`25-release-requirements.md`](25-release-requirements.md) | **大版本发布要求**（`1.x.y → 1.(x+1).0`）：端到端模型训练测试 / 发布文档 / 完整 ctest + Debug 构建 / 多编译器 × 标准库矩阵 |
+| [`33-version-branch-and-release-policy.md`](33-version-branch-and-release-policy.md) | **版本号·分支·发布治理（三条红线）**：`v1.<API 变化>.<漏洞修复>` 规则、**发布版本号必须由人提出（agent 不得擅自发布）**、`dev` 不写版本号、发布只在 `main`。定版本号 / 发版 / 改分支策略前读 |
 
 ## 相关（相邻分册 / 总档）
 

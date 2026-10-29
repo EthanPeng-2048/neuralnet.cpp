@@ -3,7 +3,8 @@
 > **读者**：项目维护者 / 发布者。本分册定位见 [`README.md`](README.md)；
 > 历史归档在 [`../history/history.md`](../history/history.md)。
 > 关联：[`18-roadmap.md`](18-roadmap.md)（**git tag 是版本权威**）；
-> [`24-f16-training-defects.md`](24-f16-training-defects.md)（F2 的端到端全 f16 训练归口本清单第 1 项）。
+> [`24-f16-training-defects.md`](24-f16-training-defects.md)（F2 的端到端全 f16 训练归口本清单第 1 项）；
+> [`33-version-branch-and-release-policy.md`](33-version-branch-and-release-policy.md)（**发布须由人提出、agent 不得擅自发布；`dev` 不写版本号、发布只在 `main`**——清单全绿也不等于可发版）。
 
 ## 0. 适用范围
 

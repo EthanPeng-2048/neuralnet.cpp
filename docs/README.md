@@ -90,6 +90,9 @@
 - `todo/28` / `todo/29` / `todo/30` — **生命周期 v3 / Session 层 / TrainingSession 单步协议**
   （P2a/P2b 已随 `v1.10.0` 发布；30 号于 2026-10-22 冻结 micro-batch、梯度累积与 global-batch 归一化边界，随 `v1.11.0` 发布）。
 - `todo/24` / `todo/25` — f16 训练缺陷台账 / **大版本发布要求**（`1.x.y → 1.(x+1).0`）。
+- `todo/10` / `todo/08` — **C++ 开发规范全文** / **踩坑警示录**（改代码前读）。
+- `todo/33` — **版本号·分支·发布治理**：版本号规则、**发布须由人提出（agent 不得擅自发布）**、
+  `dev` 不写版本号、发布只在 `main`。
 
 ### 总档
 
@@ -102,7 +105,7 @@
 | [`../CMakePresets.json`](../CMakePresets.json) | 预设构建（`cmake --preset dev` 等）——见 CONTRIBUTING §1 |
 | [`benchmarks/2026-09-25-vulkan-vs-cuda.md`](benchmarks/2026-09-25-vulkan-vs-cuda.md) | Vulkan 后端 vs CUDA（torch）基准 |
 | [`benchmarks/2026-10-06-vulkan-vs-torch.md`](benchmarks/2026-10-06-vulkan-vs-torch.md) | 第二轮复测 |
-| `release-notes/v1.5.0.md` … `v1.12.0.md` | 版本变更说明，覆盖 v1.5.0 → v1.12.0 的全部 tag（`v1.5.1` / `v1.6.1` / `v1.7.1` / `v1.8.0` 为 2026-10-18 补写；`v1.10.0-rc0` / `v1.10.0-rc0.1` 为正式版前的预发布候选记录；**大版本发布要求**见 [`todo/25-release-requirements.md`](todo/25-release-requirements.md)） |
+| `release-notes/v1.5.0.md` … `v1.13.0.md` | 版本变更说明，覆盖 v1.5.0 → v1.13.0 的全部 tag（`v1.5.1` / `v1.6.1` / `v1.7.1` / `v1.8.0` 为 2026-10-18 补写；`v1.10.0-rc0` / `v1.10.0-rc0.1` 为正式版前的预发布候选记录；**大版本发布要求**见 [`todo/25-release-requirements.md`](todo/25-release-requirements.md)） |
 
 ## 3. 2026-10-11 文档整理记录
 

@@ -9,11 +9,12 @@
 > **当前数字**（2026-10-23 实测）：引擎 virtual **52 个方法**（`bench/doc_inventory.ps1` 口径。注意 `rg -c "\bvirtual\b"` 在 `compute_engine.hpp` 里原始计 **54** 处 = 52 方法 + 析构 1 + 注释里的词 1，勿混用口径）；Layer/Loss/Optimizer 直调 **32 个**（含 `begin_expr`——由 `Adam::step`/`AdamW::step` 打开 IR-C 录制段；含 `cast_into`——层内结果按 profile 落精度；RL 多输出层新增 `slice_rows`/`insert_rows`/`try_create_tensor` 等行带适配路径）；
 > 其余 20 个公开入口只服务 DSL lowering / 序列化 / CLI / 适配层 / 测试，见 §2）；
 > CPU 求值机制 **2 套**
-> （DSL 模板路径 + IR 解释器，见 §3）；ctest **67** 个（**无 Vulkan 树**；GPU 树 **69**）＝
-> **56 个测试目标 + 13 个变体/附加**（**完整枚举只写在 `docs/todo/18` §2 / `AGENTS.md` §7**，
-> 此处不重复以免漂移）。其中 `fused_gpu_test` = 融合 shader **逐形态** GPU 对拍；`expr_graph_test` = IR-C 图融合分析（CPU 12 用例）；`error_macro_test`
-> = 错误处理宏族（`NN_UNWRAP`/`NN_EXIT`/`NN_TRY_MSG`/`NN_FAIL`）；`kvrec_test`/`nnvocab_test`/`dataset_test`
-> = 统一数据集（KVRecord v2 / `.nnvocab` / `.nndataset`，见 `docs/todo/19`）；
+> （DSL 模板路径 + IR 解释器，见 §3）；ctest **62** 个（**无 Vulkan 树**；GPU 树 **64**，2026-10-30 实测）＝
+> **51 个测试目标 + 13 个变体/附加**（**完整枚举只写在 `docs/todo/18` §2**，
+> 此处不重复以免漂移）。其中 `fused_gpu_test` = 融合 shader **逐形态** GPU 对拍；`expr_graph_test` = IR-C 图融合分析（CPU 12 用例）；
+> `error_macro_test`（错误处理宏族 `NN_UNWRAP`/`NN_EXIT`/`NN_TRY_MSG`/`NN_FAIL`）与 `kvrec_test`/`nnvocab_test`/`dataset_test`
+> （统一数据集 KVRecord v2 / `.nnvocab` / `.nndataset`，见 `docs/todo/19`）**已下沉子仓**
+> （2026-10-26 `24e0599`：本体在 `extern/base` / `extern/kvrecord` / `extern/tokenizer` / `extern/dataset` 各自 `tests/`，主仓 ctest 不再注册）；
 > `zipt_test` 随 ZiPT 移除，见 `docs/history/history.md`；`dsl_shape_infer_test` = `dsl::compute`/`compute_reduce` 的**无形状重载**（推导口径 + 负例）。
 >
 > 历史演进与收敛记录（计算类原语全量迁 DSL、算子收敛与遗留物
