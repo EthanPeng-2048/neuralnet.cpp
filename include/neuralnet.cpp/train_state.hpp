@@ -239,12 +239,6 @@ public:
     }
 };
 
-// 便捷工厂（域状态的标准构造；与旧值类型用法对齐）
-[[nodiscard]] inline TextTrainState make_text_train_state_value()
-{
-    return TextTrainState{};
-}
-
 // ═══════════════════════════════════════════════════════════════════════
 //  TrainState ⇄ KeyValueRecord（自描述编解码；写满、读缺省）
 // ═══════════════════════════════════════════════════════════════════════

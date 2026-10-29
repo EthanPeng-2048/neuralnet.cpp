@@ -45,7 +45,7 @@
 └──────────────────────────────────────────────────────────┘
 ┌─ RunDriver（本 RFC 新增，领域无关骨架）──────────────────────┐
 │    必选核心：epoch/step 循环 · lr 接线 · 断点时机 · 报告聚合      │
-│    可选能力：loss 回读槽 · checkpoint 节奏 · 指标落盘 · 评估    │
+│    可选能力：checkpoint 节奏 · 指标落盘 · 评估（loss 回读归域）│
 └──────────────────────────────────────────────────────────┘
 ┌─ TrainState 基类（本 RFC 新增）＋ ModelSpecBase（本 RFC 新增）┐
 │    状态与规格的扩展契约 + 库口径编解码/校验骨架                │
@@ -138,12 +138,13 @@ protected:
 };
 ```
 
-### 3.4 向后兼容
+### 3.4 兼容口径
 
-- 旧 `.nnckpt` 的 `state_kind` 键缺失 ⇒ `from_kv` 回退构造 `TextTrainState`
-  （历史文件全部是文本训练）；
-- `recipe.stride` 旧键仍在 `TextTrainState::read_extra_kv` 里回退读取；
-- 计数器/配方/优化器字段名与位序不变，旧文件逐位可读。
+- **仅向下兼容（新版读旧版），且不作承诺**——该能力本身是 **v4 模型格式引入 kvrec**
+  所带来的特性（自描述键值 ⇒ 新版读旧版），不是本 RFC 额外新增的保证；
+- 旧 `.nnckpt` 的 `state_kind` 键缺失 ⇒ `from_kv` 回退构造 `TextTrainState`；
+- 旧 `recipe.stride` 键仍在 `TextTrainState::read_extra_kv` 里回退读取；
+- 反向（旧读器读新文件）与跨版本逐位一致性均**不在承诺范围**。
 
 ### 3.5 断点交叉校验上收（库口径唯一）
 
@@ -233,7 +234,10 @@ using AnyBatch = std::shared_ptr<void>;   // 或 std::any；域 StepFn 自行 st
 | 类别 | 内容 | 可关？ |
 |---|---|---|
 | **必选核心** | epoch/step 计数、断点时机（epoch 边界归一化）、lr 调度接线（`compute_epoch_lr`/`compute_step_lr`）、`train_step` 调用、报告聚合 | 否（保证库口径统一） |
-| **可选能力** | 非阻塞 loss 回读槽、checkpoint 节奏、指标落盘、评估循环 | **是**（每个可关/可换/默认开） |
+| **可选能力** | checkpoint 节奏、指标落盘、评估循环 | **是**（每个可关/可换/默认开） |
+
+非阻塞 loss 回读槽**归域**（`do_update` 内：域拥有 batch 与 `train_step`，自然拥有
+loss 产出与回读时机），driver 不内置——这是实现与 §5.2 草案的差异，以本条为准。
 
 ### 5.2 接口草案
 
@@ -395,11 +399,12 @@ public:
 | `spec_summary` 类型分发 | `arch->summary()`（虚） |
 | `spec_to_kv` / `kv_to_spec` 字段循环 | `arch->write_kv/read_kv`（虚）+ 工厂表 |
 
-### 6.5 文件头向后兼容
+### 6.5 文件头兼容（仅向下，不承诺）
 
 - `type` 字段从**数值枚举改为字符串类型名**；
-- 旧文件写的是数值（`3`=GPT 等），`kv_to_spec` 检测到数值时用一张
-  **旧枚举→类型名**只读映射表还原（内建类型全部可逆），旧文件零感知；
+- 向下兼容走数值回落：`kv_to_spec` 检测到数值（`3`=GPT 等）时用一张
+  **旧枚举→类型名**只读映射表还原（内建类型全部可逆）——同样是 v4/kvrec
+  自描述特性的既有口径：只保证新读旧，反向不承诺；
 - `is_gpt()`/`is_cnn()` 等判别调用点改为 `type_name()` 比较或
   `dynamic_cast<GptSpec*>`（热路径用 `type_name()`，诊断用 cast）。
 
@@ -434,18 +439,22 @@ public:
 - [ ] `TextTrainer` 行为逐位不变（可观测锚：进度文案、seed 语义、断点计数器语义）；
 - [ ] go CLI 从 1456 行收敛到 ~200 行，且断点交叉校验零手写（走 `verify_resume`）；
 - [ ] 加一个自定义模型不改主仓任何 `switch`（子类 + 注册即可）；
-- [ ] 旧 `.nnckpt` / 模型文件逐位可读；新文件旧读器按位兼容策略明确；
+- [ ] 新版读旧 `.nnckpt` / 模型文件可读（向下；源自 v4/kvrec，不作额外承诺）；
 - [ ] `RunDriver` 关闭全部可选能力后 = 纯 epoch×step 循环（高自由度验证）；
 - [ ] 现有 ctest 68/68 保持绿 + 新增骨架/Spec 单测。
 
 ## 9. 版本口径
 
-- `TrainState` 虚基类、`RunDriver`、`BatchSource`、`ModelSpecBase` 均为**新 API** ⇒ 主仓 **v1.15.0**（第 2 位）；
-- `TextTrainer` 内部改写、文件头 `type` 字符串化 ⇒ 行为不变，第 3 位不单独发；
-- 旧文件兼容 ⇒ 无破坏性变更，无需 v2。
+- `dev` **从不定档版本号**：版本号只在本工作经审核合入 `main` 时确定（当前最新版 `v1.13.0`）；
+- 届时按 `v1.<API 变化>.<漏洞修复>` 判定档位：`TrainState` 虚基类 / `RunDriver` /
+  `BatchSource` / `ModelSpecBase` 属 API 变化面，定档由审核裁定，本稿不预判具体号；
+- `TextTrainer` 内部改写、文件头 `type` 字符串化 ⇒ 行为不变，不构成 API 变化面。
 
-## 10. 待拍板（实施前）
+## 10. 拍板记录
 
-1. `AnyBatch` 载体用 `std::shared_ptr<void>` 还是 `std::any`（倾向后者，语义更清晰）；
-2. `RunDriver::fit` 是否支持纯步进驱动（`epochs<=0`）与 epoch 驱动共存——本 RFC 倾向支持；
-3. `ModelSpecBase::build` 是否应留在 Spec（内聚）还是回 `domain_*.hpp`（保持 Spec 纯数据）——本 RFC 倾向前者（内聚），但需确认与序列化职责不冲突。
+1. ✅ `AnyBatch` 载体 = `std::any`（指针形式读取，`-fno-exceptions` 安全）；
+2. ✅ 步进驱动与 epoch 驱动共存（`epochs<=0` + `max_steps>0` = 步进驱动）；
+3. ⏳ `ModelSpecBase::build` 归属——随阶段 D（`feature/openspec-modelspec` 分支）裁定；
+4. ✅ `verify_resume` 不校验 `lr`/`min_lr`/`weight_decay`/`beta*`/`lr_per_epoch`
+   （只校验曲线形状类字段；比 go CLI 口径宽，接受）；
+5. ✅ `fit` 吞掉 `evaluate` 错误（与"评估失败不中止训练"一致；留痕由域钩子负责）。

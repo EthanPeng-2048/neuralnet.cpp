@@ -338,7 +338,7 @@ public:
     // 调用即 fail-fast。"profile 何时有效"因此从"三条注入路径的交集"收敛成一条
     // 可判定规则（docs 21 §4.3.2）：校验（唯一的、发生在 init 内的）不可能被旁路。
     // 复合层的 override 必须先调本函数（先校验），再逐子层下传。
-    // v1.14.0（issue #29）：默认按 `param_children()` 向参数子层广播——复合层
+    // 默认按 `param_children()` 向参数子层广播——复合层
     // 只需列出子层即可，漏写转发（子层留在 f32）不再可能。需要对不同子层注入
     // 不同 profile 的复合层（如 FFN 的三值分流）仍可 override：先调本函数，
     // 再逐子层覆盖为各自 profile（最终值以 override 的覆盖为准）。
@@ -639,7 +639,7 @@ public:
     // 文档感知：设置当前 step 每样本文档 id（默认 no-op，GPTModel override）
     virtual void set_doc_ids(std::span<const std::size_t> /*ids*/) {}
 
-    // 训练/推理模式切换。v1.14.0（issue #29）：默认按 `param_children()` 向
+    // 训练/推理模式切换。默认按 `param_children()` 向
     // 参数子层广播（漏写转发 → eval 时 Dropout/BN 行为错，不再可能）；
     // 自身需记录开关的层（BatchNorm 等）override 时先调本函数再记状态。
     virtual void set_training(bool training)
@@ -774,7 +774,7 @@ public:
     // 释放本层为 backward 保留的中间激活缓存（清空成员缓存 Tensor，归还显存）。
     // 由 GPTModel 在 checkpoint 块 backward 之后调用，避免重算的激活跨块累积
     // （否则所有块缓存会在 backward 末尾同时驻留，抵消检查点的显存收益）。
-    // v1.14.0（issue #29）：默认按 `param_children()` 向参数子层广播（漏写
+    // 默认按 `param_children()` 向参数子层广播（漏写
     // 转发 → 显存/状态残留，不再可能）；持有自身缓存的层 override 时先清自身
     // 缓存，需要连子层一起清再调本函数（或由默认转发代劳）。
     virtual void clear_cache()
@@ -1008,7 +1008,7 @@ struct SamplingConfig
     std::uint64_t seed = 0; // has_seed=false 时忽略
     bool has_seed = false; // true = 用 seed 播种（可复现）
 
-    // ── 外部 logits 掩码/变换钩子（v1.14.0，issue #34）────────────────
+    // ── 外部 logits 掩码/变换钩子（重复惩罚前的域约束入口）─────────────
     // 在**重复惩罚之前**（即全部库内采样策略之前）对 host 侧 logits 原地
     // 变换：约束解码场景（棋类合法着、语法约束、工具调用 schema）在此把
     // 非法位置 -inf / 加偏置。回调发生在 logits 已在 host 的那一步
