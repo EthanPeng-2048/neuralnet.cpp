@@ -107,8 +107,11 @@ struct Recorder
             ++eval_calls;
             return nn::Scalar{0.5f};
         };
-        h.on_epoch_end = [this](const nn::RunReport&, std::size_t)
-        { ++epoch_end_calls; };
+        h.on_epoch_end = [this](const nn::RunReport&, std::size_t) -> nn::Result<void>
+        {
+            ++epoch_end_calls;
+            return {};
+        };
         return h;
     }
 };
@@ -143,6 +146,15 @@ public:
         return {};
     }
 };
+
+// 空步钩子（0 步运行时不会被调用，但 fit 要求存在）
+static nn::RunHooks rec_empty_hooks()
+{
+    nn::RunHooks h;
+    h.do_update = [](nn::TrainingSession&, const nn::UpdateRequest&)
+        -> nn::Result<nn::UpdateOutcome> { return nn::UpdateOutcome{}; };
+    return h;
+}
 
 // ── [1] epoch×step 循环 ────────────────────────────────────────────────
 void test_epoch_loop()
@@ -411,12 +423,26 @@ void test_validation()
           "state 为空 → 报错");
     {
         nn::RunDriverConfig bad;
-        bad.epochs = 0;
-        bad.max_steps = 0;
+        bad.epochs = -1;
         CHECK(!nn::RunDriver::create(*fx.session, src,
                                      std::make_unique<nn::TextTrainState>(), bad)
                    .has_value(),
-              "epochs=0 且 max_steps=0 → 报错");
+              "epochs=-1 → 报错");
+    }
+    {
+        // epochs=0 + max_steps=0 = 合法的 0 步运行（TextTrainer --epochs 0 语义）
+        nn::RunDriverConfig zero;
+        zero.epochs = 0;
+        zero.max_steps = 0;
+        auto z = nn::RunDriver::create(*fx.session, src,
+                                       std::make_unique<nn::TextTrainState>(), zero);
+        CHECK(z.has_value(), "epochs=0 + max_steps=0 → 0 步运行合法");
+        if (z)
+        {
+            z->set_hooks(rec_empty_hooks());
+            auto zr = z->fit();
+            CHECK(zr && zr->steps_executed == 0, "0 步运行 → steps_executed=0");
+        }
     }
     {
         nn::RunDriverConfig bad;
