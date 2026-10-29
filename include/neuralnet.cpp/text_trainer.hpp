@@ -72,8 +72,8 @@ namespace nn
 // `save_ckpt_with_state` / 库外使用者自己的 save_model）。
 struct TextCheckpointRequest
 {
-    TrainingSession& session;    // model/optimizer 的当前状态
-    const TrainState& state;     // 已按计数器/配方/数据集身份装配好
+    TrainingSession& session;      // model/optimizer 的当前状态
+    const TextTrainState& state;   // 已按计数器/配方/数据集身份装配好
 };
 
 // ── 训练期钩子（全部可空；空 = 该能力不启用）─────────────────────────────
@@ -136,12 +136,12 @@ struct TextTrainReport
 // 计数器记的是**下一步的位置**（epoch 边界已归一化）⇒ 续训直接拿它当起点；
 // `global_step` 与 step 级调度的索引同定义（= epoch·steps_per_epoch + step）；
 // `lr` 只作显示/交叉校验（权威值由调度按步号重算）。
-[[nodiscard]] inline TrainState
+[[nodiscard]] inline TextTrainState
 make_text_train_state(const TextTrainConfig& cfg, const DatasetIdentity& identity,
                       std::size_t steps_per_epoch, std::size_t epoch, std::size_t step_done,
                       Scalar current_lr, std::uint64_t optimizer_step)
 {
-    TrainState s;
+    TextTrainState s;
     std::size_t e = epoch, st = step_done;
     if (steps_per_epoch > 0 && st >= steps_per_epoch)
     {
@@ -173,7 +173,7 @@ make_text_train_state(const TextTrainConfig& cfg, const DatasetIdentity& identit
         static_cast<std::uint64_t>(cfg.batch_size / cfg.accum_steps);
     s.recipe.batch_size_is_global = true;
     s.recipe.accum_steps = static_cast<std::uint64_t>(cfg.accum_steps);
-    s.recipe.stride = static_cast<std::uint64_t>(cfg.stride);
+    s.stride = static_cast<std::uint64_t>(cfg.stride);
     s.recipe.lr_per_epoch.clear();
     s.recipe.lr_per_epoch.reserve(cfg.lr_per_epoch.size());
     for (Scalar v : cfg.lr_per_epoch)
@@ -278,7 +278,7 @@ public:
     [[nodiscard]] const TextSampleSet* test_samples() const noexcept
     { return test_ ? &*test_ : nullptr; }
     [[nodiscard]] const DatasetIdentity& dataset_identity() const noexcept { return identity_; }
-    [[nodiscard]] const TrainState& train_state() const noexcept { return train_state_; }
+    [[nodiscard]] const TextTrainState& train_state() const noexcept { return train_state_; }
     [[nodiscard]] const TextTrainConfig& config() const noexcept { return cfg_; }
 
 private:
@@ -409,7 +409,7 @@ private:
     }
 
     // 断点状态的权威装配（计数器 = "下一步的位置"，epoch 边界归一化）。
-    [[nodiscard]] TrainState make_train_state(std::size_t epoch, std::size_t step_done,
+    [[nodiscard]] TextTrainState make_train_state(std::size_t epoch, std::size_t step_done,
                                               Scalar current_lr) const
     {
         return make_text_train_state(cfg_, identity_, steps_per_epoch_, epoch, step_done,
@@ -426,7 +426,7 @@ private:
     DatasetIdentity identity_;
     std::size_t steps_per_epoch_ = 0;
     std::size_t micro_batch_size_ = 0;
-    TrainState train_state_;
+    TextTrainState train_state_;
 };
 
 // ══════════════════════════════════════════════════════════════════════════

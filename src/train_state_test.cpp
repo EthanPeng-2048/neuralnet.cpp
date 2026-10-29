@@ -90,9 +90,9 @@ std::filesystem::path scratch_dir()
 }
 
 // ── 测试用状态（覆盖每个字段；值刻意非默认，避免"没写也相等"的假通过）──
-[[nodiscard]] nn::TrainState sample_state()
+[[nodiscard]] nn::TextTrainState sample_state()
 {
-    nn::TrainState s;
+    nn::TextTrainState s;
     s.counters.global_step = 1234;
     s.counters.epoch = 3;
     s.counters.step_in_epoch = 42;
@@ -117,7 +117,7 @@ std::filesystem::path scratch_dir()
     s.recipe.micro_batch_size = 2;
     s.recipe.batch_size_is_global = true;
     s.recipe.accum_steps = 4;
-    s.recipe.stride = 128;
+    s.stride = 128;
     s.recipe.lr_per_epoch = {1e-3, 5e-4, 2.5e-4};
     s.dataset.path = "/data/tiny.nndataset";
     s.dataset.sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -132,6 +132,7 @@ std::filesystem::path scratch_dir()
 
 [[nodiscard]] bool same_state(const nn::TrainState &a, const nn::TrainState &b)
 {
+    if (std::string(a.state_kind()) != std::string(b.state_kind())) return false;
     return a.counters.global_step == b.counters.global_step &&
            a.counters.epoch == b.counters.epoch &&
            a.counters.step_in_epoch == b.counters.step_in_epoch &&
@@ -156,14 +157,21 @@ std::filesystem::path scratch_dir()
            a.recipe.micro_batch_size == b.recipe.micro_batch_size &&
            a.recipe.batch_size_is_global == b.recipe.batch_size_is_global &&
            a.recipe.accum_steps == b.recipe.accum_steps &&
-           a.recipe.stride == b.recipe.stride &&
-           a.recipe.lr_per_epoch == b.recipe.lr_per_epoch &&
-           a.dataset.path == b.dataset.path && a.dataset.sha256 == b.dataset.sha256 &&
-           a.dataset.num_tokens == b.dataset.num_tokens &&
-           a.dataset.num_docs == b.dataset.num_docs &&
-           a.dataset.num_samples == b.dataset.num_samples &&
-           a.dataset.steps_per_epoch == b.dataset.steps_per_epoch &&
-           a.dataset.loss_scope == b.dataset.loss_scope;
+           a.recipe.lr_per_epoch == b.recipe.lr_per_epoch;
+
+    // 文本域扩展字段（stride + 数据集身份）
+    const auto* ta = dynamic_cast<const nn::TextTrainState*>(&a);
+    const auto* tb = dynamic_cast<const nn::TextTrainState*>(&b);
+    if ((ta == nullptr) != (tb == nullptr)) return false;
+    if (ta == nullptr) return true;   // 两份都无文本扩展 ⇒ 基类字段一致即一致
+    return ta->stride == tb->stride &&
+           ta->dataset.path == tb->dataset.path &&
+           ta->dataset.sha256 == tb->dataset.sha256 &&
+           ta->dataset.num_tokens == tb->dataset.num_tokens &&
+           ta->dataset.num_docs == tb->dataset.num_docs &&
+           ta->dataset.num_samples == tb->dataset.num_samples &&
+           ta->dataset.steps_per_epoch == tb->dataset.steps_per_epoch &&
+           ta->dataset.loss_scope == tb->dataset.loss_scope;
 }
 
 // ── 宿主文件辅助（测试自用；库内字节 cast 收敛在 core_file.hpp）─────────
@@ -190,7 +198,7 @@ void write_file(const std::filesystem::path &p, const std::string &bytes)
 void test_kvrec_roundtrip()
 {
     std::cout << "\n── [1] TrainState ⇄ kvrec 往返 ──\n";
-    const nn::TrainState s = sample_state();
+    const nn::TextTrainState s = sample_state();
     const std::string bytes = nn::train_state_to_kv(s).serialize();
     auto kv = nn::KeyValueRecord::parse(bytes);
     CHECK(kv.has_value(), "kvrec 解析成功");
@@ -198,14 +206,14 @@ void test_kvrec_roundtrip()
     auto back = nn::train_state_from_kv(*kv);
     CHECK(back.has_value(), "TrainState 读回成功");
     if (!back) return;
-    CHECK(same_state(s, *back), "全字段逐项一致（含精度四槽 / lr_per_epoch / 数据集身份）");
+    CHECK(back && same_state(s, **back), "全字段逐项一致（含精度四槽 / lr_per_epoch / 数据集身份）");
 
     // 缺键 → 默认值（老文件兜底口径）
     nn::KeyValueRecord empty;
     auto def = nn::train_state_from_kv(empty);
-    CHECK(def.has_value() && def->counters.global_step == 0 &&
-              def->recipe.precision.param == nn::Precision::F32 &&
-              def->recipe.optimizer == "adam",
+    CHECK(def.has_value() && (*def)->counters.global_step == 0 &&
+              (*def)->recipe.precision.param == nn::Precision::F32 &&
+              (*def)->recipe.optimizer == "adam",
           "空 kvrec → 默认值（冷启动语义的兜底）");
     // 非法精度值（BF16 保留位）→ 明确报错
     nn::KeyValueRecord bad;
@@ -239,7 +247,7 @@ void test_checkpoint_roundtrip(const std::filesystem::path &dir)
     };
 
     const std::string tok = "nnvocab-train-state-test";
-    nn::TrainState s = sample_state();
+    nn::TextTrainState s = sample_state();
     s.optimizer_blob_count = blobs.size();   // 写侧按实参回填，读回应等于它
     nn::CheckpointState ckpt{&s, blobs};
     const auto ckpt_path = dir / "state.nnckpt";
@@ -252,8 +260,8 @@ void test_checkpoint_roundtrip(const std::filesystem::path &dir)
     CHECK(pr.has_value(), "peek_train_state 成功");
     if (pr)
     {
-        CHECK(same_state(s, *pr), "peek 状态与写入前逐项一致");
-        CHECK(pr->optimizer_blob_count == 2, "blob 计数 = 2（写侧按实参回填）");
+        CHECK(same_state(s, **pr), "peek 状态与写入前逐项一致");
+        CHECK((*pr)->optimizer_blob_count == 2, "blob 计数 = 2（写侧按实参回填）");
     }
 
     auto lr = nn::load_train_state(engine, ckpt_path.string());
@@ -277,7 +285,8 @@ void test_checkpoint_roundtrip(const std::filesystem::path &dir)
                   lr->optimizer_blob_precisions[0] == nn::Precision::F32 &&
                   lr->optimizer_blob_precisions[1] == nn::Precision::F16,
               "文件里的每张量精度被如实记录（f32 / f16）");
-        CHECK(same_state(s, lr->state), "load_train_state 的状态与写入前一致");
+        CHECK(lr->state != nullptr && same_state(s, *lr->state),
+              "load_train_state 的状态与写入前一致");
     }
 
     std::cout << "\n── [6] load_model 跳过状态段后参数逐位一致 ──\n";
@@ -440,7 +449,7 @@ void test_resave_byte_identity(const std::filesystem::path &dir)
     m.span()[3] = -0.25f; m.span()[4] = 7.5f;  m.span()[5] = 0.5f;
     std::vector<nn::Tensor> blobs{upload(engine, m, nn::Precision::F32)};
 
-    nn::TrainState st = sample_state();
+    nn::TextTrainState st = sample_state();
     st.optimizer_blob_count = blobs.size();
     const std::string tok = "nnvocab-resave";
     const auto path1 = dir / "resave1.nnckpt";
@@ -453,10 +462,10 @@ void test_resave_byte_identity(const std::filesystem::path &dir)
     CHECK(loaded.has_value(), "读回状态 + 状态张量");
     if (loaded)
     {
-        nn::TrainState back = loaded->state;
         CHECK(nn::save_model(path2.string(), model, tiny_spec(), tok,
                              nn::ModelRole::Checkpoint,
-                             nn::CheckpointState{&back, loaded->optimizer_blobs}).has_value(),
+                             nn::CheckpointState{loaded->state.get(),
+                                                 loaded->optimizer_blobs}).has_value(),
               "用读回的内容重写第二份断点");
         const std::string b1 = read_file(path1);
         const std::string b2 = read_file(path2);
