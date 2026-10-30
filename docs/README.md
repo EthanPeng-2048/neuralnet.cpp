@@ -15,7 +15,7 @@
 | `history/history.md` | 项目开发者 | 全仓**唯一**历史归档：演进记录 / 已修复勘误 / 被否决方案 / 性能 A/B | 历史 |
 | `benchmarks/` | 项目开发者 / 评估者 | 对外性能对比基准报告（Vulkan vs CUDA / Torch） | 采集时的实测 |
 | `release-notes/` | 调用者 | 版本变更说明（破坏性变更 + 迁移指南 + 验收基线） | 版本发布时 |
-| [`../research/`](../research/README.md) | **想引用实测结论的人**（含库外） | 一次研究一个子目录：结论 / 证据 / **重跑命令** / 适用边界 | 实测结论（不随代码漂移） |
+| [`../research/`](../research/README.md) | **想引用实测结论或核对算法基线的人**（含库外） | 一次研究一个子目录：定义 / 结论 / 证据 / **重跑命令** / 适用边界 | 研究档案（结果与明确标注的 TODO 分开） |
 
 ### 1.1 `development/` 的定位（明确约定）
 
@@ -95,7 +95,7 @@
 | 文档 | 何时读 |
 |------|--------|
 | [`history/history.md`](history/history.md) | 查"为什么当初这么改、旧数字是多少"（全仓唯一历史归档） |
-| [`../research/README.md`](../research/README.md) | 引用**实测结论**（MNIST 准确率、f16 回弹根因、三值 STE / 尺度规则）：每条带证据、重跑命令与边界 |
+| [`../research/README.md`](../research/README.md) | 引用**实测结论**或核对算法定义（MNIST、f16、三值、RLA）：结果带证据/重跑/边界，TODO 不得当结果 |
 | [`../CONTRIBUTING.md`](../CONTRIBUTING.md) | 参与本项目（构建 / 测试 / 规范 / PR / CI 口径）——**给非作者的入口** |
 | [`../CODE_OF_CONDUCT.md`](../CODE_OF_CONDUCT.md) | 社区行为准则 |
 | [`../CMakePresets.json`](../CMakePresets.json) | 预设构建（`cmake --preset dev` 等）——见 CONTRIBUTING §1 |
