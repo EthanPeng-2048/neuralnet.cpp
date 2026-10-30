@@ -561,6 +561,10 @@ if(NN_BUILD_APPS OR NN_ENABLE_TESTS)
     nn_add_executable(attn_test src/attn_test.cpp)
     list(APPEND NN_TEST_TARGETS attn_test)
 
+    # ── CrossAttention（issue #33：双输入 / 矩形 / 双路梯度）─────────────
+    nn_add_executable(cross_attention_test src/cross_attention_test.cpp)
+    list(APPEND NN_TEST_TARGETS cross_attention_test)
+
     # ── 基础层数值梯度检查（SwiGLU / RMSNorm / Softmax）─────────────────
     nn_add_executable(layer_gradcheck_test src/layer_gradcheck_test.cpp)
     list(APPEND NN_TEST_TARGETS layer_gradcheck_test)
