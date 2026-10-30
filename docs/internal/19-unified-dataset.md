@@ -397,7 +397,7 @@ tokcache + `mark_assistant_spans` 输出**逐位一致** ⇒ `text_train` 训练
 |------|------|------|------|
 | **一** | KVRecord v2（哨兵/地址/Record 类型）+ `.nnvocab` 读写 + `tokenizer_train` 切换 + `dataset_convert vocab` | 中 | kvrec v2 单测（v1 判别、嵌套、未知类型跳过）；json→nnvocab→加载 round-trip 语义一致；旧 json 明确拒绝 |
 | **二** | `.nndataset` + `dataset_gen` + `nn::Dataset` + `text_train` 切换 + 模型 v6 内嵌 | 中–大 | §8 逐位一致口径 + 字节锚不移动；ctest 全绿 + 新增 `dataset_test`；txt 直读/tokcache/四选项符号清零 |
-| **三** | `gui.py` / `cli_controllers.py` / `train_pkg.py` 参数同步 + 文档（usage、AGENTS 索引） | 小–中 | `bench/gui_cli_audit.py` 退出码 0；`doc_align_audit.ps1` 可行动项 0 |
+| **三** | `gui.py` / `cli_controllers.py` / `train_pkg.py` 参数同步 + 文档（usage、AGENTS 索引） | 小–中 | `bench/gui_cli_audit.py` 退出码 0；`python scripts/doc_audit.py` 全绿 |
 | **四** | tabular：`dataset_convert csv` + `load_tabular` + `mnist_train` 切换；（此后才轮到 DataLoader/流式 = P2-4 后半） | 中 | csv→nndataset→加载逐位一致；MNIST 训练字节锚不移动 |
 
 阶段一/二可合并为一次交付；阶段三必须与阶段二**同批**（否则 CLI 与 GUI/audit 断裂）。

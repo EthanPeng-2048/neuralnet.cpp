@@ -52,7 +52,7 @@ RL-0 → RL-1a/b/c/d → RL-2a/b 全链已落地，公共契约、组件与编�
 | 项 | 坐标 | 为什么排这里 | 前置 / 成本 |
 |---|---|---|---|
 | **P2-2 Adafactor 类优化器** | 18 §4.3 P2-2 / §3.4 M1（= P4-3①） | 显存收益要在"训练超出 Adam m/v 预算的模型"时才兑现，当前无该场景 | RV-04 已把成本压到"`kOptimizerTable` 1 行 + `create_optimizer` 1 分支"；小 |
-| **索引/口径卫生**（`release-notes` 索引、各表计数） | 18 §8.2 门禁 2 | 一致性卫生活；`doc_align_audit` 已能抓大部分 | 小；随其他改动顺手做 |
+| **索引/口径卫生**（`release-notes` 索引、各表计数） | 18 §8.2 门禁 2 | 一致性卫生活；`python scripts/doc_audit.py` 已能抓大部分 | 小；随其他改动顺手做 |
 
 > **2026-10-16：GUI 多轮对话闭环（P0-5 尾项）已完成**——按 §8 约定从本表删除。
 > 落地形态 = `Tokenizer::chat_prompt`（唯一 prompt 构建）+ `--turn`/`--reply-out`/`--system`

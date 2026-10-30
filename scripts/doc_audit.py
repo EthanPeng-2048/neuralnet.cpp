@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """doc_audit.py — 文档↔代码对齐审计 + 文档规范检查（只读，跨平台）
 
-规范正文：docs/contributors/documentation-standard.md §5。
-移植并扩展 bench/doc_align_audit.ps1 的 A–D/F 类检查；新增 E 类（头部模板/状态词/
-索引登记）与 G 类（代码示例清单）。ps1 保留至 Windows 侧迁移完成，口径以规范为准。
+规范正文：docs/contributors/documentation-standard.md §5——本文档审计的**唯一实现**。
+八类检查：A 文件/链接、B 已删符号残留、C 数字断言披露、D CLI 参数、E 头部模板/状态词/
+索引登记、F nn:: 符号与测试名、G 代码示例清单（--report 生成人工复核报告）、
+H 历史性记载禁令。
 
 用法：
     python scripts/doc_audit.py             # 全量检查；有 FAIL 时 exit 1
@@ -29,6 +30,7 @@ HISTORICAL_FILES = [
     'compute_layer_zipt.hpp', 'domain_zipt.hpp',  # ZiPT 移除（分支 legacy/zipt）
     'ternary_deploy.hpp',                    # NNQT 独立部署格式，随库级清理（internal/23）删除
     '08-object-lifetimes.md',                # 2026-11 文档重构删除的转发页（真源 = 07-engine-ownership.md）
+    'doc_align_audit.ps1',                   # 文档审计由 scripts/doc_audit.py 承担（口径见文档规范 §5）
 ]
 
 # [B] 已删除符号（命中行若带"不存在/已删除"等否定语境则跳过）

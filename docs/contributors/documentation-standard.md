@@ -157,8 +157,7 @@ python scripts/doc_audit.py --report   # 另生成 build/doc_audit/code_examples
 
 - 白名单（历史文件/已删符号/外部 CLI/历史测试名）维护在脚本顶部，**带注释说明每一项的来历**。
 - 本地口径：改文档必跑；CI 口径见 [`../../CONTRIBUTING.md`](../../CONTRIBUTING.md) §5。
-- 旧 `bench/doc_align_audit.ps1` 的 A–F 类检查已并入本脚本并扩展（G 类新增）；ps1 保留至
-  Windows 侧迁移到 Python 为止，两者口径以本文件为准。
+- `scripts/doc_audit.py` 是文档审计的**唯一实现**（八类检查以本文档 §5 为准）。
 
 ## 6. 历史整理记录
 

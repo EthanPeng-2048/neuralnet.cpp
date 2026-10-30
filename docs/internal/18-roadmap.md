@@ -362,7 +362,7 @@ f16（P2-14/P2-15）与训练性能（P4-1/P4-2/P4-3）仍按原裁定暂缓，�
 | GPU 字节锚 | dev2 hash = `8ef51b2927253c50` | 逐位一致（GPU 档位按 17 §6 容差规则） |
 | scan 产物 | `fused_registry.hpp`（**唯一产物**；`expr_specs.bin` 已随构建期单步删除） | `tools/scan_exprs.cpp` + `tools/fused_generate.hpp` 产物 |
 | 初值锚 | `gpu_stability_probe --init-hash` 各模型跨进程一致 | 见 `AGENTS.md` §12 当前锚 |
-| 文档对齐 | `pwsh -File bench/doc_align_audit.ps1`：[A][B][D][E][F] 可行动项为 0 | 实测：[A][B][D][E][F] 可行动均为 0（历史归档提及按白名单跳过） |
+| 文档对齐 | `python scripts/doc_audit.py`：A–H 八类可行动项为 0（全绿） | 实测：全绿（历史归档提及按白名单跳过） |
 | 行为回归 | `layer_bench` 同窗交错 + 配对 A/B，无系统性回退（噪声 ±6%） | `build/layer_bench` |
 
 ### 8.2 本轮新增门禁（P0 后生效）
@@ -371,7 +371,7 @@ f16（P2-14/P2-15）与训练性能（P4-1/P4-2/P4-3）仍按原裁定暂缓，�
 2. **开发文档不得出现 ctest 计数的旧写法**：统一写实测**当前值**（真源 = §2 ctest 行与口径说明；2026-10-30 = **64**〔GPU 树〕/ **62**〔无 Vulkan 树〕）——已完成行与 history 归档里的旧数字是当时记录，不算冲突（P0-2 ✅）。
 3. **BatchNorm 行为门禁**：构造 batchnorm 规格必须有可观测结果（报错或正确层），不允许静默降级（P0-3）。**✅ 已满足**：真层 + `batchnorm_test` 工厂断言。
 4. **危险精度组合**：启动期**告警**（仅警告、不失败、不改退出码）——口径与细则见 [`24-f16-training-defects.md`](24-f16-training-defects.md) §2.3 / §5 F1（P1-3）。
-5. **审计覆盖补强**：`bench/doc_align_audit.ps1` 的 [A] **✅ 已扩展到 markdown 链接目标**（E8，2026-10-15）；新增死链会在审计里以 [A] 计数非 0 暴露。
+5. **审计覆盖补强**：文档审计（`python scripts/doc_audit.py`）覆盖 markdown 链接目标可达性；新增死链会在审计里以 [A] 计数非 0 暴露。
 
 6. **`text_train` 模块不得终止进程（P1-1，2026-10-16 起生效）**：`pwsh -File bench/doc_inventory.ps1` 第 [6] 节
    断言 `cli/text_train_{loop,recovery,checkpoint}.hpp` 与 `src/text_train.cpp` 里**不出现** `std::exit` /
@@ -436,7 +436,7 @@ f16（P2-14/P2-15）与训练性能（P4-1/P4-2/P4-3）仍按原裁定暂缓，�
 
 1. **状态只写现在式**：做完一项就把该项从 §4 移到 `docs/history/history.md`，并在 §4 留一行"已完成"指针。
 2. **数字必须带复现命令**：任何计数（行数、测试数、锚值）都要能在命令里复现；不可复现的只写"约"或删。
-3. **行号会腐烂**：行号只作入口线索；引用时优先给文件名 + 符号名，行号在改动后由 `bench/doc_align_audit.ps1` 兜底
+3. **行号会腐烂**：行号只作入口线索；引用时优先给文件名 + 符号名，行号在改动后由 `python scripts/doc_audit.py` 兜底
    不覆盖的，由自动化测试兜底（新增断言测试优于文档数字）。
 4. **裁定要留反例**：凡"不做"必须写清触发条件或反例（如 H4 的 RAPT 残差相加），否则后人无法判断能否重新立项。
 5. **与 13 的关系已终结**：13 号文档已删除（内容全在本文与 `docs/history/history.md`），新增条目只进本文。
