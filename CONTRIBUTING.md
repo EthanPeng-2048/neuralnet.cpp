@@ -145,7 +145,7 @@ clang-format -i path/to/new_file.hpp
    | 分支 | 定位 | 流转 |
    |---|---|---|
    | `main` | 主分支：只**合并其他分支**或**直接更新文档**，不直接开发 | 发布基线，tag 打在这里 |
-   | `dev` | 集成分支：hotfix + new feature 的汇合点 | 定期合入 `main` |
+   | `dev` | 集成分支：hotfix + new feature 的汇合点；**从不定档版本号**（版本号只在经审核合入 `main` 时确定） | 定期合入 `main` |
    | `feature/<feature_name>` | 功能分支：**只实现一个功能** | 完成后合入 `dev`，随即删除 |
    | `hotfix/<bug_name>` | 热修复分支：**只修复一个 bug** | 完成后合入 `dev`，随即删除 |
 

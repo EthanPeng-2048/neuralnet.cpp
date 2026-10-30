@@ -35,7 +35,7 @@
 | [写自定义层](docs/development/write-a-custom-layer.md) | 自定义层的完整示例 + 接入契约 + 数值梯度自检 + GPU 检查清单 |
 | [计算引擎开发](docs/development/01-compute-engine-development.md) | ComputeEngine 接口详解、实现模式、添加新原语 |
 | [多精度计算](docs/development/05-mixed-precision.md) | f16/混合精度语义契约：Precision 类型系统、PrecisionProfile、已知数值限制 |
-| [线性注意力](docs/development/06-rapt-algorithm.md) | RLA → RAPT → RLA-2 算法谱系 + GPU 扫描原语落地 |
+| [线性注意力](docs/development/06-rapt-algorithm.md) | RLA → RAPT → RLA-2 概览 + GPU 扫描原语落地；详细定义见 [research/rla](research/rla/README.md) |
 | [写自定义层](docs/development/20-custom-layer-ergonomics.md) | 库外使用者视角的接入契约与实测摩擦点 |
 | [快速上手：构建模型](docs/usage/01-quickstart-model.md) | ComputeEngine/Layer/Model 三件套使用教程 |
 | [快速上手：训练与推理](docs/usage/02-quickstart-train-infer.md) | MNIST/GPT 训练推理命令行 + C++ API 示例 + GUI 操作指南 |
@@ -44,13 +44,13 @@
 | [作为库嵌入](docs/usage/05-consume-as-library.md) | 把本库嵌进自己的工程（`neuralnet::nn` 门面 / FetchContent） |
 | [强化学习与可组合训练](docs/usage/06-reinforcement-learning.md) | 具名多输出、GAE、REINFORCE/PPO/GRPO、多模型 Session 与 rollout pipeline |
 | [线程安全契约](docs/usage/07-thread-safety.md) | 每个对象的并发口径矩阵 + 服务化下游设计模板 |
-| [实测结论索引](research/README.md) | **可引用的实验结论**（MNIST 准确率 / f16 回弹根因 / 三值 STE / 三值尺度规则）：结论 + 证据 + 重跑命令 + 边界 |
+| [研究档案索引](research/README.md) | **可引用的实验结论** + 算法定义基线与研究 TODO（MNIST / f16 / 三值 / RLA）：证据、重跑命令与边界 |
 | [参与本项目](CONTRIBUTING.md) | 给非作者的入口：构建、测试、代码规范、提 PR、CI 口径 |
 
 > **文档分册定位**：`introduction` / `usage` / `development` 写给**调用者**；
 > 项目内部的设计 / 路线图 / 盘点 / 规范 / 踩坑 / 故障 / 整改在 [`docs/todo/`](docs/todo/README.md)；
 > 历史归档在 [`docs/history/history.md`](docs/history/history.md)。**总索引见 [`docs/README.md`](docs/README.md)。**
-> `research/` 是**可引用的实测结论**归口（索引见 [`research/README.md`](research/README.md)），
+> `research/` 是可引用的研究档案归口：实测结论、算法定义基线与明确标注的 TODO（索引见 [`research/README.md`](research/README.md)），
 > 参与方式/门禁见 [`CONTRIBUTING.md`](CONTRIBUTING.md)。
 
 ## 项目结构
@@ -123,7 +123,7 @@ neuralnet.cpp/
 │   └── gpu_test.cpp             ← GPU 后端测试
 ├── datasets/                    ← 训练数据
 ├── pretrained/                  ← 预训练模型
-├── research/                    ← 可引用的实测结论（结论 + 证据 + 重跑命令 + 边界）
+├── research/                    ← 可引用的研究档案（定义 / 结论 + 证据 + 重跑命令 + 边界 / TODO）
 ├── scripts/                     ← 数据处理/训练辅助脚本
 ├── shaders/                     ← GPU Compute Shader
 ├── compare_with_torch/          ← PyTorch 对比实现

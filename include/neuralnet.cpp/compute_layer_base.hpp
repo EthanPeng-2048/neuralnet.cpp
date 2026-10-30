@@ -10,6 +10,7 @@
 #include <limits>
 #include <memory>
 #include <random>
+#include <functional>   // SamplingConfig::logits_transform 钩子（issue #34）
 #include <span>
 #include <string>
 #include <utility>
@@ -337,6 +338,10 @@ public:
     // 调用即 fail-fast。"profile 何时有效"因此从"三条注入路径的交集"收敛成一条
     // 可判定规则（docs 21 §4.3.2）：校验（唯一的、发生在 init 内的）不可能被旁路。
     // 复合层的 override 必须先调本函数（先校验），再逐子层下传。
+    // 默认按 `param_children()` 向参数子层广播——复合层
+    // 只需列出子层即可，漏写转发（子层留在 f32）不再可能。需要对不同子层注入
+    // 不同 profile 的复合层（如 FFN 的三值分流）仍可 override：先调本函数，
+    // 再逐子层覆盖为各自 profile（最终值以 override 的覆盖为准）。
     virtual void set_precision_profile(const PrecisionProfile& profile)
     {
         if (binding_state_ == BindingState::ready)
@@ -347,6 +352,8 @@ public:
                          "（docs/todo/21-quantized-weights.md §4.3.2(b)）");
         }
         p_ = profile;
+        for (Layer* c : param_children())
+            c->set_precision_profile(profile);
     }
     [[nodiscard]] const PrecisionProfile& precision_profile() const noexcept { return p_; }
 
@@ -487,8 +494,10 @@ protected:
     // 参数归属的子层（复合层覆盖；叶子层默认空 = 本层参数全归自己）。
     // 契约：顺序 = 本层 `parameters()` 里"子层参数"的出现顺序，且子层参数
     //       拼接结果与 `parameters()` 完全一致。
-    // ⚠ 这**不是**层树枚举 API（原公开的 `sub_layers()` 已删除）：它只服务于
-    //   参数形态协议的下标转发（export_param / import_param）。
+    // ⚠ 这**不是**层树枚举 API（原公开的 `sub_layers()` 已删除）：它服务于
+    //   参数形态协议的下标转发（export_param / import_param）与**逐子层广播**
+    //   （set_precision_profile / set_training / clear_cache 的默认转发，
+    //    issue #29）。只进参数协议、不参与广播的辅助对象不要列进来。
     [[nodiscard]] virtual std::vector<Layer*> param_children() noexcept { return {}; }
 
     // 本层**自身**参数个数（= 总数 − 子层参数数）。默认实现按 `parameters()`
@@ -630,8 +639,14 @@ public:
     // 文档感知：设置当前 step 每样本文档 id（默认 no-op，GPTModel override）
     virtual void set_doc_ids(std::span<const std::size_t> /*ids*/) {}
 
-    // 训练/推理模式切换（默认 no-op，BatchNorm 等需要 override）
-    virtual void set_training(bool /*training*/) {}
+    // 训练/推理模式切换。默认按 `param_children()` 向
+    // 参数子层广播（漏写转发 → eval 时 Dropout/BN 行为错，不再可能）；
+    // 自身需记录开关的层（BatchNorm 等）override 时先调本函数再记状态。
+    virtual void set_training(bool training)
+    {
+        for (Layer* c : param_children())
+            c->set_training(training);
+    }
 
     // 非可学习状态收集（默认空，BatchNorm 的 running 统计量等需要 override）
     [[nodiscard]] virtual std::vector<TensorRef> extra_state() { return {}; }
@@ -759,8 +774,14 @@ public:
     // 释放本层为 backward 保留的中间激活缓存（清空成员缓存 Tensor，归还显存）。
     // 由 GPTModel 在 checkpoint 块 backward 之后调用，避免重算的激活跨块累积
     // （否则所有块缓存会在 backward 末尾同时驻留，抵消检查点的显存收益）。
-    // 默认 no-op；各缓存持有层 override。
-    virtual void clear_cache() {}
+    // 默认按 `param_children()` 向参数子层广播（漏写
+    // 转发 → 显存/状态残留，不再可能）；持有自身缓存的层 override 时先清自身
+    // 缓存，需要连子层一起清再调本函数（或由默认转发代劳）。
+    virtual void clear_cache()
+    {
+        for (Layer* c : param_children())
+            c->clear_cache();
+    }
 
     // 返回本层 backward 所需的中间激活缓存引用（供 activation offload 导出/导入）。
     // 仅返回 valid 的张量；掩码等小而常驻的缓存不在此列（不参与 offload，保持常驻）。
@@ -986,6 +1007,17 @@ struct SamplingConfig
     std::size_t repeat_window = 0; // 0 = 全部 history
     std::uint64_t seed = 0; // has_seed=false 时忽略
     bool has_seed = false; // true = 用 seed 播种（可复现）
+
+    // ── 外部 logits 掩码/变换钩子（重复惩罚前的域约束入口）─────────────
+    // 在**重复惩罚之前**（即全部库内采样策略之前）对 host 侧 logits 原地
+    // 变换：约束解码场景（棋类合法着、语法约束、工具调用 schema）在此把
+    // 非法位置 -inf / 加偏置。回调发生在 logits 已在 host 的那一步
+    //（generate 已 download），零 GPU 往返。
+    //   · 不设置（默认）= 逐位旧行为（RNG 消耗序不变）；
+    //   · 对 -inf 位置：重复惩罚（logit>0 判定）、softmax（exp(-inf)=0）
+    //     均自然兼容；temperature 除法 -inf/t = -inf 亦然；
+    //   · 回调内**不得**修改 logits.size()（span 只读长度）。
+    std::function<void(std::span<Scalar> /*logits in/out*/)> logits_transform;
 };
 
 // 扩展采样器（cfg 全默认时的输出与下面 temperature 重载逐位一致）
@@ -997,6 +1029,11 @@ struct SamplingConfig
     const std::size_t n = logits.size();
     // RV-01：n == 0 时下面的 `logits[0]` / max 归约都越界 → 无条件终止
     NN_ASSERT_ALWAYS(n > 0, "sample_next_token_: empty logits");
+
+    // ── ⓪ 外部 logits 变换钩子（issue #34）：全部库内策略之前 ────────
+    // 未设置（默认）时零开销，RNG 消耗序与旧路径逐位一致。
+    if (cfg.logits_transform)
+        cfg.logits_transform(std::span<Scalar>(logits.data(), logits.size()));
 
     // ── ① 重复惩罚（去重；判定只依赖 history 的内容，不依赖扫描顺序）──
     if (cfg.repeat_penalty > 0.0 && cfg.repeat_penalty != 1.0 && !history.empty())

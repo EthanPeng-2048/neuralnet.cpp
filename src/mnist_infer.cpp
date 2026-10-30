@@ -237,7 +237,7 @@ int main(int argc, char *argv[])
     NN_EXIT(role_r, 1, "读取模型文件失败: ");
 
     // 支持的模型类型：MLP、Transformer（ViT）、CNN
-    if (spec.type == nn::ModelType::MLP)
+    if (spec.is_mlp())
     {
         std::cout << "从模型文件读取规格: MLP\n";
     }
@@ -251,8 +251,7 @@ int main(int argc, char *argv[])
     }
     else
     {
-        std::cerr << "不支持的模型类型 (type="
-                  << static_cast<uint32_t>(spec.type) << ")\n";
+        std::cerr << "不支持的模型类型 (type=" << spec.type_name() << ")\n";
         return 1;
     }
 

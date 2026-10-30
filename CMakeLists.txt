@@ -553,9 +553,17 @@ if(NN_BUILD_APPS OR NN_ENABLE_TESTS)
     nn_add_executable(adam_quant_test src/adam_quant_test.cpp)
     list(APPEND NN_TEST_TARGETS adam_quant_test)
 
+    # ── Embedding 层（issue #32：查表 / 伴随散射 / padding / 整数入口）──
+    nn_add_executable(embedding_test src/embedding_test.cpp)
+    list(APPEND NN_TEST_TARGETS embedding_test)
+
     # ── Attention（梯度检查 + forward 一致性 + batch 行号回归）──────────
     nn_add_executable(attn_test src/attn_test.cpp)
     list(APPEND NN_TEST_TARGETS attn_test)
+
+    # ── CrossAttention（issue #33：双输入 / 矩形 / 双路梯度）─────────────
+    nn_add_executable(cross_attention_test src/cross_attention_test.cpp)
+    list(APPEND NN_TEST_TARGETS cross_attention_test)
 
     # ── 基础层数值梯度检查（SwiGLU / RMSNorm / Softmax）─────────────────
     nn_add_executable(layer_gradcheck_test src/layer_gradcheck_test.cpp)
@@ -638,6 +646,22 @@ if(NN_BUILD_APPS OR NN_ENABLE_TESTS)
     # ── 稀疏交叉熵融合（loss/grad vs 参考，CPU+GPU）─────────────────────
     nn_add_executable(ce_fusion_test src/ce_fusion_test.cpp)
     list(APPEND NN_TEST_TARGETS ce_fusion_test)
+
+    # ── 复合层逐子层默认广播（issue #29：set_precision_profile / set_training /
+    # clear_cache 按 param_children() 默认转发）
+    nn_add_executable(layer_broadcast_test src/layer_broadcast_test.cpp)
+    list(APPEND NN_TEST_TARGETS layer_broadcast_test)
+
+    # ── GPU 单次推理 batch 作用域（issue #28：InferenceScope / Model::forward
+    # 自动作用域 / batch_active 查询）。无 Vulkan/无卡 → 77 = SKIP。
+    nn_add_executable(gpu_batch_scope_test src/gpu_batch_scope_test.cpp)
+    list(APPEND NN_TEST_TARGETS gpu_batch_scope_test)
+
+    # ── 宿主桥公开 API（issue #30：nn::upload_span / download_span / download_vector）
+    # 覆盖：F32/F16 往返（RHE 与 from_matrix 逐位同口径）、形状不匹配报错、
+    # nn::detail:: 旧名过渡别名向后兼容。
+    nn_add_executable(host_bridge_test src/host_bridge_test.cpp)
+    list(APPEND NN_TEST_TARGETS host_bridge_test)
 
     # ── RV-01：前置条件校验（NN_ASSERT_ALWAYS / NN_FATAL）在 NDEBUG 下也终止 ──
     # 负例经子进程断言：越界 at / 未绑定 Tensor::engine() / 空 logits 采样
@@ -725,6 +749,25 @@ if(NN_BUILD_APPS OR NN_ENABLE_TESTS)
     # [8] 剥成 v7 后仍可加载（零破坏）。全 CPU、秒级、临时目录自建自清。
     nn_add_executable(train_state_test src/train_state_test.cpp)
     list(APPEND NN_TEST_TARGETS train_state_test)
+
+    # ── TrainingSession 断点编排（issue #37：save_checkpoint/resume）──
+    nn_add_executable(session_checkpoint_test src/session_checkpoint_test.cpp)
+    list(APPEND NN_TEST_TARGETS session_checkpoint_test)
+
+    # ── issue #39 RFC 32 阶段 B：BatchSource 数据供给契约 ──────────────────
+    nn_add_executable(batch_source_test src/batch_source_test.cpp)
+    list(APPEND NN_TEST_TARGETS batch_source_test)
+
+    # ── issue #39 RFC 32 阶段 C：RunDriver 领域无关训练骨架 ────────────────
+    nn_add_executable(run_driver_test src/run_driver_test.cpp)
+    list(APPEND NN_TEST_TARGETS run_driver_test)
+
+    # ── issue #31：epoch/step 学习率调度（multistep / step_cosine / 统一 warmup）─
+    # [1] constant 兜底；[2] cosine warmup+退火+越界钳；[3] multistep ×gamma；
+    # [4] step_cosine 分段重启（SGDR）+ 末段吸收余数；[5] warmup 对所有 schedule；
+    # [6] lr_per_epoch 逃生舱优先级；[7] compute_step_lr 回归。
+    nn_add_executable(lr_scheduler_test src/lr_scheduler_test.cpp)
+    list(APPEND NN_TEST_TARGETS lr_scheduler_test)
 
     # ── P0-5 尾项：多轮对话闭环（prompt 构建 + CLI --turn/--reply-out 接线）──
     # [1] 对话模板结构；[2] ★ 上下文不丢（第 N 轮 prompt 以第 N-1 轮为前缀）；

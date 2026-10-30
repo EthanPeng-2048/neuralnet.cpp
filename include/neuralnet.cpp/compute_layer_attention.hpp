@@ -1276,4 +1276,319 @@ public:
     }
 };
 
+
+// ══════════════════════════════════════════════════════════════════════════
+//  CrossAttention — 交叉注意力（issue #33）：Q 来自 query 序列，K/V 来自
+//  memory（encoder 输出 / teacher 表征 / 检索上下文）序列。
+//
+//  下游影响（立项动机）：encoder-decoder、蒸馏、检索增强、思考模型此前只能
+//  在自己的复合层里把 MHA 的参数/mask/布局协议重新拼一遍——而 QK^T、softmax
+//  缩放、布局重排这些是"库已验证、不该在下游重写"的部分。本层复用
+//  AttentionBase 的全部投影/折叠/反向机器，只把"输入来源"分裂为二。
+//
+//  与自注意力的差异（仅两点）：
+//    1. **双输入**：w_q_ 吃 query 张量，w_k_/w_v_ 吃 memory 张量
+//       （Layer 协议是单进单出 → 双输入经 `forward_pair` / `backward_pair`
+//        显式入口；单输入 `forward/backward` fail-fast 并指向它们）；
+//    2. **双序列长**：query 每样本 seq_q 位置、memory 每样本 seq_kv 位置，
+//       可以不等（输出行数 = BH·seq_q，fold 收缩轴 = seq_kv）。
+//
+//  掩码语义：**恒 Plain（双向）** —— cross-attention 的标准语义是 query
+//  可见全部 memory（可及性由上游 padding/masking 在数据侧处理）；因果/文档
+//  掩码是"同一序列内"的概念，不适用于跨序列注意力。位置编码默认恒等
+//  （RoPE/ALiBi 是同一序列内的相对位置概念；跨序列位置对齐归数据侧）。
+//
+//  backward_pair 返回两路梯度：grad_query（喂给 query 分支的反向）与
+//  grad_memory（喂给 memory 分支的反向）——两者形状分别镜像 query/memory
+//  输入。伴随正确性（dL/dK、dL/dV 累加回 memory 路径）与自反向同一套
+//  R/X 机器，仅形状参数不同。
+//
+//  AOT 闭合世界：fold（Plain/no-bias）与 backward 表达式结构与
+//  MultiHeadAttention 完全同 key（k/seq 是形状参数不进 key）——scan_exprs
+//  的 CrossAttention dry-run（seq_q ≠ seq_kv 矩形形状）另行登记确保覆盖。
+// ══════════════════════════════════════════════════════════════════════════
+
+// backward_pair 的双路梯度（query 与 memory 各一份）
+struct CrossAttentionGrads
+{
+    Tensor grad_query;    // (d_model, batch*seq_q)
+    Tensor grad_memory;   // (d_model, batch*seq_kv)
+};
+
+class CrossAttention final : public AttentionBase
+{
+private:
+    std::size_t seq_kv_len_;   // memory 每样本序列长（0 = 单样本，cols 即 seq）
+
+public:
+    [[nodiscard]] const char* layer_name() const noexcept override
+    { return "CrossAttention"; }
+
+    // seq_len   = query 每样本序列长（0 = 单样本，cols 即 seq）
+    // seq_kv_len = memory 每样本序列长（0 = 单样本；一般 ≠ seq_len）
+    CrossAttention(std::size_t d_model, std::size_t num_heads,
+                   std::size_t seq_len = 0, std::size_t seq_kv_len = 0,
+                   std::size_t n_head_kv = 0,
+                   WeightQuant weight_quant = WeightQuant::None)
+        : AttentionBase(d_model, num_heads, seq_len, false, NormType::LayerNorm,
+                        n_head_kv, weight_quant),
+          seq_kv_len_(seq_kv_len)
+    {}
+    // 注意：掩码基类默认 PlainScoreMask、位置编码默认恒等 —— 正是本层语义
+    // （见类注释），无需 install。
+
+    // ── 单输入协议：cross-attention 无意义 → fail-fast 指路 ────────────
+    [[nodiscard]] Result<Tensor> forward(const Tensor&) override
+    {
+        NN_FAIL("CrossAttention 是双输入层：请用 forward_pair(query, memory)"
+                "（Layer 单进单出协议不适用）");
+    }
+    [[nodiscard]] Result<Tensor> backward(const Tensor&) override
+    {
+        NN_FAIL("CrossAttention 是双输入层：请用 backward_pair(grad_output)"
+                "（返回 grad_query 与 grad_memory 两路梯度）");
+    }
+
+    // ── forward_pair：query/memory 双输入 ──────────────────────────────
+    // query  (d_model, batch*seq_q)   —— 输出侧序列（decoder 位置）
+    // memory (d_model, batch*seq_kv)  —— 被注意序列（encoder 输出等）
+    // 输出 (d_model, batch*seq_q)（列布局与自注意力一致）。
+    [[nodiscard]] Result<Tensor> forward_pair(const Tensor& query,
+                                              const Tensor& memory)
+    {
+        ComputeEngine& engine = engine_ref();
+        if (query.rows() != d_model_ || memory.rows() != d_model_)
+            NN_FAIL("CrossAttention forward_pair: 输入形状不匹配（rows != d_model）");
+        // batch 一致性：两侧按各自 seq 长推 batch，必须相等
+        const std::size_t seq_q  = (seq_len_ > 0) ? seq_len_ : query.cols();
+        const std::size_t seq_kv = (seq_kv_len_ > 0) ? seq_kv_len_ : memory.cols();
+        if (query.cols() % seq_q != 0 || memory.cols() % seq_kv != 0)
+            NN_FAIL("CrossAttention forward_pair: cols 不能被各自的 seq 长整除");
+        const std::size_t batch_q  = query.cols() / seq_q;
+        const std::size_t batch_kv = memory.cols() / seq_kv;
+        if (batch_q != batch_kv)
+            NN_FAIL("CrossAttention forward_pair: query 与 memory 的 batch 不一致（"
+                    + std::to_string(batch_q) + " vs " + std::to_string(batch_kv) + "）");
+
+        // 1. 投影：Q 吃 query，K/V 吃 memory
+        NN_TRY(q_res, w_q_->forward(query));
+        NN_TRY(k_proj, w_k_->forward(memory));
+        NN_TRY(v_proj, w_v_->forward(memory));
+
+        // 2. rearrange：Q → (batch*H*d_k, seq_q)；K/V → (batch*KV_dk, seq_kv)
+        const std::size_t H_dk  = num_heads_ * d_k_;
+        const std::size_t KV_dk = n_head_kv_ * d_k_;
+        Tensor Q, K, V;
+        if (batch_q > 1)
+        {
+            NN_TRY(qr, engine.rearrange_3d(*q_res, H_dk, batch_q, seq_q, false));
+            Q = std::move(*qr);
+            NN_TRY(kr, engine.rearrange_3d(*k_proj, KV_dk, batch_kv, seq_kv, false));
+            K = std::move(*kr);
+            NN_TRY(vr, engine.rearrange_3d(*v_proj, KV_dk, batch_kv, seq_kv, false));
+            V = std::move(*vr);
+        }
+        else
+        {
+            Q = std::move(*q_res);
+            K = std::move(*k_proj);
+            V = std::move(*v_proj);
+        }
+
+        // 3. scale 折进 Q（与自注意力 2.6 同口径；rparam 承载不进 key）
+        {
+            auto qs = dsl::compute_into(engine,
+                dsl::leaf(Q) * dsl::rparam(scale_), Q);
+            NN_TRY_CHECK(qs);
+        }
+
+        // 4. 单 fold：收缩轴 = seq_kv（键长），输出行 = BH·seq_q（query 长）
+        const std::size_t BH = batch_q * num_heads_;
+        const std::size_t BH_kv = batch_kv * n_head_kv_;
+        NN_TRY(pm, mask_->prepare(engine, batch_q, seq_kv));
+        NN_TRY(V_T_full, engine.transpose(V));
+        NN_TRY(V_t, engine.rearrange_3d(*V_T_full, seq_kv, BH_kv, d_k_, false));
+        std::vector<Tensor> fold_in{Q, K, *V_t};
+        mask_->append_fold_inputs(fold_in);
+        // Plain/no-bias 构造：f.k = seq_kv；eval 输出行 = BH·seq_q（矩形）
+        const nn::ExprSpec fold_spec = nn::expr::make_fold_attn_o(
+            seq_kv, d_k_, BH, mask_->mask_kind(), /*score_bias=*/false,
+            static_cast<std::uint32_t>(kv_ratio_));
+        NN_TRY(fv, nn::validate_expr_spec(fold_spec, fold_in.size()));
+        NN_TRY(O_t_r, engine.eval_expr(fold_spec, fold_in, BH * seq_q, d_k_,
+                                       p_.compute));
+        // O_t (BH*seq_q, dk) → (BH*dk, seq_q) → (H*dk, batch*seq_q)
+        NN_TRY(O_T_full, engine.transpose(*O_t_r));
+        NN_TRY(co, engine.rearrange_3d(*O_T_full, d_k_, BH, seq_q, false));
+        Tensor concat_out = std::move(*co);
+        if (!checkpoint_mode_)
+        {
+            Q_cache_ = std::move(Q);
+            K_cache_ = std::move(K);
+            V_cache_ = std::move(V);
+        }
+        Tensor concat;
+        if (batch_q > 1)
+        {
+            NN_TRY(cb, engine.rearrange_3d(concat_out, H_dk, batch_q, seq_q, true));
+            concat = std::move(*cb);
+        }
+        else
+        {
+            concat = std::move(concat_out);
+        }
+        return w_o_->forward(concat);
+    }
+
+    // ── backward_pair：双路梯度 ────────────────────────────────────────
+    // grad_output (d_model, batch*seq_q) → {grad_query, grad_memory}
+    [[nodiscard]] Result<CrossAttentionGrads> backward_pair(
+        const Tensor& grad_output)
+    {
+        ComputeEngine& engine = engine_ref();
+        if (!Q_cache_.valid() || !K_cache_.valid() || !V_cache_.valid())
+            NN_FAIL("CrossAttention backward_pair: 无缓存（backward_pair 前必须"
+                    "先 forward_pair；checkpoint 模式下缓存不保留）");
+        // batch/seq 从缓存推（Q: (BH*dk, seq_q)，K: (BH_kv*dk, seq_kv)）
+        const std::size_t seq_q  = Q_cache_.cols();
+        const std::size_t seq_kv = K_cache_.cols();
+        if (grad_output.cols() % seq_q != 0)
+            NN_FAIL("CrossAttention backward_pair: grad_output.cols() 不能被 seq_q 整除");
+        const std::size_t batch = grad_output.cols() / seq_q;
+        const std::size_t H_dk = num_heads_ * d_k_;
+        const std::size_t BH = batch * num_heads_;
+
+        // 1. 输出投影反向 → grad_concat (H*dk, batch*seq_q)
+        NN_TRY(gc, w_o_->backward(grad_output));
+        nn_dbg_scan("xattn.gc", engine, *gc);
+        Tensor grad_concat_re;
+        if (batch > 1)
+        {
+            NN_TRY(gcr, engine.rearrange_3d(*gc, H_dk, batch, seq_q, false));
+            grad_concat_re = std::move(*gcr);
+        }
+        else
+        {
+            grad_concat_re = std::move(*gc);
+        }
+
+        // 2-7. 注意力反向（R/X 路径；形状 = 矩形 BH·seq_q × seq_kv）
+        Tensor grad_Q_re, grad_K_re, grad_V_re;
+        {
+            const std::uint32_t kvr = static_cast<std::uint32_t>(kv_ratio_);
+            // P = grad_A = grad_O^T × V → (BH*seq_q, seq_kv)
+            auto grad_A = dsl::compute(engine,
+                dsl::matmul_kv(grad_concat_re, V_cache_, true, false, BH, 1, kvr),
+                BH * grad_concat_re.cols(), V_cache_.cols(), p_.compute);
+            NN_TRY_CHECK(grad_A);
+            nn_dbg_scan("xattn.grad_A", engine, *grad_A);
+            // G = grad_concat^T → (BH*seq_q, d_k)
+            NN_TRY(G_T_full, engine.transpose(grad_concat_re));
+            NN_TRY(G, engine.rearrange_3d(*G_T_full, seq_q, BH, d_k_, false));
+            // W = softmax(mask(Q·Kᵀ))（矩形；Plain 掩码 = 无屏蔽）
+            NN_TRY(W_re, recompute_W_pair_(engine, Q_cache_, K_cache_, BH,
+                                           seq_q, seq_kv));
+            nn_dbg_scan("xattn.W_re", engine, *W_re);
+            // R = row_sum(W·P) → (BH*seq_q, 1)
+            auto R = dsl::compute_reduce(engine,
+                dsl::row_reduce_sum(dsl::leaf(*W_re) * dsl::leaf(*grad_A)),
+                BH * seq_q, seq_kv);
+            NN_TRY_CHECK(R);
+            // X = W·(P − R) → (BH*seq_q, seq_kv)
+            auto X = dsl::compute(engine,
+                dsl::leaf(*W_re)
+                    * (dsl::leaf(*grad_A) - dsl::row_broadcast(*R)),
+                BH * seq_q, seq_kv, p_.compute);
+            NN_TRY_CHECK(X);
+            nn_dbg_scan("xattn.X", engine, *X);
+            // grad_Q = K × X^T → (BH*d_k, seq_q)（scale 补乘同自反向）
+            auto gq = dsl::compute(engine,
+                dsl::matmul_kv(K_cache_, *X, false, true, BH, kvr, 1),
+                BH * d_k_, X->rows() / BH, p_.compute);
+            NN_TRY_CHECK(gq);
+            {
+                auto gqs = dsl::compute_into(engine,
+                    dsl::leaf(*gq) * dsl::rparam(scale_), *gq);
+                NN_TRY_CHECK(gqs);
+            }
+            // grad_K = Q × X → (BH*d_k, seq_kv)
+            auto gk = dsl::compute(engine,
+                dsl::matmul(Q_cache_, *X, false, false, BH),
+                Q_cache_.rows(), X->cols(), p_.compute);
+            NN_TRY_CHECK(gk);
+            // grad_V = W^T × G → (BH*seq_kv, d_k) → 转置回 (BH*d_k, seq_kv)
+            auto gv_t = dsl::compute(engine,
+                dsl::matmul(*W_re, *G, true, false, BH),
+                BH * W_re->cols(), G->cols(), p_.compute);
+            NN_TRY_CHECK(gv_t);
+            NN_TRY(gv_T, engine.transpose(*gv_t));
+            NN_TRY(gv_re, engine.rearrange_3d(*gv_T, d_k_, BH, seq_kv, false));
+            grad_Q_re = std::move(*gq);
+            grad_K_re = std::move(*gk);
+            grad_V_re = std::move(*gv_re);
+        }
+
+        // 8. rearrange 回列布局（各自 seq 长）
+        Tensor grad_Q, grad_K, grad_V;
+        if (batch > 1)
+        {
+            NN_TRY(gq8, engine.rearrange_3d(grad_Q_re, H_dk, batch, seq_q, true));
+            grad_Q = std::move(*gq8);
+            NN_TRY(gk8, engine.rearrange_3d(grad_K_re, H_dk, batch, seq_kv, true));
+            grad_K = std::move(*gk8);
+            NN_TRY(gv8, engine.rearrange_3d(grad_V_re, H_dk, batch, seq_kv, true));
+            grad_V = std::move(*gv8);
+        }
+        else
+        {
+            grad_Q = std::move(grad_Q_re);
+            grad_K = std::move(grad_K_re);
+            grad_V = std::move(grad_V_re);
+        }
+
+        // 9. 投影反向：grad_query = w_q_ 反向；grad_memory = (w_k_ + w_v_) 反向和
+        NN_TRY(giq, w_q_->backward(grad_Q));
+        auto fold_kv = [&](Tensor&& grad_full) -> Result<Tensor>
+        {
+            if (!gqa_expand_idx_.valid()) return std::move(grad_full);
+            Tensor collapsed = engine.create_tensor(n_head_kv_ * d_k_,
+                                                    grad_full.cols(),
+                                                    grad_full.precision(),
+                                                    InitSpec::zero());
+            if (!collapsed.valid()) NN_FAIL("CrossAttention: GQA 折叠缓冲分配失败");
+            NN_TRY(sr, engine.scatter_add_rows(collapsed, gqa_expand_idx_, grad_full));
+            return collapsed;
+        };
+        NN_TRY(gk_fold, fold_kv(std::move(grad_K)));
+        NN_TRY(gik, w_k_->backward(*gk_fold));
+        NN_TRY(gv_fold, fold_kv(std::move(grad_V)));
+        NN_TRY(giv, w_v_->backward(*gv_fold));
+
+        CrossAttentionGrads out;
+        out.grad_query = std::move(*giq);
+        // memory 侧两路累加（结合顺序固定 = 可复现）
+        auto acc = dsl::compute(engine,
+            dsl::leaf(*gik) + dsl::leaf(*giv),
+            gik->rows(), gik->cols(), p_.compute);
+        NN_TRY_CHECK(acc);
+        out.grad_memory = std::move(*acc);
+        return out;
+    }
+
+protected:
+    // W 重算（矩形版；与自反向 recompute_W_ 同构，仅形状参数分离为
+    // seq_q/seq_kv）。掩码恒 Plain → 屏蔽链为空；位置编码恒等 → 无偏置叠加。
+    [[nodiscard]] Result<Tensor> recompute_W_pair_(
+        ComputeEngine& engine, const Tensor& Q, const Tensor& K,
+        std::size_t BH, std::size_t seq_q, std::size_t seq_kv) const
+    {
+        NN_TRY(sres, mask_->masked_scores(engine, Q, K, BH, seq_kv, p_, kv_ratio_));
+        return dsl::compute(engine,
+            dsl::exp(dsl::leaf(*sres) - dsl::row_reduce_max(*sres))
+            / dsl::row_reduce_sum(
+                dsl::exp(dsl::leaf(*sres) - dsl::row_reduce_max(*sres))),
+            BH * seq_q, seq_kv, p_.compute);
+    }
+};
+
 } // namespace nn

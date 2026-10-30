@@ -383,8 +383,25 @@ int main(int argc, char *argv[])
     if (!spec.is_gpt() && !spec.is_rapt())
     {
         std::cerr << "模型文件不是 GPT/RAPT 类型 (type="
-                  << static_cast<uint32_t>(spec.type) << ")\n";
+                  << spec.type_name() << ")\n";
         return 1;
+    }
+
+    // GPT/RAPT 共享的规格视图（两者类型参数同名，按实际类型取值）
+    std::size_t v_vocab = 0, v_d_model = 0, v_heads = 0, v_layers = 0, v_d_ff = 0,
+                v_seq_len = 0;
+    nn::PosEncodingType v_pos = nn::PosEncodingType::Learned;
+    if (const auto *g = spec.as<nn::GptSpec>())
+    {
+        v_vocab = g->vocab_size; v_d_model = g->d_model; v_heads = g->num_heads;
+        v_layers = g->num_layers; v_d_ff = g->d_ff; v_seq_len = g->seq_len;
+        v_pos = g->pos_encoding;
+    }
+    else if (const auto *r = spec.as<nn::RaptSpec>())
+    {
+        v_vocab = r->vocab_size; v_d_model = r->d_model; v_heads = r->num_heads;
+        v_layers = r->num_layers; v_d_ff = r->d_ff; v_seq_len = r->seq_len;
+        v_pos = r->pos_encoding;
     }
 
     // ── 创建计算引擎 ─────────────────────────────────────────
@@ -396,21 +413,21 @@ int main(int argc, char *argv[])
     auto engine = std::move(*engine_res);
 
     // ── 构建 GPT 模型 ────────────────────────────────────────
-    std::cout << "模型规格: vocab=" << spec.vocab_size
-              << " d_model=" << spec.d_model
-              << " heads=" << spec.num_heads
-              << " layers=" << spec.num_layers
-              << " d_ff=" << spec.d_ff
-              << " seq_len=" << spec.seq_len;
+    std::cout << "模型规格: vocab=" << v_vocab
+              << " d_model=" << v_d_model
+              << " heads=" << v_heads
+              << " layers=" << v_layers
+              << " d_ff=" << v_d_ff
+              << " seq_len=" << v_seq_len;
     if (spec.is_rapt())
     {
         std::cout << " [RAPT (ReLU 线性注意力)]";
     }
-    if (spec.is_alibi_gpt() || spec.pos_encoding == nn::PosEncodingType::ALiBi)
+    if (spec.is_alibi_gpt() || v_pos == nn::PosEncodingType::ALiBi)
         std::cout << " [ALiBi]";
-    else if (spec.pos_encoding == nn::PosEncodingType::Sinusoidal)
+    else if (v_pos == nn::PosEncodingType::Sinusoidal)
         std::cout << " [Sinusoidal]";
-    else if (spec.pos_encoding == nn::PosEncodingType::RoPE)
+    else if (v_pos == nn::PosEncodingType::RoPE)
         std::cout << " [RoPE]";
     else
         std::cout << " [Learned]";
@@ -462,7 +479,7 @@ int main(int argc, char *argv[])
     }
     std::cout << "词表大小: " << tokenizer->vocab_size() << "\n" << std::endl;
 
-    const std::size_t seq_len = spec.seq_len;
+    const std::size_t seq_len = v_seq_len;
     const std::size_t eos_id = tokenizer->eos_id();
 
     // ── 交互模式 ─────────────────────────────────────────────

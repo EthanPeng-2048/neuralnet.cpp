@@ -317,8 +317,7 @@ void test_negative_paths()
 void test_model_spec_roundtrip()
 {
     nn::ModelSpec spec;
-    spec.type = nn::ModelType::MLP;
-    spec.layer_dims = {8, 4};
+    spec.emplace<nn::MlpSpec>().layer_dims = {8, 4};
     spec.output_schema = policy_value_schema();
     spec.output_packing = {"policy", "value"};
 
@@ -344,8 +343,7 @@ void test_model_spec_roundtrip()
     CHECK(!malformed, "spec decode rejects duplicate output packing");
 
     nn::ModelSpec old;
-    old.type = nn::ModelType::MLP;
-    old.layer_dims = {8, 4};
+    old.emplace<nn::MlpSpec>().layer_dims = {8, 4};
     auto old_loaded = nn::detail::spec_from_kv(
         *nn::KeyValueRecord::parse(
             nn::detail::spec_to_kv(old).serialize()));

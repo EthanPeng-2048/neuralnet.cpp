@@ -59,6 +59,7 @@
 #include "dataset_samples.hpp"       // nn::TextSampleSet / TextSampleBatch
 #include <neuralnet.cpp/domain_tokenizer.hpp>      // nn::load_tokenizer_from_kvrec / Tokenizer
 #include "lr_scheduler.hpp"          // nn::compute_epoch_lr / compute_step_lr
+#include "run_driver.hpp"            // nn::RunDriver（RFC 32：外层循环/lr/断点节奏）
 #include "model_container.hpp"       // nn::Model
 #include "text_train_config.hpp"     // nn::TextTrainConfig
 #include "train_state.hpp"           // nn::TrainState / DatasetIdentity
@@ -72,8 +73,8 @@ namespace nn
 // `save_ckpt_with_state` / 库外使用者自己的 save_model）。
 struct TextCheckpointRequest
 {
-    TrainingSession& session;    // model/optimizer 的当前状态
-    const TrainState& state;     // 已按计数器/配方/数据集身份装配好
+    TrainingSession& session;      // model/optimizer 的当前状态
+    const TextTrainState& state;   // 已按计数器/配方/数据集身份装配好
 };
 
 // ── 训练期钩子（全部可空；空 = 该能力不启用）─────────────────────────────
@@ -136,12 +137,12 @@ struct TextTrainReport
 // 计数器记的是**下一步的位置**（epoch 边界已归一化）⇒ 续训直接拿它当起点；
 // `global_step` 与 step 级调度的索引同定义（= epoch·steps_per_epoch + step）；
 // `lr` 只作显示/交叉校验（权威值由调度按步号重算）。
-[[nodiscard]] inline TrainState
+[[nodiscard]] inline TextTrainState
 make_text_train_state(const TextTrainConfig& cfg, const DatasetIdentity& identity,
                       std::size_t steps_per_epoch, std::size_t epoch, std::size_t step_done,
                       Scalar current_lr, std::uint64_t optimizer_step)
 {
-    TrainState s;
+    TextTrainState s;
     std::size_t e = epoch, st = step_done;
     if (steps_per_epoch > 0 && st >= steps_per_epoch)
     {
@@ -173,7 +174,7 @@ make_text_train_state(const TextTrainConfig& cfg, const DatasetIdentity& identit
         static_cast<std::uint64_t>(cfg.batch_size / cfg.accum_steps);
     s.recipe.batch_size_is_global = true;
     s.recipe.accum_steps = static_cast<std::uint64_t>(cfg.accum_steps);
-    s.recipe.stride = static_cast<std::uint64_t>(cfg.stride);
+    s.stride = static_cast<std::uint64_t>(cfg.stride);
     s.recipe.lr_per_epoch.clear();
     s.recipe.lr_per_epoch.reserve(cfg.lr_per_epoch.size());
     for (Scalar v : cfg.lr_per_epoch)
@@ -278,7 +279,7 @@ public:
     [[nodiscard]] const TextSampleSet* test_samples() const noexcept
     { return test_ ? &*test_ : nullptr; }
     [[nodiscard]] const DatasetIdentity& dataset_identity() const noexcept { return identity_; }
-    [[nodiscard]] const TrainState& train_state() const noexcept { return train_state_; }
+    [[nodiscard]] const TextTrainState& train_state() const noexcept { return train_state_; }
     [[nodiscard]] const TextTrainConfig& config() const noexcept { return cfg_; }
 
 private:
@@ -333,11 +334,16 @@ private:
         // backward 又固定用 seq_len_ ⇒ 形状错配。spec 只在 spec 工厂/加载路径
         // 上存在；手工 build_* 调用没有 spec 时无法在此校验（该缺口记入
         // v1.10.0 release note 已知限制）。
-        if (const auto& spec = session.model().spec();
-            spec.has_value() && spec->seq_len > 0 && cfg.seq_len != spec->seq_len)
+        const auto& spec = session.model().spec();
+        const std::size_t model_seq_len =
+            spec ? (spec->is_gpt()   ? spec->as<GptSpec>()->seq_len
+                    : spec->is_rapt() ? spec->as<RaptSpec>()->seq_len
+                                      : 0)
+                 : 0;
+        if (model_seq_len > 0 && cfg.seq_len != model_seq_len)
             NN_FAIL("TextTrainer::create: 配方 seq_len 与模型 spec.seq_len 不一致（"
                     + std::to_string(cfg.seq_len) + " vs "
-                    + std::to_string(spec->seq_len)
+                    + std::to_string(model_seq_len)
                     + "）；请让 TextTrainConfig.seq_len 与模型构建时的 seq_len 对齐");
         if (tokenizer->pad_id() != train.pad_id())
             NN_FAIL("TextTrainer::create: 样本集 pad_id 与词表不一致");
@@ -409,7 +415,7 @@ private:
     }
 
     // 断点状态的权威装配（计数器 = "下一步的位置"，epoch 边界归一化）。
-    [[nodiscard]] TrainState make_train_state(std::size_t epoch, std::size_t step_done,
+    [[nodiscard]] TextTrainState make_train_state(std::size_t epoch, std::size_t step_done,
                                               Scalar current_lr) const
     {
         return make_text_train_state(cfg_, identity_, steps_per_epoch_, epoch, step_done,
@@ -426,7 +432,7 @@ private:
     DatasetIdentity identity_;
     std::size_t steps_per_epoch_ = 0;
     std::size_t micro_batch_size_ = 0;
-    TrainState train_state_;
+    TextTrainState train_state_;
 };
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -434,6 +440,12 @@ private:
 // ══════════════════════════════════════════════════════════════════════════
 inline Result<TextTrainReport> TextTrainer::fit()
 {
+    // ── 分层（RFC 32 阶段 C dogfood）────────────────────────────────────
+    // 本函数 = 文本域的"可变"侧：数据装配（IndexedBatchSource）、micro 切分 +
+    // sparse-CE 单步（do_update）、非阻塞 loss 回读、epoch 汇总与测试评估
+    // （on_epoch_end）、断点状态装配（on_checkpoint）。
+    // "不变"侧（epoch×step 循环、lr 双级接线、断点节奏、--max-steps/
+    // --stop-after-epoch、续训 rewind、报告聚合）全部由 nn::RunDriver 保证。
     std::ostream& out = (hooks_.out != nullptr) ? *hooks_.out : std::cout;
     std::ostream& err = (hooks_.err != nullptr) ? *hooks_.err : std::cerr;
     ComputeEngine& engine = session_.engine();
@@ -445,7 +457,7 @@ inline Result<TextTrainReport> TextTrainer::fit()
         if (hooks_.on_phase) hooks_.on_phase(tag);
     };
 
-    // ── 测试子集概况（旧 loop 的启动打印，文案/顺序不变）─────────────────
+    // ── 测试子集概况（启动打印，文案/顺序不变）─────────────────────────
     if (test_)
     {
         if (test_->loss_scope() == "assistant")
@@ -460,305 +472,262 @@ inline Result<TextTrainReport> TextTrainer::fit()
             << "  tokens: " << test_->token_count() << std::endl;
     }
 
-    // ── 学习率调度配置（epoch 级 + step 级）──────────────────────────────
-    LrScheduleConfig lr_sched_cfg;
-    lr_sched_cfg.base_lr = cfg_.lr;
-    lr_sched_cfg.min_lr = cfg_.min_lr;
-    lr_sched_cfg.warmup_epochs = cfg_.warmup_epochs;
-    lr_sched_cfg.total_epochs = cfg_.epochs;
-    lr_sched_cfg.schedule = cfg_.lr_schedule;
-    lr_sched_cfg.lr_per_epoch = cfg_.lr_per_epoch;
-    Scalar optimizer_current_lr = cfg_.lr;
     // 优化器侧真源是 Session；create 已校验 cfg.lr 与之一致。这里再显式设一次，
     // 保证"日志/断点配方里的 lr"和优化器实际 lr 从第一步起就同源。
     session_.set_lr(cfg_.lr);
 
-    StepLrScheduleConfig step_lr_cfg;
-    step_lr_cfg.base_lr = cfg_.lr;
-    step_lr_cfg.min_lr = cfg_.min_lr;
-    step_lr_cfg.warmup_steps = static_cast<int>(cfg_.warmup_steps);
-    step_lr_cfg.total_steps =
-        static_cast<int>(steps_per_epoch * static_cast<std::size_t>(cfg_.epochs));
-    step_lr_cfg.cosine = true;
+    // ── 数据源：样本表 + 每 epoch shuffle（单流语义，见 IndexedBatchSource）──
+    // 装配回调只产出归一化单位（有效 token）；真正的 batch 装配在 do_update
+    // 里按 micro 子跨度做（global batch 的 micro 切分是文本域语义）。
+    const std::uint64_t seed = static_cast<std::uint64_t>(std::random_device{}());
+    auto source_r = IndexedBatchSource::create(
+        train_.sample_count(), cfg_.batch_size, seed,
+        [this](std::span<const std::size_t> ix)
+            -> Result<std::pair<std::any, std::size_t>>
+        {
+            NN_TRY_MSG(u, "统计 global batch 有效 token 数失败",
+                       train_.valid_target_count(ix));
+            return std::make_pair(std::any{}, static_cast<std::size_t>(*u));
+        });
+    if (!source_r) return std::unexpected(source_r.error());
+    IndexedBatchSource& source = *source_r;
 
-    // ── 样本顺序（每 epoch shuffle；batch 是 global batch）──────────────
-    std::mt19937_64 rng{std::random_device{}()};
-    std::vector<std::size_t> sample_indices(train_.sample_count());
-    for (std::size_t i = 0; i < sample_indices.size(); ++i)
-        sample_indices[i] = i;
+    // ── 非阻塞 loss 回读状态（设备侧异步槽位；host 不等 GPU）─────────────
+    // 旧 fit 是 epoch 局部量；现由 do_update/on_epoch_end 跨步持有，epoch 切换
+    // 时重置（与旧"每 epoch 新建"等价）。
+    std::deque<PendingLoss> pending_loss;
+    const std::size_t loss_slots = std::max<std::size_t>(engine.scalar_readback_slots(), 1);
+    std::size_t loss_slot_next = 0;
+    Scalar total_weighted = 0;   // Σ(loss × 有效 token)
+    std::size_t total_valid = 0;
+    std::size_t cur_epoch = static_cast<std::size_t>(-1);
+    std::chrono::steady_clock::time_point epoch_t0;
+    Scalar cur_epoch_lr = cfg_.lr;
+    bool saw_final_step = false;
 
-    // ── 可复用的 batch 装配缓冲（每步 resize 复用）────────────────────────
-    TextSampleBatch batch;
-
-    auto t_start = std::chrono::steady_clock::now();
-    std::size_t steps_executed = 0;   // update steps
-    std::size_t samples_executed = 0;
-    std::size_t ckpt_failures = 0;
-    bool stop_training = false;
-    // 真实停止位置（"下一步"）：--max-steps 提前停时用它装配 TrainState，
-    // 不能无条件写 (epochs,0)（否则会话状态谎报"训练已完成"）。
-    std::size_t last_epoch = static_cast<std::size_t>(cfg_.start_epoch);
-    std::size_t last_step_done = cfg_.start_step;
-
-    for (int epoch = cfg_.start_epoch; epoch < cfg_.epochs; ++epoch)
+    auto harvest_loss = [&]() -> Result<void>
     {
-        // ── 学习率：epoch 级（step_cosine 由 step 级接管）─────────────────
-        if (cfg_.lr_schedule != "step_cosine")
+        while (!pending_loss.empty())
         {
-            const Scalar epoch_lr = compute_epoch_lr(lr_sched_cfg, epoch);
-            if (epoch_lr != optimizer_current_lr)
+            Scalar sum = Scalar{0};
+            NN_TRY(pr, engine.poll_scalar_readback(pending_loss.front().slot, sum));
+            if (!*pr) break;   // 未就绪：留待下次（不阻塞）
+            PendingLoss pl = std::move(pending_loss.front());
+            pending_loss.pop_front();
+            const Scalar loss = -sum * pl.inv_num_valid;
+            total_weighted += loss * static_cast<Scalar>(pl.valid);
+            total_valid += pl.valid;
+            if ((pl.step + 1) % cfg_.log_interval == 0 || pl.step + 1 == steps_per_epoch)
             {
-                session_.set_lr(epoch_lr);
-                optimizer_current_lr = epoch_lr;
+                out << "\r  Epoch " << cur_epoch + 1 << "/" << cfg_.epochs << "  step "
+                    << pl.step + 1 << "/" << steps_per_epoch << "  loss: " << std::fixed
+                    << std::setprecision(4) << loss << "   " << std::flush;
             }
         }
-
-        auto ep_start = std::chrono::steady_clock::now();
-        Scalar total_weighted = 0.0;   // Σ(loss × 有效 token)
-        std::size_t total_valid = 0;
-
-        std::shuffle(sample_indices.begin(), sample_indices.end(), rng);
-        const std::size_t epoch_first_step = (epoch == cfg_.start_epoch) ? cfg_.start_step : 0;
-
-        // ── 非阻塞 loss 回读（设备侧异步槽位；host 不等 GPU）───────────────
-        std::deque<PendingLoss> pending_loss;
-        const std::size_t loss_slots = std::max<std::size_t>(engine.scalar_readback_slots(), 1);
-        std::size_t loss_slot_next = 0;
-
-        auto harvest_loss = [&]() -> Result<void>
+        return {};
+    };
+    auto drain_loss = [&]() -> Result<void>
+    {
+        while (!pending_loss.empty())
         {
-            while (!pending_loss.empty())
-            {
-                Scalar sum = Scalar{0};
-                NN_TRY(pr, engine.poll_scalar_readback(pending_loss.front().slot, sum));
-                if (!*pr) break;   // 未就绪：留待下次（不阻塞）
-                PendingLoss pl = std::move(pending_loss.front());
-                pending_loss.pop_front();
-                const Scalar loss = -sum * pl.inv_num_valid;
-                total_weighted += loss * static_cast<Scalar>(pl.valid);
-                total_valid += pl.valid;
-                if ((pl.step + 1) % cfg_.log_interval == 0 || pl.step + 1 == steps_per_epoch)
-                {
-                    out << "\r  Epoch " << epoch + 1 << "/" << cfg_.epochs << "  step "
-                        << pl.step + 1 << "/" << steps_per_epoch << "  loss: " << std::fixed
-                        << std::setprecision(4) << loss << "   " << std::flush;
-                }
-            }
-            return {};
-        };
-        auto drain_loss = [&]() -> Result<void>
-        {
-            while (!pending_loss.empty())
-            {
-                NN_TRY_CHECK(harvest_loss());
-                if (pending_loss.empty()) break;
-                std::this_thread::sleep_for(std::chrono::microseconds(200));
-            }
-            return {};
-        };
-
-        for (std::size_t step = epoch_first_step; step < steps_per_epoch; ++step)
-        {
-            // ── step 级学习率（step_cosine 模式）──────────────────────────
-            if (cfg_.lr_schedule == "step_cosine")
-            {
-                const int global_step =
-                    static_cast<int>(epoch) * static_cast<int>(steps_per_epoch) +
-                    static_cast<int>(step);
-                const Scalar step_lr = compute_step_lr(step_lr_cfg, global_step);
-                if (step_lr != optimizer_current_lr)
-                {
-                    session_.set_lr(step_lr);
-                    optimizer_current_lr = step_lr;
-                }
-            }
-
-            // ── --max-steps：达到上限的那一步为最后一步，并强制完成参数更新 ──
-            const bool is_final_step =
-                (cfg_.max_steps > 0) && (steps_executed + 1 >= cfg_.max_steps);
-            ++steps_executed;
-
-            NN_PROF_SCOPE("step");
-            nn::prof::Phase prof;
-            prof.start("data");
-
-            // ── 取一个理论 global batch（末批可能不满）────────────────────
-            const std::size_t offset = step * cfg_.batch_size;
-            const std::size_t global_bs =
-                std::min(cfg_.batch_size, train_.sample_count() - offset);
-            const auto global_indices =
-                std::span<const std::size_t>(sample_indices.data() + offset, global_bs);
-            NN_TRY_MSG(norm_r, "统计 global batch 有效 token 数失败",
-                       train_.valid_target_count(global_indices));
-            const std::size_t normalization_units = *norm_r;
-            if (normalization_units == 0)
-                NN_FAIL("TextTrainer::fit: 当前 global batch 没有任何有效 loss token");
-
-            samples_executed += global_bs;
-            const std::size_t micro_count =
-                (global_bs + micro_batch_size_ - 1) / micro_batch_size_;
-
-            bool updated_this_step = false;
-            for (std::size_t micro = 0; micro < micro_count; ++micro)
-            {
-                const std::size_t micro_offset = micro * micro_batch_size_;
-                const std::size_t this_micro_bs =
-                    std::min(micro_batch_size_, global_bs - micro_offset);
-                const auto micro_indices = global_indices.subspan(micro_offset, this_micro_bs);
-                NN_TRY_MSG(
-                    batch_r, "装配训练 micro-batch 失败",
-                    train_.make_batch(micro_indices, batch));
-                model.set_doc_ids(batch.doc_ids);
-                if (hooks_.on_batch_ready) hooks_.on_batch_ready(session_, batch, step);
-
-                // Matrix → Tensor 必须在 Session 开始录制之前完成。
-                NN_TRY_MSG(x_tensor_r, "\nfrom_matrix(x_tokens) failed",
-                           engine.from_matrix(batch.input));
-                mem_mark("micro/ready");
-
-                TrainingStepOptions options;
-                options.lr = optimizer_current_lr;
-                options.clip_grad_norm = cfg_.max_norm;
-                options.normalization_units = normalization_units;
-                options.force_update = (micro + 1 == micro_count) || is_final_step;
-                if (hooks_.on_probe_check)
-                {
-                    options.before_update = [&]() -> Result<bool> {
-                        return hooks_.on_probe_check(session_, step);
-                    };
-                }
-                if (hooks_.on_update)
-                {
-                    options.after_update = [&]() -> Result<void> {
-                        hooks_.on_update(session_, static_cast<std::size_t>(epoch), step,
-                                         optimizer_current_lr);
-                        return {};
-                    };
-                }
-
-                prof.start(micro == 0 ? "forward" : "micro");
-                NN_TRY_MSG(step_r, "TrainingSession::train_step 失败",
-                           session_.train_step(
-                               batch, std::move(options),
-                               [&](Model& step_model, ComputeEngine& step_engine,
-                                   const TextSampleBatch& micro_batch)
-                                   -> Result<TrainingStepOutput> {
-                                   auto logits_r = step_model.forward(*x_tensor_r);
-                                   NN_TRY_CHECK(logits_r);
-                                   Tensor logits = std::move(*logits_r);
-                                   if (logits.rows() != vocab_size)
-                                       NN_FAIL("TextTrainer::fit: 模型 logits 行数（"
-                                               + std::to_string(logits.rows())
-                                               + "）≠ 数据集词表大小（"
-                                               + std::to_string(vocab_size)
-                                               + "）；模型与数据集词表不匹配");
-
-                                   auto mask_span =
-                                       std::span<const Scalar>(micro_batch.flat_mask);
-                                   std::size_t loss_units = 0;
-                                   NN_TRY_MSG(
-                                       loss_sum_r, "损失前向（稀疏 CE）失败",
-                                       ce_loss_.forward_sparse_sum(
-                                           step_engine, logits, micro_batch.flat_targets,
-                                           mask_span, vocab_size, loss_units,
-                                           /*grad_reuse=*/&logits));
-                                   NN_TRY(grad_r, ce_loss_.backward());
-                                   TrainingStepOutput out;
-                                   out.grad = std::move(*grad_r);
-                                   out.gradient_units = loss_units;
-                                   out.loss_sum = std::move(*loss_sum_r);
-                                   out.loss_units = loss_units;
-                                   return out;
-                               }));
-                mem_mark("micro/backward");
-                NN_TRY_MSG(rel_r, "\n显存回收失败", engine.release_idle_pool_blocks());
-
-                if (step_r->aborted)
-                {
-                    TextTrainReport aborted;
-                    aborted.steps_executed = steps_executed;
-                    aborted.samples_executed = samples_executed;
-                    aborted.ckpt_failures = ckpt_failures;
-                    aborted.abort_code = 9;
-                    aborted.final_lr = optimizer_current_lr;
-                    aborted.final_epoch = static_cast<std::size_t>(epoch);
-                    aborted.final_step_in_epoch = step + 1;
-                    hooks_ = {};
-                    return aborted;
-                }
-
-                if (!step_r->parameters_updated) continue;
-
-                NN_TRY_MSG(hv0, "harvest_loss failed", harvest_loss());
-                if (pending_loss.size() >= loss_slots)
-                {
-                    NN_TRY_MSG(hv1, "drain_loss failed", drain_loss());
-                }
-                if (!step_r->loss_sum.valid() || step_r->loss_units == 0)
-                    NN_FAIL("TextTrainer::fit: update 完成但 loss_sum/loss_units 缺失");
-                NN_TRY_MSG(loss_sum_f32_r, "loss 回读 cast 失败",
-                           engine.cast(step_r->loss_sum, Precision::F32));
-
-                PendingLoss pl;
-                pl.slot = loss_slot_next;
-                pl.step = step;
-                pl.valid = step_r->loss_units;
-                pl.inv_num_valid =
-                    Scalar{1} / static_cast<Scalar>(step_r->loss_units);
-                pl.keepalive = std::move(*loss_sum_f32_r);
-                NN_TRY_MSG(sr, "submit_scalar_readback failed",
-                           engine.submit_scalar_readback(pl.slot, pl.keepalive));
-                loss_slot_next = (loss_slot_next + 1) % loss_slots;
-                pending_loss.push_back(std::move(pl));
-                updated_this_step = true;
-                break;
-            }
-            if (!updated_this_step)
-                NN_FAIL("TextTrainer::fit: global batch 结束时未完成参数更新");
-
-            NN_TRY_MSG(hv, "harvest_loss failed", harvest_loss());
-
-            // ── 定期断点（save_interval 以 update step 计）────────────────
-            if (cfg_.save_interval > 0 &&
-                ((step + 1) % cfg_.save_interval == 0 || step + 1 == steps_per_epoch))
-            {
-                prof.start("ckpt");
-                train_state_ = make_train_state(static_cast<std::size_t>(epoch), step + 1,
-                                                optimizer_current_lr);
-                if (hooks_.on_checkpoint)
-                {
-                    const TextCheckpointRequest req{session_, train_state_};
-                    if (!hooks_.on_checkpoint(req)) ++ckpt_failures;
-                }
-            }
-
-            last_epoch = static_cast<std::size_t>(epoch);
-            last_step_done = step + 1;
-
-            if (is_final_step)
-            {
-                stop_training = true;
-                break;
-            }
+            NN_TRY_CHECK(harvest_loss());
+            if (pending_loss.empty()) break;
+            std::this_thread::sleep_for(std::chrono::microseconds(200));
         }
+        return {};
+    };
 
+    // ── RunDriver 配置（"不变"侧全部交骨架）──────────────────────────────
+    RunDriverConfig rcfg;
+    rcfg.epochs = cfg_.epochs;
+    rcfg.max_steps = cfg_.max_steps;
+    rcfg.lr_schedule = cfg_.lr_schedule;
+    rcfg.lr = cfg_.lr;
+    rcfg.min_lr = cfg_.min_lr;
+    rcfg.warmup_epochs = cfg_.warmup_epochs;
+    rcfg.warmup_steps = cfg_.warmup_steps;
+    rcfg.lr_per_epoch = cfg_.lr_per_epoch;
+    rcfg.save_interval = cfg_.save_interval;
+    // 旧语义：断点仅由 save_interval 触发（含每 epoch 末步），save_interval=0
+    // 时不写断点 ⇒ 骨架的"epoch 边界节奏"对文本域关闭。
+    rcfg.enable_checkpoint = cfg_.save_interval > 0;
+    rcfg.enable_metrics = true;
+    rcfg.enable_eval = true;   // 评估钩子不注入：文本评估在 on_epoch_end 内，
+                               // 保持"汇总在前、test_loss 在后"的旧打印顺序
+
+    TextSampleBatch batch;   // 可复用的装配缓冲（训练 micro + 评估共用）
+
+    auto driver_r = RunDriver::create(
+        session_, source, std::make_unique<TextTrainState>(train_state_), std::move(rcfg));
+    if (!driver_r) return std::unexpected(driver_r.error());
+    RunDriver& driver = *driver_r;
+
+    RunHooks hooks;
+
+    // ── 必选：一步 update = 取 global batch + micro 切分 + train_step ─────
+    hooks.do_update = [&](TrainingSession&, const UpdateRequest& req)
+        -> Result<UpdateOutcome>
+    {
+        // epoch 切换 ⇒ 重置本 epoch 的回读/统计状态（旧 fit 的 epoch 局部量）
+        if (req.epoch != cur_epoch)
+        {
+            pending_loss.clear();
+            loss_slot_next = 0;
+            total_weighted = 0;
+            total_valid = 0;
+            cur_epoch = req.epoch;
+            epoch_t0 = std::chrono::steady_clock::now();
+        }
+        cur_epoch_lr = req.lr;
+
+        // ── 取一个理论 global batch（末批可能不满）──────────────────────
+        NN_TRY_MSG(at_r, "取 global batch 元数据失败", source.next(req.step));
+        const std::size_t global_bs = at_r->samples;
+        const std::size_t normalization_units = at_r->units;
+        if (normalization_units == 0)
+            NN_FAIL("TextTrainer::fit: 当前 global batch 没有任何有效 loss token");
+        const std::size_t offset = req.step * cfg_.batch_size;
+        const auto global_indices =
+            std::span<const std::size_t>(source.order().data() + offset, global_bs);
+
+        UpdateOutcome outcome;
+        outcome.samples = global_bs;
+        const std::size_t micro_count =
+            (global_bs + micro_batch_size_ - 1) / micro_batch_size_;
+
+        NN_PROF_SCOPE("step");
+        nn::prof::Phase prof;
+        prof.start("data");
+
+        bool updated_this_step = false;
+        for (std::size_t micro = 0; micro < micro_count; ++micro)
+        {
+            const std::size_t micro_offset = micro * micro_batch_size_;
+            const std::size_t this_micro_bs =
+                std::min(micro_batch_size_, global_bs - micro_offset);
+            const auto micro_indices = global_indices.subspan(micro_offset, this_micro_bs);
+            NN_TRY_MSG(
+                batch_r, "装配训练 micro-batch 失败",
+                train_.make_batch(micro_indices, batch));
+            model.set_doc_ids(batch.doc_ids);
+            if (hooks_.on_batch_ready) hooks_.on_batch_ready(session_, batch, req.step);
+
+            // Matrix → Tensor 必须在 Session 开始录制之前完成。
+            NN_TRY_MSG(x_tensor_r, "\nfrom_matrix(x_tokens) failed",
+                       engine.from_matrix(batch.input));
+            mem_mark("micro/ready");
+
+            TrainingStepOptions options;
+            options.lr = req.lr;
+            options.clip_grad_norm = cfg_.max_norm;
+            options.normalization_units = normalization_units;
+            options.force_update = (micro + 1 == micro_count) || req.is_final_step;
+            if (hooks_.on_probe_check)
+            {
+                options.before_update = [&]() -> Result<bool> {
+                    return hooks_.on_probe_check(session_, req.step);
+                };
+            }
+            if (hooks_.on_update)
+            {
+                options.after_update = [&]() -> Result<void> {
+                    hooks_.on_update(session_, req.epoch, req.step, req.lr);
+                    return {};
+                };
+            }
+
+            prof.start(micro == 0 ? "forward" : "micro");
+            NN_TRY_MSG(step_r, "TrainingSession::train_step 失败",
+                       session_.train_step(
+                           batch, std::move(options),
+                           [&](Model& step_model, ComputeEngine& step_engine,
+                               const TextSampleBatch& micro_batch)
+                               -> Result<TrainingStepOutput> {
+                               auto logits_r = step_model.forward(*x_tensor_r);
+                               NN_TRY_CHECK(logits_r);
+                               Tensor logits = std::move(*logits_r);
+                               if (logits.rows() != vocab_size)
+                                   NN_FAIL("TextTrainer::fit: 模型 logits 行数（"
+                                           + std::to_string(logits.rows()) +
+                                           "）≠ 数据集词表大小（" +
+                                           std::to_string(vocab_size) +
+                                           "）；模型与数据集词表不匹配");
+
+                               auto mask_span =
+                                   std::span<const Scalar>(micro_batch.flat_mask);
+                               std::size_t loss_units = 0;
+                               NN_TRY_MSG(
+                                   loss_sum_r, "损失前向（稀疏 CE）失败",
+                                   ce_loss_.forward_sparse_sum(
+                                       step_engine, logits, micro_batch.flat_targets,
+                                       mask_span, vocab_size, loss_units,
+                                       /*grad_reuse=*/&logits));
+                               NN_TRY(grad_r, ce_loss_.backward());
+                               TrainingStepOutput out;
+                               out.grad = std::move(*grad_r);
+                               out.gradient_units = loss_units;
+                               out.loss_sum = std::move(*loss_sum_r);
+                               out.loss_units = loss_units;
+                               return out;
+                           }));
+            mem_mark("micro/backward");
+            NN_TRY_MSG(rel_r, "\n显存回收失败", engine.release_idle_pool_blocks());
+
+            if (step_r->aborted)
+            {
+                outcome.aborted = true;
+                outcome.parameters_updated = false;
+                return outcome;
+            }
+
+            if (!step_r->parameters_updated) continue;
+
+            NN_TRY_MSG(hv0, "harvest_loss failed", harvest_loss());
+            if (pending_loss.size() >= loss_slots)
+            {
+                NN_TRY_MSG(hv1, "drain_loss failed", drain_loss());
+            }
+            if (!step_r->loss_sum.valid() || step_r->loss_units == 0)
+                NN_FAIL("TextTrainer::fit: update 完成但 loss_sum/loss_units 缺失");
+            NN_TRY_MSG(loss_sum_f32_r, "loss 回读 cast 失败",
+                       engine.cast(step_r->loss_sum, Precision::F32));
+
+            PendingLoss pl;
+            pl.slot = loss_slot_next;
+            pl.step = req.step;
+            pl.valid = step_r->loss_units;
+            pl.inv_num_valid =
+                Scalar{1} / static_cast<Scalar>(step_r->loss_units);
+            pl.keepalive = std::move(*loss_sum_f32_r);
+            NN_TRY_MSG(sr, "submit_scalar_readback failed",
+                       engine.submit_scalar_readback(pl.slot, pl.keepalive));
+            loss_slot_next = (loss_slot_next + 1) % loss_slots;
+            pending_loss.push_back(std::move(pl));
+            updated_this_step = true;
+            break;
+        }
+        if (!updated_this_step)
+            NN_FAIL("TextTrainer::fit: global batch 结束时未完成参数更新");
+
+        NN_TRY_MSG(hv, "harvest_loss failed", harvest_loss());
+        if (req.is_final_step) saw_final_step = true;
+        outcome.parameters_updated = true;
+        return outcome;
+    };
+
+    // ── epoch 收尾：drain + 汇总打印 + 测试评估（文案/顺序与旧 fit 一致）──
+    hooks.on_epoch_end = [&](const RunReport&, std::size_t epoch) -> Result<void>
+    {
         // ── epoch 收尾：读完最后几步尚未取回的 loss ───────────────────────
         NN_TRY_MSG(ep_drain, "loss drain failed", drain_loss());
 
-        if (stop_training)
-        {
-            out << "\n已达 --max-steps=" << cfg_.max_steps << "（本进程执行 " << steps_executed
-                << " 步），提前结束训练\n";
-            break;
-        }
-
         auto ep_end = std::chrono::steady_clock::now();
-        const Scalar ep_sec = std::chrono::duration<Scalar>(ep_end - ep_start).count();
+        const Scalar ep_sec = std::chrono::duration<Scalar>(ep_end - epoch_t0).count();
         const Scalar avg_loss =
             (total_valid > 0) ? total_weighted / static_cast<Scalar>(total_valid) : Scalar{0};
 
         out << "\r  Epoch " << epoch + 1 << "/" << cfg_.epochs << "  lr=" << std::scientific
-            << std::setprecision(4) << optimizer_current_lr << "  avg_loss=" << std::fixed
+            << std::setprecision(4) << cur_epoch_lr << "  avg_loss=" << std::fixed
             << std::setprecision(4) << avg_loss << "  time=" << std::setprecision(1) << ep_sec
             << "s";
 
@@ -837,28 +806,67 @@ inline Result<TextTrainReport> TextTrainer::fit()
         }
 
         out << std::endl;
+        return {};
+    };
+
+    // ── 断点：状态装配（"何时/是什么"由骨架决定；路径与格式由调用方落地）──
+    hooks.on_checkpoint = [&](TrainingSession&, const TrainState& st) -> Result<void>
+    {
+        const TrainCounters& c = st.counters;
+        // 权威装配走 make_train_state（配方 + 数据集身份 + 优化器 t 全量重建）
+        train_state_ = make_train_state(c.epoch, c.step_in_epoch,
+                                        static_cast<Scalar>(c.lr));
+        if (hooks_.on_checkpoint)
+        {
+            const TextCheckpointRequest req{session_, train_state_};
+            if (const auto r = hooks_.on_checkpoint(req); !r) return r;
+        }
+        return {};
+    };
+
+    driver.set_hooks(std::move(hooks));
+    NN_TRY_MSG(rep_r, "RunDriver::fit 失败", driver.fit());
+    const RunReport& rep = *rep_r;
+
+    // ── 停止收尾：drain 残余 loss + --max-steps 文案（中止不 drain，与旧
+    // 早退一致；正常路径 epoch 末已 drain，这里为空操作）────────────────────
+    if (rep.abort_code == 0)
+    {
+        NN_TRY_MSG(ep_drain, "loss drain failed", drain_loss());
+        if (saw_final_step)
+            out << "\n已达 --max-steps=" << cfg_.max_steps << "（本进程执行 "
+                << rep.steps_executed << " 步），提前结束训练\n";
     }
 
-    auto t_end = std::chrono::steady_clock::now();
     // Run state = "下一步位置"：正常跑完所有 epoch ⇒ (epochs, 0)；
-    // --max-steps 提前停 ⇒ 真实停止位置（last_epoch/last_step_done），绝不谎报完成。
-    if (stop_training)
-        train_state_ =
-            make_train_state(last_epoch, last_step_done, optimizer_current_lr);
-    else
-        train_state_ =
-            make_train_state(static_cast<std::size_t>(cfg_.epochs), 0, optimizer_current_lr);
+    // --max-steps 提前停 ⇒ 真实停止位置，绝不谎报完成。
+    // 中止（abort_code=9）不动 train_state_（与旧早退一致）。
+    if (rep.abort_code == 0)
+    {
+        const std::size_t fe = (cfg_.epochs > 0) ? rep.final_epoch : 0;
+        const std::size_t fs = (cfg_.epochs > 0) ? rep.final_step_in_epoch : 0;
+        train_state_ = make_train_state(fe, fs, rep.final_lr);
+    }
+
     TextTrainReport report;
-    report.seconds = std::chrono::duration<Scalar>(t_end - t_start).count();
-    report.elapsed_ns = static_cast<std::uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(t_end - t_start).count());
-    report.steps_executed = steps_executed;
-    report.samples_executed = samples_executed;
-    report.ckpt_failures = ckpt_failures;
-    report.final_lr = optimizer_current_lr;
-    report.final_epoch = static_cast<std::size_t>(train_state_.counters.epoch);
-    report.final_step_in_epoch =
-        static_cast<std::size_t>(train_state_.counters.step_in_epoch);
+    report.seconds = (rep.abort_code == 0) ? rep.seconds : Scalar{0};
+    report.elapsed_ns = (rep.abort_code == 0) ? rep.elapsed_ns : 0;
+    report.steps_executed = rep.steps_executed;
+    report.samples_executed = rep.samples_executed;
+    report.ckpt_failures = rep.ckpt_failures;
+    report.abort_code = rep.abort_code;
+    report.final_lr = rep.final_lr;
+    if (rep.abort_code == 0)
+    {
+        report.final_epoch = static_cast<std::size_t>(train_state_.counters.epoch);
+        report.final_step_in_epoch =
+            static_cast<std::size_t>(train_state_.counters.step_in_epoch);
+    }
+    else
+    {
+        report.final_epoch = rep.final_epoch;
+        report.final_step_in_epoch = rep.final_step_in_epoch;
+    }
     hooks_ = {};   // hooks 的契约 = 只活到 fit 返回（见 set_hooks 注释）
     return report;
 }

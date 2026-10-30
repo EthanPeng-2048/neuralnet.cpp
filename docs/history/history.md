@@ -5282,3 +5282,66 @@ P0-4 的 `install()/find_package` 与 P2-9）；剩 13 项 = 部分完成 5（P0
 - **证据**：远端 Windows clang + MSVC STL / Vulkan，全量构建 120/120；ctest 59 注册，
   58 pass + 1 个平台条件 skip（`scan_bitwise_test`）+ 0 failed。`doc_align_audit`、
   `doc_inventory`、`gui_cli_audit` 均 exit 0。
+
+## 训练骨架 RunDriver 与开放规格 RFC 32（issue #39/#26，feature/run-driver-openspec）
+
+- **动机**：`TrainingSession`（单步）与 `TextTrainer`（文本域驱动）之间没有领域无关
+  骨架，自定义域从 `train_step` 往上全要自己写（go CLI `go_train_cli.cpp` 达 1456 行，
+  其中 epoch 循环 / 断点节奏 / lr 接线 / 指标落盘全是与领域无关的重复）。
+- **RFC**：`docs/todo/32-trainer-skeleton-and-openspec.md`，四扩展点统一心智 =
+  「虚基类定义契约 + 主仓持基类引用 + 子类注入特化」（TrainState / ModelSpecBase /
+  BatchSource / RunDriver）。
+- **阶段 A**：`TrainState` 虚基类化（编解码骨架 + `state_kind`/`write_extra_kv`/
+  `read_extra_kv`/`verify_extra` 钩子），`stride` + `DatasetIdentity` 下沉为
+  `TextTrainState`；`verify_resume` + `ResumePolicy` 把 go CLI 手写的断点交叉校验
+  （配方形状 / 计数器越界 / 数据集身份）上收为库口径。
+- **阶段 B**：`BatchSource` Pull 契约 + `IndexedBatchSource` 预置适配器
+  （单 RNG 流重放式 shuffle：恒等序起同一 RNG 重放 0..epoch 次，(seed, epoch)
+  唯一决定顺序且幂等）；`steps_per_epoch=nullopt` = 步进驱动。
+- **阶段 C**：`RunDriver`（epoch×step 循环、`compute_epoch_lr`/`compute_step_lr`
+  双级接线、epoch 边界 + save_interval 断点节奏、计数器"下一步位置"归一化、
+  探针中止 exit 9、--max-steps/--stop-after-epoch、续训起点 + rewind）。
+  分层裁定：`train_step` 是 Batch 模型模板 ⇒ 取批 + micro 切分 + `train_step`
+  归域（`RunHooks::do_update`），driver 只给 lr/步号/final 标记。
+- **评审修复**：① `global_step` 原为进程本地计数（续训断点会从 0 重数），改为
+  绝对步号 `epoch·steps_per_epoch + step`，断点计数器与 step 级调度统一；
+  ② 适配器 shuffle 原为每 epoch 重播种（与 TextTrainer 单流语义冲突，同 seed
+  轨迹不同），改单流重放。
+- **注记迁移**：此前列在头文件注释里的版本注记（宿主桥公开 API、
+  `param_children` 广播、`logits_transform` 钩子、`lr_per_epoch` 正式化的
+  v1.14.0/issue 编号）系历史信息，已从注释移入本条——**注释只写行为契约，
+  不写历史**。v1.14.0 从未定档：最新版仍是 `v1.13.0`，`dev` 从不定档版本号，
+  版本只在经审核合入 `main` 时确定。
+- **兼容口径**：仅向下兼容（新读旧）且不承诺——该能力是 v4 模型格式引入 kvrec
+  的特性，不是新增保证；反向与跨版本逐位一致性不在承诺范围。
+- **验证**：ctest 70/70（新增 `batch_source_test` 6 组、`run_driver_test` 9 组；
+  `train_state_test` 含状态段逐字节重写一致校验）。
+
+## 开放规格 ModelSpecBase（issue #26，feature/openspec-modelspec）
+
+- **动机**：`ModelType` 是封闭枚举，`spec_matches` / `spec_summary` /
+  `spec_to_kv` / `spec_from_kv` 四处 `switch(type)` 构成封闭世界——衍生项目
+  加自定义模型必须改主仓枚举与所有分支。
+- **设计**（RFC 32 §6）：`ModelSpec` 改为**公共字段外壳**（output_schema /
+  output_packing + `unique_ptr<ModelSpecBase> arch`，深拷贝 clone 语义），
+  类型参数与判别符（`type_name()`）随多态对象走；五个内建子类
+  （MlpSpec/TransformerSpec/GptSpec/CnnSpec/RaptSpec）承载各自字段与
+  `arch_compatible` / `summary` / `write_kv` / `read_kv` 虚实现。
+- **文件格式**：`type` 键从数值枚举改为**类型名字符串**；读侧数值回落
+  （`legacy_spec_type_name`，0-7 一一映射，4=ALiBi_GPT 归 GptSpec 同族，
+  6=ZiPT 维持明确报错）。仅向下兼容（新读旧），反向不承诺——v4 模型格式
+  引入 kvrec 的自描述特性本就只保证这个方向。
+- **开放点**：自定义类型 = 写子类 + `ModelRegistry::instance().register_type`
+  （内建类型直通 `make_spec_by_name`，未命中查注册表），加新模型不改主仓
+  任何 switch；由 model_spec_validation_test §8 验收（注册/往返/虚分发/未注册报错）。
+- **拍板**（RFC §10 #3）：`build()` 不进基类——build 需外壳公共字段 +
+  运行期 precision + Model 类型，属域层自由函数；`model_spec.hpp` 保持纯数据头。
+  封闭点已收敛为四个虚方法 + 工厂。
+- **迁移**：约 180 处字段读取点类型化（`spec.as<T>()` / `emplace<T>()`），
+  分布在 4 个 domain 头、序列化、recovery、4 个 CLI、11 个测试；
+  `is_gpt()` 等判别调用点保留（实现改为 dynamic_cast），调用面无感。
+- **踩点**：`CnnSpec.norm_type` 的结构默认必须是 LayerNorm（旧扁平布局的
+  缺键回落值），builder 默认 BatchNorm@Conv 由 `make_cnn_spec` 显式传入并
+  落盘——两者混淆会让"缺 norm_type 键的旧文件"读成 BatchNorm、参数布局错位。
+- **验证**：全量构建 0 错误；ctest 70/70（含 spec 往返、旧数值 type 回落、
+  ZiPT 拒绝、norm_place 错配拦截、三值权重往返、自定义注册表 §8）。

@@ -69,12 +69,13 @@ struct RAPTConfig {
     ComputeEngine& engine, const ModelSpec& spec,
     PrecisionProfile precision = PrecisionProfile{})
 {
-    if (!spec.is_rapt())
+    const auto *r = spec.as<RaptSpec>();
+    if (r == nullptr)
         NN_FAIL("Invalid ModelSpec type for RAPT: expected RAPT");
     auto model = build_rapt_model(engine, RAPTConfig{
-        spec.vocab_size, spec.d_model, spec.seq_len,
-        spec.num_heads, spec.d_ff, spec.num_layers,
-        spec.pos_encoding, spec.activation, spec.norm_type, /*causal=*/true, precision});
+        r->vocab_size, r->d_model, r->seq_len,
+        r->num_heads, r->d_ff, r->num_layers,
+        r->pos_encoding, r->activation, r->norm_type, /*causal=*/true, precision});
     if (model)
         model->set_spec(spec);
     return model;
@@ -93,16 +94,16 @@ struct RAPTConfig {
     NormType norm_type = NormType::LayerNorm)
 {
     ModelSpec spec;
-    spec.type         = ModelType::RAPT;
-    spec.vocab_size   = vocab_size;
-    spec.d_model      = d_model;
-    spec.seq_len      = seq_len;
-    spec.num_heads    = num_heads;
-    spec.d_ff         = d_ff;
-    spec.num_layers   = num_layers;
-    spec.pos_encoding = pos_encoding;
-    spec.activation   = activation;
-    spec.norm_type    = norm_type;
+    auto &r = spec.emplace<RaptSpec>();
+    r.vocab_size   = vocab_size;
+    r.d_model      = d_model;
+    r.seq_len      = seq_len;
+    r.num_heads    = num_heads;
+    r.d_ff         = d_ff;
+    r.num_layers   = num_layers;
+    r.pos_encoding = pos_encoding;
+    r.activation   = activation;
+    r.norm_type    = norm_type;
     return spec;
 }
 
