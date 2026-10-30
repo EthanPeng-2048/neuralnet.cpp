@@ -480,7 +480,7 @@ inline Result<TextTrainReport> TextTrainer::fit()
     // 装配回调只产出归一化单位（有效 token）；真正的 batch 装配在 do_update
     // 里按 micro 子跨度做（global batch 的 micro 切分是文本域语义）。
     const std::uint64_t seed = static_cast<std::uint64_t>(std::random_device{}());
-    auto source_r = IndexedBatchSource::create(
+    NN_TRY(source_r, IndexedBatchSource::create(
         train_.sample_count(), cfg_.batch_size, seed,
         [this](std::span<const std::size_t> ix)
             -> Result<std::pair<std::any, std::size_t>>
@@ -488,8 +488,7 @@ inline Result<TextTrainReport> TextTrainer::fit()
             NN_TRY_MSG(u, "统计 global batch 有效 token 数失败",
                        train_.valid_target_count(ix));
             return std::make_pair(std::any{}, static_cast<std::size_t>(*u));
-        });
-    if (!source_r) return std::unexpected(source_r.error());
+        }));
     IndexedBatchSource& source = *source_r;
 
     // ── 非阻塞 loss 回读状态（设备侧异步槽位；host 不等 GPU）─────────────
@@ -557,9 +556,8 @@ inline Result<TextTrainReport> TextTrainer::fit()
 
     TextSampleBatch batch;   // 可复用的装配缓冲（训练 micro + 评估共用）
 
-    auto driver_r = RunDriver::create(
-        session_, source, std::make_unique<TextTrainState>(train_state_), std::move(rcfg));
-    if (!driver_r) return std::unexpected(driver_r.error());
+    NN_TRY(driver_r, RunDriver::create(
+        session_, source, std::make_unique<TextTrainState>(train_state_), std::move(rcfg)));
     RunDriver& driver = *driver_r;
 
     RunHooks hooks;

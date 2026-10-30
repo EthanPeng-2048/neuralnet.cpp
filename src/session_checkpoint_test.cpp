@@ -59,14 +59,12 @@ nn::Result<nn::TrainingStepReport> one_step(nn::TrainingSession& s,
     opts.force_update = true;
     return s.train_step(0, opts, [&](nn::Model& model, nn::ComputeEngine& eng,
                                      int) -> nn::Result<nn::TrainingStepOutput> {
-        auto logits = model.forward(x);
-        if (!logits) return std::unexpected(logits.error());
+        NN_TRY(logits, model.forward(x));
         // step_fn 契约：返回**对模型输出**的梯度；model.backward 由 session 执行
         //（本测试焦点是断点编排，直接给常数输出梯度，不经 loss 层）
         auto go = eng.create_tensor(logits->rows(), logits->cols(),
                                     nn::Precision::F32, nn::InitSpec::constant(0.01f));
-        if (!go.valid())
-            return std::unexpected(nn::Error{"one_step: go 分配失败"});
+        if (!go.valid()) NN_FAIL("one_step: go 分配失败");
         return nn::TrainingStepOutput{std::move(go), 1, {}, 0};
     });
 }
