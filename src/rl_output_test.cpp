@@ -28,23 +28,16 @@ nn::TensorSchema policy_value_schema()
 {
     auto r = nn::TensorSchema::create(
         "policy_value",
-        {nn::tensor_field(
-             "policy",
-             nn::TensorShapeSpec{.rows = 2, .cols = std::nullopt},
-             true, nn::Precision::F32, nn::TensorPlacement::CPU),
-         nn::tensor_field(
-             "value",
-             nn::TensorShapeSpec{.rows = 1, .cols = std::nullopt},
-             true, nn::Precision::F32, nn::TensorPlacement::CPU)});
+        {nn::tensor_field("policy", nn::TensorShapeSpec{.rows = 2, .cols = std::nullopt}, true,
+                          nn::Precision::F32, nn::TensorPlacement::CPU),
+         nn::tensor_field("value", nn::TensorShapeSpec{.rows = 1, .cols = std::nullopt}, true,
+                          nn::Precision::F32, nn::TensorPlacement::CPU)});
     NN_ASSERT_ALWAYS(r, "policy_value_schema");
     return std::move(*r);
 }
 
-void set_matrix(nn::ComputeEngine& engine, nn::Tensor& tensor,
-                const nn::Matrix& value)
-{
-    NN_UNWRAP(engine.copy_from(tensor, value));
-}
+void set_matrix(nn::ComputeEngine& engine, nn::Tensor& tensor, const nn::Matrix& value)
+{ NN_UNWRAP(engine.copy_from(tensor, value)); }
 
 auto make_bundle_model(nn::CpuEngine& engine, const nn::TensorSchema& schema)
     -> nn::Result<nn::Model>
@@ -53,22 +46,20 @@ auto make_bundle_model(nn::CpuEngine& engine, const nn::TensorSchema& schema)
     NN_TRY_CHECK(model.add<nn::Linear>(2, 2));
 
     auto bundle = std::make_unique<nn::OutputBundleLayer>(schema);
-    NN_TRY_CHECK(bundle->add_port(
-        "policy", std::make_unique<nn::Linear>(2, 2)));
-    NN_TRY_CHECK(bundle->add_port(
-        "value", std::make_unique<nn::Linear>(2, 1)));
+    NN_TRY_CHECK(bundle->add_port("policy", std::make_unique<nn::Linear>(2, 2)));
+    NN_TRY_CHECK(bundle->add_port("value", std::make_unique<nn::Linear>(2, 1)));
     NN_TRY_CHECK(bundle->set_row_band_packing({"policy", "value"}));
     NN_TRY_CHECK(model.add_layer(std::move(bundle)));
 
     // 固定参数，使 named 与 packed 两条路径比较的是同一函数。
-    auto matrix = [](std::size_t rows, std::size_t cols,
-                     std::initializer_list<float> items) {
+    auto matrix = [](std::size_t rows, std::size_t cols, std::initializer_list<float> items)
+    {
         nn::Matrix m(rows, cols);
-        NN_ASSERT_ALWAYS(items.size() == m.size(),
-                         "matrix initializer size");
+        NN_ASSERT_ALWAYS(items.size() == m.size(), "matrix initializer size");
         auto dst = m.span();
         std::size_t i = 0;
-        for (float v : items) dst[i++] = v;
+        for (float v : items)
+            dst[i++] = v;
         return m;
     };
     const std::vector<nn::Matrix> values{
@@ -80,15 +71,13 @@ auto make_bundle_model(nn::CpuEngine& engine, const nn::TensorSchema& schema)
         matrix(1, 1, {-0.03f}),
     };
     auto params = model.parameters();
-    NN_ASSERT_ALWAYS(params.size() == values.size(),
-                     "bundle model parameter inventory");
+    NN_ASSERT_ALWAYS(params.size() == values.size(), "bundle model parameter inventory");
     for (std::size_t i = 0; i < values.size(); ++i)
         set_matrix(engine, params[i].get(), values[i]);
     return model;
 }
 
-std::vector<nn::Matrix> snapshot(nn::CpuEngine& engine,
-                                 std::vector<nn::TensorRef> refs)
+std::vector<nn::Matrix> snapshot(nn::CpuEngine& engine, std::vector<nn::TensorRef> refs)
 {
     std::vector<nn::Matrix> out;
     out.reserve(refs.size());
@@ -97,21 +86,17 @@ std::vector<nn::Matrix> snapshot(nn::CpuEngine& engine,
     return out;
 }
 
-bool matrices_equal(const std::vector<nn::Matrix>& a,
-                    const std::vector<nn::Matrix>& b)
+bool matrices_equal(const std::vector<nn::Matrix>& a, const std::vector<nn::Matrix>& b)
 {
     if (a.size() != b.size()) return false;
     for (std::size_t i = 0; i < a.size(); ++i)
     {
-        if (a[i].rows() != b[i].rows() ||
-            a[i].cols() != b[i].cols())
-            return false;
+        if (a[i].rows() != b[i].rows() || a[i].cols() != b[i].cols()) return false;
         const auto as = a[i].span();
         const auto bs = b[i].span();
         for (std::size_t j = 0; j < as.size(); ++j)
         {
-            if (std::fabs(as[j] - bs[j]) >
-                1e-5f * (1.0f + std::fabs(as[j]) + std::fabs(bs[j])))
+            if (std::fabs(as[j] - bs[j]) > 1e-5f * (1.0f + std::fabs(as[j]) + std::fabs(bs[j])))
                 return false;
         }
     }
@@ -147,9 +132,9 @@ protected:
     [[nodiscard]] nn::Result<void> init_impl(nn::ComputeEngine&) override { return {}; }
 };
 
-nn::Result<ObjectiveGrads> make_objective_grads(
-    nn::CpuEngine& engine, const nn::TensorSchema& schema,
-    const nn::NamedTensorSet& output)
+nn::Result<ObjectiveGrads> make_objective_grads(nn::CpuEngine& engine,
+                                                const nn::TensorSchema& schema,
+                                                const nn::NamedTensorSet& output)
 {
     NN_TRY(policy_h, output.field("policy"));
     NN_TRY(value_h, output.field("value"));
@@ -158,12 +143,8 @@ nn::Result<ObjectiveGrads> make_objective_grads(
 
     nn::MSELoss policy_loss;
     nn::MSELoss value_loss;
-    auto zero_policy = make_tensor(engine, (*policy)->rows(),
-                                   (*policy)->cols(),
-                                   0.0f, 0.0f);
-    auto zero_value = make_tensor(engine, (*value)->rows(),
-                                  (*value)->cols(),
-                                  0.0f, 0.0f);
+    auto zero_policy = make_tensor(engine, (*policy)->rows(), (*policy)->cols(), 0.0f, 0.0f);
+    auto zero_value = make_tensor(engine, (*value)->rows(), (*value)->cols(), 0.0f, 0.0f);
     NN_TRY_CHECK(policy_loss.forward(engine, **policy, zero_policy));
     NN_TRY_CHECK(value_loss.forward(engine, **value, zero_value));
     NN_TRY(policy_grad, policy_loss.backward());
@@ -171,20 +152,15 @@ nn::Result<ObjectiveGrads> make_objective_grads(
     NN_TRY_CHECK(engine.scale_inplace(*value_grad, 0.5f));
 
     auto named = nn::NamedTensorSet::create(
-        schema,
-        {nn::NamedTensor{.name = "policy", .value = *policy_grad},
-         nn::NamedTensor{.name = "value", .value = *value_grad}});
+        schema, {nn::NamedTensor{.name = "policy", .value = *policy_grad},
+                 nn::NamedTensor{.name = "value", .value = *value_grad}});
     NN_TRY_CHECK(named);
     NN_TRY(packing, nn::RowBandPacking::create(schema, {"policy", "value"}));
     NN_TRY(packed, packing->pack(engine, *named));
     NN_TRY(named_grads, nn::GradientBundle::create(
-                            schema,
-                            {nn::NamedTensor{.name = "policy",
-                                             .value = *policy_grad},
-                             nn::NamedTensor{.name = "value",
-                                             .value = *value_grad}}));
-    return ObjectiveGrads{.named = std::move(*named_grads),
-                          .packed = std::move(*packed)};
+                            schema, {nn::NamedTensor{.name = "policy", .value = *policy_grad},
+                                     nn::NamedTensor{.name = "value", .value = *value_grad}}));
+    return ObjectiveGrads{.named = std::move(*named_grads), .packed = std::move(*packed)};
 }
 
 void test_named_and_packed()
@@ -200,9 +176,7 @@ void test_named_and_packed()
     nn::Model& named_model = *named_model_r;
     nn::Model& packed_model = *packed_model_r;
     CHECK(named_model.output_schema().has_value(), "bundle exposes schema");
-    CHECK(named_model.forward_named(
-              make_tensor(engine, 2, 3, 0.2f, 0.1f))
-              .has_value(),
+    CHECK(named_model.forward_named(make_tensor(engine, 2, 3, 0.2f, 0.1f)).has_value(),
           "named forward");
 
     const nn::Tensor input = make_tensor(engine, 2, 3, 0.2f, 0.1f);
@@ -220,34 +194,27 @@ void test_named_and_packed()
     auto value = named->require(*value_h);
     CHECK(policy && value, "named output values");
     if (!policy || !value) return;
-    CHECK((*policy)->rows() == 2 && (*policy)->cols() == 3,
-          "policy shape (A,T)");
-    CHECK((*value)->rows() == 1 && (*value)->cols() == 3,
-          "value shape (1,T)");
+    CHECK((*policy)->rows() == 2 && (*policy)->cols() == 3, "policy shape (A,T)");
+    CHECK((*value)->rows() == 1 && (*value)->cols() == 3, "value shape (1,T)");
 
-    auto packing = NN_UNWRAP(nn::RowBandPacking::create(
-        schema, {"policy", "value"}));
+    auto packing = NN_UNWRAP(nn::RowBandPacking::create(schema, {"policy", "value"}));
     auto named_packed = packing.pack(engine, *named);
     CHECK(named_packed.has_value(), "named outputs pack");
     auto packed = packed_model.forward(input);
     CHECK(packed.has_value(), "legacy packed forward");
     if (named_packed && packed)
-        check_close(engine, *packed, *named_packed,
-                    "packed forward equals named ports", g_fail);
+        check_close(engine, *packed, *named_packed, "packed forward equals named ports", g_fail);
 
     auto objective = make_objective_grads(engine, schema, *named);
     CHECK(objective.has_value(), "build policy/value objective gradients");
     if (!objective) return;
 
-    CHECK(named_model.backward_named(objective->named).has_value(),
-          "named backward");
-    CHECK(packed_model.backward(objective->packed).has_value(),
-          "packed backward");
+    CHECK(named_model.backward_named(objective->named).has_value(), "named backward");
+    CHECK(packed_model.backward(objective->packed).has_value(), "packed backward");
 
     auto named_grads = snapshot(engine, named_model.param_gradients());
     auto packed_grads = snapshot(engine, packed_model.param_gradients());
-    CHECK(matrices_equal(named_grads, packed_grads),
-          "named and packed parameter gradients agree");
+    CHECK(matrices_equal(named_grads, packed_grads), "named and packed parameter gradients agree");
     CHECK(named_grads.size() == 6, "all branch/trunk gradients materialized");
     if (named_grads.size() == 6)
     {
@@ -265,8 +232,7 @@ void test_negative_paths()
     nn::CpuEngine& engine = *owner;
     const nn::TensorSchema schema = policy_value_schema();
 
-    auto bad_order = nn::RowBandPacking::create(
-        schema, {"policy", "policy"});
+    auto bad_order = nn::RowBandPacking::create(schema, {"policy", "policy"});
     CHECK(!bad_order, "packing rejects duplicate field");
     auto missing_field = nn::RowBandPacking::create(schema, {"policy"});
     CHECK(!missing_field, "packing requires complete coverage");
@@ -282,13 +248,11 @@ void test_negative_paths()
     if (!policy_h) return;
     auto policy = output->require(*policy_h);
     if (!policy) return;
-    auto wrong_schema = nn::TensorSchema::create(
-        "wrong", {nn::tensor_field("policy")});
+    auto wrong_schema = nn::TensorSchema::create("wrong", {nn::tensor_field("policy")});
     CHECK(wrong_schema.has_value(), "wrong schema builds");
     if (!wrong_schema) return;
     auto wrong_grads = nn::GradientBundle::create(
-        *wrong_schema,
-        {nn::NamedTensor{.name = "policy", .value = **policy}});
+        *wrong_schema, {nn::NamedTensor{.name = "policy", .value = **policy}});
     CHECK(wrong_grads.has_value(), "wrong-schema gradient bundle builds");
     if (wrong_grads)
         CHECK(!model_r->backward_named(*wrong_grads).has_value(),
@@ -329,12 +293,9 @@ void test_model_spec_roundtrip()
     CHECK(loaded.has_value(), "output schema spec decodes");
     if (!loaded) return;
     CHECK(loaded->output_schema.has_value(), "loaded schema present");
-    CHECK(loaded->output_packing == spec.output_packing,
-          "loaded packing order");
-    CHECK(*loaded->output_schema == *spec.output_schema,
-          "schema semantic roundtrip");
-    CHECK(nn::spec_matches(spec, *loaded),
-          "spec_matches includes output schema");
+    CHECK(loaded->output_packing == spec.output_packing, "loaded packing order");
+    CHECK(*loaded->output_schema == *spec.output_schema, "schema semantic roundtrip");
+    CHECK(nn::spec_matches(spec, *loaded), "spec_matches includes output schema");
 
     nn::ModelSpec duplicate_packing = spec;
     duplicate_packing.output_packing = {"policy", "policy"};
@@ -345,10 +306,8 @@ void test_model_spec_roundtrip()
     nn::ModelSpec old;
     old.emplace<nn::MlpSpec>().layer_dims = {8, 4};
     auto old_loaded = nn::detail::spec_from_kv(
-        *nn::KeyValueRecord::parse(
-            nn::detail::spec_to_kv(old).serialize()));
-    CHECK(old_loaded && !old_loaded->output_schema &&
-              old_loaded->output_packing.empty(),
+        *nn::KeyValueRecord::parse(nn::detail::spec_to_kv(old).serialize()));
+    CHECK(old_loaded && !old_loaded->output_schema && old_loaded->output_packing.empty(),
           "legacy single-output spec stays schema-free");
 }
 

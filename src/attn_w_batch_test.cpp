@@ -21,8 +21,8 @@
 #include <iostream>
 #include <random>
 
-using nn::Scalar;
 using nn::Matrix;
+using nn::Scalar;
 
 int main(int argc, char** argv)
 {
@@ -37,7 +37,12 @@ int main(int argc, char** argv)
 
     const std::size_t d_model = 16;
     std::size_t batch = 0, heads = 0, seq = 5;
-    if (argc >= 4) { batch = std::stoul(argv[1]); heads = std::stoul(argv[2]); seq = std::stoul(argv[3]); }
+    if (argc >= 4)
+    {
+        batch = std::stoul(argv[1]);
+        heads = std::stoul(argv[2]);
+        seq = std::stoul(argv[3]);
+    }
 
     std::mt19937_64 rng(123);
     std::uniform_real_distribution<Scalar> dist(-1, 1);
@@ -48,8 +53,22 @@ int main(int argc, char** argv)
                   << " seq=" << seq << " batch=" << b << " (BH=" << b * h << ")\n";
         nn::CausalSelfAttention attn_cpu(d_model, h, seq, seq, nn::PosEncodingType::Learned);
         nn::CausalSelfAttention attn_gpu(d_model, h, seq, seq, nn::PosEncodingType::Learned);
-        { auto r = attn_cpu.init(cpu); if (!r) { std::cerr << "cpu init: " << r.error().message << "\n"; return false; } }
-        { auto r = attn_gpu.init(gpu); if (!r) { std::cerr << "gpu init: " << r.error().message << "\n"; return false; } }
+        {
+            auto r = attn_cpu.init(cpu);
+            if (!r)
+            {
+                std::cerr << "cpu init: " << r.error().message << "\n";
+                return false;
+            }
+        }
+        {
+            auto r = attn_gpu.init(gpu);
+            if (!r)
+            {
+                std::cerr << "gpu init: " << r.error().message << "\n";
+                return false;
+            }
+        }
 
         // 权重同步：CPU 随机 → GPU
         {
@@ -58,28 +77,53 @@ int main(int argc, char** argv)
             for (std::size_t i = 0; i < pc.size(); ++i)
             {
                 auto cm = cpu.to_matrix(pc[i].get());
-                if (!cm) { std::cerr << "to_matrix cpu failed\n"; return false; }
+                if (!cm)
+                {
+                    std::cerr << "to_matrix cpu failed\n";
+                    return false;
+                }
                 auto cp = gpu.write(pg[i].get(), cm->span());
-                if (!cp) { std::cerr << "write gpu failed: " << cp.error().message << "\n"; return false; }
+                if (!cp)
+                {
+                    std::cerr << "write gpu failed: " << cp.error().message << "\n";
+                    return false;
+                }
             }
         }
 
         const std::size_t total = seq * b;
         Matrix x_m(d_model, total);
-        for (std::size_t i = 0; i < x_m.size(); ++i) x_m.span()[i] = dist(rng);
+        for (std::size_t i = 0; i < x_m.size(); ++i)
+            x_m.span()[i] = dist(rng);
 
         auto xc = cpu.from_matrix(x_m);
         auto xg = gpu.from_matrix(x_m);
-        if (!xc || !xg) { std::cerr << "from_matrix failed\n"; return false; }
+        if (!xc || !xg)
+        {
+            std::cerr << "from_matrix failed\n";
+            return false;
+        }
 
         auto yc = attn_cpu.forward(*xc);
         auto yg = attn_gpu.forward(*xg);
-        if (!yc) { std::cout << "CPU forward 失败: " << yc.error().message << "\n"; return false; }
-        if (!yg) { std::cout << "GPU forward 失败: " << yg.error().message << "\n"; return false; }
+        if (!yc)
+        {
+            std::cout << "CPU forward 失败: " << yc.error().message << "\n";
+            return false;
+        }
+        if (!yg)
+        {
+            std::cout << "GPU forward 失败: " << yg.error().message << "\n";
+            return false;
+        }
 
         auto ycm = cpu.to_matrix(*yc);
         auto ygm = gpu.to_matrix(*yg);
-        if (!ycm || !ygm) { std::cerr << "to_matrix failed\n"; return false; }
+        if (!ycm || !ygm)
+        {
+            std::cerr << "to_matrix failed\n";
+            return false;
+        }
 
         Scalar max_abs = 0;
         std::size_t bad = 0;
@@ -91,9 +135,8 @@ int main(int argc, char** argv)
             if (d > max_abs) max_abs = d;
             if (d > 1e-3f) ++bad;
         }
-        std::cout << "  max_abs_diff=" << max_abs
-                  << "  bad_cells(>1e-3)=" << bad << " / " << ycm->size()
-                  << "  " << (max_abs <= 1e-3f ? "✅ 一致" : "❌ 不一致") << "\n";
+        std::cout << "  max_abs_diff=" << max_abs << "  bad_cells(>1e-3)=" << bad << " / "
+                  << ycm->size() << "  " << (max_abs <= 1e-3f ? "✅ 一致" : "❌ 不一致") << "\n";
         return max_abs <= 1e-3f;
     };
 

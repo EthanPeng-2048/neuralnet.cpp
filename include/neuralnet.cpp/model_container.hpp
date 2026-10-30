@@ -53,8 +53,7 @@ private:
 public:
     Model() = default;
     explicit Model(ComputeEngine& engine) : engine_(engine.weak_from_this().lock()) {}
-    explicit Model(std::shared_ptr<ComputeEngine> engine)
-        : engine_(std::move(engine)) {}
+    explicit Model(std::shared_ptr<ComputeEngine> engine) : engine_(std::move(engine)) {}
 
     // 不可拷贝（unique_ptr 语义），可移动
     Model(const Model&) = delete;
@@ -68,20 +67,17 @@ public:
     // 构造函数 `Model(ComputeEngine&)`（或移动后沿用既有绑定）。
     // 是否已绑定引擎（不触发 fail-fast 的只读查询；TrainingSession::create
     // 等"编排层"在构造前用它做 Result 错误而不是 abort）。
-    [[nodiscard]] bool engine_bound() const noexcept
-    {
-        return static_cast<bool>(engine_);
-    }
+    [[nodiscard]] bool engine_bound() const noexcept { return static_cast<bool>(engine_); }
 
-    [[nodiscard]] ComputeEngine& engine(
-        std::source_location loc = std::source_location::current()) const
+    [[nodiscard]] ComputeEngine&
+    engine(std::source_location loc = std::source_location::current()) const
     {
         if (!engine_)
         {
             const std::string msg =
                 "[model-lifetime] Model: 未绑定引擎（构造时引擎必须由 shared_ptr 管理）";
-            detail::fatal_at("NN_FATAL", loc.file_name(),
-                             static_cast<int>(loc.line()), msg.c_str());
+            detail::fatal_at("NN_FATAL", loc.file_name(), static_cast<int>(loc.line()),
+                             msg.c_str());
         }
         return *engine_;
     }
@@ -92,8 +88,7 @@ public:
     // 注意：MultiHeadAttention 的构造函数是 protected（设计为基类，
     //       由 TransformerEncoderLayer / CausalSelfAttention 内部组合），
     //       因此不直接通过 add 添加。
-    template <typename LayerType, typename... Args>
-    Result<void> add(Args&&... args)
+    template <typename LayerType, typename... Args> Result<void> add(Args&&... args)
     {
         auto layer = std::make_unique<LayerType>(std::forward<Args>(args)...);
         if (default_precision_.has_value())
@@ -130,9 +125,7 @@ public:
 
     // ── 默认精度配置（§9.2）：须在 add()/add_layer() 之前调用 ─────────────
     void set_default_precision_profile(const PrecisionProfile& profile)
-    {
-        default_precision_ = profile;
-    }
+    { default_precision_ = profile; }
     [[nodiscard]] const PrecisionProfile& default_precision_profile() const noexcept
     {
         static const PrecisionProfile f32{};
@@ -162,16 +155,13 @@ public:
     void set_output_schema(TensorSchema schema)
     {
         output_schema_ = std::move(schema);
-        if (spec_)
-            spec_->output_schema = output_schema_;
+        if (spec_) spec_->output_schema = output_schema_;
     }
 
     [[nodiscard]] Result<TensorSchema> output_schema() const
     {
-        if (output_schema_)
-            return *output_schema_;
-        if (layers_.empty())
-            NN_FAIL("Model::output_schema: no layers");
+        if (output_schema_) return *output_schema_;
+        if (layers_.empty()) NN_FAIL("Model::output_schema: no layers");
         return layers_.back()->output_schema();
     }
 
@@ -238,16 +228,13 @@ public:
     // ── 前向传播：Tensor → Tensor（全程不离开 engine 设备） ───────────────
     [[nodiscard]] Result<Tensor> forward(const Tensor& input)
     {
-        if (layers_.empty())
-            NN_FAIL("Model::forward: no layers");
-        if (!engine_)
-            NN_FAIL("Model::forward: engine 未绑定（构造时引擎必须由 shared_ptr 管理）");
+        if (layers_.empty()) NN_FAIL("Model::forward: no layers");
+        if (!engine_) NN_FAIL("Model::forward: engine 未绑定（构造时引擎必须由 shared_ptr 管理）");
         // GPU 单次推理自动 batch 作用域（issue #28）：外层未持有 batch 时
         // 临时开一个，多 Conv 模型不再因逐原语路径不回收帧内分配而
         // VK_ERROR_OUT_OF_DEVICE_MEMORY。外层训练循环已持有 batch → 透传。
         InferenceScope scope(*engine_);
-        if (!scope.ok())
-            NN_FAIL("Model::forward: " + scope.error().message);
+        if (!scope.ok()) NN_FAIL("Model::forward: " + scope.error().message);
         Tensor x = input;
         for (std::size_t li = 0; li < layers_.size(); ++li)
         {
@@ -262,14 +249,11 @@ public:
     // ── 反向传播：Tensor → Tensor（从最后一层到第一层） ───────────────────
     [[nodiscard]] Result<Tensor> backward(const Tensor& grad_output)
     {
-        if (layers_.empty())
-            NN_FAIL("Model::backward: no layers");
-        if (!engine_)
-            NN_FAIL("Model::backward: engine 未绑定（构造时引擎必须由 shared_ptr 管理）");
+        if (layers_.empty()) NN_FAIL("Model::backward: no layers");
+        if (!engine_) NN_FAIL("Model::backward: engine 未绑定（构造时引擎必须由 shared_ptr 管理）");
         // 同 forward（issue #28）：外层未持有 batch 时临时开一个。
         InferenceScope scope(*engine_);
-        if (!scope.ok())
-            NN_FAIL("Model::backward: " + scope.error().message);
+        if (!scope.ok()) NN_FAIL("Model::backward: " + scope.error().message);
         Tensor g = grad_output;
         for (std::size_t i = layers_.size(); i-- > 0;)
         {
@@ -284,10 +268,8 @@ public:
     // ── 具名 forward/backward：中间层仍走单 Tensor，最后一层可展开多端口 ──
     [[nodiscard]] Result<NamedTensorSet> forward_named(const Tensor& input)
     {
-        if (layers_.empty())
-            NN_FAIL("Model::forward_named: no layers");
-        if (!engine_)
-            NN_FAIL("Model::forward_named: engine 未绑定");
+        if (layers_.empty()) NN_FAIL("Model::forward_named: no layers");
+        if (!engine_) NN_FAIL("Model::forward_named: engine 未绑定");
         NN_TRY(schema, output_schema());
 
         Tensor x = input;
@@ -297,22 +279,17 @@ public:
             NN_TRY(out, layers_[li]->forward(x));
             x = std::move(*out);
         }
-        NN_PROF_SCOPE(nn::prof::interned("fwd_named.layer",
-                                         layers_.size() - 1));
+        NN_PROF_SCOPE(nn::prof::interned("fwd_named.layer", layers_.size() - 1));
         return layers_.back()->forward_named(x, *schema);
     }
 
-    [[nodiscard]] Result<Tensor> backward_named(
-        const GradientBundle& gradients)
+    [[nodiscard]] Result<Tensor> backward_named(const GradientBundle& gradients)
     {
-        if (layers_.empty())
-            NN_FAIL("Model::backward_named: no layers");
-        if (!engine_)
-            NN_FAIL("Model::backward_named: engine 未绑定");
+        if (layers_.empty()) NN_FAIL("Model::backward_named: no layers");
+        if (!engine_) NN_FAIL("Model::backward_named: engine 未绑定");
         NN_TRY(schema, output_schema());
 
-        NN_TRY(last_grad,
-               layers_.back()->backward_named(gradients, *schema));
+        NN_TRY(last_grad, layers_.back()->backward_named(gradients, *schema));
         Tensor g = std::move(*last_grad);
         for (std::size_t i = layers_.size() - 1; i-- > 0;)
         {

@@ -38,12 +38,14 @@
 #define NN_TEST_COUNTER g_fail
 #endif
 
-#define CHECK(cond, msg)                                                     \
-    do {                                                                     \
-        if (!(cond)) {                                                       \
-            std::printf("[FAIL] %s:%d: %s\n", __FILE__, __LINE__, (msg));    \
-            ++NN_TEST_COUNTER;                                               \
-        }                                                                    \
+#define CHECK(cond, msg)                                                  \
+    do                                                                    \
+    {                                                                     \
+        if (!(cond))                                                      \
+        {                                                                 \
+            std::printf("[FAIL] %s:%d: %s\n", __FILE__, __LINE__, (msg)); \
+            ++NN_TEST_COUNTER;                                            \
+        }                                                                 \
     } while (0)
 
 // ── M1 访问收口（docs/internal/17 §4.1）：库外一律经引擎上传/下载 ───────
@@ -61,8 +63,7 @@ inline nn::Tensor upload(nn::ComputeEngine& e, const nn::Matrix& m,
 }
 
 // f16 宿主矩阵上传（f16→f32 逐元素升位后按 F16 落盘：往返精确无损）
-inline nn::Tensor upload(nn::ComputeEngine& e,
-                         const nn::MatrixT<nn::Precision::F16>& m)
+inline nn::Tensor upload(nn::ComputeEngine& e, const nn::MatrixT<nn::Precision::F16>& m)
 {
     nn::Matrix m32(m.rows(), m.cols());
     const auto s = m.span();
@@ -80,9 +81,8 @@ inline nn::Matrix download(nn::ComputeEngine& e, const nn::Tensor& t)
 }
 
 // ── 构造确定性测试张量（base + i*step 填充；经引擎上传，出生即绑定）────────
-inline nn::Tensor make_tensor(nn::ComputeEngine& e, std::size_t rows,
-                              std::size_t cols, float base = 0.0f,
-                              float step = 0.01f)
+inline nn::Tensor make_tensor(nn::ComputeEngine& e, std::size_t rows, std::size_t cols,
+                              float base = 0.0f, float step = 0.01f)
 {
     nn::Matrix m(rows, cols);
     auto sp = m.span();
@@ -92,13 +92,13 @@ inline nn::Tensor make_tensor(nn::ComputeEngine& e, std::size_t rows,
 }
 
 // ── 逐元素比对 Tensor（容差 1e-4 相对；失败计数进 fails = 调用方的 g_fail）──
-inline void check_close(nn::ComputeEngine& e, const nn::Tensor& got,
-                        const nn::Tensor& ref, const char* msg, int& fails)
+inline void check_close(nn::ComputeEngine& e, const nn::Tensor& got, const nn::Tensor& ref,
+                        const char* msg, int& fails)
 {
     if (got.rows() != ref.rows() || got.cols() != ref.cols())
     {
-        std::printf("[FAIL] %s: shape mismatch got %zux%zu ref %zux%zu\n",
-                    msg, got.rows(), got.cols(), ref.rows(), ref.cols());
+        std::printf("[FAIL] %s: shape mismatch got %zux%zu ref %zux%zu\n", msg, got.rows(),
+                    got.cols(), ref.rows(), ref.cols());
         ++fails;
         return;
     }
@@ -119,15 +119,12 @@ inline void check_close(nn::ComputeEngine& e, const nn::Tensor& got,
         }
     }
     if (ok) std::printf("[ OK ] %s\n", msg);
-    else    ++fails;
+    else ++fails;
 }
 
 // ── 数值 vs 解析梯度的相对容差判据（gradcheck 通用）───────────────────────
 inline bool approx(nn::Scalar num, nn::Scalar ana, nn::Scalar tol)
-{
-    return std::fabs(num - ana) <=
-           tol * (nn::Scalar{1} + std::fabs(num) + std::fabs(ana));
-}
+{ return std::fabs(num - ana) <= tol * (nn::Scalar{1} + std::fabs(num) + std::fabs(ana)); }
 
 // ── 矩阵点积（gradcheck 计算参考损失用）───────────────────────────────────
 inline nn::Scalar dot(const nn::Matrix& a, const nn::Matrix& b)
@@ -144,8 +141,7 @@ inline nn::Scalar dot(const nn::Matrix& a, const nn::Matrix& b)
 inline bool close_to(const nn::Matrix& a, const nn::Matrix& b, nn::Scalar tol,
                      const std::string& name, std::size_t idx)
 {
-    NN_ASSERT_ALWAYS(a.rows() == b.rows() && a.cols() == b.cols(),
-                     "close_to: shape mismatch");
+    NN_ASSERT_ALWAYS(a.rows() == b.rows() && a.cols() == b.cols(), "close_to: shape mismatch");
     nn::Scalar max_abs = 0;
     nn::Scalar max_rel = 0;
     const auto& sa = a.span();
@@ -159,8 +155,7 @@ inline bool close_to(const nn::Matrix& a, const nn::Matrix& b, nn::Scalar tol,
         if (rel > max_rel) max_rel = rel;
     }
     const bool pass = (max_abs <= tol) || (max_rel <= tol);
-    std::cout << "    [" << idx << "] " << name
-              << "  max_abs=" << max_abs << "  max_rel=" << max_rel
-              << (pass ? "  OK" : "  FAIL") << "\n";
+    std::cout << "    [" << idx << "] " << name << "  max_abs=" << max_abs
+              << "  max_rel=" << max_rel << (pass ? "  OK" : "  FAIL") << "\n";
     return pass;
 }

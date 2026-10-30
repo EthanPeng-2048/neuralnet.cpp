@@ -46,7 +46,7 @@ using nn::Scalar;
 // 不兼容组合由 `Layer::init` 的能力校验给出"层 X 不支持 param=t1_58"的报错，
 // 这正是设计意图（§4.1）—— CLI 不加模型白名单。
 nn::Precision parse_precision_arg(const std::string& name, const char* flag,
-                              bool allow_t1_58 = false)
+                                  bool allow_t1_58 = false)
 {
     if (name == "f16" || name == "half") return nn::Precision::F16;
     if (name == "f32" || name == "float") return nn::Precision::F32;
@@ -57,83 +57,121 @@ nn::Precision parse_precision_arg(const std::string& name, const char* flag,
                   << "，可选: f16, f32\n";
         std::exit(1);
     }
-    std::cerr << "无效 --" << flag << ": " << name << "，可选: "
-              << (allow_t1_58 ? "f16, f32, t1_58" : "f16, f32") << "\n";
+    std::cerr << "无效 --" << flag << ": " << name
+              << "，可选: " << (allow_t1_58 ? "f16, f32, t1_58" : "f16, f32") << "\n";
     std::exit(1);
 }
 
 // ==================== 帮助信息 ====================
-void print_text_train_usage(const char *prog)
+void print_text_train_usage(const char* prog)
 {
     nn::cli::Help help(std::cout, prog, "GPT 文本生成训练程序");
 
     help.usage("<dataset.nndataset> [选项]");
 
     help.section("参数");
-    help.item("<dataset.nndataset>", "数据集文件路径 (.nndataset，由 dataset_gen 生成；\n词表/loss 掩码/test 子集都在生成期定好)");
+    help.item("<dataset.nndataset>", "数据集文件路径 (.nndataset，由 dataset_gen 生成；\n词表/loss "
+                                     "掩码/test 子集都在生成期定好)");
 
     help.section("选项");
-    help.opt("--save <path>", "推理模型保存路径 (默认: gpt_model.nnmodel；\n只含推理所需参数——三值层写打包形态，不含训练参数)");
-    help.opt("--resume <path>", "从模型文件恢复训练：\n断点 .nnckpt = 断点续训（形状/配方/计数器由断点决定，二者不得再由命令行给出）；\n推理模型 .nnmodel = warm start（SFT：CLI 全权、优化器冷启动；\n三值模型的打包权重按文件 τ 反量化成 f32 latent 后可继续训练）");
+    help.opt("--save <path>",
+             "推理模型保存路径 (默认: "
+             "gpt_model.nnmodel；\n只含推理所需参数——三值层写打包形态，不含训练参数)");
+    help.opt("--resume <path>",
+             "从模型文件恢复训练：\n断点 .nnckpt = "
+             "断点续训（形状/配方/计数器由断点决定，二者不得再由命令行给出）；\n推理模型 .nnmodel "
+             "= warm start（SFT：CLI 全权、优化器冷启动；\n三值模型的打包权重按文件 τ 反量化成 f32 "
+             "latent 后可继续训练）");
     help.opt("--resume-epoch <n>", "从第 n 个 epoch 继续 (0-based，需配合 --resume；默认 0)");
     help.opt("--resume-step <n>", "从本 epoch 内第 n 步继续 (0-based，需配合 --resume；默认 0)");
     help.opt("--epochs <n>", "训练轮数 (默认: 10)");
     help.opt("--lr <lr>", "学习率 (默认: 0.001)");
     help.opt("--batch-size <n>", "理论 global batch / 每次参数更新的样本数 (默认: 32)");
-    help.opt("--accum-steps <n>", "梯度累积次数 (默认: 1)\n实际 micro-batch = batch-size / accum-steps；必须整除");
+    help.opt("--accum-steps <n>",
+             "梯度累积次数 (默认: 1)\n实际 micro-batch = batch-size / accum-steps；必须整除");
     help.opt("--seq-len <n>", "序列长度 (默认: 256)");
-    help.opt("--stride <n>", "滑动窗口步长 (默认: 等于 --seq-len，即不重叠)\n设小可产生重叠窗口，增加训练样本数");
+    help.opt("--stride <n>",
+             "滑动窗口步长 (默认: 等于 --seq-len，即不重叠)\n设小可产生重叠窗口，增加训练样本数");
     // RV-04：名单文本由 nn::optimizer_table()（唯一真源）生成，不再手抄
-    help.opt("--optimizer <name>",
-             "优化器: " + nn::optimizer_names("/") +
-                 " (默认: adam)\nadamwquant: 量化状态的 AdamW（状态 4 B/权重 vs 8 B；见 docs/internal/21 §4.13）");
+    help.opt("--optimizer <name>", "优化器: " + nn::optimizer_names("/") +
+                                       " (默认: adam)\nadamwquant: 量化状态的 AdamW（状态 4 B/权重 "
+                                       "vs 8 B；见 docs/internal/21 §4.13）");
     help.opt("--weight-decay <w>", "AdamW 权重衰减系数 (默认: 0.01)");
     help.opt("--beta1 <b>", "Adam/AdamW 一阶动量衰减 β1 (默认: 0.9，sgd/muon 忽略)");
-    help.opt("--beta2 <b>", "Adam/AdamW 二阶动量衰减 β2 (默认: 0.999，sgd/muon 忽略)\nLLM 预训练惯例常取 0.95 (GPT-3/LLaMA 配方)");
+    help.opt("--beta2 <b>", "Adam/AdamW 二阶动量衰减 β2 (默认: 0.999，sgd/muon 忽略)\nLLM "
+                            "预训练惯例常取 0.95 (GPT-3/LLaMA 配方)");
     help.opt("--max-norm <f>", "梯度裁剪最大全局 L2 范数 (默认: 0=不裁剪)");
     help.opt("--log-interval <n>", "每隔多少 step 显示进度 (默认: 50)");
-    help.opt("--save-interval <n>", "每隔多少 update step 保存训练断点 .nnckpt (默认: 100；\n文件名 = --save 的路径换 .nnckpt 扩展名)");
-    help.opt("--max-steps <n>", "本次运行最多执行多少 update step (默认: 0=不限)\n按本进程参数更新次数计，可与 --resume 组合分段跑；用于吞吐实测/分段训练");
+    help.opt("--save-interval <n>", "每隔多少 update step 保存训练断点 .nnckpt (默认: "
+                                    "100；\n文件名 = --save 的路径换 .nnckpt 扩展名)");
+    help.opt("--max-steps <n>",
+             "本次运行最多执行多少 update step (默认: 0=不限)\n按本进程参数更新次数计，可与 "
+             "--resume 组合分段跑；用于吞吐实测/分段训练");
     help.opt("--grad-log", "显示梯度统计 (范数/最大值/均值)");
-    help.opt("--gpu [索引|名称]", "启用 GPU 加速 (需要 Vulkan SDK)\n空格形式只收枚举索引；名称子串用 --gpu=<名称>，如 --gpu=NVIDIA / --gpu=40HX");
+    help.opt("--gpu [索引|名称]",
+             "启用 GPU 加速 (需要 Vulkan SDK)\n空格形式只收枚举索引；名称子串用 --gpu=<名称>，如 "
+             "--gpu=NVIDIA / --gpu=40HX");
     help.opt("--help, -h", "显示此帮助信息");
 
     help.section("模型结构");
-    help.opt("--model <type>", "模型架构: gpt/rapt (默认: gpt)\ngpt: 标准 Transformer 语言模型\nrapt: ReLU 线性注意力 (RLA) 语言模型，动态稀疏检索，\nO(L·d²) 复杂度；强制 RoPE (ReLU 前施加)");
-    help.opt("--positional-encoding <type>", "位置编码类型: learned/sinusoidal/alibi/rope (默认: learned)\nlearned: 可学习位置嵌入 (GPT 原版)\nsinusoidal: 正弦波固定位置编码 (不参与训练)\nalibi: 线性偏置注意力 (无位置嵌入，支持长度外推)\nrope: 旋转位置编码 (现代方案，在注意力 Q/K 上施加)");
-    help.opt("--activation <type>", "FFN 激活: gelu/swiglu/relu2 (默认: gelu)\ngelu: QuickGeLU (GPT-2 风格)\nswiglu: SwiGLU (LLaMA/Mistral 风格，每参数效率更高)\nrelu2: 门控平方 ReLU (BitNet b1.58 2B4T 的 hidden_act)");
-    help.opt("--norm <type>", "归一化层: layernorm/rmsnorm (默认: layernorm)\nlayernorm: LayerNorm (GPT-2 风格)\nrmsnorm: RMSNorm (LLaMA/Mistral 风格，更快更稳)");
+    help.opt("--model <type>",
+             "模型架构: gpt/rapt (默认: gpt)\ngpt: 标准 Transformer 语言模型\nrapt: ReLU "
+             "线性注意力 (RLA) 语言模型，动态稀疏检索，\nO(L·d²) 复杂度；强制 RoPE (ReLU 前施加)");
+    help.opt("--positional-encoding <type>",
+             "位置编码类型: learned/sinusoidal/alibi/rope (默认: learned)\nlearned: 可学习位置嵌入 "
+             "(GPT 原版)\nsinusoidal: 正弦波固定位置编码 (不参与训练)\nalibi: 线性偏置注意力 "
+             "(无位置嵌入，支持长度外推)\nrope: 旋转位置编码 (现代方案，在注意力 Q/K 上施加)");
+    help.opt("--activation <type>",
+             "FFN 激活: gelu/swiglu/relu2 (默认: gelu)\ngelu: QuickGeLU (GPT-2 风格)\nswiglu: "
+             "SwiGLU (LLaMA/Mistral 风格，每参数效率更高)\nrelu2: 门控平方 ReLU (BitNet b1.58 2B4T "
+             "的 hidden_act)");
+    help.opt("--norm <type>", "归一化层: layernorm/rmsnorm (默认: layernorm)\nlayernorm: LayerNorm "
+                              "(GPT-2 风格)\nrmsnorm: RMSNorm (LLaMA/Mistral 风格，更快更稳)");
     help.opt("--d-model <n>", "模型维度 (默认: 128)");
     help.opt("--num-heads <n>", "注意力头数 (默认: 4)");
     help.opt("--num-layers <n>", "Transformer 层数 (默认: 4)");
     help.opt("--d-ff <n>", "FFN 中间维度 (默认: 512)");
 
     help.section("学习率调度");
-    help.opt("--lr-schedule <type>", "学习率调度: fixed/cosine/step_cosine (默认: fixed)\ncosine: 余弦退火 (epoch 级)，lr 从初始值衰减到 min-lr\nstep_cosine: 余弦退火 (step 级)，按单个训练步预热+退火，\n适合每 epoch 步数很多的场景 (如大语料)");
+    help.opt("--lr-schedule <type>",
+             "学习率调度: fixed/cosine/step_cosine (默认: fixed)\ncosine: 余弦退火 (epoch 级)，lr "
+             "从初始值衰减到 min-lr\nstep_cosine: 余弦退火 (step "
+             "级)，按单个训练步预热+退火，\n适合每 epoch 步数很多的场景 (如大语料)");
     help.opt("--warmup-epochs <n>", "线性预热轮数 (默认: 0，仅 cosine)");
     help.opt("--warmup-steps <n>", "线性预热步数 (默认: 0，仅 step_cosine)");
     help.opt("--min-lr <lr>", "余弦退火最低学习率 (默认: 1e-6)");
     help.opt("--lr-per-epoch <v1,v2,...>", "手动指定每轮学习率 (逗号分隔，优先级最高)");
 
     help.section("显存优化");
-    help.opt("--checkpoint-every <n>", "每 N 个 Transformer block 重算一次 forward (激活重计算，默认: 0=不启用)\n1=每块都重算，显存收益最大，以约 1 次额外前向\nFLOPs 为代价省去整层激活驻留");
-    help.opt("--activation-offload", "把每块激活搬 host-visible，backward 拷回\n不重算，FLOPs 保持 1.0×，代价是 PCIe 传输；可与\n--checkpoint-every 混合使用：checkpoint 块重算、其余块 offload；仅 GPU 有效；\n与 --f16 / --t1_58 / 四槽精度参数不兼容（slab 恒 f32，配置期拒绝）");
+    help.opt(
+        "--checkpoint-every <n>",
+        "每 N 个 Transformer block 重算一次 forward (激活重计算，默认: "
+        "0=不启用)\n1=每块都重算，显存收益最大，以约 1 次额外前向\nFLOPs 为代价省去整层激活驻留");
+    help.opt("--activation-offload",
+             "把每块激活搬 host-visible，backward 拷回\n不重算，FLOPs 保持 1.0×，代价是 PCIe "
+             "传输；可与\n--checkpoint-every 混合使用：checkpoint 块重算、其余块 offload；仅 GPU "
+             "有效；\n与 --f16 / --t1_58 / 四槽精度参数不兼容（slab 恒 f32，配置期拒绝）");
     help.note("GPU 训练每 step 末尾自动归还完全空闲的内存池底材 (L2 整块释放)。");
 
     help.section("Batch 录制粒度");
     help.opt("--flush-interval <n>", "每 N 个 Transformer block flush 一次 (默认: 1)");
-    help.note("按层切 batch 缩短 D1 延迟销毁锁窗、拆分大提交防 TDR；\n非阻塞提交后细粒度 flush 的额外 submit 代价不在关键路径，\n不影响 batch_size 和训练质量");
+    help.note("按层切 batch 缩短 D1 延迟销毁锁窗、拆分大提交防 TDR；\n非阻塞提交后细粒度 flush "
+              "的额外 submit 代价不在关键路径，\n不影响 batch_size 和训练质量");
 
     help.section("混合精度 (docs/development/05-mixed-precision.md)");
     help.opt("--f16", "快捷方式: f16 存储 (param/compute=F16，stable/optimizer=F32)");
-    help.opt("--t1_58", "快捷方式: 精度预设 t1_58 = f16 存储 + 三值权重\n(param=T1_58，compute=F16，stable/optimizer=F32；等价于 --f16 再把 param 换成 t1_58)。\n范围与前置拒绝同 --precision-param t1_58（docs/internal/21-quantized-weights.md §4.10）");
+    help.opt("--t1_58", "快捷方式: 精度预设 t1_58 = f16 存储 + "
+                        "三值权重\n(param=T1_58，compute=F16，stable/optimizer=F32；等价于 --f16 "
+                        "再把 param 换成 t1_58)。\n范围与前置拒绝同 --precision-param "
+                        "t1_58（docs/internal/21-quantized-weights.md §4.10）");
     help.opt("--precision-param <f16|f32|t1_58>",
              "权重/参数精度 (默认: f32)；t1_58 = 三值权重（1.58-bit）——\n"
              "GPT 已支持（注意力 4 投影 + fc1/fc2 + 未 tie 的 LM head 全部换成\n"
              "BitLinear；P1.5 落地）；--model rapt 选它会被前置拒绝\n"
              "(docs/internal/21-quantized-weights.md §4.8.3)");
     help.opt("--precision-compute <f16|f32>", "常规算子计算精度 (matmul/逐元素/gather，默认: f32)");
-    help.opt("--precision-stable <f16|f32>", "数值敏感算子精度 (softmax/LayerNorm/loss，默认: f32)");
+    help.opt("--precision-stable <f16|f32>",
+             "数值敏感算子精度 (softmax/LayerNorm/loss，默认: f32)");
     help.opt("--precision-optimizer <f16|f32>", "优化器状态精度 (Adam m/v，默认: f32)");
 }
 struct TrainConfig : nn::TextTrainConfig
@@ -184,20 +222,42 @@ struct TrainConfig : nn::TextTrainConfig
 // `--checkpoint-every` / `--activation-offload` / `--flush-interval` / `--resume`
 // 本身（含数据集路径 = 位置）、以及探针环境变量。
 inline constexpr std::string_view kForbiddenResumeFlags[] = {
-    "--resume-epoch", "--resume-step",
-    "--epochs", "--lr", "--batch-size", "--accum-steps", "--seq-len", "--stride",
-    "--optimizer", "--weight-decay", "--beta1", "--beta2",
-    "--d-model", "--num-heads", "--num-layers", "--d-ff", "--model",
-    "--f16", "--t1_58",
-    "--precision-param", "--precision-compute", "--precision-stable", "--precision-optimizer",
-    "--lr-schedule", "--warmup-epochs", "--warmup-steps", "--min-lr", "--lr-per-epoch",
-    "--max-norm", "--positional-encoding", "--activation", "--norm",
+    "--resume-epoch",
+    "--resume-step",
+    "--epochs",
+    "--lr",
+    "--batch-size",
+    "--accum-steps",
+    "--seq-len",
+    "--stride",
+    "--optimizer",
+    "--weight-decay",
+    "--beta1",
+    "--beta2",
+    "--d-model",
+    "--num-heads",
+    "--num-layers",
+    "--d-ff",
+    "--model",
+    "--f16",
+    "--t1_58",
+    "--precision-param",
+    "--precision-compute",
+    "--precision-stable",
+    "--precision-optimizer",
+    "--lr-schedule",
+    "--warmup-epochs",
+    "--warmup-steps",
+    "--min-lr",
+    "--lr-per-epoch",
+    "--max-norm",
+    "--positional-encoding",
+    "--activation",
+    "--norm",
 };
 
 [[nodiscard]] constexpr std::span<const std::string_view> forbidden_resume_flags() noexcept
-{
-    return kForbiddenResumeFlags;
-}
+{ return kForbiddenResumeFlags; }
 
 [[nodiscard]] inline bool is_forbidden_resume_flag(std::string_view arg) noexcept
 {
@@ -230,22 +290,19 @@ inline constexpr std::string_view kForbiddenResumeFlags[] = {
 // 决定出口（argparse 层 `std::exit`；`run_text_train` 经 `NN_FAIL` 走 `Result`，
 // 保持"三模块不终止进程"不变量）。
 [[nodiscard]] inline std::optional<std::string>
-precision_offload_combo_error(const TrainConfig &cfg)
+precision_offload_combo_error(const TrainConfig& cfg)
 {
     if (!cfg.activation_offload || !cfg.gpu_enabled) return std::nullopt;
-    if (cfg.precision.param == nn::Precision::F32 &&
-        cfg.precision.compute == nn::Precision::F32 &&
-        cfg.precision.stable == nn::Precision::F32 &&
-        cfg.precision.optimizer == nn::Precision::F32)
+    if (cfg.precision.param == nn::Precision::F32 && cfg.precision.compute == nn::Precision::F32 &&
+        cfg.precision.stable == nn::Precision::F32 && cfg.precision.optimizer == nn::Precision::F32)
         return std::nullopt;
-    return std::string(
-        "--activation-offload 与混合精度/三值精度不兼容（--f16 / --t1_58 /"
-        " 四槽精度参数）：\n"
-        "  offload slab 恒 f32，f16 激活 restore 后会变成 f32（精度语义漂移）。\n"
-        "  请改用 --checkpoint-every，或去掉 --activation-offload。\n");
+    return std::string("--activation-offload 与混合精度/三值精度不兼容（--f16 / --t1_58 /"
+                       " 四槽精度参数）：\n"
+                       "  offload slab 恒 f32，f16 激活 restore 后会变成 f32（精度语义漂移）。\n"
+                       "  请改用 --checkpoint-every，或去掉 --activation-offload。\n");
 }
 
-TrainConfig parse_text_train_args(int argc, char *argv[])
+TrainConfig parse_text_train_args(int argc, char* argv[])
 {
     TrainConfig cfg;
     // 配方默认值继承自 nn::TextTrainConfig；seq_len 的 CLI 默认是 GPT 序列长度，
@@ -257,15 +314,13 @@ TrainConfig parse_text_train_args(int argc, char *argv[])
         // ── A/B 类旗标登记（P1-2 断点续训禁列；按**旗标名**判定、不看值）──
         // 解析层的默认值与用户输入无法区分，故必须在解析期记录"本进程真出现过"
         // 的旗标；续训路径在断点带训练状态段时发现列表非空即报错。
-        if (nn::cli::is_forbidden_resume_flag(arg))
-            cfg.explicit_train_flags.push_back(arg);
+        if (nn::cli::is_forbidden_resume_flag(arg)) cfg.explicit_train_flags.push_back(arg);
         if (arg == "--help" || arg == "-h")
         {
             print_text_train_usage(argv[0]);
             std::exit(0);
         }
-        else if (arg == "--save" && i + 1 < argc)
-            cfg.save_path = argv[++i];
+        else if (arg == "--save" && i + 1 < argc) cfg.save_path = argv[++i];
         else if (arg == "--resume" && i + 1 < argc)
         {
             cfg.resume_path = argv[++i];
@@ -274,51 +329,91 @@ TrainConfig parse_text_train_args(int argc, char *argv[])
         else if (arg == "--resume-epoch" && i + 1 < argc)
         {
             auto v = nn::parse_number<int>(argv[++i]);
-            if (!v || *v < 0) { std::cerr << "无效 --resume-epoch: " << argv[i] << "\n"; std::exit(1); }
+            if (!v || *v < 0)
+            {
+                std::cerr << "无效 --resume-epoch: " << argv[i] << "\n";
+                std::exit(1);
+            }
             cfg.start_epoch = *v;
         }
         else if (arg == "--resume-step" && i + 1 < argc)
         {
             auto v = nn::parse_number<std::size_t>(argv[++i]);
-            if (!v) { std::cerr << "无效 --resume-step: " << argv[i] << "\n"; std::exit(1); }
+            if (!v)
+            {
+                std::cerr << "无效 --resume-step: " << argv[i] << "\n";
+                std::exit(1);
+            }
             cfg.start_step = *v;
         }
         else if (arg == "--epochs" && i + 1 < argc)
         {
             auto v = nn::parse_number<int>(argv[++i]);
-            if (!v) { std::cerr << "无效 --epochs: " << v.error().message << "\n"; std::exit(1); }
+            if (!v)
+            {
+                std::cerr << "无效 --epochs: " << v.error().message << "\n";
+                std::exit(1);
+            }
             cfg.epochs = *v;
         }
         else if (arg == "--lr" && i + 1 < argc)
         {
             auto v = nn::parse_number<Scalar>(argv[++i]);
-            if (!v) { std::cerr << "无效 --lr: " << v.error().message << "\n"; std::exit(1); }
+            if (!v)
+            {
+                std::cerr << "无效 --lr: " << v.error().message << "\n";
+                std::exit(1);
+            }
             cfg.lr = *v;
         }
         else if (arg == "--batch-size" && i + 1 < argc)
         {
             auto v = nn::parse_number<std::size_t>(argv[++i]);
-            if (!v) { std::cerr << "无效 --batch-size: " << v.error().message << "\n"; std::exit(1); }
-            if (*v == 0) { std::cerr << "--batch-size 必须 >= 1\n"; std::exit(1); }
+            if (!v)
+            {
+                std::cerr << "无效 --batch-size: " << v.error().message << "\n";
+                std::exit(1);
+            }
+            if (*v == 0)
+            {
+                std::cerr << "--batch-size 必须 >= 1\n";
+                std::exit(1);
+            }
             cfg.batch_size = *v;
         }
         else if (arg == "--accum-steps" && i + 1 < argc)
         {
             auto v = nn::parse_number<std::size_t>(argv[++i]);
-            if (!v) { std::cerr << "无效 --accum-steps: " << v.error().message << "\n"; std::exit(1); }
-            if (*v == 0) { std::cerr << "--accum-steps 必须 >= 1\n"; std::exit(1); }
+            if (!v)
+            {
+                std::cerr << "无效 --accum-steps: " << v.error().message << "\n";
+                std::exit(1);
+            }
+            if (*v == 0)
+            {
+                std::cerr << "--accum-steps 必须 >= 1\n";
+                std::exit(1);
+            }
             cfg.accum_steps = *v;
         }
         else if (arg == "--seq-len" && i + 1 < argc)
         {
             auto v = nn::parse_number<std::size_t>(argv[++i]);
-            if (!v) { std::cerr << "无效 --seq-len: " << v.error().message << "\n"; std::exit(1); }
+            if (!v)
+            {
+                std::cerr << "无效 --seq-len: " << v.error().message << "\n";
+                std::exit(1);
+            }
             cfg.seq_len = *v;
         }
         else if (arg == "--stride" && i + 1 < argc)
         {
             auto v = nn::parse_number<std::size_t>(argv[++i]);
-            if (!v) { std::cerr << "无效 --stride: " << v.error().message << "\n"; std::exit(1); }
+            if (!v)
+            {
+                std::cerr << "无效 --stride: " << v.error().message << "\n";
+                std::exit(1);
+            }
             cfg.stride = *v;
         }
         else if (arg == "--optimizer" && i + 1 < argc)
@@ -335,43 +430,71 @@ TrainConfig parse_text_train_args(int argc, char *argv[])
         else if (arg == "--weight-decay" && i + 1 < argc)
         {
             auto v = nn::parse_number<Scalar>(argv[++i]);
-            if (!v) { std::cerr << "无效 --weight-decay: " << v.error().message << "\n"; std::exit(1); }
+            if (!v)
+            {
+                std::cerr << "无效 --weight-decay: " << v.error().message << "\n";
+                std::exit(1);
+            }
             cfg.weight_decay = *v;
         }
         else if (arg == "--beta1" && i + 1 < argc)
         {
             auto v = nn::parse_number<Scalar>(argv[++i]);
-            if (!v || *v <= 0 || *v >= 1) { std::cerr << "--beta1 须在 (0, 1) 区间内\n"; std::exit(1); }
+            if (!v || *v <= 0 || *v >= 1)
+            {
+                std::cerr << "--beta1 须在 (0, 1) 区间内\n";
+                std::exit(1);
+            }
             cfg.beta1 = *v;
         }
         else if (arg == "--beta2" && i + 1 < argc)
         {
             auto v = nn::parse_number<Scalar>(argv[++i]);
-            if (!v || *v <= 0 || *v >= 1) { std::cerr << "--beta2 须在 (0, 1) 区间内\n"; std::exit(1); }
+            if (!v || *v <= 0 || *v >= 1)
+            {
+                std::cerr << "--beta2 须在 (0, 1) 区间内\n";
+                std::exit(1);
+            }
             cfg.beta2 = *v;
         }
         else if (arg == "--d-model" && i + 1 < argc)
         {
             auto v = nn::parse_number<std::size_t>(argv[++i]);
-            if (!v) { std::cerr << "无效 --d-model: " << v.error().message << "\n"; std::exit(1); }
+            if (!v)
+            {
+                std::cerr << "无效 --d-model: " << v.error().message << "\n";
+                std::exit(1);
+            }
             cfg.d_model = *v;
         }
         else if (arg == "--num-heads" && i + 1 < argc)
         {
             auto v = nn::parse_number<std::size_t>(argv[++i]);
-            if (!v) { std::cerr << "无效 --num-heads: " << v.error().message << "\n"; std::exit(1); }
+            if (!v)
+            {
+                std::cerr << "无效 --num-heads: " << v.error().message << "\n";
+                std::exit(1);
+            }
             cfg.num_heads = *v;
         }
         else if (arg == "--num-layers" && i + 1 < argc)
         {
             auto v = nn::parse_number<std::size_t>(argv[++i]);
-            if (!v) { std::cerr << "无效 --num-layers: " << v.error().message << "\n"; std::exit(1); }
+            if (!v)
+            {
+                std::cerr << "无效 --num-layers: " << v.error().message << "\n";
+                std::exit(1);
+            }
             cfg.num_layers = *v;
         }
         else if (arg == "--d-ff" && i + 1 < argc)
         {
             auto v = nn::parse_number<std::size_t>(argv[++i]);
-            if (!v) { std::cerr << "无效 --d-ff: " << v.error().message << "\n"; std::exit(1); }
+            if (!v)
+            {
+                std::cerr << "无效 --d-ff: " << v.error().message << "\n";
+                std::exit(1);
+            }
             cfg.d_ff = *v;
         }
         else if (arg == "--model" && i + 1 < argc)
@@ -379,8 +502,7 @@ TrainConfig parse_text_train_args(int argc, char *argv[])
             cfg.model_type = argv[++i];
             if (cfg.model_type != "gpt" && cfg.model_type != "rapt")
             {
-                std::cerr << "未知模型架构: " << cfg.model_type
-                          << ", 可选: gpt, rapt\n";
+                std::cerr << "未知模型架构: " << cfg.model_type << ", 可选: gpt, rapt\n";
                 if (cfg.model_type == "zipt")
                     std::cerr << "（ZiPT 已移除，代码保留在 legacy/zipt 分支；"
                                  "恢复前提见 docs/history/history.md）\n";
@@ -390,19 +512,31 @@ TrainConfig parse_text_train_args(int argc, char *argv[])
         else if (arg == "--log-interval" && i + 1 < argc)
         {
             auto v = nn::parse_number<std::size_t>(argv[++i]);
-            if (!v) { std::cerr << "无效 --log-interval: " << v.error().message << "\n"; std::exit(1); }
+            if (!v)
+            {
+                std::cerr << "无效 --log-interval: " << v.error().message << "\n";
+                std::exit(1);
+            }
             cfg.log_interval = std::max<std::size_t>(1, *v);  // 0 → 1，避免步进 % 0 除零
         }
         else if (arg == "--save-interval" && i + 1 < argc)
         {
             auto v = nn::parse_number<std::size_t>(argv[++i]);
-            if (!v) { std::cerr << "无效 --save-interval: " << v.error().message << "\n"; std::exit(1); }
+            if (!v)
+            {
+                std::cerr << "无效 --save-interval: " << v.error().message << "\n";
+                std::exit(1);
+            }
             cfg.save_interval = *v;  // 0 = 禁用保存（下方 % 前有 >0 保护）
         }
         else if (arg == "--max-steps" && i + 1 < argc)
         {
             auto v = nn::parse_number<std::size_t>(argv[++i]);
-            if (!v) { std::cerr << "无效 --max-steps: " << v.error().message << "\n"; std::exit(1); }
+            if (!v)
+            {
+                std::cerr << "无效 --max-steps: " << v.error().message << "\n";
+                std::exit(1);
+            }
             cfg.max_steps = *v;  // 0 = 不限步数
         }
         else if (auto gpu_dev = nn::cli::parse_gpu_option(argc, argv, i))
@@ -410,8 +544,7 @@ TrainConfig parse_text_train_args(int argc, char *argv[])
             cfg.gpu_enabled = true;
             if (!gpu_dev->empty()) cfg.gpu_device = *gpu_dev;
         }
-        else if (arg == "--grad-log")
-            cfg.grad_log = true;
+        else if (arg == "--grad-log") cfg.grad_log = true;
         else if (arg == "--f16")
         {
             // 快捷方式：**f16 存储**（param=F16 + compute=F16；stable/optimizer
@@ -437,7 +570,7 @@ TrainConfig parse_text_train_args(int argc, char *argv[])
         else if (arg == "--precision-param" && i + 1 < argc)
         {
             cfg.precision.param = parse_precision_arg(argv[++i], "precision-param",
-                                                  /*allow_t1_58=*/true);
+                                                      /*allow_t1_58=*/true);
         }
         else if (arg == "--precision-compute" && i + 1 < argc)
         {
@@ -465,19 +598,31 @@ TrainConfig parse_text_train_args(int argc, char *argv[])
         else if (arg == "--warmup-epochs" && i + 1 < argc)
         {
             auto v = nn::parse_number<int>(argv[++i]);
-            if (!v) { std::cerr << "无效 --warmup-epochs: " << v.error().message << "\n"; std::exit(1); }
+            if (!v)
+            {
+                std::cerr << "无效 --warmup-epochs: " << v.error().message << "\n";
+                std::exit(1);
+            }
             cfg.warmup_epochs = *v;
         }
         else if (arg == "--warmup-steps" && i + 1 < argc)
         {
             auto v = nn::parse_number<std::size_t>(argv[++i]);
-            if (!v) { std::cerr << "无效 --warmup-steps: " << v.error().message << "\n"; std::exit(1); }
+            if (!v)
+            {
+                std::cerr << "无效 --warmup-steps: " << v.error().message << "\n";
+                std::exit(1);
+            }
             cfg.warmup_steps = *v;
         }
         else if (arg == "--min-lr" && i + 1 < argc)
         {
             auto v = nn::parse_number<Scalar>(argv[++i]);
-            if (!v) { std::cerr << "无效 --min-lr: " << v.error().message << "\n"; std::exit(1); }
+            if (!v)
+            {
+                std::cerr << "无效 --min-lr: " << v.error().message << "\n";
+                std::exit(1);
+            }
             cfg.min_lr = *v;
         }
         else if (arg == "--lr-per-epoch" && i + 1 < argc)
@@ -488,27 +633,31 @@ TrainConfig parse_text_train_args(int argc, char *argv[])
             while (std::getline(ss, token, ','))
             {
                 auto v = nn::parse_number<Scalar>(token);
-                if (!v) { std::cerr << "无效 --lr-per-epoch 值: " << v.error().message << "\n"; std::exit(1); }
+                if (!v)
+                {
+                    std::cerr << "无效 --lr-per-epoch 值: " << v.error().message << "\n";
+                    std::exit(1);
+                }
                 cfg.lr_per_epoch.push_back(*v);
             }
         }
         else if (arg == "--max-norm" && i + 1 < argc)
         {
             auto v = nn::parse_number<Scalar>(argv[++i]);
-            if (!v) { std::cerr << "无效 --max-norm: " << v.error().message << "\n"; std::exit(1); }
+            if (!v)
+            {
+                std::cerr << "无效 --max-norm: " << v.error().message << "\n";
+                std::exit(1);
+            }
             cfg.max_norm = *v;
         }
         else if (arg == "--positional-encoding" && i + 1 < argc)
         {
             std::string v = argv[++i];
-            if (v == "learned")
-                cfg.pos_encoding = nn::PosEncodingType::Learned;
-            else if (v == "sinusoidal")
-                cfg.pos_encoding = nn::PosEncodingType::Sinusoidal;
-            else if (v == "alibi")
-                cfg.pos_encoding = nn::PosEncodingType::ALiBi;
-            else if (v == "rope")
-                cfg.pos_encoding = nn::PosEncodingType::RoPE;
+            if (v == "learned") cfg.pos_encoding = nn::PosEncodingType::Learned;
+            else if (v == "sinusoidal") cfg.pos_encoding = nn::PosEncodingType::Sinusoidal;
+            else if (v == "alibi") cfg.pos_encoding = nn::PosEncodingType::ALiBi;
+            else if (v == "rope") cfg.pos_encoding = nn::PosEncodingType::RoPE;
             else
             {
                 std::cerr << "未知位置编码类型: " << v
@@ -519,51 +668,48 @@ TrainConfig parse_text_train_args(int argc, char *argv[])
         else if (arg == "--activation" && i + 1 < argc)
         {
             std::string v = argv[++i];
-            if (v == "gelu")
-                cfg.activation = nn::ActivationType::GeLU;
-            else if (v == "swiglu")
-                cfg.activation = nn::ActivationType::SwiGLU;
-            else if (v == "relu2")
-                cfg.activation = nn::ActivationType::ReLU2;
+            if (v == "gelu") cfg.activation = nn::ActivationType::GeLU;
+            else if (v == "swiglu") cfg.activation = nn::ActivationType::SwiGLU;
+            else if (v == "relu2") cfg.activation = nn::ActivationType::ReLU2;
             else
             {
-                std::cerr << "未知激活类型: " << v
-                          << "，可选: gelu, swiglu, relu2\n";
+                std::cerr << "未知激活类型: " << v << "，可选: gelu, swiglu, relu2\n";
                 std::exit(1);
             }
         }
         else if (arg == "--norm" && i + 1 < argc)
         {
             std::string v = argv[++i];
-            if (v == "layernorm")
-                cfg.norm_type = nn::NormType::LayerNorm;
-            else if (v == "rmsnorm")
-                cfg.norm_type = nn::NormType::RMSNorm;
+            if (v == "layernorm") cfg.norm_type = nn::NormType::LayerNorm;
+            else if (v == "rmsnorm") cfg.norm_type = nn::NormType::RMSNorm;
             else
             {
-                std::cerr << "未知归一化层类型: " << v
-                          << "，可选: layernorm, rmsnorm\n";
+                std::cerr << "未知归一化层类型: " << v << "，可选: layernorm, rmsnorm\n";
                 std::exit(1);
             }
         }
         else if (arg == "--flush-interval" && i + 1 < argc)
         {
             auto v = nn::parse_number<std::size_t>(argv[++i]);
-            if (!v) { std::cerr << "无效 --flush-interval: " << v.error().message << "\n"; std::exit(1); }
+            if (!v)
+            {
+                std::cerr << "无效 --flush-interval: " << v.error().message << "\n";
+                std::exit(1);
+            }
             cfg.flush_interval = *v;
         }
         else if (arg == "--checkpoint-every" && i + 1 < argc)
         {
             auto v = nn::parse_number<std::size_t>(argv[++i]);
-            if (!v) { std::cerr << "无效 --checkpoint-every: " << v.error().message << "\n"; std::exit(1); }
+            if (!v)
+            {
+                std::cerr << "无效 --checkpoint-every: " << v.error().message << "\n";
+                std::exit(1);
+            }
             cfg.checkpoint_every = *v;
         }
-        else if (arg == "--activation-offload")
-        {
-            cfg.activation_offload = true;
-        }
-        else if (!arg.starts_with("--"))
-            cfg.text_path = arg;
+        else if (arg == "--activation-offload") { cfg.activation_offload = true; }
+        else if (!arg.starts_with("--")) cfg.text_path = arg;
         else
         {
             std::cerr << "未知参数: " << arg << "\n使用 --help 查看用法\n";

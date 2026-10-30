@@ -42,79 +42,76 @@ enum class ExprEmitKind : std::uint8_t
 };
 
 // CPU 标量语义函数指针（比较类返回 1.0/0.0 的 Scalar，与写回寄存器的语义一致）
-using ExprUnaryFn  = Scalar (*)(Scalar) noexcept;
+using ExprUnaryFn = Scalar (*)(Scalar) noexcept;
 using ExprBinaryFn = Scalar (*)(Scalar, Scalar) noexcept;
 
 struct ExprOpInfo
 {
     std::uint8_t arity;         // 实际使用操作数个数（== expr_instr_num_operands）
-    bool         is_reduce;     // dst 是隐式"每行/每列一个标量"的归约向量
-    bool         reduces_cols;  // 归约方向：true=按列 → (1,cols)，false=按行 → (rows,1)
-    bool         foldable;      // 常量折叠（仅 IEEE 754 基本运算；不含超越函数/归约）
-    ExprUnaryFn  unary;         // arity==1 且非归约：unary(a)
+    bool is_reduce;     // dst 是隐式"每行/每列一个标量"的归约向量
+    bool reduces_cols;  // 归约方向：true=按列 → (1,cols)，false=按行 → (rows,1)
+    bool foldable;      // 常量折叠（仅 IEEE 754 基本运算；不含超越函数/归约）
+    ExprUnaryFn unary;         // arity==1 且非归约：unary(a)
     ExprBinaryFn binary;        // arity==2：binary(a,b)
     ExprEmitKind emit;          // GLSL 发射形态
-    const char*  sym;           // 中缀符号 / 函数名
-    const char*  sym_vec;       // Compare 的 vec4 内建名（否则 ""）
+    const char* sym;           // 中缀符号 / 函数名
+    const char* sym_vec;       // Compare 的 vec4 内建名（否则 ""）
 };
 
 // 比较算子：`ops::Lt` 等的 apply 返回 bool（供条件表达式），寄存器写回要 Scalar
 //  1.0/0.0——此处做唯一一次桥接。
 namespace cmp
 {
-[[nodiscard]] inline Scalar lt(Scalar a, Scalar b) noexcept { return ops::Lt::apply(a, b) ? Scalar{1} : Scalar{0}; }
-[[nodiscard]] inline Scalar le(Scalar a, Scalar b) noexcept { return ops::Le::apply(a, b) ? Scalar{1} : Scalar{0}; }
-[[nodiscard]] inline Scalar gt(Scalar a, Scalar b) noexcept { return ops::Gt::apply(a, b) ? Scalar{1} : Scalar{0}; }
-[[nodiscard]] inline Scalar ge(Scalar a, Scalar b) noexcept { return ops::Ge::apply(a, b) ? Scalar{1} : Scalar{0}; }
-[[nodiscard]] inline Scalar eq(Scalar a, Scalar b) noexcept { return ops::Eq::apply(a, b) ? Scalar{1} : Scalar{0}; }
-[[nodiscard]] inline Scalar ne(Scalar a, Scalar b) noexcept { return ops::Ne::apply(a, b) ? Scalar{1} : Scalar{0}; }
+[[nodiscard]] inline Scalar lt(Scalar a, Scalar b) noexcept
+{ return ops::Lt::apply(a, b) ? Scalar{1} : Scalar{0}; }
+[[nodiscard]] inline Scalar le(Scalar a, Scalar b) noexcept
+{ return ops::Le::apply(a, b) ? Scalar{1} : Scalar{0}; }
+[[nodiscard]] inline Scalar gt(Scalar a, Scalar b) noexcept
+{ return ops::Gt::apply(a, b) ? Scalar{1} : Scalar{0}; }
+[[nodiscard]] inline Scalar ge(Scalar a, Scalar b) noexcept
+{ return ops::Ge::apply(a, b) ? Scalar{1} : Scalar{0}; }
+[[nodiscard]] inline Scalar eq(Scalar a, Scalar b) noexcept
+{ return ops::Eq::apply(a, b) ? Scalar{1} : Scalar{0}; }
+[[nodiscard]] inline Scalar ne(Scalar a, Scalar b) noexcept
+{ return ops::Ne::apply(a, b) ? Scalar{1} : Scalar{0}; }
 }  // namespace cmp
 
 // 行构造器（字段全列——避开 -Wmissing-designated-field-initializers）
 namespace row
 {
-[[nodiscard]] consteval ExprOpInfo unary(ExprUnaryFn f, ExprEmitKind e,
-                                         const char* sym, bool fold = false) noexcept
-{
-    return ExprOpInfo{1, false, false, fold, f, nullptr, e, sym, ""};
-}
-[[nodiscard]] consteval ExprOpInfo binary(ExprBinaryFn f, ExprEmitKind e,
-                                          const char* sym, const char* sym_vec = "",
-                                          bool fold = true) noexcept
-{
-    return ExprOpInfo{2, false, false, fold, nullptr, f, e, sym, sym_vec};
-}
+[[nodiscard]] consteval ExprOpInfo unary(ExprUnaryFn f, ExprEmitKind e, const char* sym,
+                                         bool fold = false) noexcept
+{ return ExprOpInfo{1, false, false, fold, f, nullptr, e, sym, ""}; }
+[[nodiscard]] consteval ExprOpInfo binary(ExprBinaryFn f, ExprEmitKind e, const char* sym,
+                                          const char* sym_vec = "", bool fold = true) noexcept
+{ return ExprOpInfo{2, false, false, fold, nullptr, f, e, sym, sym_vec}; }
 [[nodiscard]] consteval ExprOpInfo select_op() noexcept
-{
-    return ExprOpInfo{3, false, false, true, nullptr, nullptr, ExprEmitKind::Select, "", ""};
-}
+{ return ExprOpInfo{3, false, false, true, nullptr, nullptr, ExprEmitKind::Select, "", ""}; }
 [[nodiscard]] consteval ExprOpInfo reduce(bool cols) noexcept
-{
-    return ExprOpInfo{1, true, cols, false, nullptr, nullptr, ExprEmitKind::None, "", ""};
-}
+{ return ExprOpInfo{1, true, cols, false, nullptr, nullptr, ExprEmitKind::None, "", ""}; }
 }  // namespace row
 
 // 表按下标 == static_cast<uint8_t>(ExprOp) 直接索引（顺序不得改动）
 inline constexpr ExprOpInfo kExprOpTable[] = {
-    /* Neg   */ row::unary(&ops::Neg::apply,   ExprEmitKind::Neg,   "-",           /*fold=*/true),
-    /* Exp   */ row::unary(&ops::Exp::apply,   ExprEmitKind::Func1, "exp"),
-    /* Log   */ row::unary(&ops::Log::apply,   ExprEmitKind::Func1, "log"),
-    /* Sqrt  */ row::unary(&ops::Sqrt::apply,  ExprEmitKind::Func1, "sqrt"),
+    /* Neg   */ row::unary(&ops::Neg::apply, ExprEmitKind::Neg, "-", /*fold=*/true),
+    /* Exp   */ row::unary(&ops::Exp::apply, ExprEmitKind::Func1, "exp"),
+    /* Log   */ row::unary(&ops::Log::apply, ExprEmitKind::Func1, "log"),
+    /* Sqrt  */ row::unary(&ops::Sqrt::apply, ExprEmitKind::Func1, "sqrt"),
     /* Rsqrt */ row::unary(&ops::Rsqrt::apply, ExprEmitKind::Func1, "inversesqrt"),
-    /* Abs   */ row::unary(&ops::Abs::apply,   ExprEmitKind::Func1, "abs",         /*fold=*/true),
-    /* Tanh  */ row::unary(&ops::Tanh::apply,  ExprEmitKind::Func1, "tanh"),
-    /* Add   */ row::binary(&ops::Add::apply,  ExprEmitKind::Infix,   "+"),
-    /* Sub   */ row::binary(&ops::Sub::apply,  ExprEmitKind::Infix,   "-"),
-    /* Mul   */ row::binary(&ops::Mul::apply,  ExprEmitKind::Infix,   "*"),
-    /* Div   */ row::binary(&ops::Div::apply,  ExprEmitKind::Infix,   "/"),
-    /* Max   */ row::binary(&ops::Max::apply,  ExprEmitKind::Func2,   "max"),
-    /* Min   */ row::binary(&ops::Min::apply,  ExprEmitKind::Func2,   "min"),
-    /* Lt    */ row::binary(&cmp::lt,          ExprEmitKind::Compare, "<",  "lessThan"),
-    /* Le    */ row::binary(&cmp::le,          ExprEmitKind::Compare, "<=", "lessThanEqual"),
-    /* Gt    */ row::binary(&cmp::gt,          ExprEmitKind::Compare, ">",  "greaterThan"),
-    /* Ge    */ row::binary(&cmp::ge,          ExprEmitKind::Compare, ">=", "greaterThanEqual"),
-    /* Eq    */ row::binary(&cmp::eq,          ExprEmitKind::Compare, "==", "equal"),
-    /* Ne    */ row::binary(&cmp::ne,          ExprEmitKind::Compare, "!=", "notEqual"),
+    /* Abs   */ row::unary(&ops::Abs::apply, ExprEmitKind::Func1, "abs", /*fold=*/true),
+    /* Tanh  */ row::unary(&ops::Tanh::apply, ExprEmitKind::Func1, "tanh"),
+    /* Add   */ row::binary(&ops::Add::apply, ExprEmitKind::Infix, "+"),
+    /* Sub   */ row::binary(&ops::Sub::apply, ExprEmitKind::Infix, "-"),
+    /* Mul   */ row::binary(&ops::Mul::apply, ExprEmitKind::Infix, "*"),
+    /* Div   */ row::binary(&ops::Div::apply, ExprEmitKind::Infix, "/"),
+    /* Max   */ row::binary(&ops::Max::apply, ExprEmitKind::Func2, "max"),
+    /* Min   */ row::binary(&ops::Min::apply, ExprEmitKind::Func2, "min"),
+    /* Lt    */ row::binary(&cmp::lt, ExprEmitKind::Compare, "<", "lessThan"),
+    /* Le    */ row::binary(&cmp::le, ExprEmitKind::Compare, "<=", "lessThanEqual"),
+    /* Gt    */ row::binary(&cmp::gt, ExprEmitKind::Compare, ">", "greaterThan"),
+    /* Ge    */ row::binary(&cmp::ge, ExprEmitKind::Compare, ">=", "greaterThanEqual"),
+    /* Eq    */ row::binary(&cmp::eq, ExprEmitKind::Compare, "==", "equal"),
+    /* Ne    */ row::binary(&cmp::ne, ExprEmitKind::Compare, "!=", "notEqual"),
     /* Select*/ row::select_op(),
     /* ColSum*/ row::reduce(/*cols=*/true),
     /* ColMax*/ row::reduce(/*cols=*/true),
@@ -122,12 +119,11 @@ inline constexpr ExprOpInfo kExprOpTable[] = {
     /* RowMax*/ row::reduce(/*cols=*/false),
 };
 
-[[nodiscard]] inline constexpr std::size_t expr_op_count() noexcept { return std::size(kExprOpTable); }
+[[nodiscard]] inline constexpr std::size_t expr_op_count() noexcept
+{ return std::size(kExprOpTable); }
 
 [[nodiscard]] inline constexpr const ExprOpInfo& expr_op_info(ExprOp op) noexcept
-{
-    return kExprOpTable[static_cast<std::uint8_t>(op)];
-}
+{ return kExprOpTable[static_cast<std::uint8_t>(op)]; }
 
 // CPU 标量求值（一元 / 二元 / Select 三元）；**归约指令不得走本函数**（调用方分流）。
 [[nodiscard]] inline Scalar expr_alu_scalar(ExprOp op, Scalar a, Scalar b, Scalar c) noexcept
@@ -144,9 +140,9 @@ inline constexpr ExprOpInfo kExprOpTable[] = {
     for (std::size_t i = 0; i < expr_op_count(); ++i)
     {
         const ExprOp op = static_cast<ExprOp>(i);
-        if (kExprOpTable[i].arity        != expr_instr_num_operands(op)) return false;
-        if (kExprOpTable[i].is_reduce    != expr_op_is_reduce(op))       return false;
-        if (kExprOpTable[i].reduces_cols != expr_op_reduces_cols(op))    return false;
+        if (kExprOpTable[i].arity != expr_instr_num_operands(op)) return false;
+        if (kExprOpTable[i].is_reduce != expr_op_is_reduce(op)) return false;
+        if (kExprOpTable[i].reduces_cols != expr_op_reduces_cols(op)) return false;
     }
     return true;
 }

@@ -101,8 +101,7 @@ private:
 
 
     // ── variant 安全访问辅助（避免 std::get UB，§6.1）────────────────────
-    template <Precision P>
-    [[nodiscard]] std::shared_ptr<MatrixT<P>> cpu_get() const noexcept
+    template <Precision P> [[nodiscard]] std::shared_ptr<MatrixT<P>> cpu_get() const noexcept
     {
         constexpr auto slot = static_cast<std::size_t>(P);
         return cpu_data_.index() == slot ? std::get<slot>(cpu_data_) : nullptr;
@@ -113,22 +112,19 @@ private:
     // cpu_matrix()；若每次拷贝 shared_ptr，则每元素两次原子引用计数操作
     // （实测 ~20ns/元素，使 DSL 模板路径比等价手写循环慢 8-70 倍）。
     // 调用方（cpu_matrix 的调用者）本身持有该 Tensor，故裸指针在其生存期内有效。
-    template <Precision P>
-    [[nodiscard]] MatrixT<P>* cpu_get_ptr() noexcept
+    template <Precision P> [[nodiscard]] MatrixT<P>* cpu_get_ptr() noexcept
     {
         constexpr auto slot = static_cast<std::size_t>(P);
         return cpu_data_.index() == slot ? std::get<slot>(cpu_data_).get() : nullptr;
     }
-    template <Precision P>
-    [[nodiscard]] const MatrixT<P>* cpu_get_ptr() const noexcept
+    template <Precision P> [[nodiscard]] const MatrixT<P>* cpu_get_ptr() const noexcept
     {
         constexpr auto slot = static_cast<std::size_t>(P);
         return cpu_data_.index() == slot ? std::get<slot>(cpu_data_).get() : nullptr;
     }
 
 #ifdef NN_HAS_VULKAN
-    template <Precision P>
-    [[nodiscard]] std::shared_ptr<GpuTensorT<P>> gpu_get() const noexcept
+    template <Precision P> [[nodiscard]] std::shared_ptr<GpuTensorT<P>> gpu_get() const noexcept
     {
         constexpr auto slot = static_cast<std::size_t>(P);
         return gpu_data_.index() == slot ? std::get<slot>(gpu_data_) : nullptr;
@@ -136,14 +132,12 @@ private:
 
     // 同 gpu_get，但返回**裸指针、不拷贝 shared_ptr**（设备域派生/import 热路径：
     // 每次拷贝 shared_ptr 都是一对原子操作）。
-    template <Precision P>
-    [[nodiscard]] GpuTensorT<P>* gpu_get_ptr() noexcept
+    template <Precision P> [[nodiscard]] GpuTensorT<P>* gpu_get_ptr() noexcept
     {
         constexpr auto slot = static_cast<std::size_t>(P);
         return gpu_data_.index() == slot ? std::get<slot>(gpu_data_).get() : nullptr;
     }
-    template <Precision P>
-    [[nodiscard]] const GpuTensorT<P>* gpu_get_ptr() const noexcept
+    template <Precision P> [[nodiscard]] const GpuTensorT<P>* gpu_get_ptr() const noexcept
     {
         constexpr auto slot = static_cast<std::size_t>(P);
         return gpu_data_.index() == slot ? std::get<slot>(gpu_data_).get() : nullptr;
@@ -156,33 +150,28 @@ public:
 private:
     // ── CPU 构造（f32）────────────────────────────────────────────────────
     explicit Tensor(std::shared_ptr<Matrix> m)
-        : device_(Device::CPU), precision_(Precision::F32),
-          rows_(m->rows()), cols_(m->cols()),
-          cpu_data_(std::in_place_index<1>, std::move(m)) {}
+        : device_(Device::CPU), precision_(Precision::F32), rows_(m->rows()), cols_(m->cols()),
+          cpu_data_(std::in_place_index<1>, std::move(m))
+    {
+    }
 
     // ── CPU 构造（f16，§6.4）──────────────────────────────────────────────
     explicit Tensor(std::shared_ptr<MatrixT<Precision::F16>> m)
-        : device_(Device::CPU), precision_(Precision::F16),
-          rows_(m->rows()), cols_(m->cols()),
-          cpu_data_(std::in_place_index<0>, std::move(m)) {}
+        : device_(Device::CPU), precision_(Precision::F16), rows_(m->rows()), cols_(m->cols()),
+          cpu_data_(std::in_place_index<0>, std::move(m))
+    {
+    }
 
     // ── 从 Matrix 创建（f32 by-value）─────────────────────────────────────
-    static Tensor from_matrix(Matrix m)
-    {
-        return Tensor(std::make_shared<Matrix>(std::move(m)));
-    }
+    static Tensor from_matrix(Matrix m) { return Tensor(std::make_shared<Matrix>(std::move(m))); }
 
     // ── 从 MatrixT<F16> 创建（f16 by-value，§6.4）────────────────────────
     static Tensor from_matrix(MatrixT<Precision::F16> m)
-    {
-        return Tensor(std::make_shared<MatrixT<Precision::F16>>(std::move(m)));
-    }
+    { return Tensor(std::make_shared<MatrixT<Precision::F16>>(std::move(m))); }
 
     // ── 创建 CPU 空张量（f32）─────────────────────────────────────────────
     static Tensor cpu(std::size_t rows, std::size_t cols)
-    {
-        return Tensor(std::make_shared<Matrix>(rows, cols));
-    }
+    { return Tensor(std::make_shared<Matrix>(rows, cols)); }
 
     // ── 创建 CPU 未初始化张量（f32）───────────────────────────────────────
     // 语义契约：调用方必须在任何读取之前把**全部**元素写满。
@@ -190,14 +179,11 @@ private:
     // 输出缓冲）：省掉"分配 + 写满一遍零 + 马上被全覆盖"里的那一遍零写。
     // 实测本机单线程写满 1.57MB 要 0.50ms（~3.2 GB/s），是纯浪费。
     [[nodiscard]] static Tensor cpu_uninitialized(std::size_t rows, std::size_t cols)
-    {
-        return Tensor(std::make_shared<Matrix>(rows, cols, Matrix::uninitialized_tag{}));
-    }
+    { return Tensor(std::make_shared<Matrix>(rows, cols, Matrix::uninitialized_tag{})); }
 
     // ── 创建 CPU 空张量（显式 P，§6.4）───────────────────────────────────
     // compile-time P；BF16/F64 → static_assert 报错
-    template <Precision P>
-    [[nodiscard]] static Tensor cpu(std::size_t rows, std::size_t cols)
+    template <Precision P> [[nodiscard]] static Tensor cpu(std::size_t rows, std::size_t cols)
     {
         static_assert(P == Precision::F16 || P == Precision::F32,
                       "Phase 1 仅支持 F16/F32（BF16/F64 为保留值）");
@@ -207,27 +193,25 @@ private:
 #ifdef NN_HAS_VULKAN
     // ── GPU 构造（f32）────────────────────────────────────────────────────
     explicit Tensor(std::shared_ptr<GpuTensor> t)
-        : device_(Device::GPU), precision_(Precision::F32),
-          rows_(t->rows()), cols_(t->cols()),
-          gpu_data_(std::in_place_index<1>, std::move(t)) {}
+        : device_(Device::GPU), precision_(Precision::F32), rows_(t->rows()), cols_(t->cols()),
+          gpu_data_(std::in_place_index<1>, std::move(t))
+    {
+    }
 
     // ── GPU 构造（f16，§6.4）──────────────────────────────────────────────
     explicit Tensor(std::shared_ptr<GpuTensorT<Precision::F16>> t)
-        : device_(Device::GPU), precision_(Precision::F16),
-          rows_(t->rows()), cols_(t->cols()),
-          gpu_data_(std::in_place_index<0>, std::move(t)) {}
+        : device_(Device::GPU), precision_(Precision::F16), rows_(t->rows()), cols_(t->cols()),
+          gpu_data_(std::in_place_index<0>, std::move(t))
+    {
+    }
 
     // ── 从 GpuTensor 创建（f32）───────────────────────────────────────────
     static Tensor from_gpu(GpuTensor t)
-    {
-        return Tensor(std::make_shared<GpuTensor>(std::move(t)));
-    }
+    { return Tensor(std::make_shared<GpuTensor>(std::move(t))); }
 
     // ── 从 GpuTensorT<F16> 创建（f16）─────────────────────────────────────
     static Tensor from_gpu(GpuTensorT<Precision::F16> t)
-    {
-        return Tensor(std::make_shared<GpuTensorT<Precision::F16>>(std::move(t)));
-    }
+    { return Tensor(std::make_shared<GpuTensorT<Precision::F16>>(std::move(t))); }
 #endif
 
 public:
@@ -258,13 +242,13 @@ public:
         if (device_ == Device::CPU)
         {
             return precision_ == Precision::F16
-                ? cpu_get<Precision::F16>() == o.cpu_get<Precision::F16>()
-                : cpu_get<Precision::F32>() == o.cpu_get<Precision::F32>();
+                       ? cpu_get<Precision::F16>() == o.cpu_get<Precision::F16>()
+                       : cpu_get<Precision::F32>() == o.cpu_get<Precision::F32>();
         }
 #ifdef NN_HAS_VULKAN
         return precision_ == Precision::F16
-            ? gpu_get<Precision::F16>() == o.gpu_get<Precision::F16>()
-            : gpu_get<Precision::F32>() == o.gpu_get<Precision::F32>();
+                   ? gpu_get<Precision::F16>() == o.gpu_get<Precision::F16>()
+                   : gpu_get<Precision::F32>() == o.gpu_get<Precision::F32>();
 #else
         return false;
 #endif
@@ -311,11 +295,9 @@ public:
 
 private:
     // ── CPU 存储访问（模板化，P 默认 F32，§6.1）──────────────────────────
-    template <Precision P = Precision::F32>
-    [[nodiscard]] MatrixT<P>& cpu_matrix()
+    template <Precision P = Precision::F32> [[nodiscard]] MatrixT<P>& cpu_matrix()
     {
-        static_assert(P == Precision::F16 || P == Precision::F32,
-                      "Phase 1 仅支持 F16/F32");
+        static_assert(P == Precision::F16 || P == Precision::F32, "Phase 1 仅支持 F16/F32");
         // 用 cpu_get_ptr（不拷贝 shared_ptr）：该函数在逐元素热点上会被按元素
         // 调用，拷贝 shared_ptr 的原子引用计数是实测的主要开销来源。
         MatrixT<P>* p = cpu_get_ptr<P>();
@@ -324,11 +306,9 @@ private:
         return *p;
     }
 
-    template <Precision P = Precision::F32>
-    [[nodiscard]] const MatrixT<P>& cpu_matrix() const
+    template <Precision P = Precision::F32> [[nodiscard]] const MatrixT<P>& cpu_matrix() const
     {
-        static_assert(P == Precision::F16 || P == Precision::F32,
-                      "Phase 1 仅支持 F16/F32");
+        static_assert(P == Precision::F16 || P == Precision::F32, "Phase 1 仅支持 F16/F32");
         const MatrixT<P>* p = cpu_get_ptr<P>();
         NN_ASSERT_ALWAYS(device_ == Device::CPU && p,
                          "cpu_matrix<P>() const: tensor has no P-precision CPU storage");
@@ -337,35 +317,28 @@ private:
 
     template <Precision P = Precision::F32>
     [[nodiscard]] std::shared_ptr<MatrixT<P>> cpu_shared() const noexcept
-    {
-        return cpu_get<P>();
-    }
+    { return cpu_get<P>(); }
 
 #ifdef NN_HAS_VULKAN
     // ── GPU 存储访问（模板化，P 默认 F32，§6.1）──────────────────────────
-    template <Precision P = Precision::F32>
-    [[nodiscard]] GpuTensorT<P>& gpu_tensor()
+    template <Precision P = Precision::F32> [[nodiscard]] GpuTensorT<P>& gpu_tensor()
     {
-        static_assert(P == Precision::F16 || P == Precision::F32,
-                      "Phase 1 仅支持 F16/F32");
+        static_assert(P == Precision::F16 || P == Precision::F32, "Phase 1 仅支持 F16/F32");
         auto p = gpu_get<P>();
         if (!p)
             std::fprintf(stderr,
                          "[gpu_tensor-fail] P=%d precision_=%d gpu_slot=%zu "
                          "dev=%d %zux%zu\n",
-                         static_cast<int>(P), static_cast<int>(precision_),
-                         gpu_data_.index(), static_cast<int>(device_),
-                         rows_, cols_);
+                         static_cast<int>(P), static_cast<int>(precision_), gpu_data_.index(),
+                         static_cast<int>(device_), rows_, cols_);
         NN_ASSERT_ALWAYS(device_ == Device::GPU && p,
                          "gpu_tensor<P>(): tensor has no P-precision GPU storage");
         return *p;
     }
 
-    template <Precision P = Precision::F32>
-    [[nodiscard]] const GpuTensorT<P>& gpu_tensor() const
+    template <Precision P = Precision::F32> [[nodiscard]] const GpuTensorT<P>& gpu_tensor() const
     {
-        static_assert(P == Precision::F16 || P == Precision::F32,
-                      "Phase 1 仅支持 F16/F32");
+        static_assert(P == Precision::F16 || P == Precision::F32, "Phase 1 仅支持 F16/F32");
         auto p = gpu_get<P>();
         NN_ASSERT_ALWAYS(device_ == Device::GPU && p,
                          "gpu_tensor<P>() const: tensor has no P-precision GPU storage");
@@ -374,9 +347,7 @@ private:
 
     template <Precision P = Precision::F32>
     [[nodiscard]] std::shared_ptr<GpuTensorT<P>> gpu_shared() const noexcept
-    {
-        return gpu_get<P>();
-    }
+    { return gpu_get<P>(); }
 #endif
 
     // 推进写版本：**只允许 ComputeEngine 的写入口护栏调用**（friend 限定）。
@@ -387,9 +358,8 @@ public:
     // ── 形状描述（调试用） ────────────────────────────────────────────────
     [[nodiscard]] std::string shape_str() const
     {
-        return "(" + std::to_string(rows_) + "x" + std::to_string(cols_) + ")"
-             + (device_ == Device::CPU ? "[CPU]" : "[GPU]")
-             + precision_name(precision_);
+        return "(" + std::to_string(rows_) + "x" + std::to_string(cols_) + ")" +
+               (device_ == Device::CPU ? "[CPU]" : "[GPU]") + precision_name(precision_);
     }
 
 private:
@@ -402,11 +372,9 @@ private:
     // 私有 + friend 引擎：不重新引入"从张量找引擎"的用法。
     [[nodiscard]] DomainId device_domain_() const noexcept
     {
-        if (device_ == Device::CPU)
-            return valid() ? kHostDomain : 0;
+        if (device_ == Device::CPU) return valid() ? kHostDomain : 0;
 #ifdef NN_HAS_VULKAN
-        if (!valid())
-            return 0;
+        if (!valid()) return 0;
         if (const auto* t16 = gpu_get_ptr<Precision::F16>())
             return t16->buffer().backend_identity();
         if (const auto* t32 = gpu_get_ptr<Precision::F32>())
@@ -423,8 +391,7 @@ private:
     // 视图"能力，按 precision_ 复制数据到新形状的 Matrix（§6.1）。
     [[nodiscard]] Tensor reshape(std::size_t new_rows, std::size_t new_cols) const
     {
-        NN_ASSERT_ALWAYS(rows_ * cols_ == new_rows * new_cols,
-                         "reshape: element count mismatch");
+        NN_ASSERT_ALWAYS(rows_ * cols_ == new_rows * new_cols, "reshape: element count mismatch");
         Tensor t;
         t.device_ = device_;
         t.precision_ = precision_;
@@ -537,10 +504,11 @@ inline void Tensor::touch_write_epoch_() noexcept
 // 绕过引擎摸张量的正道是 engine.from_matrix / to_matrix / create_tensor。
 struct detail::TensorAccess
 {
+    template <Precision P = Precision::F32> [[nodiscard]] static MatrixT<P>& cpu_matrix(Tensor& t)
+    { return t.cpu_matrix<P>(); }
     template <Precision P = Precision::F32>
-    [[nodiscard]] static MatrixT<P>& cpu_matrix(Tensor& t) { return t.cpu_matrix<P>(); }
-    template <Precision P = Precision::F32>
-    [[nodiscard]] static const MatrixT<P>& cpu_matrix(const Tensor& t) { return t.cpu_matrix<P>(); }
+    [[nodiscard]] static const MatrixT<P>& cpu_matrix(const Tensor& t)
+    { return t.cpu_matrix<P>(); }
 
     // 引擎域内的"写下"记账：DSL 的 CPU 编译期模板路径（eval_into_tensor_cpu）
     // **直接**写 dst 的 span，不经 ComputeEngine 的写入口 —— 必须自己推进写
@@ -549,22 +517,16 @@ struct detail::TensorAccess
     static void mark_written(Tensor& t) noexcept { t.touch_write_epoch_(); }
 
     [[nodiscard]] static Tensor from_matrix(Matrix m) { return Tensor::from_matrix(std::move(m)); }
-    [[nodiscard]] static Tensor from_matrix(MatrixT<Precision::F16> m) { return Tensor::from_matrix(std::move(m)); }
+    [[nodiscard]] static Tensor from_matrix(MatrixT<Precision::F16> m)
+    { return Tensor::from_matrix(std::move(m)); }
 
     [[nodiscard]] static Tensor cpu(std::size_t rows, std::size_t cols)
-    {
-        return Tensor::cpu(rows, cols);
-    }
-    template <Precision P>
-    [[nodiscard]] static Tensor cpu(std::size_t rows, std::size_t cols)
-    {
-        return Tensor::cpu<P>(rows, cols);
-    }
+    { return Tensor::cpu(rows, cols); }
+    template <Precision P> [[nodiscard]] static Tensor cpu(std::size_t rows, std::size_t cols)
+    { return Tensor::cpu<P>(rows, cols); }
 
     [[nodiscard]] static Tensor cpu_uninitialized(std::size_t rows, std::size_t cols)
-    {
-        return Tensor::cpu_uninitialized(rows, cols);
-    }
+    { return Tensor::cpu_uninitialized(rows, cols); }
 };
 
 // ── 非拥有型引用包装器（替代裸指针） ─────────────────────────────────────

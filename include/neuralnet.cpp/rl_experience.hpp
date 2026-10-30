@@ -34,10 +34,7 @@ class TensorRecord
 private:
     NamedTensorSet values_;
 
-    explicit TensorRecord(NamedTensorSet values)
-        : values_(std::move(values))
-    {
-    }
+    explicit TensorRecord(NamedTensorSet values) : values_(std::move(values)) {}
 
 public:
     TensorRecord() = default;
@@ -47,43 +44,27 @@ public:
     TensorRecord& operator=(TensorRecord&&) noexcept = default;
     ~TensorRecord() = default;
 
-    [[nodiscard]] static Result<TensorRecord> create(
-        TensorSchema schema, std::vector<NamedTensor> values)
+    [[nodiscard]] static Result<TensorRecord> create(TensorSchema schema,
+                                                     std::vector<NamedTensor> values)
     {
-        NN_TRY(set, NamedTensorSet::create(std::move(schema),
-                                           std::move(values)));
+        NN_TRY(set, NamedTensorSet::create(std::move(schema), std::move(values)));
         return TensorRecord(std::move(*set));
     }
 
-    [[nodiscard]] const TensorSchema& schema() const noexcept
-    {
-        return values_.schema();
-    }
+    [[nodiscard]] const TensorSchema& schema() const noexcept { return values_.schema(); }
     [[nodiscard]] std::size_t size() const noexcept { return values_.size(); }
     [[nodiscard]] Result<FieldHandle> field(std::string_view name) const
-    {
-        return values_.field(name);
-    }
+    { return values_.field(name); }
     [[nodiscard]] Result<FieldHandle> optional_field(std::string_view name) const
-    {
-        return values_.optional_field(name);
-    }
+    { return values_.optional_field(name); }
     [[nodiscard]] Result<const Tensor*> require(const FieldHandle& handle) const
-    {
-        return values_.require(handle);
-    }
+    { return values_.require(handle); }
     [[nodiscard]] Result<const Tensor*> require(std::string_view name) const
-    {
-        return values_.require(name);
-    }
+    { return values_.require(name); }
     [[nodiscard]] const Tensor* find(const FieldHandle& handle) const noexcept
-    {
-        return values_.find(handle);
-    }
+    { return values_.find(handle); }
     [[nodiscard]] const Tensor* find(std::string_view name) const noexcept
-    {
-        return values_.find(name);
-    }
+    { return values_.find(name); }
 };
 
 class ExperienceSchema
@@ -101,17 +82,14 @@ private:
     std::optional<FieldHandle> done_;
     std::optional<FieldHandle> group_id_;
 
-    static void resolve_(const TensorSchema& schema,
-                         std::string_view name,
+    static void resolve_(const TensorSchema& schema, std::string_view name,
                          std::optional<FieldHandle>& out)
     {
         auto h = NN_UNWRAP(schema.optional_field(name));
         if (h.valid()) out = h;
     }
 
-    ExperienceSchema(TensorSchema schema,
-                     std::vector<std::string>)
-        : schema_(std::move(schema))
+    ExperienceSchema(TensorSchema schema, std::vector<std::string>) : schema_(std::move(schema))
     {
         resolve_(schema_, "action", action_);
         resolve_(schema_, "old_log_prob", old_log_prob_);
@@ -135,21 +113,15 @@ public:
 
     // 标准字段先全部登记为可选，再按 required 列表收紧；custom 字段追加在
     // 标准字段之后。required 中的未知名称 -> 明确错误。
-    [[nodiscard]] static Result<ExperienceSchema> create(
-        std::vector<std::string> required = {},
-        std::vector<TensorFieldSpec> custom = {})
+    [[nodiscard]] static Result<ExperienceSchema> create(std::vector<std::string> required = {},
+                                                         std::vector<TensorFieldSpec> custom = {})
     {
         std::vector<TensorFieldSpec> fields{
-            tensor_field("action", {}, false),
-            tensor_field("old_log_prob", {}, false),
-            tensor_field("advantage", {}, false),
-            tensor_field("return", {}, false),
-            tensor_field("old_value", {}, false),
-            tensor_field("action_mask", {}, false),
-            tensor_field("value_mask", {}, false),
-            tensor_field("reward", {}, false),
-            tensor_field("done", {}, false),
-            tensor_field("group_id", {}, false),
+            tensor_field("action", {}, false),     tensor_field("old_log_prob", {}, false),
+            tensor_field("advantage", {}, false),  tensor_field("return", {}, false),
+            tensor_field("old_value", {}, false),  tensor_field("action_mask", {}, false),
+            tensor_field("value_mask", {}, false), tensor_field("reward", {}, false),
+            tensor_field("done", {}, false),       tensor_field("group_id", {}, false),
         };
         for (const std::string& name : required)
         {
@@ -164,8 +136,8 @@ public:
                 }
             }
             if (!found)
-                NN_FAIL("ExperienceSchema::create: required 含未知标准字段 '" +
-                        name + "'（自定义字段请在定义中自行设 required）");
+                NN_FAIL("ExperienceSchema::create: required 含未知标准字段 '" + name +
+                        "'（自定义字段请在定义中自行设 required）");
         }
         fields.insert(fields.end(), custom.begin(), custom.end());
         NN_TRY(schema, TensorSchema::create("experience", std::move(fields)));
@@ -173,46 +145,16 @@ public:
     }
 
     [[nodiscard]] const TensorSchema& schema() const noexcept { return schema_; }
-    [[nodiscard]] std::optional<FieldHandle> action() const noexcept
-    {
-        return action_;
-    }
-    [[nodiscard]] std::optional<FieldHandle> old_log_prob() const noexcept
-    {
-        return old_log_prob_;
-    }
-    [[nodiscard]] std::optional<FieldHandle> advantage() const noexcept
-    {
-        return advantage_;
-    }
-    [[nodiscard]] std::optional<FieldHandle> returns() const noexcept
-    {
-        return returns_;
-    }
-    [[nodiscard]] std::optional<FieldHandle> old_value() const noexcept
-    {
-        return old_value_;
-    }
-    [[nodiscard]] std::optional<FieldHandle> action_mask() const noexcept
-    {
-        return action_mask_;
-    }
-    [[nodiscard]] std::optional<FieldHandle> value_mask() const noexcept
-    {
-        return value_mask_;
-    }
-    [[nodiscard]] std::optional<FieldHandle> reward() const noexcept
-    {
-        return reward_;
-    }
-    [[nodiscard]] std::optional<FieldHandle> done() const noexcept
-    {
-        return done_;
-    }
-    [[nodiscard]] std::optional<FieldHandle> group_id() const noexcept
-    {
-        return group_id_;
-    }
+    [[nodiscard]] std::optional<FieldHandle> action() const noexcept { return action_; }
+    [[nodiscard]] std::optional<FieldHandle> old_log_prob() const noexcept { return old_log_prob_; }
+    [[nodiscard]] std::optional<FieldHandle> advantage() const noexcept { return advantage_; }
+    [[nodiscard]] std::optional<FieldHandle> returns() const noexcept { return returns_; }
+    [[nodiscard]] std::optional<FieldHandle> old_value() const noexcept { return old_value_; }
+    [[nodiscard]] std::optional<FieldHandle> action_mask() const noexcept { return action_mask_; }
+    [[nodiscard]] std::optional<FieldHandle> value_mask() const noexcept { return value_mask_; }
+    [[nodiscard]] std::optional<FieldHandle> reward() const noexcept { return reward_; }
+    [[nodiscard]] std::optional<FieldHandle> done() const noexcept { return done_; }
+    [[nodiscard]] std::optional<FieldHandle> group_id() const noexcept { return group_id_; }
 };
 
 class PolicyBatchView
@@ -228,10 +170,7 @@ private:
     std::optional<FieldHandle> value_mask_;
     std::optional<FieldHandle> group_id_;
 
-    PolicyBatchView(const TensorRecord& record)
-        : record_(&record)
-    {
-    }
+    PolicyBatchView(const TensorRecord& record) : record_(&record) {}
 
 public:
     PolicyBatchView() = default;
@@ -241,20 +180,17 @@ public:
     PolicyBatchView& operator=(PolicyBatchView&&) noexcept = default;
     ~PolicyBatchView() = default;
 
-    [[nodiscard]] static Result<PolicyBatchView> create(
-        const TensorRecord& record)
+    [[nodiscard]] static Result<PolicyBatchView> create(const TensorRecord& record)
     {
         auto action = record.field("action");
-        if (!action)
-            NN_FAIL("PolicyBatchView::create: 缺少 action");
+        if (!action) NN_FAIL("PolicyBatchView::create: 缺少 action");
         auto action_mask = record.field("action_mask");
-        if (!action_mask)
-            NN_FAIL("PolicyBatchView::create: 缺少 action_mask");
+        if (!action_mask) NN_FAIL("PolicyBatchView::create: 缺少 action_mask");
         PolicyBatchView view(record);
         view.action_ = *action;
         view.action_mask_ = *action_mask;
-        auto set_optional = [&](std::string_view name,
-                                std::optional<FieldHandle>& out) {
+        auto set_optional = [&](std::string_view name, std::optional<FieldHandle>& out)
+        {
             auto h = record.optional_field(name);
             if (h && h->valid()) out = *h;
         };
@@ -268,38 +204,20 @@ public:
     }
 
     [[nodiscard]] const TensorRecord& record() const noexcept { return *record_; }
-    [[nodiscard]] const Tensor& action() const
-    {
-        return *record_->find(action_);
-    }
-    [[nodiscard]] const Tensor& action_mask() const
-    {
-        return *record_->find(action_mask_);
-    }
+    [[nodiscard]] const Tensor& action() const { return *record_->find(action_); }
+    [[nodiscard]] const Tensor& action_mask() const { return *record_->find(action_mask_); }
     [[nodiscard]] const Tensor* old_log_prob() const noexcept
-    {
-        return old_log_prob_ ? record_->find(*old_log_prob_) : nullptr;
-    }
+    { return old_log_prob_ ? record_->find(*old_log_prob_) : nullptr; }
     [[nodiscard]] const Tensor* advantage() const noexcept
-    {
-        return advantage_ ? record_->find(*advantage_) : nullptr;
-    }
+    { return advantage_ ? record_->find(*advantage_) : nullptr; }
     [[nodiscard]] const Tensor* returns() const noexcept
-    {
-        return returns_ ? record_->find(*returns_) : nullptr;
-    }
+    { return returns_ ? record_->find(*returns_) : nullptr; }
     [[nodiscard]] const Tensor* old_value() const noexcept
-    {
-        return old_value_ ? record_->find(*old_value_) : nullptr;
-    }
+    { return old_value_ ? record_->find(*old_value_) : nullptr; }
     [[nodiscard]] const Tensor* value_mask() const noexcept
-    {
-        return value_mask_ ? record_->find(*value_mask_) : nullptr;
-    }
+    { return value_mask_ ? record_->find(*value_mask_) : nullptr; }
     [[nodiscard]] const Tensor* group_id() const noexcept
-    {
-        return group_id_ ? record_->find(*group_id_) : nullptr;
-    }
+    { return group_id_ ? record_->find(*group_id_) : nullptr; }
 };
 
 struct AdvantageConfig
@@ -311,36 +229,29 @@ struct AdvantageConfig
 
 namespace detail
 {
-[[nodiscard]] inline Result<Tensor> rl_zero(
-    ComputeEngine& engine, std::size_t rows, std::size_t cols, Precision p)
+[[nodiscard]] inline Result<Tensor> rl_zero(ComputeEngine& engine, std::size_t rows,
+                                            std::size_t cols, Precision p)
 {
     NN_TRY(t, engine.try_create_tensor(rows, cols, p));
     NN_TRY_CHECK(engine.zero(*t));
     return t;
 }
 
-[[nodiscard]] inline Result<Tensor> rl_constant(
-    ComputeEngine& engine, std::size_t rows, std::size_t cols,
-    Scalar value, Precision p)
+[[nodiscard]] inline Result<Tensor> rl_constant(ComputeEngine& engine, std::size_t rows,
+                                                std::size_t cols, Scalar value, Precision p)
 {
     NN_TRY(zero, rl_zero(engine, rows, cols, p));
-    if (value == Scalar{0})
-        return zero;
-    return dsl::compute(engine,
-                        dsl::leaf(*zero) + dsl::rparam(value),
-                        rows, cols, p);
+    if (value == Scalar{0}) return zero;
+    return dsl::compute(engine, dsl::leaf(*zero) + dsl::rparam(value), rows, cols, p);
 }
 
-inline Result<void> rl_check_same_shape(
-    const Tensor& reference, const Tensor* other, const char* name)
+inline Result<void> rl_check_same_shape(const Tensor& reference, const Tensor* other,
+                                        const char* name)
 {
     if (other == nullptr) return {};
-    if (other->rows() != reference.rows() ||
-        other->cols() != reference.cols())
-        NN_FAIL(std::string("RL transform: ") + name +
-                " 形状与 reward/value 不一致（期望 " +
-                reference.shape_str() + "，实际 " +
-                other->shape_str() + "）");
+    if (other->rows() != reference.rows() || other->cols() != reference.cols())
+        NN_FAIL(std::string("RL transform: ") + name + " 形状与 reward/value 不一致（期望 " +
+                reference.shape_str() + "，实际 " + other->shape_str() + "）");
     return {};
 }
 } // namespace detail
@@ -351,10 +262,7 @@ private:
     AdvantageConfig cfg_;
 
 public:
-    explicit GaeAdvantage(AdvantageConfig cfg = {})
-        : cfg_(cfg)
-    {
-    }
+    explicit GaeAdvantage(AdvantageConfig cfg = {}) : cfg_(cfg) {}
 
     struct Output
     {
@@ -362,22 +270,20 @@ public:
         Tensor returns;
     };
 
-    [[nodiscard]] Result<Output> apply(
-        ComputeEngine& engine, const Tensor& rewards, const Tensor& values,
-        const Tensor* done = nullptr, const Tensor* mask = nullptr,
-        const Tensor* bootstrap_value = nullptr) const
+    [[nodiscard]] Result<Output> apply(ComputeEngine& engine, const Tensor& rewards,
+                                       const Tensor& values, const Tensor* done = nullptr,
+                                       const Tensor* mask = nullptr,
+                                       const Tensor* bootstrap_value = nullptr) const
     {
         const std::size_t steps = rewards.rows();
         const std::size_t batch = rewards.cols();
-        if (steps == 0 || batch == 0)
-            NN_FAIL("GaeAdvantage: reward 不能为空");
+        if (steps == 0 || batch == 0) NN_FAIL("GaeAdvantage: reward 不能为空");
         if (values.rows() != steps || values.cols() != batch)
             NN_FAIL("GaeAdvantage: value 与 reward 形状不一致");
         NN_TRY_CHECK(detail::rl_check_same_shape(rewards, done, "done"));
         NN_TRY_CHECK(detail::rl_check_same_shape(rewards, mask, "mask"));
         if (bootstrap_value != nullptr &&
-            (bootstrap_value->rows() != 1 ||
-             bootstrap_value->cols() != batch))
+            (bootstrap_value->rows() != 1 || bootstrap_value->cols() != batch))
             NN_FAIL("GaeAdvantage: bootstrap_value 形状必须为 (1,batch)");
 
         const Precision p = cfg_.precision;
@@ -410,8 +316,8 @@ public:
             {
                 NN_TRY(d, engine.slice_rows(*done, ti, 1));
                 NN_TRY(c, dsl::compute(engine,
-                                       dsl::leaf(*reward) * dsl::rparam(0) +
-                                           dsl::rparam(1) - dsl::leaf(*d),
+                                       dsl::leaf(*reward) * dsl::rparam(0) + dsl::rparam(1) -
+                                           dsl::leaf(*d),
                                        1, batch, p));
                 continuation = std::move(*c);
             }
@@ -427,38 +333,32 @@ public:
                                                dsl::leaf(continuation) -
                                            dsl::leaf(*value),
                                        1, batch, p));
-            NN_TRY(advance, dsl::compute(
-                                engine,
-                                dsl::leaf(*delta) +
-                                    dsl::leaf(*next_adv) *
-                                        dsl::rparam(cfg_.gamma * cfg_.lambda) *
-                                        dsl::leaf(continuation),
+            NN_TRY(advance,
+                   dsl::compute(engine,
+                                dsl::leaf(*delta) + dsl::leaf(*next_adv) *
+                                                        dsl::rparam(cfg_.gamma * cfg_.lambda) *
+                                                        dsl::leaf(continuation),
                                 1, batch, p));
 
             if (mask_row != nullptr)
             {
-                NN_TRY(masked_a, dsl::compute(engine,
-                                              dsl::leaf(*advance) *
-                                                  dsl::leaf(*mask_row),
-                                              1, batch, p));
+                NN_TRY(masked_a, dsl::compute(engine, dsl::leaf(*advance) * dsl::leaf(*mask_row), 1,
+                                              batch, p));
                 advance = std::move(*masked_a);
             }
             Tensor ret_row;
             if (mask_row != nullptr)
             {
-                NN_TRY(ret, dsl::compute(
-                                engine,
-                                (dsl::leaf(*advance) + dsl::leaf(*value)) *
-                                    dsl::leaf(*mask_row),
-                                1, batch, p));
+                NN_TRY(ret,
+                       dsl::compute(
+                           engine, (dsl::leaf(*advance) + dsl::leaf(*value)) * dsl::leaf(*mask_row),
+                           1, batch, p));
                 ret_row = std::move(*ret);
             }
             else
             {
-                NN_TRY(ret, dsl::compute(
-                                engine,
-                                dsl::leaf(*advance) + dsl::leaf(*value),
-                                1, batch, p));
+                NN_TRY(ret,
+                       dsl::compute(engine, dsl::leaf(*advance) + dsl::leaf(*value), 1, batch, p));
                 ret_row = std::move(*ret);
             }
 
@@ -476,8 +376,7 @@ public:
                 next_value = *value;
             }
         }
-        return Output{.advantage = std::move(*out_a),
-                      .returns = std::move(*out_r)};
+        return Output{.advantage = std::move(*out_a), .returns = std::move(*out_r)};
     }
 };
 
@@ -488,20 +387,18 @@ private:
     Precision precision_ = Precision::F32;
 
 public:
-    explicit MonteCarloReturn(Scalar gamma = 0.99f,
-                              Precision precision = Precision::F32)
+    explicit MonteCarloReturn(Scalar gamma = 0.99f, Precision precision = Precision::F32)
         : gamma_(gamma), precision_(precision)
     {
     }
 
-    [[nodiscard]] Result<Tensor> apply(
-        ComputeEngine& engine, const Tensor& rewards,
-        const Tensor* done = nullptr, const Tensor* mask = nullptr) const
+    [[nodiscard]] Result<Tensor> apply(ComputeEngine& engine, const Tensor& rewards,
+                                       const Tensor* done = nullptr,
+                                       const Tensor* mask = nullptr) const
     {
         const std::size_t steps = rewards.rows();
         const std::size_t batch = rewards.cols();
-        if (steps == 0 || batch == 0)
-            NN_FAIL("MonteCarloReturn: reward 不能为空");
+        if (steps == 0 || batch == 0) NN_FAIL("MonteCarloReturn: reward 不能为空");
         NN_TRY_CHECK(detail::rl_check_same_shape(rewards, done, "done"));
         NN_TRY_CHECK(detail::rl_check_same_shape(rewards, mask, "mask"));
 
@@ -515,29 +412,25 @@ public:
             {
                 NN_TRY(d, engine.slice_rows(*done, ti, 1));
                 NN_TRY(c, dsl::compute(engine,
-                                       dsl::leaf(*reward) * dsl::rparam(0) +
-                                           dsl::rparam(1) - dsl::leaf(*d),
+                                       dsl::leaf(*reward) * dsl::rparam(0) + dsl::rparam(1) -
+                                           dsl::leaf(*d),
                                        1, batch, precision_));
                 continuation = std::move(*c);
             }
             else
             {
-                NN_TRY(c, detail::rl_constant(engine, 1, batch, 1,
-                                               precision_));
+                NN_TRY(c, detail::rl_constant(engine, 1, batch, 1, precision_));
                 continuation = std::move(*c);
             }
-            NN_TRY(row, dsl::compute(
-                            engine,
-                            dsl::leaf(*reward) + dsl::leaf(*next) *
-                                dsl::rparam(gamma_) *
-                                dsl::leaf(continuation),
-                            1, batch, precision_));
+            NN_TRY(row, dsl::compute(engine,
+                                     dsl::leaf(*reward) + dsl::leaf(*next) * dsl::rparam(gamma_) *
+                                                              dsl::leaf(continuation),
+                                     1, batch, precision_));
             if (mask != nullptr)
             {
                 NN_TRY(m, engine.slice_rows(*mask, ti, 1));
-                NN_TRY(masked, dsl::compute(engine,
-                                            dsl::leaf(*row) * dsl::leaf(*m),
-                                            1, batch, precision_));
+                NN_TRY(masked,
+                       dsl::compute(engine, dsl::leaf(*row) * dsl::leaf(*m), 1, batch, precision_));
                 row = std::move(*masked);
             }
             NN_TRY_CHECK(engine.insert_rows(*out, ti, *row));
@@ -555,47 +448,33 @@ private:
     Precision precision_ = Precision::F32;
 
 public:
-    explicit MaskedNormalizer(Scalar epsilon = 1e-8f,
-                              Precision precision = Precision::F32)
+    explicit MaskedNormalizer(Scalar epsilon = 1e-8f, Precision precision = Precision::F32)
         : epsilon_(epsilon), precision_(precision)
     {
     }
 
-    [[nodiscard]] Result<Tensor> apply(
-        ComputeEngine& engine, const Tensor& values,
-        const Tensor& mask) const
+    [[nodiscard]] Result<Tensor> apply(ComputeEngine& engine, const Tensor& values,
+                                       const Tensor& mask) const
     {
-        if (values.rows() == 0 || values.cols() == 0)
-            NN_FAIL("MaskedNormalizer: values 不能为空");
+        if (values.rows() == 0 || values.cols() == 0) NN_FAIL("MaskedNormalizer: values 不能为空");
         NN_TRY_CHECK(detail::rl_check_same_shape(values, &mask, "mask"));
 
-        NN_TRY(weighted, dsl::compute(engine,
-                                      dsl::leaf(values) * dsl::leaf(mask),
-                                      values.rows(), values.cols(),
-                                      precision_));
-        NN_TRY(square, dsl::compute(engine,
-                                    dsl::leaf(values) * dsl::leaf(values) *
-                                        dsl::leaf(mask),
-                                    values.rows(), values.cols(),
-                                    precision_));
-        NN_TRY(sum_w, dsl::compute_reduce(
-                          engine, dsl::col_reduce_sum(dsl::leaf(*weighted)),
-                          values.rows(), values.cols(), precision_));
-        NN_TRY(sum_sq, dsl::compute_reduce(
-                           engine, dsl::col_reduce_sum(dsl::leaf(*square)),
-                           values.rows(), values.cols(), precision_));
-        NN_TRY(sum_m, dsl::compute_reduce(
-                          engine, dsl::col_reduce_sum(dsl::leaf(mask)),
-                          values.rows(), values.cols(), precision_));
-        NN_TRY(total_w, dsl::compute_reduce(
-                            engine, dsl::row_reduce_sum(dsl::leaf(*sum_w)),
-                            1, values.cols(), precision_));
-        NN_TRY(total_sq, dsl::compute_reduce(
-                             engine, dsl::row_reduce_sum(dsl::leaf(*sum_sq)),
-                             1, values.cols(), precision_));
-        NN_TRY(total_m, dsl::compute_reduce(
-                            engine, dsl::row_reduce_sum(dsl::leaf(*sum_m)),
-                            1, values.cols(), precision_));
+        NN_TRY(weighted, dsl::compute(engine, dsl::leaf(values) * dsl::leaf(mask), values.rows(),
+                                      values.cols(), precision_));
+        NN_TRY(square, dsl::compute(engine, dsl::leaf(values) * dsl::leaf(values) * dsl::leaf(mask),
+                                    values.rows(), values.cols(), precision_));
+        NN_TRY(sum_w, dsl::compute_reduce(engine, dsl::col_reduce_sum(dsl::leaf(*weighted)),
+                                          values.rows(), values.cols(), precision_));
+        NN_TRY(sum_sq, dsl::compute_reduce(engine, dsl::col_reduce_sum(dsl::leaf(*square)),
+                                           values.rows(), values.cols(), precision_));
+        NN_TRY(sum_m, dsl::compute_reduce(engine, dsl::col_reduce_sum(dsl::leaf(mask)),
+                                          values.rows(), values.cols(), precision_));
+        NN_TRY(total_w, dsl::compute_reduce(engine, dsl::row_reduce_sum(dsl::leaf(*sum_w)), 1,
+                                            values.cols(), precision_));
+        NN_TRY(total_sq, dsl::compute_reduce(engine, dsl::row_reduce_sum(dsl::leaf(*sum_sq)), 1,
+                                             values.cols(), precision_));
+        NN_TRY(total_m, dsl::compute_reduce(engine, dsl::row_reduce_sum(dsl::leaf(*sum_m)), 1,
+                                            values.cols(), precision_));
         auto w = detail::download_vector(engine, *total_w);
         NN_TRY_CHECK(w);
         auto sq = detail::download_vector(engine, *total_sq);
@@ -605,18 +484,16 @@ public:
 
         const Scalar count = (*m)[0];
         if (count <= Scalar{0})
-            return detail::rl_zero(engine, values.rows(), values.cols(),
-                                   precision_);
+            return detail::rl_zero(engine, values.rows(), values.cols(), precision_);
         const Scalar mean = (*w)[0] / count;
         Scalar variance = (*sq)[0] / count - mean * mean;
         if (variance < Scalar{0}) variance = Scalar{0};
         if (variance <= epsilon_ * epsilon_)
-            return detail::rl_zero(engine, values.rows(), values.cols(),
-                                   precision_);
+            return detail::rl_zero(engine, values.rows(), values.cols(), precision_);
         const Scalar inv_std = Scalar{1} / std::sqrt(variance);
         return dsl::compute(engine,
-                            (dsl::leaf(values) - dsl::rparam(mean)) *
-                                dsl::rparam(inv_std) * dsl::leaf(mask),
+                            (dsl::leaf(values) - dsl::rparam(mean)) * dsl::rparam(inv_std) *
+                                dsl::leaf(mask),
                             values.rows(), values.cols(), precision_);
     }
 };
@@ -634,40 +511,32 @@ private:
     Precision precision_ = Precision::F32;
 
 public:
-    explicit GroupAdvantage(Scalar epsilon = 1e-8f,
-                            Precision precision = Precision::F32)
+    explicit GroupAdvantage(Scalar epsilon = 1e-8f, Precision precision = Precision::F32)
         : epsilon_(epsilon), precision_(precision)
     {
     }
 
     // returns: (N,1)；spans 必须有序、互不重叠并连续覆盖全部 N 行。
-    [[nodiscard]] Result<Tensor> apply(
-        ComputeEngine& engine, const Tensor& returns,
-        std::span<const GroupSpan> spans) const
+    [[nodiscard]] Result<Tensor> apply(ComputeEngine& engine, const Tensor& returns,
+                                       std::span<const GroupSpan> spans) const
     {
         if (returns.cols() != 1 || returns.rows() == 0)
             NN_FAIL("GroupAdvantage: returns 形状必须为 (N,1)");
         std::size_t cursor = 0;
         for (const GroupSpan& span : spans)
         {
-            if (span.row_count == 0)
-                NN_FAIL("GroupAdvantage: group row_count 必须 > 0");
-            if (span.first_row != cursor)
-                NN_FAIL("GroupAdvantage: group spans 必须连续且无重叠");
+            if (span.row_count == 0) NN_FAIL("GroupAdvantage: group row_count 必须 > 0");
+            if (span.first_row != cursor) NN_FAIL("GroupAdvantage: group spans 必须连续且无重叠");
             cursor += span.row_count;
         }
-        if (cursor != returns.rows())
-            NN_FAIL("GroupAdvantage: group spans 未覆盖全部 returns 行");
+        if (cursor != returns.rows()) NN_FAIL("GroupAdvantage: group spans 未覆盖全部 returns 行");
 
         NN_TRY(out, engine.try_create_tensor(returns.rows(), 1, precision_));
         MaskedNormalizer normalizer(epsilon_, precision_);
         for (const GroupSpan& span : spans)
         {
-            NN_TRY(group,
-                   engine.slice_rows(returns, span.first_row, span.row_count));
-            NN_TRY(mask,
-                   detail::rl_constant(engine, span.row_count, 1, 1,
-                                       precision_));
+            NN_TRY(group, engine.slice_rows(returns, span.first_row, span.row_count));
+            NN_TRY(mask, detail::rl_constant(engine, span.row_count, 1, 1, precision_));
             NN_TRY(normalized, normalizer.apply(engine, *group, *mask));
             NN_TRY_CHECK(engine.insert_rows(*out, span.first_row, *normalized));
         }

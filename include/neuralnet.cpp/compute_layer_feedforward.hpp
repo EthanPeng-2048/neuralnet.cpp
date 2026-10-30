@@ -16,7 +16,8 @@
 #include "model_spec.hpp"
 #include "expr_dsl.hpp"
 
-namespace nn {
+namespace nn
+{
 
 class FeedForward final : public Layer
 {
@@ -27,7 +28,7 @@ private:
     std::unique_ptr<Layer> fc2_;  // (d_ff → d_model)
     // 三值模式（构造期定型；决定 fc1_/fc2_ 的**具体类型**与 profile 分流）
     WeightQuant weight_quant_ = WeightQuant::None;
-    GeLU  gelu_;
+    GeLU gelu_;
     SwiGLU swiglu_;  // SwiGLU 激活（含 split/merge）
     ReLU2GLU relu2glu_;  // 门控平方 ReLU 激活（BitNet 2B4T；同 split/merge 接线）
     bool use_swiglu_ = false;
@@ -47,22 +48,20 @@ public:
     [[nodiscard]] const char* layer_name() const noexcept override { return "FeedForward"; }
 
     FeedForward(std::size_t d_model, std::size_t d_ff,
-                ActivationType activation = ActivationType::GeLU,
-                bool subln = false,
+                ActivationType activation = ActivationType::GeLU, bool subln = false,
                 NormType subln_norm_type = NormType::LayerNorm,
                 WeightQuant weight_quant = WeightQuant::None)
-        : fc1_(make_linear_layer(d_model,
-               (activation == ActivationType::SwiGLU ||
-                activation == ActivationType::ReLU2) ? 2 * d_ff : d_ff, weight_quant)),
-          fc2_(make_linear_layer(d_ff, d_model, weight_quant)),
-          weight_quant_(weight_quant),
-          swiglu_(d_ff),
-          relu2glu_(d_ff),
-          use_swiglu_(activation == ActivationType::SwiGLU),
+        : fc1_(make_linear_layer(
+              d_model,
+              (activation == ActivationType::SwiGLU || activation == ActivationType::ReLU2)
+                  ? 2 * d_ff
+                  : d_ff,
+              weight_quant)),
+          fc2_(make_linear_layer(d_ff, d_model, weight_quant)), weight_quant_(weight_quant),
+          swiglu_(d_ff), relu2glu_(d_ff), use_swiglu_(activation == ActivationType::SwiGLU),
           use_relu2_(activation == ActivationType::ReLU2)
     {
-        if (subln)
-            sub_norm_ = make_norm_layer(d_ff, subln_norm_type);
+        if (subln) sub_norm_ = make_norm_layer(d_ff, subln_norm_type);
     }
 
     [[nodiscard]] Result<void> init_impl(ComputeEngine& engine) override
@@ -71,9 +70,15 @@ public:
         NN_TRY(r2, fc2_->init(engine));
         // M6 段 C：激活子层也是 Layer（engine 由 init 绑定），必须一并 init——
         // 否则 forward 里调 gelu_/swiglu_.forward() 会在 engine_ref() 处 fail-fast。
-        { NN_TRY(r, gelu_.init(engine)); }
-        { NN_TRY(r, swiglu_.init(engine)); }
-        { NN_TRY(r, relu2glu_.init(engine)); }
+        {
+            NN_TRY(r, gelu_.init(engine));
+        }
+        {
+            NN_TRY(r, swiglu_.init(engine));
+        }
+        {
+            NN_TRY(r, relu2glu_.init(engine));
+        }
         if (sub_norm_) { NN_TRY(r, sub_norm_->init(engine)); }
         return {};
     }
@@ -131,8 +136,8 @@ public:
     // 三值权重）。非三值模式逐位不变（split 退化为恒等）。
     void set_precision_profile(const PrecisionProfile& profile) override
     {
-        const TernaryProfileSplit sp = split_ternary_profile(
-            layer_name(), profile, weight_quant_ == WeightQuant::T1_58);
+        const TernaryProfileSplit sp =
+            split_ternary_profile(layer_name(), profile, weight_quant_ == WeightQuant::T1_58);
         Layer::set_precision_profile(sp.self);
         fc1_->set_precision_profile(sp.linear);
         fc2_->set_precision_profile(sp.linear);
@@ -155,11 +160,16 @@ public:
     std::vector<TensorRef> activation_cache() override
     {
         std::vector<TensorRef> r;
-        auto a = fc1_->activation_cache(); r.insert(r.end(), a.begin(), a.end());
-        auto b = fc2_->activation_cache(); r.insert(r.end(), b.begin(), b.end());
-        auto g = gelu_.activation_cache(); r.insert(r.end(), g.begin(), g.end());
-        auto s = swiglu_.activation_cache(); r.insert(r.end(), s.begin(), s.end());
-        auto r2 = relu2glu_.activation_cache(); r.insert(r.end(), r2.begin(), r2.end());
+        auto a = fc1_->activation_cache();
+        r.insert(r.end(), a.begin(), a.end());
+        auto b = fc2_->activation_cache();
+        r.insert(r.end(), b.begin(), b.end());
+        auto g = gelu_.activation_cache();
+        r.insert(r.end(), g.begin(), g.end());
+        auto s = swiglu_.activation_cache();
+        r.insert(r.end(), s.begin(), s.end());
+        auto r2 = relu2glu_.activation_cache();
+        r.insert(r.end(), r2.begin(), r2.end());
         if (sub_norm_)
         {
             auto sn = sub_norm_->activation_cache();
@@ -168,8 +178,7 @@ public:
         return r;
     }
 
-    [[nodiscard]] Result<Tensor> forward(
-        const Tensor& input) override
+    [[nodiscard]] Result<Tensor> forward(const Tensor& input) override
     {
         NN_TRY(h1, fc1_->forward(input));
         Tensor h2_out;
@@ -197,8 +206,7 @@ public:
         return fc2_->forward(h2_out);
     }
 
-    [[nodiscard]] Result<Tensor> backward(
-        const Tensor& grad_output) override
+    [[nodiscard]] Result<Tensor> backward(const Tensor& grad_output) override
     {
         NN_TRY(b2, fc2_->backward(grad_output));
         Tensor g = std::move(*b2);

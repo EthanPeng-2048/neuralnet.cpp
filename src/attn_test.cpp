@@ -43,19 +43,21 @@ static int mha_bidirectional_probe()
     std::uniform_real_distribution<nn::Scalar> dist(-1, 1);
 
     nn::Matrix x1(d_model, total);
-    for (std::size_t i = 0; i < x1.size(); ++i) x1.span()[i] = dist(rng);
+    for (std::size_t i = 0; i < x1.size(); ++i)
+        x1.span()[i] = dist(rng);
     nn::Matrix x2(d_model, total);          // 仅扰动 (b0, t=seq-1) 一列
-    for (std::size_t i = 0; i < x2.size(); ++i) x2.span()[i] = x1.span()[i];
+    for (std::size_t i = 0; i < x2.size(); ++i)
+        x2.span()[i] = x1.span()[i];
     for (std::size_t r = 0; r < d_model; ++r)
         x2.span()[r * total + (seq - 1)] = dist(rng);
 
     // 位置 0 输出的扰动敏感度（d_model 行 × 第 0 列）
-    const auto col0_delta = [](const nn::Matrix& a, const nn::Matrix& b) {
+    const auto col0_delta = [](const nn::Matrix& a, const nn::Matrix& b)
+    {
         nn::Scalar m = 0;
         for (std::size_t r = 0; r < a.rows(); ++r)
         {
-            const nn::Scalar d = std::fabs(
-                a.span()[r * a.cols()] - b.span()[r * b.cols()]);
+            const nn::Scalar d = std::fabs(a.span()[r * a.cols()] - b.span()[r * b.cols()]);
             if (d > m) m = d;
         }
         return m;
@@ -66,14 +68,26 @@ static int mha_bidirectional_probe()
     NN_EXIT(attn_c.init(cpu), 1, "MHA cpu init: ");
     auto t1 = cpu.from_matrix(x1);
     auto t2 = cpu.from_matrix(x2);
-    if (!t1 || !t2) { std::cerr << "MHA probe: from_matrix failed\n"; return 1; }
+    if (!t1 || !t2)
+    {
+        std::cerr << "MHA probe: from_matrix failed\n";
+        return 1;
+    }
     auto y1 = attn_c.forward(*t1);
     auto y2 = attn_c.forward(*t2);
-    if (!y1 || !y2) { std::cerr << "MHA probe forward: "
-                                << (!y1 ? y1.error().message : y2.error().message) << "\n"; return 1; }
+    if (!y1 || !y2)
+    {
+        std::cerr << "MHA probe forward: " << (!y1 ? y1.error().message : y2.error().message)
+                  << "\n";
+        return 1;
+    }
     auto m1 = cpu.to_matrix(*y1);
     auto m2 = cpu.to_matrix(*y2);
-    if (!m1 || !m2) { std::cerr << "MHA probe: to_matrix failed\n"; return 1; }
+    if (!m1 || !m2)
+    {
+        std::cerr << "MHA probe: to_matrix failed\n";
+        return 1;
+    }
     const nn::Scalar d_mha = col0_delta(*m1, *m2);
     const bool mha_ok = d_mha > 1e-5f;
     std::cout << "  MHA 双向探针(改未来列→位置0须变): delta=" << d_mha
@@ -84,10 +98,18 @@ static int mha_bidirectional_probe()
     NN_EXIT(attn_cs_c.init(cpu), 1, "CSA cpu init: ");
     auto cy1 = attn_cs_c.forward(*t1);
     auto cy2 = attn_cs_c.forward(*t2);
-    if (!cy1 || !cy2) { std::cerr << "CSA probe forward failed\n"; return 1; }
+    if (!cy1 || !cy2)
+    {
+        std::cerr << "CSA probe forward failed\n";
+        return 1;
+    }
     auto cm1 = cpu.to_matrix(*cy1);
     auto cm2 = cpu.to_matrix(*cy2);
-    if (!cm1 || !cm2) { std::cerr << "CSA probe: to_matrix failed\n"; return 1; }
+    if (!cm1 || !cm2)
+    {
+        std::cerr << "CSA probe: to_matrix failed\n";
+        return 1;
+    }
     const nn::Scalar d_csa = col0_delta(*cm1, *cm2);
     const bool csa_ok = d_csa < 1e-5f;
     std::cout << "  CSA 因果阴性对照(位置0须不变): delta=" << d_csa
@@ -119,7 +141,11 @@ static int mha_bidirectional_probe()
     }
     auto g1 = gpu.from_matrix(x1);
     auto g2 = gpu.from_matrix(x2);
-    if (!g1 || !g2) { std::cerr << "MHA probe gpu from_matrix failed\n"; return 1; }
+    if (!g1 || !g2)
+    {
+        std::cerr << "MHA probe gpu from_matrix failed\n";
+        return 1;
+    }
     auto gy1 = attn_g.forward(*g1);     // 覆盖 GPU Plain fold key
     auto gy2 = attn_g.forward(*g2);     // GPU 双向探针
     if (!gy1 || !gy2)
@@ -130,7 +156,11 @@ static int mha_bidirectional_probe()
     }
     auto gm1 = gpu.to_matrix(*gy1);
     auto gm2 = gpu.to_matrix(*gy2);
-    if (!gm1 || !gm2) { std::cerr << "MHA gpu to_matrix failed\n"; return 1; }
+    if (!gm1 || !gm2)
+    {
+        std::cerr << "MHA gpu to_matrix failed\n";
+        return 1;
+    }
     const nn::Scalar d_gpu = col0_delta(*gm1, *gm2);
     const bool gpu_ok = d_gpu > 1e-5f;
     std::cout << "  MHA GPU 双向探针: delta=" << d_gpu
@@ -144,31 +174,44 @@ static int mha_bidirectional_probe()
         if (d > max_abs) max_abs = d;
     }
     const bool cons_ok = max_abs <= 1e-3f;
-    std::cout << "  MHA CPU/GPU forward 一致性: max_abs=" << max_abs
-              << (cons_ok ? " ✅" : " ❌") << "\n";
+    std::cout << "  MHA CPU/GPU forward 一致性: max_abs=" << max_abs << (cons_ok ? " ✅" : " ❌")
+              << "\n";
     if (!cons_ok) ++failures;
 
     // backward 一致性：两侧最后 forward 对齐为同一输入后反传同一梯度
     // （GPU 侧触发 MHA 裸 S 重算表达式——scan 闭合世界注册的验针）
     auto b1c = attn_c.forward(*t1);
     auto b1g = attn_g.forward(*g1);
-    if (!b1c || !b1g) { std::cerr << "MHA re-forward failed\n"; return 1; }
+    if (!b1c || !b1g)
+    {
+        std::cerr << "MHA re-forward failed\n";
+        return 1;
+    }
     nn::Matrix gm(d_model, total);
-    for (std::size_t i = 0; i < gm.size(); ++i) gm.span()[i] = dist(rng);
+    for (std::size_t i = 0; i < gm.size(); ++i)
+        gm.span()[i] = dist(rng);
     auto tg_c = cpu.from_matrix(gm);
     auto tg_g = gpu.from_matrix(gm);
-    if (!tg_c || !tg_g) { std::cerr << "grad from_matrix failed\n"; return 1; }
+    if (!tg_c || !tg_g)
+    {
+        std::cerr << "grad from_matrix failed\n";
+        return 1;
+    }
     auto bc = attn_c.backward(*tg_c);
     auto bg = attn_g.backward(*tg_g);
     if (!bc || !bg)
     {
-        std::cerr << "MHA backward FAILED: "
-                  << (!bc ? bc.error().message : bg.error().message) << "\n";
+        std::cerr << "MHA backward FAILED: " << (!bc ? bc.error().message : bg.error().message)
+                  << "\n";
         return 1;
     }
     auto bcm = cpu.to_matrix(*bc);
     auto bgm = gpu.to_matrix(*bg);
-    if (!bcm || !bgm) { std::cerr << "backward to_matrix failed\n"; return 1; }
+    if (!bcm || !bgm)
+    {
+        std::cerr << "backward to_matrix failed\n";
+        return 1;
+    }
     nn::Scalar bmax = 0;
     for (std::size_t i = 0; i < bcm->size(); ++i)
     {
@@ -176,8 +219,7 @@ static int mha_bidirectional_probe()
         if (d > bmax) bmax = d;
     }
     const bool bok = bmax <= 1e-3f;
-    std::cout << "  MHA CPU/GPU backward 一致性: max_abs=" << bmax
-              << (bok ? " ✅" : " ❌") << "\n";
+    std::cout << "  MHA CPU/GPU backward 一致性: max_abs=" << bmax << (bok ? " ✅" : " ❌") << "\n";
     if (!bok) ++failures;
 
     return failures;
@@ -187,7 +229,10 @@ int main(int argc, char* argv[])
 {
     int failures = 0;
     // 77 = 子测试因 GPU 不可用而跳过（ctest SKIP 约定），不计入失败
-    const auto add = [&failures](int r) { if (r != 77) failures += r; };
+    const auto add = [&failures](int r)
+    {
+        if (r != 77) failures += r;
+    };
 
     std::puts("=== attn_gradcheck (CausalSelfAttention numerical) ===");
     add(test_attn_gradcheck(argc, argv));
@@ -195,9 +240,8 @@ int main(int argc, char* argv[])
         //   CausalAlibiDocScoreMask 分支的梯度（仅 forward 通过不足以验证——
         //   梯度跨文档串扰 forward 抓不住）；默认 learned+doc 与
         //   alibi+doc 各跑一遍数值梯度
-        char n0[] = "attn_gradcheck", n1[] = "--doc", n2[] = "--pos-enc",
-             n3[] = "alibi";
-        char* av_doc[]  = {n0, n1};
+        char n0[] = "attn_gradcheck", n1[] = "--doc", n2[] = "--pos-enc", n3[] = "alibi";
+        char* av_doc[] = {n0, n1};
         char* av_adoc[] = {n0, n2, n3, n1};
         std::puts("--- gradcheck: doc variant ---");
         add(test_attn_gradcheck(2, av_doc));

@@ -39,12 +39,14 @@
 // 上溢边界、±inf、NaN（含负载）、以及一半值的往返。
 namespace
 {
-constexpr std::uint16_t soft_h(float v) { return nn::detail::float_to_half_bits(v); }
-constexpr float soft_f(std::uint16_t h) { return nn::detail::half_bits_to_float(h); }
+constexpr std::uint16_t soft_h(float v)
+{ return nn::detail::float_to_half_bits(v); }
+constexpr float soft_f(std::uint16_t h)
+{ return nn::detail::half_bits_to_float(h); }
 
 struct HalfCase
 {
-    float        v;
+    float v;
     std::uint16_t soft;   // 编译期（软件路径）结果
 };
 constexpr HalfCase kHalfCases[] = {
@@ -64,10 +66,8 @@ constexpr HalfCase kHalfCases[] = {
     {65536.0f, soft_h(65536.0f)},                 // 2^16 → inf
     {1e30f, soft_h(1e30f)},
     {-1e30f, soft_h(-1e30f)},
-    {std::numeric_limits<float>::infinity(),
-     soft_h(std::numeric_limits<float>::infinity())},
-    {-std::numeric_limits<float>::infinity(),
-     soft_h(-std::numeric_limits<float>::infinity())},
+    {std::numeric_limits<float>::infinity(), soft_h(std::numeric_limits<float>::infinity())},
+    {-std::numeric_limits<float>::infinity(), soft_h(-std::numeric_limits<float>::infinity())},
     {std::bit_cast<float>(0x7FC00000u), soft_h(std::bit_cast<float>(0x7FC00000u))},
     {std::bit_cast<float>(0xFFC00000u), soft_h(std::bit_cast<float>(0xFFC00000u))},
     {std::bit_cast<float>(0x7F800001u), soft_h(std::bit_cast<float>(0x7F800001u))},
@@ -76,9 +76,9 @@ constexpr HalfCase kHalfCases[] = {
 };
 
 // f16 → f32 侧：软件路径恒精确，硬件同；用一组位型对比
-constexpr std::uint16_t kHalfBits[] = {
-    0x0000u, 0x8000u, 0x0001u, 0x03FFu, 0x0400u, 0x3555u, 0x3C00u, 0x3C01u,
-    0x7BFFu, 0x7C00u, 0xFC00u, 0x7E00u, 0xFE00u, 0x7C01u, 0xFFFFu};
+constexpr std::uint16_t kHalfBits[] = {0x0000u, 0x8000u, 0x0001u, 0x03FFu, 0x0400u,
+                                       0x3555u, 0x3C00u, 0x3C01u, 0x7BFFu, 0x7C00u,
+                                       0xFC00u, 0x7E00u, 0xFE00u, 0x7C01u, 0xFFFFu};
 } // namespace
 
 namespace
@@ -100,16 +100,14 @@ int test_f16_fastpath_parity()
     for (const std::uint16_t h : kHalfBits)
     {
         const float hw = nn::detail::half_bits_to_float(h);             // 运行期
-        if (std::bit_cast<std::uint32_t>(hw) !=
-            std::bit_cast<std::uint32_t>(soft_f(h)))
+        if (std::bit_cast<std::uint32_t>(hw) != std::bit_cast<std::uint32_t>(soft_f(h)))
         {
             std::printf("  [FAIL] f16→f32 位型不一致: h=0x%04x\n", h);
             ++bad;
         }
     }
     std::printf("  %s（%zu 条 f32→f16 + %zu 条 f16→f32，逐位一致）\n",
-                bad == 0 ? "[PASS]" : "[FAIL]",
-                sizeof(kHalfCases) / sizeof(kHalfCases[0]),
+                bad == 0 ? "[PASS]" : "[FAIL]", sizeof(kHalfCases) / sizeof(kHalfCases[0]),
                 sizeof(kHalfBits) / sizeof(kHalfBits[0]));
     return bad;
 }

@@ -24,44 +24,41 @@
 
 namespace nn::cli
 {
-    // 纯数字 token（枚举索引）判定
-    [[nodiscard]] inline bool is_device_index_token(const char *token) noexcept
+// 纯数字 token（枚举索引）判定
+[[nodiscard]] inline bool is_device_index_token(const char* token) noexcept
+{
+    if (token == nullptr || *token == '\0') return false;
+    for (const char* p = token; *p != '\0'; ++p)
     {
-        if (token == nullptr || *token == '\0')
-            return false;
-        for (const char *p = token; *p != '\0'; ++p)
+        if (*p < '0' || *p > '9') return false;
+    }
+    return true;
+}
+
+// 在 argv[i] 处尝试解析 `--gpu` 选项。
+//   返回 std::nullopt → 不是 --gpu（i 不变，调用方继续判断其他 flag）
+//   返回 空 string    → 是 --gpu，未指定设备（i 不变）
+//   返回 非空 string  → 是 --gpu 且指定了设备（i 递增到本次消费的索引）
+//
+// allow_name_value：空格形式是否连名称也收（仅无位置参数的程序可开）。
+[[nodiscard]] inline std::optional<std::string> parse_gpu_option(int argc, char* argv[], int& i,
+                                                                 bool allow_name_value = false)
+{
+    const std::string_view arg = argv[i];
+    if (arg == "--gpu")
+    {
+        if (i + 1 < argc && argv[i + 1] != nullptr)
         {
-            if (*p < '0' || *p > '9')
-                return false;
+            const bool is_index = is_device_index_token(argv[i + 1]);
+            if (is_index || (allow_name_value && argv[i + 1][0] != '-'))
+                return std::string(argv[++i]);
         }
-        return true;
+        return std::string{};
     }
 
-    // 在 argv[i] 处尝试解析 `--gpu` 选项。
-    //   返回 std::nullopt → 不是 --gpu（i 不变，调用方继续判断其他 flag）
-    //   返回 空 string    → 是 --gpu，未指定设备（i 不变）
-    //   返回 非空 string  → 是 --gpu 且指定了设备（i 递增到本次消费的索引）
-    //
-    // allow_name_value：空格形式是否连名称也收（仅无位置参数的程序可开）。
-    [[nodiscard]] inline std::optional<std::string> parse_gpu_option(
-        int argc, char *argv[], int &i, bool allow_name_value = false)
-    {
-        const std::string_view arg = argv[i];
-        if (arg == "--gpu")
-        {
-            if (i + 1 < argc && argv[i + 1] != nullptr)
-            {
-                const bool is_index = is_device_index_token(argv[i + 1]);
-                if (is_index || (allow_name_value && argv[i + 1][0] != '-'))
-                    return std::string(argv[++i]);
-            }
-            return std::string{};
-        }
+    constexpr std::string_view kPrefix = "--gpu=";
+    if (arg.rfind(kPrefix, 0) == 0) return std::string(arg.substr(kPrefix.size()));
 
-        constexpr std::string_view kPrefix = "--gpu=";
-        if (arg.rfind(kPrefix, 0) == 0)
-            return std::string(arg.substr(kPrefix.size()));
-
-        return std::nullopt;
-    }
+    return std::nullopt;
+}
 } // namespace nn::cli

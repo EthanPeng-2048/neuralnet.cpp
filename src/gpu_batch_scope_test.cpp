@@ -18,16 +18,18 @@
 #include <vector>
 
 int g_fail = 0;
-#define CHECK(cond, msg)                                                     \
-    do {                                                                     \
-        if (!(cond)) {                                                       \
-            std::cout << "[FAIL] " << __FILE__ << ":" << __LINE__ << ": "    \
-                      << msg << "\n";                                        \
-            ++g_fail;                                                        \
-        }                                                                    \
+#define CHECK(cond, msg)                                                                  \
+    do                                                                                    \
+    {                                                                                     \
+        if (!(cond))                                                                      \
+        {                                                                                 \
+            std::cout << "[FAIL] " << __FILE__ << ":" << __LINE__ << ": " << msg << "\n"; \
+            ++g_fail;                                                                     \
+        }                                                                                 \
     } while (0)
 
-namespace {
+namespace
+{
 
 // 多 Conv 小模型：issue #28 的触发形态（第二次 Conv 分配处 OOM）
 nn::Result<nn::Model> make_conv_model(nn::ComputeEngine& eng)

@@ -130,8 +130,7 @@ void test_windowing_and_samples()
         auto vr = set.make_batch(idx, batch);
         auto units_r = set.valid_target_count(idx);
         CHECK(vr && *vr == 2, "make_batch 返回本批参与 loss 的位置数");
-        CHECK(units_r && *units_r == 2,
-              "valid_target_count 与 batch 的 loss 有效单位一致");
+        CHECK(units_r && *units_r == 2, "valid_target_count 与 batch 的 loss 有效单位一致");
         CHECK(batch.batch == 2 && batch.seq_len == 4, "batch 形状");
         CHECK(batch.valid_tokens == 2, "valid_tokens");
         // input: (seq_len, batch) 列 = 样本

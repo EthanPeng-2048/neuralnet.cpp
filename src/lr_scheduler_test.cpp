@@ -27,10 +27,10 @@ namespace
 {
 int g_fail = 0;
 
-using nn::Scalar;
 using nn::compute_epoch_lr;
 using nn::compute_step_lr;
 using nn::LrScheduleConfig;
+using nn::Scalar;
 using nn::StepLrScheduleConfig;
 
 // 相对容差比较（float 调度曲线）

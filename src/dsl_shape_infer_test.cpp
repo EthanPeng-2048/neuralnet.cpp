@@ -33,8 +33,7 @@ namespace
 {
 
 // ── 小工具 ────────────────────────────────────────────────────────────────
-template <typename R>
-nn::Tensor must(R&& r, const char* what)
+template <typename R> nn::Tensor must(R&& r, const char* what)
 {
     if (!r)
     {
@@ -47,12 +46,11 @@ nn::Tensor must(R&& r, const char* what)
 }
 
 // 推导路径 (2/3 参) 与显式路径 (4/5 参) 的形状必须一致
-void check_same_shape(nn::CpuEngine&, const nn::Tensor& a, const nn::Tensor& b,
-                      const char* what)
+void check_same_shape(nn::CpuEngine&, const nn::Tensor& a, const nn::Tensor& b, const char* what)
 {
     const bool ok = (a.rows() == b.rows() && a.cols() == b.cols());
-    std::printf("[%s] %s: inferred %zux%zu vs explicit %zux%zu\n",
-                ok ? " OK " : "FAIL", what, a.rows(), a.cols(), b.rows(), b.cols());
+    std::printf("[%s] %s: inferred %zux%zu vs explicit %zux%zu\n", ok ? " OK " : "FAIL", what,
+                a.rows(), a.cols(), b.rows(), b.cols());
     if (!ok) ++g_fail;
 }
 
@@ -62,8 +60,8 @@ void check_same_values(nn::CpuEngine& eng, const nn::Tensor& a, const nn::Tensor
 {
     if (a.rows() != b.rows() || a.cols() != b.cols())
     {
-        std::printf("[FAIL] %s: 形状不同（%zux%zu vs %zux%zu）\n", what,
-                    a.rows(), a.cols(), b.rows(), b.cols());
+        std::printf("[FAIL] %s: 形状不同（%zux%zu vs %zux%zu）\n", what, a.rows(), a.cols(),
+                    b.rows(), b.cols());
         ++g_fail;
         return;
     }
@@ -73,8 +71,7 @@ void check_same_values(nn::CpuEngine& eng, const nn::Tensor& a, const nn::Tensor
         if (ma.span()[i] != mb.span()[i])
         {
             std::printf("[FAIL] %s: [%zu] %.9g != %.9g\n", what, i,
-                        static_cast<double>(ma.span()[i]),
-                        static_cast<double>(mb.span()[i]));
+                        static_cast<double>(ma.span()[i]), static_cast<double>(mb.span()[i]));
             ++g_fail;
             return;
         }
@@ -82,13 +79,12 @@ void check_same_values(nn::CpuEngine& eng, const nn::Tensor& a, const nn::Tensor
 }
 
 // 期望失败：返回错误且消息含"无法推导输出形状"（提示改用显式形式）
-template <typename R>
-void check_infer_error(R&& r, const char* what)
+template <typename R> void check_infer_error(R&& r, const char* what)
 {
     const bool failed = !r;
-    const bool explained = failed
-        && r.error().message.find("无法推导输出形状") != std::string::npos
-        && r.error().message.find("rows/cols") != std::string::npos;
+    const bool explained = failed &&
+                           r.error().message.find("无法推导输出形状") != std::string::npos &&
+                           r.error().message.find("rows/cols") != std::string::npos;
     std::printf("[%s] %s%s\n", explained ? " OK " : "FAIL", what,
                 failed ? ("  ->  " + r.error().message).c_str() : "  （未报错）");
     if (!explained) ++g_fail;
@@ -100,55 +96,50 @@ void test_infer_matches_explicit()
     auto eng_owner = nn::CpuEngine::create();
     nn::CpuEngine& eng = *eng_owner;
 
-    auto t = [&](std::size_t r, std::size_t c, float base) {
-        return make_tensor(eng, r, c, base, 0.01f);
-    };
+    auto t = [&](std::size_t r, std::size_t c, float base)
+    { return make_tensor(eng, r, c, base, 0.01f); };
 
     // ① 一元
     {
         nn::Tensor x = t(4, 3, 0.1f);
         auto e = nn::dsl::exp(nn::dsl::leaf(x));
         check_same_shape(eng, must(nn::dsl::compute(eng, e), "unary inferred"),
-                              must(nn::dsl::compute(eng, e, x.rows(), x.cols()),
-                                   "unary explicit"), "一元 exp(leaf)");
+                         must(nn::dsl::compute(eng, e, x.rows(), x.cols()), "unary explicit"),
+                         "一元 exp(leaf)");
         check_same_values(eng, must(nn::dsl::compute(eng, e), "unary inferred"),
-                               must(nn::dsl::compute(eng, e, x.rows(), x.cols()),
-                                    "unary explicit"), "一元 exp(leaf)");
+                          must(nn::dsl::compute(eng, e, x.rows(), x.cols()), "unary explicit"),
+                          "一元 exp(leaf)");
     }
     // ② 二元（同形状）
     {
         nn::Tensor a = t(4, 3, 0.1f), b = t(4, 3, 0.2f);
         auto e = nn::dsl::leaf(a) * nn::dsl::leaf(b) + nn::dsl::rparam(Scalar{0.5});
         check_same_shape(eng, must(nn::dsl::compute(eng, e), "binary inferred"),
-                              must(nn::dsl::compute(eng, e, 4, 3), "binary explicit"),
-                         "二元 a*b+k");
+                         must(nn::dsl::compute(eng, e, 4, 3), "binary explicit"), "二元 a*b+k");
     }
     // ③ 列广播 (1,C) + 全网格
     {
         nn::Tensor a = t(4, 3, 0.1f), v = t(1, 3, 0.7f);
         auto e = nn::dsl::leaf(a) * nn::dsl::col_broadcast(v);
         check_same_shape(eng, must(nn::dsl::compute(eng, e), "colbcast inferred"),
-                              must(nn::dsl::compute(eng, e, 4, 3), "colbcast explicit"),
-                         "列广播 (1,C)");
+                         must(nn::dsl::compute(eng, e, 4, 3), "colbcast explicit"), "列广播 (1,C)");
     }
     // ④ 行广播 (F,1) + 全网格
     {
         nn::Tensor a = t(4, 3, 0.1f), v = t(4, 1, 0.7f);
         auto e = nn::dsl::leaf(a) + nn::dsl::row_broadcast(v);
         check_same_shape(eng, must(nn::dsl::compute(eng, e), "rowbcast inferred"),
-                              must(nn::dsl::compute(eng, e, 4, 3), "rowbcast explicit"),
-                         "行广播 (F,1)");
+                         must(nn::dsl::compute(eng, e, 4, 3), "rowbcast explicit"), "行广播 (F,1)");
         check_same_values(eng, must(nn::dsl::compute(eng, e), "rowbcast inferred"),
-                               must(nn::dsl::compute(eng, e, 4, 3), "rowbcast explicit"),
+                          must(nn::dsl::compute(eng, e, 4, 3), "rowbcast explicit"),
                           "行广播 (F,1)");
     }
     // ⑤ 条件选择
     {
         nn::Tensor a = t(4, 3, -0.3f);
-        auto e = nn::dsl::select(nn::dsl::leaf(a) > Scalar{0}, nn::dsl::leaf(a),
-                                 Scalar{0});
+        auto e = nn::dsl::select(nn::dsl::leaf(a) > Scalar{0}, nn::dsl::leaf(a), Scalar{0});
         check_same_shape(eng, must(nn::dsl::compute(eng, e), "select inferred"),
-                              must(nn::dsl::compute(eng, e, 4, 3), "select explicit"),
+                         must(nn::dsl::compute(eng, e, 4, 3), "select explicit"),
                          "select(c>0,a,0)");
     }
     // ⑥ matmul + 行广播 bias（Linear::forward 的形态）──────── transA/transB 四组合
@@ -156,61 +147,59 @@ void test_infer_matches_explicit()
         nn::Tensor W = t(5, 7, 0.01f), x = t(7, 3, 0.1f), bias = t(1, 3, 0.5f);
         auto e = nn::dsl::matmul(W, x, false, false) + nn::dsl::row_broadcast(bias);
         check_same_shape(eng, must(nn::dsl::compute(eng, e), "mm+bias inferred"),
-                              must(nn::dsl::compute(eng, e, 5, 3), "mm+bias explicit"),
+                         must(nn::dsl::compute(eng, e, 5, 3), "mm+bias explicit"),
                          "matmul + row_broadcast(bias)");
         check_same_values(eng, must(nn::dsl::compute(eng, e), "mm+bias inferred"),
-                               must(nn::dsl::compute(eng, e, 5, 3), "mm+bias explicit"),
+                          must(nn::dsl::compute(eng, e, 5, 3), "mm+bias explicit"),
                           "matmul + row_broadcast(bias)");
     }
     {   // transA：A 存 (K,M)
         nn::Tensor A = t(7, 5, 0.01f), x = t(7, 3, 0.1f);
         auto e = nn::dsl::matmul(A, x, true, false);
         check_same_shape(eng, must(nn::dsl::compute(eng, e), "mm-transA inferred"),
-                              must(nn::dsl::compute(eng, e, 5, 3), "mm-transA explicit"),
+                         must(nn::dsl::compute(eng, e, 5, 3), "mm-transA explicit"),
                          "matmul transA");
     }
     {   // transB：B 存 (N,K)
         nn::Tensor W = t(5, 7, 0.01f), B = t(3, 7, 0.1f);
         auto e = nn::dsl::matmul(W, B, false, true);
         check_same_shape(eng, must(nn::dsl::compute(eng, e), "mm-transB inferred"),
-                              must(nn::dsl::compute(eng, e, 5, 3), "mm-transB explicit"),
+                         must(nn::dsl::compute(eng, e, 5, 3), "mm-transB explicit"),
                          "matmul transB");
     }
     // ⑦ batch>1 的 matmul（注意力 Q·Kᵀ 形态：A/B 都按 batch 垂直切分）
     {
         const std::size_t BH = 3, seq = 5, dk = 4;
         nn::Tensor Q = t(BH * dk, seq, 0.01f), K = t(BH * dk, seq, 0.02f);
-        auto e = nn::dsl::matmul_kv(Q, K, true, false,
-                                    static_cast<std::uint32_t>(BH), 1, 1);
+        auto e = nn::dsl::matmul_kv(Q, K, true, false, static_cast<std::uint32_t>(BH), 1, 1);
         check_same_shape(eng, must(nn::dsl::compute(eng, e), "bmm inferred"),
-                              must(nn::dsl::compute(eng, e, BH * seq, seq),
-                                   "bmm explicit"), "batch=BH 的 matmul (Q·Kᵀ)");
+                         must(nn::dsl::compute(eng, e, BH * seq, seq), "bmm explicit"),
+                         "batch=BH 的 matmul (Q·Kᵀ)");
         check_same_values(eng, must(nn::dsl::compute(eng, e), "bmm inferred"),
-                               must(nn::dsl::compute(eng, e, BH * seq, seq),
-                                    "bmm explicit"), "batch=BH 的 matmul (Q·Kᵀ)");
+                          must(nn::dsl::compute(eng, e, BH * seq, seq), "bmm explicit"),
+                          "batch=BH 的 matmul (Q·Kᵀ)");
     }
     // ⑧ GQA：KV 侧只存 batch/ratio 份行块（b_kv_ratio=2）
     {
         const std::size_t BH = 4, seq = 5, dk = 4, ratio = 2;
         nn::Tensor Q = t(BH * dk, seq, 0.01f), K = t((BH / ratio) * dk, seq, 0.02f);
-        auto e = nn::dsl::matmul_kv(Q, K, true, false,
-                                    static_cast<std::uint32_t>(BH), 1,
+        auto e = nn::dsl::matmul_kv(Q, K, true, false, static_cast<std::uint32_t>(BH), 1,
                                     static_cast<std::uint32_t>(ratio));
         check_same_shape(eng, must(nn::dsl::compute(eng, e), "gqa inferred"),
-                              must(nn::dsl::compute(eng, e, BH * seq, seq),
-                                   "gqa explicit"), "GQA matmul (ratio=2)");
+                         must(nn::dsl::compute(eng, e, BH * seq, seq), "gqa explicit"),
+                         "GQA matmul (ratio=2)");
     }
     // ⑨ 分组归约视图根（MaxPool 形态：输出 (rows/R, cols)）
     {
         const std::size_t C = 2, R = 4, PB = 3;
         nn::Tensor col = t(C * R, PB, 0.1f);
-        auto e = nn::dsl::grouped_reduce_max(col, static_cast<std::uint32_t>(R))
-               + nn::dsl::rparam(Scalar{0});
+        auto e = nn::dsl::grouped_reduce_max(col, static_cast<std::uint32_t>(R)) +
+                 nn::dsl::rparam(Scalar{0});
         check_same_shape(eng, must(nn::dsl::compute(eng, e), "gred inferred"),
-                              must(nn::dsl::compute(eng, e, C, PB), "gred explicit"),
+                         must(nn::dsl::compute(eng, e, C, PB), "gred explicit"),
                          "grouped_reduce_max + 0");
         check_same_values(eng, must(nn::dsl::compute(eng, e), "gred inferred"),
-                               must(nn::dsl::compute(eng, e, C, PB), "gred explicit"),
+                          must(nn::dsl::compute(eng, e, C, PB), "gred explicit"),
                           "grouped_reduce_max + 0");
     }
     // ⑩ 归约视图嵌套在逐元素链里（softmax 形态）：输出仍是整网格
@@ -219,11 +208,11 @@ void test_infer_matches_explicit()
         // 归约视图本身即"按行广播向量"，直接参与算术（无需 row_broadcast 包裹）
         auto e = nn::dsl::exp(nn::dsl::leaf(x) - nn::dsl::row_reduce_max(x));
         check_same_shape(eng, must(nn::dsl::compute(eng, e), "reduce-nest inferred"),
-                              must(nn::dsl::compute(eng, e, 4, 3),
-                                   "reduce-nest explicit"), "归约视图嵌套（softmax 形态）");
+                         must(nn::dsl::compute(eng, e, 4, 3), "reduce-nest explicit"),
+                         "归约视图嵌套（softmax 形态）");
         check_same_values(eng, must(nn::dsl::compute(eng, e), "reduce-nest inferred"),
-                               must(nn::dsl::compute(eng, e, 4, 3),
-                                    "reduce-nest explicit"), "归约视图嵌套（softmax 形态）");
+                          must(nn::dsl::compute(eng, e, 4, 3), "reduce-nest explicit"),
+                          "归约视图嵌套（softmax 形态）");
     }
 }
 
@@ -238,10 +227,9 @@ void test_explicit_precision()
 
     // F16：3 参重载必须把 P 透传（输出存储精度 f16）
     nn::Tensor inf = must(nn::dsl::compute(eng, e, nn::Precision::F16), "f16 inferred");
-    nn::Tensor exp_ = must(nn::dsl::compute(eng, e, 4, 3, nn::Precision::F16),
-                           "f16 explicit");
-    const bool ok = (inf.precision() == nn::Precision::F16)
-                 && (exp_.precision() == nn::Precision::F16);
+    nn::Tensor exp_ = must(nn::dsl::compute(eng, e, 4, 3, nn::Precision::F16), "f16 explicit");
+    const bool ok =
+        (inf.precision() == nn::Precision::F16) && (exp_.precision() == nn::Precision::F16);
     std::printf("[%s] 3 参重载透传 P（f16 输出）\n", ok ? " OK " : "FAIL");
     if (!ok) ++g_fail;
     check_same_shape(eng, inf, exp_, "P=F16 的 3 参重载");
@@ -258,8 +246,7 @@ void test_compute_reduce_infer()
     nn::Tensor inf = must(nn::dsl::compute_reduce(eng, e), "reduce inferred");
     nn::Tensor exp_ = must(nn::dsl::compute_reduce(eng, e, 4, 3), "reduce explicit");
     const bool ok = (inf.rows() == 4 && inf.cols() == 1);
-    std::printf("[%s] compute_reduce 无形状重载 → 归约向量 (rows,1)=(4,1)\n",
-                ok ? " OK " : "FAIL");
+    std::printf("[%s] compute_reduce 无形状重载 → 归约向量 (rows,1)=(4,1)\n", ok ? " OK " : "FAIL");
     if (!ok) ++g_fail;
     check_same_shape(eng, inf, exp_, "compute_reduce 无形状重载");
     check_same_values(eng, inf, exp_, "compute_reduce 无形状重载");
@@ -278,13 +265,11 @@ void test_negative_cases()
                           "形状冲突 (4,3)+(2,3) → 报错");
     }
     // 无任何可确定网格的操作数（标量 + 网格索引叶）
-    check_infer_error(
-        nn::dsl::compute(eng, nn::dsl::row() + nn::dsl::rparam(Scalar{0})),
-        "无网格贡献者（row()+rparam）→ 报错");
+    check_infer_error(nn::dsl::compute(eng, nn::dsl::row() + nn::dsl::rparam(Scalar{0})),
+                      "无网格贡献者（row()+rparam）→ 报错");
     // compute_reduce 同样不猜
-    check_infer_error(
-        nn::dsl::compute_reduce(eng, nn::dsl::rparam(Scalar{1})),
-        "compute_reduce 无网格贡献者 → 报错");
+    check_infer_error(nn::dsl::compute_reduce(eng, nn::dsl::rparam(Scalar{1})),
+                      "compute_reduce 无网格贡献者 → 报错");
 }
 
 } // namespace

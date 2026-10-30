@@ -45,9 +45,7 @@ namespace nn::dsl
 // ⚠ 探针门：默认构建（未 -DNN_ENABLE_PROBES=ON）里恒返回 false 且**不求值 getenv**
 //   → 调用点被编译期折叠，"NN_F16_DEBUG" 之类的诊断开关不会在正常训练里生效。
 inline bool env_flag(const char* name)
-{
-    return ::nn::detail::probe_flag_raw(name);
-}
+{ return ::nn::detail::probe_flag_raw(name); }
 } // namespace nn::dsl
 #include <utility>
 #include <vector>
@@ -129,21 +127,13 @@ struct SpecBuilder
         return expr::input(static_cast<std::uint8_t>(inputs.size() - 1));
     }
     ExprOperand add_input_linear(const Tensor& t, bool dedup = true)
-    {
-        return add_input(t, expr::linear(), dedup);
-    }
+    { return add_input(t, expr::linear(), dedup); }
     ExprOperand add_input_rotate(const Tensor& t, std::uint32_t block)
-    {
-        return add_input(t, expr::rotate_half(block, /*negate_first_half=*/true));
-    }
+    { return add_input(t, expr::rotate_half(block, /*negate_first_half=*/true)); }
     ExprOperand add_input_rowmod(const Tensor& t, std::uint32_t mod)
-    {
-        return add_input(t, expr::row_mod(mod));
-    }
+    { return add_input(t, expr::row_mod(mod)); }
     ExprOperand add_input_rowaccess(const Tensor& t, std::uint32_t offset, std::uint32_t mod)
-    {
-        return add_input(t, expr::row_access(offset, mod));
-    }
+    { return add_input(t, expr::row_access(offset, mod)); }
     // 分组归约视图输入：输出 (G,N)、输入 (G*R,N)，out[r][c] = Σ/max over
     // t<R of in[(r*R+t)][c]。R = 组长度，**运行期视图参数**（vp 槽，不进
     // expr_spec_key）：glsl_gen 发运行期循环 `gr_r<i>(row,col)`（见
@@ -152,7 +142,7 @@ struct SpecBuilder
     {
         ExprView v;
         v.kind = static_cast<std::uint8_t>(is_max ? ExprViewKind::GroupedReduceMax
-                                                   : ExprViewKind::GroupedReduceSum);
+                                                  : ExprViewKind::GroupedReduceSum);
         v.param = R;
         return add_input(t, v);
     }
@@ -177,19 +167,17 @@ struct SpecBuilder
     }
     // 广播视图：输入本身已是 (rows,1)/(1,cols) 小向量，按行/列广播
     ExprOperand add_input_rowbroadcast(const Tensor& t)
-    {
-        return add_input(t, expr::row_broadcast());
-    }
+    { return add_input(t, expr::row_broadcast()); }
     ExprOperand add_input_colbroadcast(const Tensor& t)
-    {
-        return add_input(t, expr::col_broadcast());
-    }
+    { return add_input(t, expr::col_broadcast()); }
     ExprOperand add_instr(ExprOp op, ExprOperand a, ExprOperand b = {}, ExprOperand c = {})
     {
         ExprInstr in;
         in.op = static_cast<std::uint8_t>(op);
         in.dst = static_cast<std::uint8_t>(spec.num_regs++);
-        in.a = a; in.b = b; in.c = c;
+        in.a = a;
+        in.b = b;
+        in.c = c;
         spec.instrs.push_back(in);
         return expr::reg(in.dst);
     }
@@ -210,18 +198,15 @@ struct SpecBuilder
 // 模板求值路径 → 编译器内联 + 与其它逐元素路径共用同一并行门控。
 // ══════════════════════════════════════════════════════════════════════════
 template <typename T>
-concept ColsAwareEval = requires(const T& t, std::size_t i, std::size_t cols)
-{
+concept ColsAwareEval = requires (const T& t, std::size_t i, std::size_t cols) {
     { t.eval(i, cols) } -> std::convertible_to<Scalar>;
 };
 
 template <typename E>
 [[nodiscard]] Scalar eval_with_cols(const E& e, std::size_t i, std::size_t cols)
 {
-    if constexpr (ColsAwareEval<E>)
-        return static_cast<Scalar>(e.eval(i, cols));
-    else
-        return static_cast<Scalar>(e.eval(i));
+    if constexpr (ColsAwareEval<E>) return static_cast<Scalar>(e.eval(i, cols));
+    else return static_cast<Scalar>(e.eval(i));
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -247,13 +232,11 @@ template <typename E>
 // 524288——按全局门控会**整段串行**（归一化层将只用 ~1 核），故本路径
 // 取更低的专属门控。
 // ══════════════════════════════════════════════════════════════════════════
-template <typename E>
-inline void eval_into_span(const E& e, Span d_span, std::size_t cols) noexcept
+template <typename E> inline void eval_into_span(const E& e, Span d_span, std::size_t cols) noexcept
 {
     Scalar* d = d_span.data();
     const std::size_t n = d_span.size();
-    if (n == 0)
-        return;
+    if (n == 0) return;
     if (n < kDslParallelThreshold)
     {
         NN_VECTORIZE_PRAGMA
@@ -269,19 +252,20 @@ inline void eval_into_span(const E& e, Span d_span, std::size_t cols) noexcept
     // 1.7→1.9ms）——隔离内核的收益不会传递到层；再调整必须先有层级别证据。
     // 并行区固定开销实测 ~100µs（32 线程）/ ~3~16µs（≤16 线程）。
     constexpr std::size_t TARGET_CHUNK = std::size_t{1} << 16;
-    const std::size_t n_chunks = std::clamp(n / TARGET_CHUNK, std::size_t{1},
-                                           std::max<std::size_t>(hw, 1) * 4);
+    const std::size_t n_chunks =
+        std::clamp(n / TARGET_CHUNK, std::size_t{1}, std::max<std::size_t>(hw, 1) * 4);
     const std::size_t base = n / n_chunks;
-    const std::size_t rem  = n % n_chunks;
-    nn::parallel_for_samples(n_chunks, [&e, d, cols, base, rem](std::size_t c) noexcept
-    {
-        const std::size_t off = c * base + std::min(c, rem);
-        const std::size_t len = base + (c < rem ? 1 : 0);
-        Scalar* dc = d + off;
-        NN_VECTORIZE_PRAGMA
-        for (std::size_t k = 0; k < len; ++k)
-            dc[k] = eval_with_cols(e, off + k, cols);
-    });
+    const std::size_t rem = n % n_chunks;
+    nn::parallel_for_samples(n_chunks,
+                             [&e, d, cols, base, rem](std::size_t c) noexcept
+                             {
+                                 const std::size_t off = c * base + std::min(c, rem);
+                                 const std::size_t len = base + (c < rem ? 1 : 0);
+                                 Scalar* dc = d + off;
+                                 NN_VECTORIZE_PRAGMA
+                                 for (std::size_t k = 0; k < len; ++k)
+                                     dc[k] = eval_with_cols(e, off + k, cols);
+                             });
 }
 // ══════════════════════════════════════════════════════════════════════════
 // CpuViewCache — 叶子节点的 CPU 数据视图缓存
@@ -311,13 +295,11 @@ struct CpuViewCache
 
     void cache_cpu_view(const Tensor& t)
     {
-        if (!t.is_cpu())
-            return;
+        if (!t.is_cpu()) return;
         // 符号张量（默认构造：未绑定、无存储）——AOT 自登记需要"从表达式类型
         // 折叠出结构"，那条路径只看 to_spec 折出的视图/指令，不会 eval；此处
         // 直接返回，避免在无存储张量上取 CPU 视图（原会 NN_ASSERT 硬失败）。
-        if (!t.valid())
-            return;
+        if (!t.valid()) return;
         if (t.precision() == Precision::F16)
         {
             auto m = std::make_shared<Matrix>(t.rows(), t.cols());
@@ -396,8 +378,7 @@ struct RotateHalfRef : CpuViewCache
         const std::size_t c = i % cols, r = i / cols;
         const std::size_t blk = block;
         const std::size_t rl = r % blk;
-        const std::size_t rr = (r / blk) * blk
-            + ((rl < blk / 2) ? (rl + blk / 2) : (rl - blk / 2));
+        const std::size_t rr = (r / blk) * blk + ((rl < blk / 2) ? (rl + blk / 2) : (rl - blk / 2));
         const Scalar v = at(rr * cols + c);
         return (rl < blk / 2) ? -v : v;
     }
@@ -434,7 +415,8 @@ struct RowAccessRef : CpuViewCache
     std::uint32_t mod = 1;      // 同上
 
     RowAccessRef(Tensor tt, std::uint32_t off, std::uint32_t m)
-        : t(std::move(tt)), offset(off), mod(m) { cache_cpu_view(t); }
+        : t(std::move(tt)), offset(off), mod(m)
+    { cache_cpu_view(t); }
     // 符号实例（AOT 自登记）：结构由类型决定，视图参数取中性值（不进 key）
     RowAccessRef() = default;
 
@@ -462,15 +444,12 @@ struct RowAccessRef : CpuViewCache
 //   而"结构 = 表达式类型"是 AOT 自登记（`FusedAnchor<Expr>` 默认构造符号实例）
 //   的前提——运行期 bool 会让两种视图同类型、结构不可枚举。
 //   r_len（R）是运行期视图参数，不进 expr_spec_key（见 expr_spec.hpp）。
-template <bool IsMax>
-struct GroupedReduceRef : CpuViewCache
+template <bool IsMax> struct GroupedReduceRef : CpuViewCache
 {
     Tensor t;
     std::uint32_t r_len = 1;   // 组长度 R（运行期视图参数，不进 expr_spec_key）
 
-    GroupedReduceRef(Tensor tt, std::uint32_t R)
-        : t(std::move(tt)), r_len(R)
-    { cache_cpu_view(t); }
+    GroupedReduceRef(Tensor tt, std::uint32_t R) : t(std::move(tt)), r_len(R) { cache_cpu_view(t); }
     // 符号实例（AOT 自登记）：结构由类型决定，R 取中性值（不进 key）
     GroupedReduceRef() = default;
 
@@ -483,8 +462,14 @@ struct GroupedReduceRef : CpuViewCache
         for (std::uint32_t tt = 0; tt < r_len; ++tt)
         {
             const Scalar v = at((base + tt) * cols + c);
-            if (IsMax) { if (v > acc) acc = v; }
-            else       { acc += v; }
+            if (IsMax)
+            {
+                if (v > acc) acc = v;
+            }
+            else
+            {
+                acc += v;
+            }
         }
         return acc;
     }
@@ -510,8 +495,7 @@ using GroupedReduceMaxRef = GroupedReduceRef<true>;
 // 分流到引擎 eval_expr，由引擎实现归约视图/指令语义），故 eval 仅需满足
 // nn::Expression 概念约束，返回占位值。
 // ══════════════════════════════════════════════════════════════════════════
-template <ExprViewKind Kind>
-struct ReduceViewRef
+template <ExprViewKind Kind> struct ReduceViewRef
 {
     // 归约轴与算子：行归约 → 向量长度 rows；列归约 → 长度 cols
     static constexpr bool reduces_rows =
@@ -527,14 +511,13 @@ struct ReduceViewRef
     // 预计算逐字节一致（铁律 8：并行只是把独立槽分给不同线程）。
     // GPU/scan 不使用本状态（to_spec 只读 t 与 Kind）。
     mutable std::vector<Scalar> vec_{};
-    mutable const Scalar *v_ = nullptr;
+    mutable const Scalar* v_ = nullptr;
 
     [[nodiscard]] constexpr Scalar eval(std::size_t) const noexcept { return Scalar{0}; }
     // CPU 模板路径（2 参）：归约视图按行/列广播
     [[nodiscard]] Scalar eval(std::size_t i, std::size_t cols) const noexcept
     {
-        if (v_ == nullptr)
-            return Scalar{0};
+        if (v_ == nullptr) return Scalar{0};
         return reduces_rows ? v_[i / cols] : v_[i % cols];
     }
     ExprOperand to_spec(SpecBuilder& b) const { return b.add_reduce_input(t, Kind); }
@@ -583,8 +566,7 @@ struct MatmulRef
         // 头映射）。预绑定只是优化，回退不引入正确性风险。
         if (a_kv_ratio > 1 || b_kv_ratio > 1)
             NN_FAIL("dsl matmul prepare: kv_ratio > 1 走解释器路径（CPU 预绑定不支持头映射）");
-        if (c_data_ != nullptr)
-            return {};  // 幂等：同一棵树重复求值只物化一次
+        if (c_data_ != nullptr) return {};  // 幂等：同一棵树重复求值只物化一次
         // ── 精度安全（§7.2 f32 参考）────────────────────────────────────
         // C 固定以 P=F32 物化，而操作数可能带 **f16 存储**（profile_f16 的
         // Linear 权重/激活）：内层 GEMM 的 f32 路径按 f32 存储直接读
@@ -609,13 +591,11 @@ struct MatmulRef
         }
         constexpr Precision P = Precision::F32;
         Result<Tensor> c = (batch > 1)
-            ? eng.batched_matmul(*pa, *pb, batch, transA, transB, Scalar{1}, P)
-            : eng.matmul(*pa, *pb, transA, transB, P);
+                               ? eng.batched_matmul(*pa, *pb, batch, transA, transB, Scalar{1}, P)
+                               : eng.matmul(*pa, *pb, transA, transB, P);
         NN_TRY_CHECK(c);
-        if (!c->is_cpu())
-            NN_FAIL("dsl matmul prepare: result not on CPU");
-        if (c->precision() != Precision::F32)
-            NN_FAIL("dsl matmul prepare: result not f32");
+        if (!c->is_cpu()) NN_FAIL("dsl matmul prepare: result not on CPU");
+        if (c->precision() != Precision::F32) NN_FAIL("dsl matmul prepare: result not f32");
         if (env_flag("NN_F16_DEBUG"))
         {
             const auto sp = TensorAccess::cpu_matrix(*c).span();
@@ -631,10 +611,9 @@ struct MatmulRef
                              "[dbg][prepare] C=(%zux%zu) A=(%zux%zu)%s B=(%zux%zu)%s "
                              "max(C)=%.6g%s <<< 异常\n",
                              c->rows(), c->cols(), pa->rows(), pa->cols(),
-                             pa->precision() == Precision::F16 ? "f16" : "f32",
-                             pb->rows(), pb->cols(),
-                             pb->precision() == Precision::F16 ? "f16" : "f32",
-                             mx, bad ? " NONFINITE" : "");
+                             pa->precision() == Precision::F16 ? "f16" : "f32", pb->rows(),
+                             pb->cols(), pb->precision() == Precision::F16 ? "f16" : "f32", mx,
+                             bad ? " NONFINITE" : "");
         }
         c_cache_ = std::move(*c);
         c_data_ = TensorAccess::cpu_matrix(c_cache_).span().data();
@@ -644,9 +623,7 @@ struct MatmulRef
     [[nodiscard]] constexpr Scalar eval(std::size_t) const noexcept { return Scalar{0}; }
     // CPU 模板路径（2 参）：读预绑定的 C（形状与输出网格一致）
     [[nodiscard]] Scalar eval(std::size_t i, std::size_t) const noexcept
-    {
-        return c_data_ != nullptr ? c_data_[i] : Scalar{0};
-    }
+    { return c_data_ != nullptr ? c_data_[i] : Scalar{0}; }
     ExprOperand to_spec(SpecBuilder& sb) const
     {
         // 显式固定登记顺序（A 先 B 后），保证跨编译器确定（同 Binary 约定）。
@@ -661,8 +638,12 @@ struct MatmulRef
         // transA=1 → A.rows()/batch（A 存储 (batch*K, M)，每批 (K, M)）
         const std::uint32_t k = static_cast<std::uint32_t>(
             transA ? (a.rows() / (batch / (a_kv_ratio ? a_kv_ratio : 1))) : a.cols());
-        sb.spec.matmul = MatmulSpec{ai, bi, transA ? std::uint8_t{1} : std::uint8_t{0},
-                                    transB ? std::uint8_t{1} : std::uint8_t{0}, k, batch};
+        sb.spec.matmul = MatmulSpec{ai,
+                                    bi,
+                                    transA ? std::uint8_t{1} : std::uint8_t{0},
+                                    transB ? std::uint8_t{1} : std::uint8_t{0},
+                                    k,
+                                    batch};
         // GQA（ratio>1）：把该操作数的**视图**标成 HeadGroup 并记下头分组比
         //   —— param 是运行期形状数据（不进 key），任意 n_rep 共用一份 shader。
         if (a_kv_ratio > 1)
@@ -688,9 +669,21 @@ struct MatmulRef
 // 用于位置相关掩码/偏置（causal select(Col > Row, -inf, 0)、ALiBi 等）。
 // 走引擎 eval_expr（索引由引擎按网格推导），eval 仅满足概念约束。
 // ══════════════════════════════════════════════════════════════════════════
-struct RowIdxLeaf  { [[nodiscard]] constexpr Scalar eval(std::size_t) const noexcept { return Scalar{0}; } ExprOperand to_spec(SpecBuilder&) const { return expr::row(); } };
-struct ColIdxLeaf  { [[nodiscard]] constexpr Scalar eval(std::size_t) const noexcept { return Scalar{0}; } ExprOperand to_spec(SpecBuilder&) const { return expr::col(); } };
-struct BatchIdxLeaf{ [[nodiscard]] constexpr Scalar eval(std::size_t) const noexcept { return Scalar{0}; } ExprOperand to_spec(SpecBuilder&) const { return expr::batch(); } };
+struct RowIdxLeaf
+{
+    [[nodiscard]] constexpr Scalar eval(std::size_t) const noexcept { return Scalar{0}; }
+    ExprOperand to_spec(SpecBuilder&) const { return expr::row(); }
+};
+struct ColIdxLeaf
+{
+    [[nodiscard]] constexpr Scalar eval(std::size_t) const noexcept { return Scalar{0}; }
+    ExprOperand to_spec(SpecBuilder&) const { return expr::col(); }
+};
+struct BatchIdxLeaf
+{
+    [[nodiscard]] constexpr Scalar eval(std::size_t) const noexcept { return Scalar{0}; }
+    ExprOperand to_spec(SpecBuilder&) const { return expr::batch(); }
+};
 
 // ══════════════════════════════════════════════════════════════════════════
 // 视图叶子：标签行收集 / 按批次索引
@@ -737,9 +730,7 @@ struct BatchColRef
 
     [[nodiscard]] constexpr Scalar eval(std::size_t) const noexcept { return Scalar{0}; }
     ExprOperand to_spec(SpecBuilder& sb) const
-    {
-        return sb.add_input(t, expr::batch_col(per_batch_cols));
-    }
+    { return sb.add_input(t, expr::batch_col(per_batch_cols)); }
 };
 
 // 广播视图叶子：输入 (rows,1)/(1,cols) 小向量，按行/列广播参与算术。
@@ -750,8 +741,7 @@ struct BatchColRef
 //   - 行广播：输入 (rows,1)，读第 i/cols 个标量 —— 需要"输出列数"，输入自身
 //     推不出，故 1 参 eval(i)（无 cols）无法给出正确值，返回占位值；行广播
 //     一律经 2 参 eval(i, cols)（eval_with_cols 自动选择）求值。
-template <ExprViewKind Kind>
-struct BroadcastRef : CpuViewCache
+template <ExprViewKind Kind> struct BroadcastRef : CpuViewCache
 {
     Tensor t;
 
@@ -763,22 +753,17 @@ struct BroadcastRef : CpuViewCache
     {
         if constexpr (Kind == ExprViewKind::ColBroadcast)
             return at(i % cols);   // 输入 (1,cols) → cols 即输出列数
-        else
-            return Scalar{0};  // 行广播需输出列数，见 eval(i, out_cols)
+        else return Scalar{0};  // 行广播需输出列数，见 eval(i, out_cols)
     }
     [[nodiscard]] Scalar eval(std::size_t i, std::size_t out_cols) const
     {
-        if constexpr (Kind == ExprViewKind::ColBroadcast)
-            return at(i % cols);
-        else
-            return at(i / out_cols);  // 输入 (rows,1)：读第 r 个标量
+        if constexpr (Kind == ExprViewKind::ColBroadcast) return at(i % cols);
+        else return at(i / out_cols);  // 输入 (rows,1)：读第 r 个标量
     }
     ExprOperand to_spec(SpecBuilder& b) const
     {
-        if constexpr (Kind == ExprViewKind::RowBroadcast)
-            return b.add_input_rowbroadcast(t);
-        else
-            return b.add_input_colbroadcast(t);
+        if constexpr (Kind == ExprViewKind::RowBroadcast) return b.add_input_rowbroadcast(t);
+        else return b.add_input_colbroadcast(t);
     }
 };
 
@@ -794,8 +779,7 @@ using ColBroadcastRef = BroadcastRef<ExprViewKind::ColBroadcast>;
 // 候选，误用在编译期即暴露。
 // ══════════════════════════════════════════════════════════════════════════
 template <typename T>
-concept DslExpr = nn::Expression<T> && requires(SpecBuilder& b, const T& t)
-{
+concept DslExpr = nn::Expression<T> && requires (SpecBuilder& b, const T& t) {
     { t.to_spec(b) } -> std::convertible_to<ExprOperand>;
 };
 
@@ -803,23 +787,21 @@ concept DslExpr = nn::Expression<T> && requires(SpecBuilder& b, const T& t)
 // 节点模板（每个都同时支持 CPU 求值 eval(i) 与 GPU 折叠 to_spec）
 // ══════════════════════════════════════════════════════════════════════════
 
-template <typename Op, nn::Expression C>
-struct Unary
+template <typename Op, nn::Expression C> struct Unary
 {
     C child;
     [[nodiscard]] auto eval(std::size_t i) const { return Op::apply(child.eval(i)); }
     [[nodiscard]] auto eval(std::size_t i, std::size_t cols) const
     { return Op::apply(eval_with_cols(child, i, cols)); }
-    ExprOperand to_spec(SpecBuilder& b) const
-    { return b.add_instr(Op::op_id(), child.to_spec(b)); }
+    ExprOperand to_spec(SpecBuilder& b) const { return b.add_instr(Op::op_id(), child.to_spec(b)); }
 };
 
 // 比较算子（ops::Gt 等）使 eval 返回 bool → 该 Binary 是 BoolExpression，
 // 供 select() 使用；to_spec 仍折叠成单条比较指令（输出 0.0/1.0 到寄存器）。
-template <typename Op, nn::Expression L, nn::Expression R>
-struct Binary
+template <typename Op, nn::Expression L, nn::Expression R> struct Binary
 {
-    L l; R r;
+    L l;
+    R r;
     [[nodiscard]] auto eval(std::size_t i) const { return Op::apply(l.eval(i), r.eval(i)); }
     [[nodiscard]] auto eval(std::size_t i, std::size_t cols) const
     { return Op::apply(eval_with_cols(l, i, cols), eval_with_cols(r, i, cols)); }
@@ -836,16 +818,17 @@ struct Binary
 };
 
 // select(cond, then, else) —— cond 为 BoolExpression，then/else 为值表达式
-template <nn::BoolExpression C, nn::Expression T, nn::Expression E>
-struct Select
+template <nn::BoolExpression C, nn::Expression T, nn::Expression E> struct Select
 {
-    C cond; T then_e; E else_e;
+    C cond;
+    T then_e;
+    E else_e;
     [[nodiscard]] Scalar eval(std::size_t i) const
     { return cond.eval(i) ? then_e.eval(i) : else_e.eval(i); }
     [[nodiscard]] Scalar eval(std::size_t i, std::size_t cols) const
     {
-        return (eval_with_cols(cond, i, cols) != Scalar{0})
-            ? eval_with_cols(then_e, i, cols) : eval_with_cols(else_e, i, cols);
+        return (eval_with_cols(cond, i, cols) != Scalar{0}) ? eval_with_cols(then_e, i, cols)
+                                                            : eval_with_cols(else_e, i, cols);
     }
     ExprOperand to_spec(SpecBuilder& b) const
     {
@@ -860,8 +843,7 @@ struct Select
 // 归约节点：对子表达式结果做归约（归约**指令**）→ 隐式标量向量（Reduce 操作数）。
 //   row_reduce_sum(exp(x)) 这类"表达式内部归约"；对输入 Tensor 直接归约请用
 //   ReduceViewRef（归约视图，GPU 融合更友好）。
-template <nn::dsl::DslExpr E, ExprOp Rop>
-struct ReduceRef
+template <nn::dsl::DslExpr E, ExprOp Rop> struct ReduceRef
 {
     // 归约轴与算子：行归约 → 向量长度 rows；列归约 → 长度 cols
     static constexpr bool reduces_rows = (Rop == ExprOp::RowSum || Rop == ExprOp::RowMax);
@@ -874,14 +856,13 @@ struct ReduceRef
     // 对子表达式求值并归约到 vec_。槽内沿归约轴升序累加 → 与解释器
     // replay_prefix 的累加顺序逐字节一致（铁律 8）。
     mutable std::vector<Scalar> vec_{};
-    mutable const Scalar *v_ = nullptr;
+    mutable const Scalar* v_ = nullptr;
 
     [[nodiscard]] constexpr Scalar eval(std::size_t) const noexcept { return Scalar{0}; }
     // CPU 模板路径（2 参）：归约指令按行/列广播
     [[nodiscard]] Scalar eval(std::size_t i, std::size_t cols) const noexcept
     {
-        if (v_ == nullptr)
-            return Scalar{0};
+        if (v_ == nullptr) return Scalar{0};
         return reduces_rows ? v_[i / cols] : v_[i % cols];
     }
     ExprOperand to_spec(SpecBuilder& b) const { return b.add_reduce_instr(Rop, child.to_spec(b)); }
@@ -899,35 +880,24 @@ struct ReduceRef
 template <typename T> inline constexpr bool has_reduction_v = false;
 
 // 归约叶子需走 eval_expr（模板求值无法表达全行/全列归约）
-template <ExprViewKind K>
-inline constexpr bool has_reduction_v<ReduceViewRef<K>> = true;
+template <ExprViewKind K> inline constexpr bool has_reduction_v<ReduceViewRef<K>> = true;
 // 广播视图**不需要**走 eval_expr：它是纯索引映射（无跨元素依赖），2 参
 // eval(i, cols) 即可在模板求值路径上正确求值（见 BroadcastRef 与
 // eval_with_cols）→ 留在编译期模板路径（内联 + 并行）。
-template <ExprViewKind K>
-inline constexpr bool has_reduction_v<BroadcastRef<K>> = false;
+template <ExprViewKind K> inline constexpr bool has_reduction_v<BroadcastRef<K>> = false;
 // 分组归约视图：每输出元素独立归约 R 行、元素间零依赖 → 非归约（留
 // 编译期模板路径；fail-safe 显式声明，防默认值漂移把它推进解释器）
-template <>
-inline constexpr bool has_reduction_v<GroupedReduceSumRef> = false;
-template <>
-inline constexpr bool has_reduction_v<GroupedReduceMaxRef> = false;
+template <> inline constexpr bool has_reduction_v<GroupedReduceSumRef> = false;
+template <> inline constexpr bool has_reduction_v<GroupedReduceMaxRef> = false;
 // matmul 叶子同样需走 eval_expr（matmul 预计算 + 逐元素链，引擎实现）
-template <>
-inline constexpr bool has_reduction_v<MatmulRef> = true;
+template <> inline constexpr bool has_reduction_v<MatmulRef> = true;
 // 索引/收集叶子：行/列/批次下标与标签收集由引擎按网格推导
-template <>
-inline constexpr bool has_reduction_v<RowIdxLeaf> = true;
-template <>
-inline constexpr bool has_reduction_v<ColIdxLeaf> = true;
-template <>
-inline constexpr bool has_reduction_v<BatchIdxLeaf> = true;
-template <>
-inline constexpr bool has_reduction_v<RowGatherRef> = true;
-template <>
-inline constexpr bool has_reduction_v<BatchModRef> = true;
-template <>
-inline constexpr bool has_reduction_v<BatchColRef> = true;
+template <> inline constexpr bool has_reduction_v<RowIdxLeaf> = true;
+template <> inline constexpr bool has_reduction_v<ColIdxLeaf> = true;
+template <> inline constexpr bool has_reduction_v<BatchIdxLeaf> = true;
+template <> inline constexpr bool has_reduction_v<RowGatherRef> = true;
+template <> inline constexpr bool has_reduction_v<BatchModRef> = true;
+template <> inline constexpr bool has_reduction_v<BatchColRef> = true;
 template <nn::dsl::DslExpr E, ExprOp Rop>
 inline constexpr bool has_reduction_v<ReduceRef<E, Rop>> = true;
 template <typename Op, nn::Expression C>
@@ -935,32 +905,31 @@ inline constexpr bool has_reduction_v<Unary<Op, C>> = has_reduction_v<C>;
 template <typename Op, nn::Expression L, nn::Expression R>
 inline constexpr bool has_reduction_v<Binary<Op, L, R>> = has_reduction_v<L> || has_reduction_v<R>;
 template <nn::BoolExpression C, nn::Expression T, nn::Expression E>
-inline constexpr bool has_reduction_v<Select<C, T, E>>
-    = has_reduction_v<C> || has_reduction_v<T> || has_reduction_v<E>;
+inline constexpr bool has_reduction_v<Select<C, T, E>> =
+    has_reduction_v<C> || has_reduction_v<T> || has_reduction_v<E>;
 
 // ══════════════════════════════════════════════════════════════════════════
 // 叶子构造（普通写法入口）
 // ══════════════════════════════════════════════════════════════════════════
-[[nodiscard]] inline TensorRef leaf(Tensor t) { return TensorRef{std::move(t)}; }
+[[nodiscard]] inline TensorRef leaf(Tensor t)
+{ return TensorRef{std::move(t)}; }
 
 // 运行时标量参数（RParam）：值不限、结构固定 → 同结构共享融合 shader。
 // 用于优化器超参（lr/eps/β）、偏差修正系数等每步会变但结构不变的标量。
-[[nodiscard]] inline constexpr RParamLeaf rparam(Scalar v) { return RParamLeaf{v}; }
+[[nodiscard]] inline constexpr RParamLeaf rparam(Scalar v)
+{ return RParamLeaf{v}; }
 
 // matmul 叶子：C = op(A,B)，折叠为 ExprSpec 的前置 matmul 段。
 // 逐元素链（如 +bias、激活）自动与 matmul 融合成一个 kernel（GPU AOT）。
 // batch：A/B 按 batch 垂直切分（batched_matmul 同布局），形状参数。
-[[nodiscard]] inline MatmulRef matmul(Tensor a, Tensor b,
-                                      bool transA = false, bool transB = false,
+[[nodiscard]] inline MatmulRef matmul(Tensor a, Tensor b, bool transA = false, bool transB = false,
                                       std::uint32_t batch = 1)
 { return MatmulRef{std::move(a), std::move(b), transA, transB, batch}; }
 
 // GQA 变体：a_kv_ratio / b_kv_ratio > 1 时该操作数只存 batch/ratio 份行块
 // （多个连续 query 头共享一个 KV 头；块映射见 docs/internal/22 §3.2）。
-[[nodiscard]] inline MatmulRef matmul_kv(Tensor a, Tensor b,
-                                         bool transA, bool transB,
-                                         std::uint32_t batch,
-                                         std::uint32_t a_kv_ratio,
+[[nodiscard]] inline MatmulRef matmul_kv(Tensor a, Tensor b, bool transA, bool transB,
+                                         std::uint32_t batch, std::uint32_t a_kv_ratio,
                                          std::uint32_t b_kv_ratio)
 {
     MatmulRef m{std::move(a), std::move(b), transA, transB, batch};
@@ -970,9 +939,12 @@ inline constexpr bool has_reduction_v<Select<C, T, E>>
 }
 
 // 网格索引叶子：行号/列号/批次下标
-[[nodiscard]] inline RowIdxLeaf row()   { return {}; }
-[[nodiscard]] inline ColIdxLeaf col()   { return {}; }
-[[nodiscard]] inline BatchIdxLeaf batch() { return {}; }
+[[nodiscard]] inline RowIdxLeaf row()
+{ return {}; }
+[[nodiscard]] inline ColIdxLeaf col()
+{ return {}; }
+[[nodiscard]] inline BatchIdxLeaf batch()
+{ return {}; }
 
 // 视图叶子：标签行收集（稀疏 CE loss）/ 按批次取模索引（ALiBi 斜率）/
 // 按 (batch,col) 切片（doc_ids）
@@ -1004,70 +976,104 @@ inline constexpr bool has_reduction_v<Select<C, T, E>>
 // 对表达式结果归约 → 归约**指令**（重载按参数类型自动选择，见 ReduceRef）。
 // 返回的归约叶子参与算术时自动按行/按列广播。
 // ══════════════════════════════════════════════════════════════════════════
-[[nodiscard]] inline RowReduceSumRef row_reduce_sum(Tensor t) { return {std::move(t)}; }
-[[nodiscard]] inline RowReduceMaxRef row_reduce_max(Tensor t) { return {std::move(t)}; }
-[[nodiscard]] inline ColReduceSumRef col_reduce_sum(Tensor t) { return {std::move(t)}; }
-[[nodiscard]] inline ColReduceMaxRef col_reduce_max(Tensor t) { return {std::move(t)}; }
+[[nodiscard]] inline RowReduceSumRef row_reduce_sum(Tensor t)
+{ return {std::move(t)}; }
+[[nodiscard]] inline RowReduceMaxRef row_reduce_max(Tensor t)
+{ return {std::move(t)}; }
+[[nodiscard]] inline ColReduceSumRef col_reduce_sum(Tensor t)
+{ return {std::move(t)}; }
+[[nodiscard]] inline ColReduceMaxRef col_reduce_max(Tensor t)
+{ return {std::move(t)}; }
 
-template <nn::dsl::DslExpr E> [[nodiscard]] auto row_reduce_sum(const E& e) { return ReduceRef<E, ExprOp::RowSum>{e}; }
-template <nn::dsl::DslExpr E> [[nodiscard]] auto row_reduce_max(const E& e) { return ReduceRef<E, ExprOp::RowMax>{e}; }
-template <nn::dsl::DslExpr E> [[nodiscard]] auto col_reduce_sum(const E& e) { return ReduceRef<E, ExprOp::ColSum>{e}; }
-template <nn::dsl::DslExpr E> [[nodiscard]] auto col_reduce_max(const E& e) { return ReduceRef<E, ExprOp::ColMax>{e}; }
+template <nn::dsl::DslExpr E> [[nodiscard]] auto row_reduce_sum(const E& e)
+{ return ReduceRef<E, ExprOp::RowSum>{e}; }
+template <nn::dsl::DslExpr E> [[nodiscard]] auto row_reduce_max(const E& e)
+{ return ReduceRef<E, ExprOp::RowMax>{e}; }
+template <nn::dsl::DslExpr E> [[nodiscard]] auto col_reduce_sum(const E& e)
+{ return ReduceRef<E, ExprOp::ColSum>{e}; }
+template <nn::dsl::DslExpr E> [[nodiscard]] auto col_reduce_max(const E& e)
+{ return ReduceRef<E, ExprOp::ColMax>{e}; }
 
 // 广播视图自由函数：gamma/beta (F,1) 按行广播、std_inv (1,B) 按列广播
-[[nodiscard]] inline RowBroadcastRef row_broadcast(Tensor t) { return {std::move(t)}; }
-[[nodiscard]] inline ColBroadcastRef col_broadcast(Tensor t) { return {std::move(t)}; }
+[[nodiscard]] inline RowBroadcastRef row_broadcast(Tensor t)
+{ return {std::move(t)}; }
+[[nodiscard]] inline ColBroadcastRef col_broadcast(Tensor t)
+{ return {std::move(t)}; }
 
 // ══════════════════════════════════════════════════════════════════════════
 // 一元函数（普通数学写法）
 // ══════════════════════════════════════════════════════════════════════════
-template <nn::dsl::DslExpr E> [[nodiscard]] constexpr auto neg(const E& e) { return Unary<ops::Neg, E>{e}; }
-template <nn::dsl::DslExpr E> [[nodiscard]] auto abs(const E& e)   { return Unary<ops::Abs, E>{e}; }
-template <nn::dsl::DslExpr E> [[nodiscard]] auto exp(const E& e)   { return Unary<ops::Exp, E>{e}; }
-template <nn::dsl::DslExpr E> [[nodiscard]] auto log(const E& e)   { return Unary<ops::Log, E>{e}; }
-template <nn::dsl::DslExpr E> [[nodiscard]] auto sqrt(const E& e)  { return Unary<ops::Sqrt, E>{e}; }
-template <nn::dsl::DslExpr E> [[nodiscard]] auto rsqrt(const E& e) { return Unary<ops::Rsqrt, E>{e}; }
-template <nn::dsl::DslExpr E> [[nodiscard]] auto tanh(const E& e)  { return Unary<ops::Tanh, E>{e}; }
+template <nn::dsl::DslExpr E> [[nodiscard]] constexpr auto neg(const E& e)
+{ return Unary<ops::Neg, E>{e}; }
+template <nn::dsl::DslExpr E> [[nodiscard]] auto abs(const E& e)
+{ return Unary<ops::Abs, E>{e}; }
+template <nn::dsl::DslExpr E> [[nodiscard]] auto exp(const E& e)
+{ return Unary<ops::Exp, E>{e}; }
+template <nn::dsl::DslExpr E> [[nodiscard]] auto log(const E& e)
+{ return Unary<ops::Log, E>{e}; }
+template <nn::dsl::DslExpr E> [[nodiscard]] auto sqrt(const E& e)
+{ return Unary<ops::Sqrt, E>{e}; }
+template <nn::dsl::DslExpr E> [[nodiscard]] auto rsqrt(const E& e)
+{ return Unary<ops::Rsqrt, E>{e}; }
+template <nn::dsl::DslExpr E> [[nodiscard]] auto tanh(const E& e)
+{ return Unary<ops::Tanh, E>{e}; }
 
 // ══════════════════════════════════════════════════════════════════════════
 // 二元函数：max / min / select
 // ══════════════════════════════════════════════════════════════════════════
-template <nn::dsl::DslExpr L, nn::dsl::DslExpr R> [[nodiscard]] constexpr auto max(const L& l, const R& r) { return Binary<ops::Max, L, R>{l, r}; }
-template <nn::dsl::DslExpr E> [[nodiscard]] constexpr auto max(const E& e, Scalar s) { return Binary<ops::Max, E, ConstLeaf>{e, ConstLeaf{s}}; }
-template <nn::dsl::DslExpr E> [[nodiscard]] constexpr auto max(Scalar s, const E& e) { return Binary<ops::Max, ConstLeaf, E>{ConstLeaf{s}, e}; }
-template <nn::dsl::DslExpr L, nn::dsl::DslExpr R> [[nodiscard]] constexpr auto min(const L& l, const R& r) { return Binary<ops::Min, L, R>{l, r}; }
-template <nn::dsl::DslExpr E> [[nodiscard]] constexpr auto min(const E& e, Scalar s) { return Binary<ops::Min, E, ConstLeaf>{e, ConstLeaf{s}}; }
-template <nn::dsl::DslExpr E> [[nodiscard]] constexpr auto min(Scalar s, const E& e) { return Binary<ops::Min, ConstLeaf, E>{ConstLeaf{s}, e}; }
+template <nn::dsl::DslExpr L, nn::dsl::DslExpr R>
+[[nodiscard]] constexpr auto max(const L& l, const R& r)
+{ return Binary<ops::Max, L, R>{l, r}; }
+template <nn::dsl::DslExpr E> [[nodiscard]] constexpr auto max(const E& e, Scalar s)
+{
+    return Binary<ops::Max, E, ConstLeaf>{e, ConstLeaf{s}};
+}
+template <nn::dsl::DslExpr E> [[nodiscard]] constexpr auto max(Scalar s, const E& e)
+{ return Binary<ops::Max, ConstLeaf, E>{ConstLeaf{s}, e}; }
+template <nn::dsl::DslExpr L, nn::dsl::DslExpr R>
+[[nodiscard]] constexpr auto min(const L& l, const R& r)
+{ return Binary<ops::Min, L, R>{l, r}; }
+template <nn::dsl::DslExpr E> [[nodiscard]] constexpr auto min(const E& e, Scalar s)
+{
+    return Binary<ops::Min, E, ConstLeaf>{e, ConstLeaf{s}};
+}
+template <nn::dsl::DslExpr E> [[nodiscard]] constexpr auto min(Scalar s, const E& e)
+{ return Binary<ops::Min, ConstLeaf, E>{ConstLeaf{s}, e}; }
 
 /// relu(x) = max(x, 0)
-template <nn::dsl::DslExpr E> [[nodiscard]] auto relu(const E& e) { return nn::dsl::max(e, ConstLeaf{Scalar{0}}); }
+template <nn::dsl::DslExpr E> [[nodiscard]] auto relu(const E& e)
+{ return nn::dsl::max(e, ConstLeaf{Scalar{0}}); }
 
 template <nn::BoolExpression C, nn::dsl::DslExpr T, nn::dsl::DslExpr E>
 [[nodiscard]] constexpr auto select(const C& c, const T& t, const E& e)
 { return Select<C, T, E>{c, t, e}; }
 template <nn::BoolExpression C, nn::dsl::DslExpr T>
 [[nodiscard]] constexpr auto select(const C& c, const T& t, Scalar ev)
-{ return Select<C, T, ConstLeaf>{c, t, ConstLeaf{ev}}; }
+{
+    return Select<C, T, ConstLeaf>{c, t, ConstLeaf{ev}};
+}
 template <nn::BoolExpression C, nn::dsl::DslExpr E>
 [[nodiscard]] constexpr auto select(const C& c, Scalar tv, const E& e)
 { return Select<C, ConstLeaf, E>{c, ConstLeaf{tv}, e}; }
 template <nn::BoolExpression C>
 [[nodiscard]] constexpr auto select(const C& c, Scalar tv, Scalar ev)
-{ return Select<C, ConstLeaf, ConstLeaf>{c, ConstLeaf{tv}, ConstLeaf{ev}}; }
+{
+    return Select<C, ConstLeaf, ConstLeaf>{c, ConstLeaf{tv}, ConstLeaf{ev}};
+}
 
 // ══════════════════════════════════════════════════════════════════════════
 // 运算符（Sym 生成，覆盖 Expr×Expr / Expr×Scalar / Scalar×Expr）
 // 值运算（+ - * /）返回值表达式；比较（> < >= <= == !=）返回布尔表达式。
 // ══════════════════════════════════════════════════════════════════════════
-#define NN_DSL_BINARY(OP, OpT)                                                            \
-    template <nn::dsl::DslExpr L, nn::dsl::DslExpr R>                                     \
-    [[nodiscard]] constexpr auto operator OP(const L& l, const R& r)                      \
-    { return Binary<OpT, L, R>{l, r}; }                                                   \
-    template <nn::dsl::DslExpr E>                                                         \
-    [[nodiscard]] constexpr auto operator OP(const E& e, Scalar s)                        \
-    { return Binary<OpT, E, ConstLeaf>{e, ConstLeaf{s}}; }                                \
-    template <nn::dsl::DslExpr E>                                                         \
-    [[nodiscard]] constexpr auto operator OP(Scalar s, const E& e)                        \
+#define NN_DSL_BINARY(OP, OpT)                                                                   \
+    template <nn::dsl::DslExpr L, nn::dsl::DslExpr R>                                            \
+    [[nodiscard]] constexpr auto operator OP(const L& l, const R& r)                             \
+    { return Binary<OpT, L, R>{l, r}; }                                                          \
+    template <nn::dsl::DslExpr E> [[nodiscard]] constexpr auto operator OP(const E& e, Scalar s) \
+    {                                                                                            \
+        return Binary<OpT, E, ConstLeaf>{e, ConstLeaf{s}};                                       \
+    }                                                                                            \
+    template <nn::dsl::DslExpr E> [[nodiscard]] constexpr auto operator OP(Scalar s, const E& e) \
     { return Binary<OpT, ConstLeaf, E>{ConstLeaf{s}, e}; }
 
 NN_DSL_BINARY(+, ops::Add)
@@ -1128,8 +1134,7 @@ struct GridInfer
     bool conflict = false;   // 广播规则不成立（某维既不等、又都不为 1）
     bool unknown = false;    // 有贡献者存在但形状推不出来（如行块不整除）
 
-    [[nodiscard]] static std::size_t merge_dim(std::size_t a, std::size_t b,
-                                               bool& conflict)
+    [[nodiscard]] static std::size_t merge_dim(std::size_t a, std::size_t b, bool& conflict)
     {
         if (a == b) return a;
         if (a == 1) return b;
@@ -1140,40 +1145,63 @@ struct GridInfer
     void merge(std::size_t r, std::size_t c)
     {
         if (conflict || unknown) return;
-        if (!any) { rows = r; cols = c; any = true; return; }
+        if (!any)
+        {
+            rows = r;
+            cols = c;
+            any = true;
+            return;
+        }
         rows = merge_dim(rows, r, conflict);
         cols = merge_dim(cols, c, conflict);
     }
 };
 
 // 缺省：不贡献（标量叶 / 网格索引叶 / 稀疏与批视图）
-template <typename E>
-inline void grid_contrib(const E&, GridInfer&) {}
+template <typename E> inline void grid_contrib(const E&, GridInfer&) {}
 
 // 形状保持的叶子/视图
 inline void grid_contrib(const TensorRef& e, GridInfer& g)
-{ if (e.t.valid()) g.merge(e.t.rows(), e.t.cols()); else g.unknown = true; }
+{
+    if (e.t.valid()) g.merge(e.t.rows(), e.t.cols());
+    else g.unknown = true;
+}
 inline void grid_contrib(const RotateHalfRef& e, GridInfer& g)
-{ if (e.t.valid()) g.merge(e.t.rows(), e.t.cols()); else g.unknown = true; }
+{
+    if (e.t.valid()) g.merge(e.t.rows(), e.t.cols());
+    else g.unknown = true;
+}
 inline void grid_contrib(const RowModRef& e, GridInfer& g)
-{ if (e.t.valid()) g.merge(e.t.rows(), e.t.cols()); else g.unknown = true; }
+{
+    if (e.t.valid()) g.merge(e.t.rows(), e.t.cols());
+    else g.unknown = true;
+}
 inline void grid_contrib(const RowAccessRef& e, GridInfer& g)
-{ if (e.t.valid()) g.merge(e.t.rows(), e.t.cols()); else g.unknown = true; }
-template <ExprViewKind Kind>
-inline void grid_contrib(const BroadcastRef<Kind>& e, GridInfer& g)
-{ if (e.t.valid()) g.merge(e.t.rows(), e.t.cols()); else g.unknown = true; }
+{
+    if (e.t.valid()) g.merge(e.t.rows(), e.t.cols());
+    else g.unknown = true;
+}
+template <ExprViewKind Kind> inline void grid_contrib(const BroadcastRef<Kind>& e, GridInfer& g)
+{
+    if (e.t.valid()) g.merge(e.t.rows(), e.t.cols());
+    else g.unknown = true;
+}
 // 归约视图：compute 下是广播读 → 贡献输入整网格（compute_reduce 要的也是
 // 输入网格，两者同口径）
-template <ExprViewKind Kind>
-inline void grid_contrib(const ReduceViewRef<Kind>& e, GridInfer& g)
-{ if (e.t.valid()) g.merge(e.t.rows(), e.t.cols()); else g.unknown = true; }
+template <ExprViewKind Kind> inline void grid_contrib(const ReduceViewRef<Kind>& e, GridInfer& g)
+{
+    if (e.t.valid()) g.merge(e.t.rows(), e.t.cols());
+    else g.unknown = true;
+}
 
 // 分组归约：输出 (rows/R, cols)
-template <bool IsMax>
-inline void grid_contrib(const GroupedReduceRef<IsMax>& e, GridInfer& g)
+template <bool IsMax> inline void grid_contrib(const GroupedReduceRef<IsMax>& e, GridInfer& g)
 {
     if (!e.t.valid() || e.r_len == 0 || e.t.rows() % e.r_len != 0)
-    { g.unknown = true; return; }
+    {
+        g.unknown = true;
+        return;
+    }
     g.merge(e.t.rows() / e.r_len, e.t.cols());
 }
 
@@ -1183,39 +1211,54 @@ inline void grid_contrib(const MatmulRef& e, GridInfer& g)
     const std::size_t batch = e.batch;
     const std::size_t ra = e.a_kv_ratio ? e.a_kv_ratio : 1;
     const std::size_t rb = e.b_kv_ratio ? e.b_kv_ratio : 1;
-    if (batch == 0 || !e.a.valid() || !e.b.valid()
-        || batch % ra != 0 || batch % rb != 0)
-    { g.unknown = true; return; }
+    if (batch == 0 || !e.a.valid() || !e.b.valid() || batch % ra != 0 || batch % rb != 0)
+    {
+        g.unknown = true;
+        return;
+    }
     const std::size_t a_blocks = batch / ra;   // GQA：该操作数只存 batch/ratio 份行块
     const std::size_t b_blocks = batch / rb;
     if (e.a.rows() % a_blocks != 0 || e.b.rows() % b_blocks != 0)
-    { g.unknown = true; return; }
+    {
+        g.unknown = true;
+        return;
+    }
     const std::size_t a_rows_per = e.a.rows() / a_blocks;
     const std::size_t b_rows_per = e.b.rows() / b_blocks;
     const std::size_t M = e.transA ? e.a.cols() : a_rows_per;
     const std::size_t N = e.transB ? b_rows_per : e.b.cols();
-    if (M == 0 || N == 0) { g.unknown = true; return; }
+    if (M == 0 || N == 0)
+    {
+        g.unknown = true;
+        return;
+    }
     g.merge(batch * M, N);
 }
 
 // 复合节点：递进子节点合并
-template <typename E, ExprOp Rop>
-inline void grid_contrib(const ReduceRef<E, Rop>& e, GridInfer& g)
+template <typename E, ExprOp Rop> inline void grid_contrib(const ReduceRef<E, Rop>& e, GridInfer& g)
 { grid_contrib(e.child, g); }
 template <typename Op, nn::Expression C>
 inline void grid_contrib(const Unary<Op, C>& e, GridInfer& g)
 { grid_contrib(e.child, g); }
 template <typename Op, nn::Expression L, nn::Expression R>
 inline void grid_contrib(const Binary<Op, L, R>& e, GridInfer& g)
-{ grid_contrib(e.l, g); grid_contrib(e.r, g); }
+{
+    grid_contrib(e.l, g);
+    grid_contrib(e.r, g);
+}
 template <nn::BoolExpression C, nn::Expression T, nn::Expression Ex>
 inline void grid_contrib(const Select<C, T, Ex>& e, GridInfer& g)
-{ grid_contrib(e.cond, g); grid_contrib(e.then_e, g); grid_contrib(e.else_e, g); }
+{
+    grid_contrib(e.cond, g);
+    grid_contrib(e.then_e, g);
+    grid_contrib(e.else_e, g);
+}
 
 // 推导出口：失败一律给出"可操作"的错误（点名入口 + 提示显式 rows/cols）
 template <typename E>
-[[nodiscard]] inline Result<std::pair<std::size_t, std::size_t>>
-infer_grid_shape(const E& e, const char* entry)
+[[nodiscard]] inline Result<std::pair<std::size_t, std::size_t>> infer_grid_shape(const E& e,
+                                                                                  const char* entry)
 {
     GridInfer g;
     grid_contrib(e, g);
@@ -1266,22 +1309,22 @@ template <typename T> inline constexpr bool cpu_preparable_leaf_v = false;
 // （与 CpuEngine::eval_expr_into 的 expr_spec_reduce_axis != -1 守卫一致）。
 template <typename T> inline constexpr bool has_real_reduction_v = false;
 template <ExprViewKind K> inline constexpr bool has_real_reduction_v<ReduceViewRef<K>> = true;
-template <typename C, ExprOp Rop> inline constexpr bool has_real_reduction_v<ReduceRef<C, Rop>> = true;
+template <typename C, ExprOp Rop>
+inline constexpr bool has_real_reduction_v<ReduceRef<C, Rop>> = true;
 template <typename Op, nn::Expression C>
 inline constexpr bool has_real_reduction_v<Unary<Op, C>> = has_real_reduction_v<C>;
 template <typename Op, nn::Expression L, nn::Expression R>
-inline constexpr bool has_real_reduction_v<Binary<Op, L, R>>
-    = has_real_reduction_v<L> || has_real_reduction_v<R>;
+inline constexpr bool has_real_reduction_v<Binary<Op, L, R>> =
+    has_real_reduction_v<L> || has_real_reduction_v<R>;
 template <nn::BoolExpression C, nn::Expression T, nn::Expression E>
-inline constexpr bool has_real_reduction_v<Select<C, T, E>>
-    = has_real_reduction_v<C> || has_real_reduction_v<T> || has_real_reduction_v<E>;
+inline constexpr bool has_real_reduction_v<Select<C, T, E>> =
+    has_real_reduction_v<C> || has_real_reduction_v<T> || has_real_reduction_v<E>;
 
 // matmul：用引擎通用 GEMM 原语物化 C 后绑定指针，尾链交模板路径内联
 template <> inline constexpr bool cpu_preparable_leaf_v<MatmulRef> = true;
 
 // 归约视图：按输出槽预计算行/列归约向量后交模板路径（语义与解释器一致）
-template <ExprViewKind K>
-inline constexpr bool cpu_preparable_leaf_v<ReduceViewRef<K>> = true;
+template <ExprViewKind K> inline constexpr bool cpu_preparable_leaf_v<ReduceViewRef<K>> = true;
 
 // 归约指令：内部会先递归备好子表达式
 template <typename C, ExprOp Rop>
@@ -1295,19 +1338,18 @@ inline constexpr bool cpu_preparable_v = !has_reduction_v<T> || cpu_preparable_l
 template <typename Op, nn::Expression C>
 inline constexpr bool cpu_preparable_v<Unary<Op, C>> = cpu_preparable_v<C>;
 template <typename Op, nn::Expression L, nn::Expression R>
-inline constexpr bool cpu_preparable_v<Binary<Op, L, R>>
-    = cpu_preparable_v<L> && cpu_preparable_v<R>;
+inline constexpr bool cpu_preparable_v<Binary<Op, L, R>> =
+    cpu_preparable_v<L> && cpu_preparable_v<R>;
 template <nn::BoolExpression C, nn::Expression T, nn::Expression E>
-inline constexpr bool cpu_preparable_v<Select<C, T, E>>
-    = cpu_preparable_v<C> && cpu_preparable_v<T> && cpu_preparable_v<E>;
+inline constexpr bool cpu_preparable_v<Select<C, T, E>> =
+    cpu_preparable_v<C> && cpu_preparable_v<T> && cpu_preparable_v<E>;
 // 归约指令：可预绑定 ⇔ 子表达式可预绑定（其自身归约由 cpu_prepare 负责）
 template <typename C, ExprOp Rop>
 inline constexpr bool cpu_preparable_v<ReduceRef<C, Rop>> = cpu_preparable_v<C>;
 
 // 默认：普通叶子 / 视图 / 索引叶子无需预绑定
 template <typename T>
-[[nodiscard]] inline Result<void> cpu_prepare(const T&, ComputeEngine&,
-                                              std::size_t, std::size_t)
+[[nodiscard]] inline Result<void> cpu_prepare(const T&, ComputeEngine&, std::size_t, std::size_t)
 { return {}; }
 
 template <typename Op, nn::Expression C>
@@ -1319,8 +1361,7 @@ template <typename Op, nn::Expression L, nn::Expression R>
 [[nodiscard]] inline Result<void> cpu_prepare(const Binary<Op, L, R>& b, ComputeEngine& eng,
                                               std::size_t rows, std::size_t cols)
 {
-    if (auto r = cpu_prepare(b.l, eng, rows, cols); !r)
-        return r;
+    if (auto r = cpu_prepare(b.l, eng, rows, cols); !r) return r;
     return cpu_prepare(b.r, eng, rows, cols);
 }
 
@@ -1328,16 +1369,14 @@ template <nn::BoolExpression C, nn::Expression T, nn::Expression E>
 [[nodiscard]] inline Result<void> cpu_prepare(const Select<C, T, E>& s, ComputeEngine& eng,
                                               std::size_t rows, std::size_t cols)
 {
-    if (auto r = cpu_prepare(s.cond, eng, rows, cols); !r)
-        return r;
-    if (auto r = cpu_prepare(s.then_e, eng, rows, cols); !r)
-        return r;
+    if (auto r = cpu_prepare(s.cond, eng, rows, cols); !r) return r;
+    if (auto r = cpu_prepare(s.then_e, eng, rows, cols); !r) return r;
     return cpu_prepare(s.else_e, eng, rows, cols);
 }
 
 // matmul：把 C 物化一次（引擎通用 GEMM 原语）并绑定指针
-[[nodiscard]] inline Result<void> cpu_prepare(const MatmulRef& m, ComputeEngine& eng,
-                                              std::size_t, std::size_t)
+[[nodiscard]] inline Result<void> cpu_prepare(const MatmulRef& m, ComputeEngine& eng, std::size_t,
+                                              std::size_t)
 { return m.prepare_cpu(eng); }
 
 // 归约视图：按输出槽算出行/列归约向量（槽内沿归约轴升序累加）
@@ -1345,10 +1384,8 @@ template <ExprViewKind K>
 [[nodiscard]] inline Result<void> cpu_prepare(const ReduceViewRef<K>& r, ComputeEngine&,
                                               std::size_t rows, std::size_t cols)
 {
-    if (r.v_ != nullptr)
-        return {};
-    if (!r.t.is_cpu())
-        NN_FAIL("dsl reduce-view prepare: input not on CPU");
+    if (r.v_ != nullptr) return {};
+    if (!r.t.is_cpu()) NN_FAIL("dsl reduce-view prepare: input not on CPU");
     if (r.t.rows() != rows || r.t.cols() != cols)
         NN_FAIL("dsl reduce-view prepare: shape mismatch");
     using R = ReduceViewRef<K>;
@@ -1357,10 +1394,7 @@ template <ExprViewKind K>
     // 精度-存储不匹配约束）。
     Matrix mirror;
     std::span<const Scalar> s;
-    if (r.t.precision() == Precision::F32)
-    {
-        s = TensorAccess::cpu_matrix(r.t).span();
-    }
+    if (r.t.precision() == Precision::F32) { s = TensorAccess::cpu_matrix(r.t).span(); }
     else if (r.t.precision() == Precision::F16)
     {
         const auto s16 = TensorAccess::cpu_matrix<Precision::F16>(r.t).span();
@@ -1383,17 +1417,14 @@ template <ExprViewKind K>
         Scalar a = init;
         if constexpr (R::reduces_rows)
             for (std::size_t c = 0; c < cols; ++c)
-                a = R::reduces_max ? std::max(a, s[slot * cols + c])
-                                   : a + s[slot * cols + c];
+                a = R::reduces_max ? std::max(a, s[slot * cols + c]) : a + s[slot * cols + c];
         else
             for (std::size_t rr = 0; rr < rows; ++rr)
-                a = R::reduces_max ? std::max(a, s[rr * cols + slot])
-                                   : a + s[rr * cols + slot];
+                a = R::reduces_max ? std::max(a, s[rr * cols + slot]) : a + s[rr * cols + slot];
         r.vec_[slot] = a;
     };
     // 槽间独立（累加方向固定）→ 并行与串行逐字节一致，无需归并
-    if (rows * cols >= kDslParallelThreshold && len > 1)
-        nn::parallel_for_samples(len, slot_kernel);
+    if (rows * cols >= kDslParallelThreshold && len > 1) nn::parallel_for_samples(len, slot_kernel);
     else
         for (std::size_t k = 0; k < len; ++k)
             slot_kernel(k);
@@ -1408,10 +1439,8 @@ template <typename C, ExprOp Rop>
 [[nodiscard]] inline Result<void> cpu_prepare(const ReduceRef<C, Rop>& r, ComputeEngine& eng,
                                               std::size_t rows, std::size_t cols)
 {
-    if (r.v_ != nullptr)
-        return {};
-    if (auto pr = cpu_prepare(r.child, eng, rows, cols); !pr)
-        return pr;
+    if (r.v_ != nullptr) return {};
+    if (auto pr = cpu_prepare(r.child, eng, rows, cols); !pr) return pr;
 
     using R = ReduceRef<C, Rop>;
     const Scalar init = R::reduces_max ? std::numeric_limits<Scalar>::lowest() : Scalar{0};
@@ -1435,8 +1464,7 @@ template <typename C, ExprOp Rop>
             }
         r.vec_[slot] = a;
     };
-    if (rows * cols >= kDslParallelThreshold && len > 1)
-        nn::parallel_for_samples(len, slot_kernel);
+    if (rows * cols >= kDslParallelThreshold && len > 1) nn::parallel_for_samples(len, slot_kernel);
     else
         for (std::size_t k = 0; k < len; ++k)
             slot_kernel(k);
@@ -1452,11 +1480,11 @@ template <typename T> inline constexpr bool cpu_reduce_root_v = false;
 template <ExprViewKind K> inline constexpr bool cpu_reduce_root_v<ReduceViewRef<K>> = true;
 template <typename C, ExprOp Rop> inline constexpr bool cpu_reduce_root_v<ReduceRef<C, Rop>> = true;
 
-[[nodiscard]] inline Tensor copy_reduce_vector(const Scalar* v, bool reduces_rows,
-                                               std::size_t rows, std::size_t cols)
+[[nodiscard]] inline Tensor copy_reduce_vector(const Scalar* v, bool reduces_rows, std::size_t rows,
+                                               std::size_t cols)
 {
-    Matrix out = reduces_rows ? Matrix::make_uninitialized(rows, 1)
-                              : Matrix::make_uninitialized(1, cols);
+    Matrix out =
+        reduces_rows ? Matrix::make_uninitialized(rows, 1) : Matrix::make_uninitialized(1, cols);
     const std::size_t len = reduces_rows ? rows : cols;
     for (std::size_t k = 0; k < len; ++k)
         out.span()[k] = v[k];
@@ -1464,13 +1492,13 @@ template <typename C, ExprOp Rop> inline constexpr bool cpu_reduce_root_v<Reduce
 }
 
 template <ExprViewKind K>
-[[nodiscard]] inline Tensor reduce_vector_tensor(const ReduceViewRef<K>& r,
-                                                 std::size_t rows, std::size_t cols)
+[[nodiscard]] inline Tensor reduce_vector_tensor(const ReduceViewRef<K>& r, std::size_t rows,
+                                                 std::size_t cols)
 { return copy_reduce_vector(r.v_, ReduceViewRef<K>::reduces_rows, rows, cols); }
 
 template <typename C, ExprOp Rop>
-[[nodiscard]] inline Tensor reduce_vector_tensor(const ReduceRef<C, Rop>& r,
-                                                 std::size_t rows, std::size_t cols)
+[[nodiscard]] inline Tensor reduce_vector_tensor(const ReduceRef<C, Rop>& r, std::size_t rows,
+                                                 std::size_t cols)
 { return copy_reduce_vector(r.v_, ReduceRef<C, Rop>::reduces_rows, rows, cols); }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -1551,15 +1579,14 @@ template <typename E>
 // 锚点：每个被扫描的表达式**类型**实例化一个 `FusedAnchor<Expr>`，其静态
 // 初始化期把"从类型默认构造的符号实例"折叠出的结构登记进**锚点注册表**
 // （scan_exprs 结尾与 dry-run 注册表合并，见下）。
-template <class Expr>
-struct FusedAnchor
+template <class Expr> struct FusedAnchor
 {
-    static inline const int reg = [] {
+    static inline const int reg = []
+    {
         const Expr sym{};
         auto [spec, inputs] = to_expr_spec(sym);
         (void)inputs;   // 符号实例：inputs 全是占位张量，注册只用结构
-        if (auto v = validate_expr_spec(spec, spec.views.size()); !v)
-            scan_reject(v.error());
+        if (auto v = validate_expr_spec(spec, spec.views.size()); !v) scan_reject(v.error());
         anchor_registry().add(spec);
         return 0;
     }();
@@ -1574,8 +1601,7 @@ struct FoldAnchor
 {
     explicit FoldAnchor(ExprSpec s)
     {
-        if (auto v = validate_expr_spec(s, s.views.size()); !v)
-            scan_reject(v.error());
+        if (auto v = validate_expr_spec(s, s.views.size()); !v) scan_reject(v.error());
         anchor_registry().add(std::move(s));
     }
 };
@@ -1594,15 +1620,13 @@ struct FoldAnchor
 // 覆盖，且只在 GPU 闭合世界报错时才暴露）。锚点路径的输入是**符号占位张量**
 // （默认 f32）→ 其签名恒 0，不会污染特化集合。
 template <class Expr>
-[[nodiscard]] inline ExprSpec scan_register(const Expr& e,
-                                            Precision P = Precision::F32)
+[[nodiscard]] inline ExprSpec scan_register(const Expr& e, Precision P = Precision::F32)
 {
 #if !defined(NN_SCAN_NO_ANCHOR)
     (void)FusedAnchor<Expr>::reg;
 #endif
     auto [spec, inputs] = to_expr_spec(e);
-    if (auto v = validate_expr_spec(spec, inputs.size()); !v)
-        scan_reject(v.error());
+    if (auto v = validate_expr_spec(spec, inputs.size()); !v) scan_reject(v.error());
     fused::global_registry().add(spec);
     // 签名位：bit i = 第 i 个输入是 f16，bit16 = 输出是 f16（与运行时
     // expr_prec_sig_of / 生成阶段同源）。这里就地算，避免依赖 compute_engine
@@ -1611,10 +1635,8 @@ template <class Expr>
         std::uint32_t bits = 0;
         const std::size_t n = inputs.size() < 16u ? inputs.size() : 16u;
         for (std::size_t i = 0; i < n; ++i)
-            if (inputs[i].precision() == Precision::F16)
-                bits |= (1u << i);
-        fused::global_registry().add_variant(
-            spec, expr_prec_sig_make(bits, P == Precision::F16));
+            if (inputs[i].precision() == Precision::F16) bits |= (1u << i);
+        fused::global_registry().add_variant(spec, expr_prec_sig_make(bits, P == Precision::F16));
     }
     return spec;
 }
@@ -1634,8 +1656,8 @@ template <class Expr>
 //   · **不做 Auto 推导**：P 是唯一可见实参，来源可追溯（§8.5 G4）。
 // ══════════════════════════════════════════════════════════════════════════
 template <typename E>
-[[nodiscard]] Result<Tensor> compute(ComputeEngine& eng, const E& e,
-                                     std::size_t rows, std::size_t cols,
+[[nodiscard]] Result<Tensor> compute(ComputeEngine& eng, const E& e, std::size_t rows,
+                                     std::size_t cols,
                                      Precision P)   // 默认实参在 compute_engine.hpp 前置声明处
 {
     NN_PROF_OP("dsl::compute");   // CPU 模板路径不经引擎入口，须在此计时（剖析器）
@@ -1645,8 +1667,7 @@ template <typename E>
     // 不拦会静默按 f32 建张量（两端语义不一致）。
     if (auto ok = check_precision_supported(P); !ok)
     {
-        std::fprintf(stderr, "[dsl] compute 拒绝非存储精度: %s\n",
-                     ok.error().message.c_str());
+        std::fprintf(stderr, "[dsl] compute 拒绝非存储精度: %s\n", ok.error().message.c_str());
         return Tensor{};
     }
 #ifdef NN_EXPR_SCAN
@@ -1663,20 +1684,18 @@ template <typename E>
     if (auto* g = fused::recording_graph())
     {
         auto [spec, inputs] = to_expr_spec(e);
-        if (auto v = validate_expr_spec(spec, inputs.size()); !v)
-            scan_reject(v.error());
+        if (auto v = validate_expr_spec(spec, inputs.size()); !v) scan_reject(v.error());
         const int node = g->add_node(spec, inputs, rows, cols,
                                      /*vector_out=*/false, P);
-        Tensor ph = (P == Precision::F16
-            ? TensorAccess::cpu<Precision::F16>(rows, cols)
-            : TensorAccess::cpu(rows, cols));
+        Tensor ph = (P == Precision::F16 ? TensorAccess::cpu<Precision::F16>(rows, cols)
+                                         : TensorAccess::cpu(rows, cols));
         ph.set_virtual_tag(g->tag_of_node[static_cast<std::size_t>(node)]);
         g->node_outputs[node] = ph;
         return ph;
     }
     (void)reg_spec;
     return (P == Precision::F16 ? TensorAccess::cpu<Precision::F16>(rows, cols)
-                                         : TensorAccess::cpu(rows, cols));
+                                : TensorAccess::cpu(rows, cols));
 #else
     if (eng.device() == Device::CPU)
     {
@@ -1717,16 +1736,14 @@ template <typename E>
     return compute(eng, e, rc->first, rc->second, P);
 }
 
-template <typename E>
-[[nodiscard]] Result<Tensor> compute(ComputeEngine& eng, const E& e)
+template <typename E> [[nodiscard]] Result<Tensor> compute(ComputeEngine& eng, const E& e)
 { return compute(eng, e, Precision::F32); }
 
 // ── CPU 侧"写进目标张量"（f16 目标 → f32 参考求值 + 舍入写回，§7.2）────────
 // f32 目标 = 直通 span 写入（零额外拷贝）。
 // 写版本：本函数是 DSL 在 CPU 上**绕过 ComputeEngine 写入口**的唯一落点，
 // 故出口处自己记账（TensorAccess::mark_written）—— 参数派生物缓存依赖它。
-template <typename E>
-inline void eval_into_tensor_cpu(const E& e, Tensor& dst)
+template <typename E> inline void eval_into_tensor_cpu(const E& e, Tensor& dst)
 {
     TensorAccess::mark_written(dst);
     static const auto dbg_max = [](const Matrix& m)
@@ -1795,8 +1812,7 @@ template <typename E>
     if (auto* g = fused::recording_graph())
     {
         auto [tspec, tinputs] = to_expr_spec(e);
-        if (auto v = validate_expr_spec(tspec, tinputs.size()); !v)
-            scan_reject(v.error());
+        if (auto v = validate_expr_spec(tspec, tinputs.size()); !v) scan_reject(v.error());
         const int node = g->add_node(tspec, tinputs, dst.rows(), dst.cols(),
                                      /*vector_out=*/false, dst.precision(),
                                      // RV-03：写目标存储标识（同目标写序的显式建边依据）
@@ -1809,8 +1825,7 @@ template <typename E>
 #else
     if (eng.device() == Device::CPU)
     {
-        if (!dst.is_cpu())
-            NN_FAIL("dsl::compute_into: dst not on CPU");
+        if (!dst.is_cpu()) NN_FAIL("dsl::compute_into: dst not on CPU");
         if constexpr (nn::dsl::has_reduction_v<E>)
         {
             // 注意：只在"不含真归约"时才走预绑定路径。含真归约的表达式必须落到
@@ -1861,12 +1876,12 @@ template <typename E>
 // P：输出向量精度（§8.1；归约恒 f32 累加 + 输出舍入到 P，§7.3）。
 // ══════════════════════════════════════════════════════════════════════════
 template <typename E>
-[[nodiscard]] Result<Tensor> compute_reduce(ComputeEngine& eng, const E& e,
-                                            std::size_t rows, std::size_t cols,
-                                            Precision P)   // 默认实参在 compute_engine.hpp 前置声明处
+[[nodiscard]] Result<Tensor> compute_reduce(ComputeEngine& eng, const E& e, std::size_t rows,
+                                            std::size_t cols,
+                                            Precision P) // 默认实参在 compute_engine.hpp 前置声明处
 {
-    NN_PROF_OP("dsl::compute_reduce");   // CPU 模板路径不经引擎入口，须在此计时（剖析器）
-    NN_TRY(pc, check_precision_supported(P));   // 同 compute()：拒绝非存储精度
+    NN_PROF_OP("dsl::compute_reduce"); // CPU 模板路径不经引擎入口，须在此计时（剖析器）
+    NN_TRY(pc, check_precision_supported(P)); // 同 compute()：拒绝非存储精度
 #ifdef NN_EXPR_SCAN
     // 构建期扫描：同 compute()，登记结构（归约轴供下面取占位张量形状）。
     // 占位张量按归约轴取向量形状 (rows,1)/(1,cols)，使 Layer 后续
@@ -1879,18 +1894,17 @@ template <typename E>
     if (auto* g = fused::recording_graph())
     {
         auto [rspec, rinputs] = to_expr_spec(e);
-        if (auto v = validate_expr_spec(rspec, rinputs.size()); !v)
-            scan_reject(v.error());
+        if (auto v = validate_expr_spec(rspec, rinputs.size()); !v) scan_reject(v.error());
         const int raxis0 = expr_spec_reduce_axis(rspec);
         const int node = g->add_node(rspec, rinputs, rows, cols,
                                      /*vector_out=*/true, P);
-        Tensor ph = (P == Precision::F16
-            ? ((raxis0 == 0) ? TensorAccess::cpu<Precision::F16>(rows, 1)
-               : (raxis0 == 1) ? TensorAccess::cpu<Precision::F16>(1, cols)
-               : TensorAccess::cpu<Precision::F16>(rows, cols))
-            : ((raxis0 == 0) ? TensorAccess::cpu(rows, 1)
-               : (raxis0 == 1) ? TensorAccess::cpu(1, cols)
-               : TensorAccess::cpu(rows, cols)));
+        Tensor ph =
+            (P == Precision::F16 ? ((raxis0 == 0)   ? TensorAccess::cpu<Precision::F16>(rows, 1)
+                                    : (raxis0 == 1) ? TensorAccess::cpu<Precision::F16>(1, cols)
+                                                    : TensorAccess::cpu<Precision::F16>(rows, cols))
+                                 : ((raxis0 == 0)   ? TensorAccess::cpu(rows, 1)
+                                    : (raxis0 == 1) ? TensorAccess::cpu(1, cols)
+                                                    : TensorAccess::cpu(rows, cols)));
         ph.set_virtual_tag(g->tag_of_node[static_cast<std::size_t>(node)]);
         g->node_outputs[node] = ph;
         return ph;
@@ -1898,12 +1912,12 @@ template <typename E>
     const ExprSpec spec = reg_spec;
     const int raxis = expr_spec_reduce_axis(spec);
     if (P == Precision::F16)
-        return ((raxis == 0) ? TensorAccess::cpu<Precision::F16>(rows, 1)
-             : (raxis == 1) ? TensorAccess::cpu<Precision::F16>(1, cols)
-             : TensorAccess::cpu<Precision::F16>(rows, cols));
-    return ((raxis == 0) ? TensorAccess::cpu(rows, 1)
-         : (raxis == 1) ? TensorAccess::cpu(1, cols)
-         : TensorAccess::cpu(rows, cols));
+        return ((raxis == 0)   ? TensorAccess::cpu<Precision::F16>(rows, 1)
+                : (raxis == 1) ? TensorAccess::cpu<Precision::F16>(1, cols)
+                               : TensorAccess::cpu<Precision::F16>(rows, cols));
+    return ((raxis == 0)   ? TensorAccess::cpu(rows, 1)
+            : (raxis == 1) ? TensorAccess::cpu(1, cols)
+                           : TensorAccess::cpu(rows, cols));
 #else
     if (eng.device() == Device::CPU)
     {
@@ -1915,8 +1929,7 @@ template <typename E>
             if (auto r = cpu_prepare(e, eng, rows, cols); r)
             {
                 auto v = reduce_vector_tensor(e, rows, cols);
-                if (P == Precision::F32)
-                    return (std::move(v));
+                if (P == Precision::F32) return (std::move(v));
                 // f16 目标：归约向量求值在 f32 参考空间，结果舍入到 f16（§7.3）
                 return eng.cast(std::move(v), P);
             }
@@ -1938,8 +1951,7 @@ template <typename E>
     return compute_reduce(eng, e, rc->first, rc->second, P);
 }
 
-template <typename E>
-[[nodiscard]] Result<Tensor> compute_reduce(ComputeEngine& eng, const E& e)
+template <typename E> [[nodiscard]] Result<Tensor> compute_reduce(ComputeEngine& eng, const E& e)
 { return compute_reduce(eng, e, Precision::F32); }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -1953,28 +1965,25 @@ template <typename E>
 //       - leaf(d)));
 // ⚠ 与 ComputeEngine::begin_expr/end_expr（**跨表达式**图录制）不是一回事。
 // ══════════════════════════════════════════════════════════════════════════
-template <typename E>
-struct ExprBlock
+template <typename E> struct ExprBlock
 {
     // 强引用：ExprBlock 存活期间引擎不会析构。
     std::shared_ptr<ComputeEngine> eng;
-    std::size_t    rows, cols;
-    E              expr;
+    std::size_t rows, cols;
+    E expr;
 };
 
 template <typename E>
-[[nodiscard]] ExprBlock<E> start_expr(ComputeEngine& eng, std::size_t rows,
-                                      std::size_t cols, const E& e)
+[[nodiscard]] ExprBlock<E> start_expr(ComputeEngine& eng, std::size_t rows, std::size_t cols,
+                                      const E& e)
 {
     auto keepalive = eng.weak_from_this().lock();
     return {std::move(keepalive), rows, cols, e};
 }
 
-template <typename E>
-[[nodiscard]] Result<Tensor> end_expr(const ExprBlock<E>& b)
+template <typename E> [[nodiscard]] Result<Tensor> end_expr(const ExprBlock<E>& b)
 {
-    if (!b.eng)
-        NN_FAIL("dsl::end_expr: ExprBlock 未绑定引擎");
+    if (!b.eng) NN_FAIL("dsl::end_expr: ExprBlock 未绑定引擎");
     return compute(*b.eng, b.expr, b.rows, b.cols);
 }
 

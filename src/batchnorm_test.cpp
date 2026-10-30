@@ -26,23 +26,23 @@
 
 #include "test_common.hpp"
 
-using nn::Scalar;
+using nn::ComputeEngine;
 using nn::Matrix;
+using nn::Scalar;
 using nn::Tensor;
 using nn::TensorRef;
-using nn::ComputeEngine;
 
 int g_fail = 0;   // CHECK 计数器（test_common.hpp 约定）
 
-namespace {
+namespace
+{
 
 constexpr Scalar EPS = 1e-5f;
 constexpr Scalar MOMENTUM = 0.1f;   // 与 BatchNorm 默认一致（新 batch 权重）
 
 // ── 宿主参考：单次 forward（训练态用 batch 统计，推理态用 running 统计）──
-Matrix ref_forward(bool training, const Matrix &x, const Matrix &gamma,
-                   const Matrix &beta, const Matrix &run_mean,
-                   const Matrix &run_var)
+Matrix ref_forward(bool training, const Matrix& x, const Matrix& gamma, const Matrix& beta,
+                   const Matrix& run_mean, const Matrix& run_var)
 {
     const std::size_t F = x.rows(), B = x.cols();
     Matrix out(F, B);
@@ -51,7 +51,8 @@ Matrix ref_forward(bool training, const Matrix &x, const Matrix &gamma,
         Scalar mean = 0, var = 0;
         if (training)
         {
-            for (std::size_t b = 0; b < B; ++b) mean += x.at_unchecked(f, b);
+            for (std::size_t b = 0; b < B; ++b)
+                mean += x.at_unchecked(f, b);
             mean /= static_cast<Scalar>(B);
             for (std::size_t b = 0; b < B; ++b)
             {
@@ -63,36 +64,38 @@ Matrix ref_forward(bool training, const Matrix &x, const Matrix &gamma,
         else
         {
             mean = run_mean.at_unchecked(f, 0);
-            var  = run_var.at_unchecked(f, 0);
+            var = run_var.at_unchecked(f, 0);
         }
         const Scalar inv = 1.0f / std::sqrt(var + EPS);
         for (std::size_t b = 0; b < B; ++b)
             out.set_value_unchecked(f, b,
-                gamma.at_unchecked(f, 0) * (x.at_unchecked(f, b) - mean) * inv
-                + beta.at_unchecked(f, 0));
+                                    gamma.at_unchecked(f, 0) * (x.at_unchecked(f, b) - mean) * inv +
+                                        beta.at_unchecked(f, 0));
     }
     return out;
 }
 
 // 随机 (F,1) 列向量（宿主）
-Matrix rand_col(std::size_t F, std::mt19937_64 &rng, Scalar lo, Scalar hi)
+Matrix rand_col(std::size_t F, std::mt19937_64& rng, Scalar lo, Scalar hi)
 {
     Matrix m(F, 1);
     std::uniform_real_distribution<Scalar> dist(lo, hi);
-    for (std::size_t i = 0; i < F; ++i) m.span()[i] = dist(rng);
+    for (std::size_t i = 0; i < F; ++i)
+        m.span()[i] = dist(rng);
     return m;
 }
 
 // 随机 (F,B)
-Matrix rand_mat(std::size_t F, std::size_t B, std::mt19937_64 &rng)
+Matrix rand_mat(std::size_t F, std::size_t B, std::mt19937_64& rng)
 {
     Matrix m(F, B);
     std::uniform_real_distribution<Scalar> dist(-1, 1);
-    for (std::size_t i = 0; i < m.size(); ++i) m.span()[i] = dist(rng);
+    for (std::size_t i = 0; i < m.size(); ++i)
+        m.span()[i] = dist(rng);
     return m;
 }
 
-bool matrices_equal(const Matrix &a, const Matrix &b)
+bool matrices_equal(const Matrix& a, const Matrix& b)
 {
     if (a.rows() != b.rows() || a.cols() != b.cols()) return false;
     const auto sa = a.span(), sb = b.span();
@@ -102,8 +105,7 @@ bool matrices_equal(const Matrix &a, const Matrix &b)
 }
 
 // ── gradcheck 辅助（rmsnorm_gradcheck 同款：中心差分）────────────────────
-Scalar eval_loss(ComputeEngine &engine, nn::Layer &norm,
-                 const Tensor &x, const Tensor &go)
+Scalar eval_loss(ComputeEngine& engine, nn::Layer& norm, const Tensor& x, const Tensor& go)
 {
     auto y = norm.forward(x);
     NN_ASSERT_ALWAYS(y, "eval_loss: forward failed");
@@ -113,11 +115,10 @@ Scalar eval_loss(ComputeEngine &engine, nn::Layer &norm,
     return dot(*y_m, *go_m);
 }
 
-bool check_grad_tensor(
-    ComputeEngine &engine, nn::Layer &norm,
-    const Tensor &fwd_input, const Tensor &go,
-    Tensor &param, const Matrix &base, const Matrix &grad_analytical,
-    const std::string &name, Scalar eps, Scalar tol)
+bool check_grad_tensor(ComputeEngine& engine, nn::Layer& norm, const Tensor& fwd_input,
+                       const Tensor& go, Tensor& param, const Matrix& base,
+                       const Matrix& grad_analytical, const std::string& name, Scalar eps,
+                       Scalar tol)
 {
     bool ok = true;
     std::size_t bad = 0;
@@ -131,17 +132,29 @@ bool check_grad_tensor(
             Matrix pp = base;
             pp.set_value_unchecked(r, c, orig + eps);
             auto r_p = engine.write(param, pp.span());
-            if (!r_p) { std::cerr << "write(+) failed\n"; return false; }
+            if (!r_p)
+            {
+                std::cerr << "write(+) failed\n";
+                return false;
+            }
             const Scalar lp = eval_loss(engine, norm, fwd_input, go);
 
             Matrix pm = base;
             pm.set_value_unchecked(r, c, orig - eps);
             auto r_m = engine.write(param, pm.span());
-            if (!r_m) { std::cerr << "write(-) failed\n"; return false; }
+            if (!r_m)
+            {
+                std::cerr << "write(-) failed\n";
+                return false;
+            }
             const Scalar lm = eval_loss(engine, norm, fwd_input, go);
 
             auto r_r = engine.write(param, base.span());
-            if (!r_r) { std::cerr << "write(restore) failed\n"; return false; }
+            if (!r_r)
+            {
+                std::cerr << "write(restore) failed\n";
+                return false;
+            }
 
             const Scalar num = (lp - lm) / (Scalar{2} * eps);
             const Scalar ana = grad_analytical.at_unchecked(r, c);
@@ -151,14 +164,14 @@ bool check_grad_tensor(
             {
                 ok = false;
                 if (bad < 10)
-                    std::cout << "  [FAIL] " << name << "(" << r << "," << c
-                              << ") num=" << num << " ana=" << ana << "\n";
+                    std::cout << "  [FAIL] " << name << "(" << r << "," << c << ") num=" << num
+                              << " ana=" << ana << "\n";
                 ++bad;
             }
         }
     }
-    std::cout << "  " << name << ": " << (ok ? "OK" : "FAIL")
-              << "  max_err=" << max_err << "  bad=" << bad << "\n";
+    std::cout << "  " << name << ": " << (ok ? "OK" : "FAIL") << "  max_err=" << max_err
+              << "  bad=" << bad << "\n";
     return ok;
 }
 
@@ -168,30 +181,33 @@ void test_factory()
     std::cout << "\n── 1. 工厂分支（禁止静默回落）──\n";
     {
         auto l = nn::make_norm_layer(8, nn::NormType::BatchNorm);
-        CHECK(l && dynamic_cast<nn::BatchNorm *>(l.get()) != nullptr,
+        CHECK(l && dynamic_cast<nn::BatchNorm*>(l.get()) != nullptr,
               "make_norm_layer(BatchNorm) 应返回真 BatchNorm");
     }
     {
         auto l = nn::make_norm_layer(8, nn::NormType::LayerNorm);
-        CHECK(l && dynamic_cast<nn::LayerNorm *>(l.get()) != nullptr,
+        CHECK(l && dynamic_cast<nn::LayerNorm*>(l.get()) != nullptr,
               "make_norm_layer(LayerNorm) 应返回 LayerNorm");
     }
     {
         auto l = nn::make_norm_layer(8, nn::NormType::RMSNorm);
-        CHECK(l && dynamic_cast<nn::RMSNorm *>(l.get()) != nullptr,
+        CHECK(l && dynamic_cast<nn::RMSNorm*>(l.get()) != nullptr,
               "make_norm_layer(RMSNorm) 应返回 RMSNorm");
     }
 }
 
 // ── 2/3. 训练态 & 推理态 forward 对拍 ────────────────────────────────────
-void test_forward(ComputeEngine &eng)
+void test_forward(ComputeEngine& eng)
 {
     std::cout << "\n── 2/3. 训练态 / 推理态 forward vs 宿主参考 ──\n";
     const std::size_t F = 8, B = 5;
     std::mt19937_64 rng(42);
 
     nn::BatchNorm bn(F);
-    { auto r = bn.init(eng); CHECK(r, "BatchNorm init"); }
+    {
+        auto r = bn.init(eng);
+        CHECK(r, "BatchNorm init");
+    }
 
     // 随机 γ/β（覆盖参数广播路径）
     const Matrix g_m = rand_col(F, rng, 0.5f, 1.5f);
@@ -211,7 +227,8 @@ void test_forward(ComputeEngine &eng)
     if (y)
     {
         Matrix zeros(F, 1), ones(F, 1);
-        for (std::size_t i = 0; i < F; ++i) ones.span()[i] = 1;
+        for (std::size_t i = 0; i < F; ++i)
+            ones.span()[i] = 1;
         const Matrix ref = ref_forward(true, x_m, g_m, b_m, zeros, ones);
         CHECK(close_to(download(eng, *y), ref, 2e-4f, "训练态 forward", 0),
               "训练态 forward 与宿主参考一致");
@@ -230,8 +247,7 @@ void test_forward(ComputeEngine &eng)
             const Matrix rm = download(eng, extras[0].get());
             const Matrix rv = download(eng, extras[1].get());
             const Matrix ref = ref_forward(false, x_m, g_m, b_m, rm, rv);
-            CHECK(close_to(download(eng, *y_eval), ref, 2e-4f,
-                           "推理态 forward(running 更新后)", 1),
+            CHECK(close_to(download(eng, *y_eval), ref, 2e-4f, "推理态 forward(running 更新后)", 1),
                   "推理态 forward 与宿主参考一致");
         }
     }
@@ -251,8 +267,7 @@ void test_forward(ComputeEngine &eng)
                 const Matrix rm = download(eng, extras[0].get());
                 const Matrix rv = download(eng, extras[1].get());
                 const Matrix ref = ref_forward(false, x1, g_m, b_m, rm, rv);
-                CHECK(close_to(download(eng, *ye), ref, 2e-4f,
-                               "推理态 forward batch=1", 2),
+                CHECK(close_to(download(eng, *ye), ref, 2e-4f, "推理态 forward batch=1", 2),
                       "推理态 batch=1 与宿主参考一致");
             }
         }
@@ -260,19 +275,24 @@ void test_forward(ComputeEngine &eng)
 }
 
 // ── 4. running 统计 EMA ──────────────────────────────────────────────────
-void test_running_stats(ComputeEngine &eng)
+void test_running_stats(ComputeEngine& eng)
 {
     std::cout << "\n── 4. running 统计 EMA（多批）──\n";
     const std::size_t F = 6, B = 7;
     std::mt19937_64 rng(7);
 
     nn::BatchNorm bn(F);
-    { auto r = bn.init(eng); CHECK(r, "BatchNorm init"); }
+    {
+        auto r = bn.init(eng);
+        CHECK(r, "BatchNorm init");
+    }
 
     Matrix run_mean(F, 1), run_var(F, 1);   // 宿主 EMA：初值 mean=0 / var=1
-    for (std::size_t i = 0; i < F; ++i) run_var.span()[i] = 1;
+    for (std::size_t i = 0; i < F; ++i)
+        run_var.span()[i] = 1;
     Matrix zeros(F, 1), ones(F, 1);
-    for (std::size_t i = 0; i < F; ++i) ones.span()[i] = 1;
+    for (std::size_t i = 0; i < F; ++i)
+        ones.span()[i] = 1;
 
     bn.set_training(true);
     for (int step = 0; step < 4; ++step)
@@ -285,7 +305,8 @@ void test_running_stats(ComputeEngine &eng)
         for (std::size_t f = 0; f < F; ++f)
         {
             Scalar mean = 0, var = 0;
-            for (std::size_t b = 0; b < B; ++b) mean += x_m.at_unchecked(f, b);
+            for (std::size_t b = 0; b < B; ++b)
+                mean += x_m.at_unchecked(f, b);
             mean /= static_cast<Scalar>(B);
             for (std::size_t b = 0; b < B; ++b)
             {
@@ -293,10 +314,10 @@ void test_running_stats(ComputeEngine &eng)
                 var += d * d;
             }
             var /= static_cast<Scalar>(B);
-            run_mean.set_value_unchecked(f, 0,
-                (1 - MOMENTUM) * run_mean.at_unchecked(f, 0) + MOMENTUM * mean);
-            run_var.set_value_unchecked(f, 0,
-                (1 - MOMENTUM) * run_var.at_unchecked(f, 0) + MOMENTUM * var);
+            run_mean.set_value_unchecked(
+                f, 0, (1 - MOMENTUM) * run_mean.at_unchecked(f, 0) + MOMENTUM * mean);
+            run_var.set_value_unchecked(
+                f, 0, (1 - MOMENTUM) * run_var.at_unchecked(f, 0) + MOMENTUM * var);
         }
     }
 
@@ -304,11 +325,9 @@ void test_running_stats(ComputeEngine &eng)
     CHECK(extras.size() == 2, "extra_state 应为 2 个张量");
     if (extras.size() == 2)
     {
-        CHECK(close_to(download(eng, extras[0].get()), run_mean, 2e-4f,
-                       "running_mean EMA", 3),
+        CHECK(close_to(download(eng, extras[0].get()), run_mean, 2e-4f, "running_mean EMA", 3),
               "running_mean 与宿主 EMA 一致");
-        CHECK(close_to(download(eng, extras[1].get()), run_var, 2e-4f,
-                       "running_var EMA", 4),
+        CHECK(close_to(download(eng, extras[1].get()), run_var, 2e-4f, "running_var EMA", 4),
               "running_var 与宿主 EMA 一致");
     }
 
@@ -329,31 +348,34 @@ void test_running_stats(ComputeEngine &eng)
 }
 
 // ── 5. gradcheck（训练态：γ / β / 输入）──────────────────────────────────
-void test_gradcheck(ComputeEngine &eng, Scalar tol)
+void test_gradcheck(ComputeEngine& eng, Scalar tol)
 {
     std::cout << "\n── 5. gradcheck（训练态中心差分）──\n";
     const std::size_t F = 8, B = 6;
     std::mt19937_64 rng(123);
 
     nn::BatchNorm bn(F);
-    { auto r = bn.init(eng); CHECK(r, "BatchNorm init"); }
+    {
+        auto r = bn.init(eng);
+        CHECK(r, "BatchNorm init");
+    }
     bn.set_training(true);
 
     const Matrix x_m = rand_mat(F, B, rng);
     const Matrix go_m = rand_mat(F, B, rng);
-    auto x  = upload(eng, x_m);
+    auto x = upload(eng, x_m);
     auto go = upload(eng, go_m);
 
     // 先 forward 一次填缓存，再 backward（铁律 #8 前置：缓存非空）
     auto y_fwd = bn.forward(x);
     CHECK(y_fwd, "gradcheck forward");
-    for (auto &g : bn.param_gradients())
+    for (auto& g : bn.param_gradients())
         CHECK(eng.zero(g.get()), "zero_grad");
     auto gx = bn.backward(go);
     CHECK(gx, "gradcheck backward");
 
     auto params = bn.parameters();        // [gamma, beta]
-    auto grads  = bn.param_gradients();   // [grad_gamma, grad_beta]
+    auto grads = bn.param_gradients();   // [grad_gamma, grad_beta]
     bool all_pass = true;
     const Scalar eps = 1e-3f;
     for (std::size_t pi = 0; pi < params.size(); ++pi)
@@ -363,8 +385,7 @@ void test_gradcheck(ComputeEngine &eng, Scalar tol)
         CHECK(p && g, "to_matrix(param/grad)");
         if (!p || !g) return;
         const std::string name = (pi == 0) ? "gamma" : "beta";
-        all_pass &= check_grad_tensor(eng, bn, x, go, params[pi].get(),
-                                      *p, *g, name, eps, tol);
+        all_pass &= check_grad_tensor(eng, bn, x, go, params[pi].get(), *p, *g, name, eps, tol);
     }
     // 输入梯度（扰动输入副本，前向用副本）
     {
@@ -374,21 +395,23 @@ void test_gradcheck(ComputeEngine &eng, Scalar tol)
         auto xt = eng.clone(x);
         CHECK(xt, "clone(x)");
         if (!xt) return;
-        all_pass &= check_grad_tensor(eng, bn, *xt, go, *xt, x_m, *gxm,
-                                      "grad_x", eps, tol);
+        all_pass &= check_grad_tensor(eng, bn, *xt, go, *xt, x_m, *gxm, "grad_x", eps, tol);
     }
     CHECK(all_pass, "训练态 gradcheck 全部通过");
 }
 
 // ── 6. 推理态 backward vs 宿主参考 ───────────────────────────────────────
-void test_eval_backward(ComputeEngine &eng)
+void test_eval_backward(ComputeEngine& eng)
 {
     std::cout << "\n── 6. 推理态 backward vs 宿主参考 ──\n";
     const std::size_t F = 8, B = 5;
     std::mt19937_64 rng(99);
 
     nn::BatchNorm bn(F);
-    { auto r = bn.init(eng); CHECK(r, "BatchNorm init"); }
+    {
+        auto r = bn.init(eng);
+        CHECK(r, "BatchNorm init");
+    }
 
     // 非平凡 running 统计：先跑两次训练态 forward（EMA 从 0/1 起步）
     bn.set_training(true);
@@ -404,11 +427,11 @@ void test_eval_backward(ComputeEngine &eng)
     bn.set_training(false);
     const Matrix x_m = rand_mat(F, B, rng);
     const Matrix go_m = rand_mat(F, B, rng);
-    auto x  = upload(eng, x_m);
+    auto x = upload(eng, x_m);
     auto go = upload(eng, go_m);
     auto y = bn.forward(x);
     CHECK(y, "推理态 forward");
-    for (auto &g : bn.param_gradients())
+    for (auto& g : bn.param_gradients())
         CHECK(eng.zero(g.get()), "zero_grad");
     auto gx = bn.backward(go);
     CHECK(gx, "推理态 backward");
@@ -433,7 +456,7 @@ void test_eval_backward(ComputeEngine &eng)
         const Scalar inv = 1.0f / std::sqrt(rv.at_unchecked(f, 0) + EPS);
         for (std::size_t b = 0; b < B; ++b)
             ref_gx.set_value_unchecked(f, b,
-                go_m.at_unchecked(f, b) * g_m.at_unchecked(f, 0) * inv);
+                                       go_m.at_unchecked(f, b) * g_m.at_unchecked(f, 0) * inv);
     }
     CHECK(close_to(download(eng, *gx), ref_gx, 2e-4f, "推理态 grad_x", 6),
           "推理态 grad_x 与宿主参考一致");
@@ -449,21 +472,18 @@ void test_eval_backward(ComputeEngine &eng)
         {
             const Scalar n = (x_m.at_unchecked(f, b) - rm.at_unchecked(f, 0)) * inv;
             ref_gg.set_value_unchecked(f, 0,
-                ref_gg.at_unchecked(f, 0) + go_m.at_unchecked(f, b) * n);
-            ref_gb.set_value_unchecked(f, 0,
-                ref_gb.at_unchecked(f, 0) + go_m.at_unchecked(f, b));
+                                       ref_gg.at_unchecked(f, 0) + go_m.at_unchecked(f, b) * n);
+            ref_gb.set_value_unchecked(f, 0, ref_gb.at_unchecked(f, 0) + go_m.at_unchecked(f, b));
         }
     }
-    CHECK(close_to(download(eng, grads[0].get()), ref_gg, 2e-4f,
-                   "推理态 grad_gamma", 7),
+    CHECK(close_to(download(eng, grads[0].get()), ref_gg, 2e-4f, "推理态 grad_gamma", 7),
           "推理态 grad_gamma 与宿主参考一致");
-    CHECK(close_to(download(eng, grads[1].get()), ref_gb, 2e-4f,
-                   "推理态 grad_beta", 8),
+    CHECK(close_to(download(eng, grads[1].get()), ref_gb, 2e-4f, "推理态 grad_beta", 8),
           "推理态 grad_beta 与宿主参考一致");
 }
 
 // ── 7. Model 级：extra_state / set_training 转发 / save-load 往返 ────────
-void test_model_level(ComputeEngine &eng)
+void test_model_level(ComputeEngine& eng)
 {
     std::cout << "\n── 7. Model 级（extra_state / set_training / 序列化）──\n";
     const std::vector<std::size_t> dims = {12, 8, 4};
@@ -472,17 +492,16 @@ void test_model_level(ComputeEngine &eng)
     auto model_r = nn::build_mnist_mlp_model(eng, dims, nn::NormType::BatchNorm);
     CHECK(model_r, "build_mnist_mlp_model(BatchNorm)");
     if (!model_r) return;
-    nn::Model &model = *model_r;
+    nn::Model& model = *model_r;
 
     // extra_state 非空 = 工厂真的造了 BatchNorm（LayerNorm/RMSNorm 为空）
     CHECK(model.extra_state().size() == 2 * n_norms,
           "Model::extra_state = 每个 BatchNorm 2 个 running 张量");
 
     // set_training 转发：定位 BatchNorm 层（层序 = Linear, BN, GeLU, Linear…）
-    nn::BatchNorm *bn_layer = nullptr;
+    nn::BatchNorm* bn_layer = nullptr;
     for (std::size_t i = 0; i < model.num_layers(); ++i)
-        if (auto *p = dynamic_cast<nn::BatchNorm *>(&model.layer_at(i)))
-            bn_layer = p;
+        if (auto* p = dynamic_cast<nn::BatchNorm*>(&model.layer_at(i))) bn_layer = p;
     CHECK(bn_layer != nullptr, "模型中应含 BatchNorm 层");
     if (!bn_layer) return;
 
@@ -519,7 +538,8 @@ void test_model_level(ComputeEngine &eng)
         for (std::size_t f = 0; f < F && ok; ++f)
         {
             Scalar mean = 0;
-            for (std::size_t b = 0; b < B; ++b) mean += got.at_unchecked(f, b);
+            for (std::size_t b = 0; b < B; ++b)
+                mean += got.at_unchecked(f, b);
             mean /= static_cast<Scalar>(B);
             if (std::fabs(mean) > 2e-4f) ok = false;
         }
@@ -528,7 +548,7 @@ void test_model_level(ComputeEngine &eng)
 
     // ── save/load 往返：参数 + running 统计逐位一致 ──
     nn::ModelSpec spec;
-    auto &sp = spec.emplace<nn::MlpSpec>();
+    auto& sp = spec.emplace<nn::MlpSpec>();
     sp.layer_dims = dims;
     sp.norm_type = nn::NormType::BatchNorm;
 
@@ -556,19 +576,16 @@ void test_model_level(ComputeEngine &eng)
         CHECK(a.size() == b.size(), "参数个数一致");
         bool same = a.size() == b.size();
         for (std::size_t i = 0; i < a.size() && same; ++i)
-            same = matrices_equal(download(eng, a[i].get()),
-                                  download(eng, b[i].get()));
+            same = matrices_equal(download(eng, a[i].get()), download(eng, b[i].get()));
         CHECK(same, "参数 save/load 逐位一致");
     }
     // running 统计逐位一致（extra_state 往返）
     {
         auto a = model.extra_state(), b = model2_r->extra_state();
-        CHECK(a.size() == b.size() && a.size() == 2 * n_norms,
-              "extra_state 个数一致");
+        CHECK(a.size() == b.size() && a.size() == 2 * n_norms, "extra_state 个数一致");
         bool same = a.size() == b.size();
         for (std::size_t i = 0; i < a.size() && same; ++i)
-            same = matrices_equal(download(eng, a[i].get()),
-                                  download(eng, b[i].get()));
+            same = matrices_equal(download(eng, a[i].get()), download(eng, b[i].get()));
         CHECK(same, "running 统计 save/load 逐位一致");
     }
     std::remove(file.c_str());
@@ -576,7 +593,7 @@ void test_model_level(ComputeEngine &eng)
 
 } // namespace
 
-int main(int argc, char *argv[])
+int main(int argc, char* argv[])
 {
     // --gpu 预检不可用 → 77（ctest SKIP 约定，与 cnn_test 同款）
     bool use_gpu = false;
@@ -585,8 +602,7 @@ int main(int argc, char *argv[])
     {
         std::string a = argv[i];
         if (a == "--gpu") use_gpu = true;
-        else if (a == "--tol" && i + 1 < argc)
-            tol = static_cast<Scalar>(std::atof(argv[++i]));
+        else if (a == "--tol" && i + 1 < argc) tol = static_cast<Scalar>(std::atof(argv[++i]));
         else if (a == "--help")
         {
             std::cout << "用法: batchnorm_test [--gpu] [--tol <f>]\n";
@@ -606,7 +622,7 @@ int main(int argc, char *argv[])
     auto engine_res = nn::cli::create_engine(ecfg, std::cout);
     NN_EXIT(engine_res, 1, "引擎创建失败: ");
     auto engine = std::move(*engine_res);
-    ComputeEngine &eng = *engine;
+    ComputeEngine& eng = *engine;
 
     std::cout << "========================================\n";
     std::cout << "  BatchNorm 测试 " << (use_gpu ? "(GPU)" : "(CPU)") << "\n";

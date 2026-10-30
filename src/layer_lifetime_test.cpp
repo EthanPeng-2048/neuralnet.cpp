@@ -32,13 +32,9 @@ class FlakyLayer : public nn::Layer
 {
 public:
     [[nodiscard]] nn::Result<nn::Tensor> forward(const nn::Tensor&) override
-    {
-        NN_FAIL("FlakyLayer::forward: 未实现");
-    }
+    { NN_FAIL("FlakyLayer::forward: 未实现"); }
     [[nodiscard]] nn::Result<nn::Tensor> backward(const nn::Tensor&) override
-    {
-        NN_FAIL("FlakyLayer::backward: 未实现");
-    }
+    { NN_FAIL("FlakyLayer::backward: 未实现"); }
     [[nodiscard]] const char* layer_name() const noexcept override { return "FlakyLayer"; }
 
     int attempts = 0;
@@ -47,16 +43,14 @@ protected:
     [[nodiscard]] nn::Result<void> init_impl(nn::ComputeEngine&) override
     {
         ++attempts;
-        if (attempts == 1)
-            NN_FAIL("first init fails（测试注入）");
+        if (attempts == 1) NN_FAIL("first init fails（测试注入）");
         return {};
     }
 };
 
 void test_domain_model()
 {
-    static_assert(std::is_same_v<nn::DomainId, std::uintptr_t>,
-                  "DomainId = 不透明整数域标识");
+    static_assert(std::is_same_v<nn::DomainId, std::uintptr_t>, "DomainId = 不透明整数域标识");
     static_assert(nn::kHostDomain != 0, "宿主域非零（0 保留给空张量）");
     static_assert(!std::is_default_constructible_v<nn::CpuEngine>,
                   "CpuEngine 不允许栈上构造（必须用 create()）");
@@ -150,10 +144,10 @@ void test_cross_engine_reinit_rejected()
 void test_optimizer_keeps_engine_alive()
 {
     auto engine = nn::CpuEngine::create();
-    nn::Tensor p = engine->create_tensor(
-        2, 2, nn::Precision::F32, nn::InitSpec::constant(nn::Scalar{1}));
-    nn::Tensor g = engine->create_tensor(
-        2, 2, nn::Precision::F32, nn::InitSpec::constant(nn::Scalar{0.5}));
+    nn::Tensor p =
+        engine->create_tensor(2, 2, nn::Precision::F32, nn::InitSpec::constant(nn::Scalar{1}));
+    nn::Tensor g =
+        engine->create_tensor(2, 2, nn::Precision::F32, nn::InitSpec::constant(nn::Scalar{0.5}));
     std::vector<nn::TensorRef> params{std::ref(p)};
     std::vector<nn::TensorRef> grads{std::ref(g)};
     auto opt = nn::create_optimizer("sgd", *engine, params, grads, 0.1f, 0.0f);
@@ -250,24 +244,20 @@ void test_layer_init_failure_rollback()
     auto engine = nn::CpuEngine::create();
     FlakyLayer layer;
 
-    CHECK(layer.binding_state() == nn::Layer::BindingState::unbound,
-          "新层状态 = unbound");
+    CHECK(layer.binding_state() == nn::Layer::BindingState::unbound, "新层状态 = unbound");
     CHECK(!layer.engine_alive(), "新层未持有引擎");
 
     auto r1 = layer.init(*engine);
     CHECK(!r1, "首次 init 按注入失败");
-    CHECK(layer.binding_state() == nn::Layer::BindingState::failed,
-          "init 失败后状态 = failed");
+    CHECK(layer.binding_state() == nn::Layer::BindingState::failed, "init 失败后状态 = failed");
     CHECK(layer.engine_alive(), "失败后仍保留可诊断的引擎强引用");
 
     layer.set_precision_profile(nn::profile_f16());
-    CHECK(layer.precision_profile().compute == nn::Precision::F16,
-          "failed 状态允许修正 profile");
+    CHECK(layer.precision_profile().compute == nn::Precision::F16, "failed 状态允许修正 profile");
 
     auto r2 = layer.init(*engine);
     CHECK(r2, "失败后可重新 init");
-    CHECK(layer.binding_state() == nn::Layer::BindingState::ready,
-          "重新 init 成功后状态 = ready");
+    CHECK(layer.binding_state() == nn::Layer::BindingState::ready, "重新 init 成功后状态 = ready");
 }
 
 } // namespace
@@ -285,9 +275,7 @@ int main()
     test_cross_domain_rejected();
     test_layer_init_failure_rollback();
 
-    if (g_fail == 0)
-        std::printf("layer_lifetime_test: ALL PASS\n");
-    else
-        std::printf("layer_lifetime_test: %d failure(s)\n", g_fail);
+    if (g_fail == 0) std::printf("layer_lifetime_test: ALL PASS\n");
+    else std::printf("layer_lifetime_test: %d failure(s)\n", g_fail);
     return g_fail == 0 ? 0 : 1;
 }

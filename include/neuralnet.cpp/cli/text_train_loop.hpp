@@ -50,10 +50,10 @@ namespace nn::cli
 // ── 断点落盘（CLI 序列化策略；何时保存由 TextTrainer 决定）─────────────────
 // 状态段（计数器/配方/数据集身份）由 Trainer 装配好后经 TextCheckpointRequest
 // 传入；本函数只做"导出优化器张量 + 写 .nnckpt + 失败记账"。
-inline void save_ckpt_with_state(
-    const std::string& path, nn::Model& model, const nn::ModelSpec& spec,
-    const std::string& tokenizer_bytes, const nn::TrainState& state,
-    nn::Optimizer& optimizer, TextTrainCheckpointLog& log, std::ostream& err)
+inline void save_ckpt_with_state(const std::string& path, nn::Model& model,
+                                 const nn::ModelSpec& spec, const std::string& tokenizer_bytes,
+                                 const nn::TrainState& state, nn::Optimizer& optimizer,
+                                 TextTrainCheckpointLog& log, std::ostream& err)
 {
     std::vector<nn::Tensor> blobs;
     auto sr = optimizer.save_state(blobs);
@@ -76,7 +76,8 @@ inline void save_ckpt_with_state(
 inline bool nn_nan_trace_on()
 {
     // MSVC CRT 弃用 getenv（-Werror 下必须走 _dupenv_s），与 NN_MEM_STATS 同款。
-    static const bool on = [] {
+    static const bool on = []
+    {
 #if defined(_MSC_VER)
         char* buf = nullptr;
         std::size_t len = 0;
@@ -108,14 +109,14 @@ inline std::vector<std::size_t>& nn_nan_trace_tokens()
     return toks;
 }
 
-inline bool nn_nan_trace_step(nn::ComputeEngine& engine, nn::Model& model,
-                              std::size_t step, std::size_t seq_len)
+inline bool nn_nan_trace_step(nn::ComputeEngine& engine, nn::Model& model, std::size_t step,
+                              std::size_t seq_len)
 {
     for (int pass = 0; pass < 2; ++pass)
     {
         const char* what = (pass == 0) ? "param" : "grad";
-        std::vector<nn::TensorRef> refs = (pass == 0) ? model.parameters()
-                                                      : model.param_gradients();
+        std::vector<nn::TensorRef> refs =
+            (pass == 0) ? model.parameters() : model.param_gradients();
         std::size_t idx = 0;
         for (auto& ref : refs)
         {
@@ -140,8 +141,7 @@ inline bool nn_nan_trace_step(nn::ComputeEngine& engine, nn::Model& model,
                         ++bad;
                         row_bad = true;
                     }
-                    else
-                        amax = std::max(amax, std::fabs(static_cast<double>(v)));
+                    else amax = std::max(amax, std::fabs(static_cast<double>(v)));
                 }
                 if (row_bad && bad_rows.size() < 32) bad_rows.push_back(r);
             }
@@ -149,8 +149,7 @@ inline bool nn_nan_trace_step(nn::ComputeEngine& engine, nn::Model& model,
             {
                 std::printf("[NAN-TRACE] step %zu: %s[%zu] %zux%zu 非有限 %zu/%zu，"
                             "max|有限|=%.4g\n",
-                            step, what, idx, m.rows(), m.cols(), bad,
-                            m.rows() * m.cols(), amax);
+                            step, what, idx, m.rows(), m.cols(), bad, m.rows() * m.cols(), amax);
                 // 同一 batch 的 doc_ids 快照（首样本）：文档感知掩码是
                 // "逐行可见列数"的源头，命中时把序列与统计一起打出来。
                 const auto& ids = nn_nan_trace_doc_ids();
@@ -169,33 +168,37 @@ inline bool nn_nan_trace_step(nn::ComputeEngine& engine, nn::Model& model,
                         min_visible = std::min(min_visible, vis);
                         if (vis == 0) ++zero_visible;
                     }
-                    std::printf("[NAN-TRACE] doc_ids 统计: 零可见列的行=%zu，最小可见列=%zu，"
-                                "递减次数=%zu，唯一 id 数=%zu\n",
-                                zero_visible, min_visible,
-                                [&] { std::size_t d = 0;
-                                      for (std::size_t t = 1; t < seq_len; ++t)
-                                          if (ids[t] < ids[t - 1]) ++d;
-                                      return d; }(),
-                                [&] { auto v = ids;
-                                      std::sort(v.begin(), v.begin() + seq_len);
-                                      return static_cast<std::size_t>(
-                                          std::unique(v.begin(), v.begin() + seq_len)
-                                          - v.begin()); }());
+                    std::printf(
+                        "[NAN-TRACE] doc_ids 统计: 零可见列的行=%zu，最小可见列=%zu，"
+                        "递减次数=%zu，唯一 id 数=%zu\n",
+                        zero_visible, min_visible,
+                        [&]
+                        {
+                            std::size_t d = 0;
+                            for (std::size_t t = 1; t < seq_len; ++t)
+                                if (ids[t] < ids[t - 1]) ++d;
+                            return d;
+                        }(),
+                        [&]
+                        {
+                            auto v = ids;
+                            std::sort(v.begin(), v.begin() + seq_len);
+                            return static_cast<std::size_t>(
+                                std::unique(v.begin(), v.begin() + seq_len) - v.begin());
+                        }());
                 }
                 // 行级定位：`grad[0]` 是 token embedding 的梯度，行号 = token id；
                 // 把它映射回 batch 内的 (t,b) 位置，可区分"某些 id 坏"（数据/查表）
                 // 与"某些位置坏"（掩码/位置相关算子）。
                 if (pass == 1 && idx == 0 && !bad_rows.empty())
                 {
-                    std::printf("[NAN-TRACE] 非有限行(token id, 前 %zu): ",
-                                bad_rows.size());
+                    std::printf("[NAN-TRACE] 非有限行(token id, 前 %zu): ", bad_rows.size());
                     for (std::size_t k = 0; k < bad_rows.size(); ++k)
-                        std::printf("%zu%s", bad_rows[k],
-                                    k + 1 < bad_rows.size() ? "," : "");
+                        std::printf("%zu%s", bad_rows[k], k + 1 < bad_rows.size() ? "," : "");
                     std::printf("\n");
                     const auto& toks = nn_nan_trace_tokens();
-                    const std::size_t bs = (seq_len > 0 && !toks.empty())
-                                               ? toks.size() / seq_len : 0;
+                    const std::size_t bs =
+                        (seq_len > 0 && !toks.empty()) ? toks.size() / seq_len : 0;
                     if (bs > 0)
                     {
                         std::printf("[NAN-TRACE] 命中位置 (t,b) 前 24: ");
@@ -204,8 +207,8 @@ inline bool nn_nan_trace_step(nn::ComputeEngine& engine, nn::Model& model,
                             for (std::size_t t = 0; t < seq_len && shown < 24; ++t)
                             {
                                 const std::size_t id = toks[b * seq_len + t];
-                                if (std::find(bad_rows.begin(), bad_rows.end(), id)
-                                    != bad_rows.end())
+                                if (std::find(bad_rows.begin(), bad_rows.end(), id) !=
+                                    bad_rows.end())
                                 {
                                     std::printf("(%zu,%zu)=%zu ", t, b, id);
                                     ++shown;
@@ -227,7 +230,7 @@ inline bool nn_nan_trace_step(nn::ComputeEngine& engine, nn::Model& model,
 // 计算并打印全局梯度统计：L2 范数、绝对值最大值、均值。
 // GPU 模式下自动通过 engine.to_matrix() 下载张量到 CPU。
 inline void log_text_train_gradient_stats(nn::ComputeEngine& engine,
-                                           const std::vector<nn::TensorRef>& grads)
+                                          const std::vector<nn::TensorRef>& grads)
 {
     Scalar global_sum_sq = 0.0;
     Scalar global_abs_max = 0.0;
@@ -247,13 +250,12 @@ inline void log_text_train_gradient_stats(nn::ComputeEngine& engine,
             mat = std::move(*m);
         }
 
-        const Scalar sum_sq = mat.reduce(Scalar{0}, std::plus<>{},
-            [](Scalar x) { return x * x; });
-        const Scalar abs_max = mat.reduce(Scalar{0},
-            [](Scalar a, Scalar b) { return std::max(a, b); },
+        const Scalar sum_sq = mat.reduce(Scalar{0}, std::plus<>{}, [](Scalar x) { return x * x; });
+        const Scalar abs_max = mat.reduce(
+            Scalar{0}, [](Scalar a, Scalar b) { return std::max(a, b); },
             [](Scalar x) { return std::abs(x); });
-        const Scalar abs_sum = mat.reduce(Scalar{0}, std::plus<>{},
-            [](Scalar x) { return std::abs(x); });
+        const Scalar abs_sum =
+            mat.reduce(Scalar{0}, std::plus<>{}, [](Scalar x) { return std::abs(x); });
         const std::size_t n = mat.size();
 
         global_sum_sq += sum_sq;
@@ -266,9 +268,8 @@ inline void log_text_train_gradient_stats(nn::ComputeEngine& engine,
         {
             std::cout << "    [" << tensor_idx << "] "
                       << "(" << mat.rows() << "x" << mat.cols() << ") "
-                      << "norm=" << std::scientific << std::setprecision(4)
-                      << std::sqrt(sum_sq) << "  max|g|=" << abs_max
-                      << "  mean|g|=" << (n > 0 ? abs_sum / n : Scalar{0})
+                      << "norm=" << std::scientific << std::setprecision(4) << std::sqrt(sum_sq)
+                      << "  max|g|=" << abs_max << "  mean|g|=" << (n > 0 ? abs_sum / n : Scalar{0})
                       << std::endl;
         }
         ++tensor_idx;
@@ -277,11 +278,8 @@ inline void log_text_train_gradient_stats(nn::ComputeEngine& engine,
     const Scalar global_norm = std::sqrt(global_sum_sq);
     const Scalar global_mean = global_count > 0 ? global_abs_sum / global_count : Scalar{0};
     std::cout << "    >> grad_norm=" << std::scientific << std::setprecision(4) << global_norm
-              << "  max|g|=" << global_abs_max
-              << "  mean|g|=" << global_mean
-              << "  params=" << global_count
-              << "  tensors=" << grads.size()
-              << std::endl;
+              << "  max|g|=" << global_abs_max << "  mean|g|=" << global_mean
+              << "  params=" << global_count << "  tensors=" << grads.size() << std::endl;
 }
 
 // ── 显存阶段采样（NN_MEM_STATS=1；探针门关时恒 false 且不读环境变量）─────────
@@ -294,8 +292,8 @@ struct TextTrainMemProbe
     void mark(nn::ComputeEngine& engine, const char* tag) const
     {
         if (!on) return;
-        std::cout << "[mem] " << std::left << std::setw(16) << tag << std::right
-                  << " " << engine.pool_stats() << std::endl;
+        std::cout << "[mem] " << std::left << std::setw(16) << tag << std::right << " "
+                  << engine.pool_stats() << std::endl;
     }
 };
 
@@ -322,17 +320,17 @@ struct TextTrainMemProbe
 // ══════════════════════════════════════════════════════════════════════════
 //  训练入口适配：给 TextTrainer 装 CLI 侧 hooks（诊断/断点），然后跑 fit()
 // ══════════════════════════════════════════════════════════════════════════
-[[nodiscard]] inline nn::Result<nn::TextTrainReport> run_text_train_loop(
-    nn::TextTrainer& trainer, const TrainConfig& cfg, const nn::ModelSpec& spec,
-    const std::string& tokenizer_bytes, const TextTrainMemProbe& mem_probe)
+[[nodiscard]] inline nn::Result<nn::TextTrainReport>
+run_text_train_loop(nn::TextTrainer& trainer, const TrainConfig& cfg, const nn::ModelSpec& spec,
+                    const std::string& tokenizer_bytes, const TextTrainMemProbe& mem_probe)
 {
     nn::TextTrainerHooks hooks;
     hooks.on_phase = [&mem_probe, &trainer](const char* tag)
     { mem_probe.mark(trainer.session().engine(), tag); };
 
     // 梯度统计（--grad-log；step 后、zero_grad 前）
-    hooks.on_update = [&cfg, &trainer](nn::TrainingSession& session, std::size_t,
-                                       std::size_t step, Scalar)
+    hooks.on_update =
+        [&cfg, &trainer](nn::TrainingSession& session, std::size_t, std::size_t step, Scalar)
     {
         if (!cfg.grad_log) return;
         const std::size_t steps_per_epoch = trainer.steps_per_epoch();
@@ -343,8 +341,7 @@ struct TextTrainMemProbe
 
 #if NN_PROBES_ENABLED
     // NN_NAN_TRACE：batch 装配后快照 doc_ids/token（batch-major），backward 后扫描
-    hooks.on_batch_ready = [](nn::TrainingSession&, const nn::TextSampleBatch& batch,
-                              std::size_t)
+    hooks.on_batch_ready = [](nn::TrainingSession&, const nn::TextSampleBatch& batch, std::size_t)
     {
         if (!nn_nan_trace_on()) return;
         nn_nan_trace_doc_ids() = batch.doc_ids;
@@ -353,14 +350,12 @@ struct TextTrainMemProbe
         const auto in = batch.input.span();
         for (std::size_t b = 0; b < batch.batch; ++b)
             for (std::size_t t = 0; t < batch.seq_len; ++t)
-                toks[b * batch.seq_len + t] =
-                    static_cast<std::size_t>(in[t * batch.batch + b]);
+                toks[b * batch.seq_len + t] = static_cast<std::size_t>(in[t * batch.batch + b]);
     };
     hooks.on_probe_check = [&cfg](nn::TrainingSession& session, std::size_t step)
     {
         if (!nn_nan_trace_on()) return false;
-        if (nn_nan_trace_step(session.engine(), session.model(), step, cfg.seq_len))
-            return false;
+        if (nn_nan_trace_step(session.engine(), session.model(), step, cfg.seq_len)) return false;
         std::printf("[NAN-TRACE] 命中即停止（NN_NAN_TRACE=1）\n");
         return true;
     };
@@ -368,15 +363,14 @@ struct TextTrainMemProbe
 
     // 定期断点（.nnckpt）：路径派生/记账/状态段序列化都在 CLI 侧。
     auto ckpt_log = std::make_shared<TextTrainCheckpointLog>();
-    hooks.on_checkpoint = [&cfg, &spec, &tokenizer_bytes, ckpt_log](
-                              const nn::TextCheckpointRequest& req) -> nn::Result<void>
+    hooks.on_checkpoint = [&cfg, &spec, &tokenizer_bytes,
+                           ckpt_log](const nn::TextCheckpointRequest& req) -> nn::Result<void>
     {
         const std::size_t before = ckpt_log->failures();
         save_ckpt_with_state(text_train_ckpt_path(cfg.save_path), req.session.model(), spec,
                              tokenizer_bytes, req.state, req.session.optimizer(), *ckpt_log,
                              std::cerr);
-        if (ckpt_log->failures() != before)
-            NN_FAIL("checkpoint 未落盘（记账见 stderr）");
+        if (ckpt_log->failures() != before) NN_FAIL("checkpoint 未落盘（记账见 stderr）");
         return {};
     };
 

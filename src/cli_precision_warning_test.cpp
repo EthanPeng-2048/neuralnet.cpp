@@ -71,8 +71,7 @@ bool file_exists(const std::string& p)
 std::string read_file(const std::string& p)
 {
     std::ifstream f(p, std::ios::binary);
-    return std::string((std::istreambuf_iterator<char>(f)),
-                       std::istreambuf_iterator<char>());
+    return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
 }
 
 // 运行 cmd，stderr 落到 err_file；返回进程退出码（-1 = 无法启动子进程）。
@@ -117,20 +116,17 @@ std::string find_app(const std::string& name)
 void test_helper_matrix()
 {
     using P = nn::Precision;
-    const auto has = [](nn::PrecisionProfile p) {
-        return !nn::cli::dangerous_precision_warning(p).empty();
-    };
+    const auto has = [](nn::PrecisionProfile p)
+    { return !nn::cli::dangerous_precision_warning(p).empty(); };
 
     // 静默：f32 / --f16（profile_f16）/ --t1_58（profile_t1_58）
-    CHECK(nn::cli::dangerous_precision_warning(nn::profile_f32()).empty(),
-          "全 f32 应静默");
+    CHECK(nn::cli::dangerous_precision_warning(nn::profile_f32()).empty(), "全 f32 应静默");
     CHECK(nn::cli::dangerous_precision_warning(nn::profile_f16()).empty(),
           "--f16（profile_f16）应静默");
     CHECK(nn::cli::dangerous_precision_warning(nn::profile_t1_58()).empty(),
           "--t1_58（profile_t1_58）应静默");
     // stable=f16 单独出现不触发（24 §2.3 口径）
-    CHECK(!has({P::F32, P::F32, P::F16, P::F32}),
-          "stable=f16 单独出现不触发告警");
+    CHECK(!has({P::F32, P::F32, P::F16, P::F32}), "stable=f16 单独出现不触发告警");
     // param=t1_58（非 F16 存储）+ compute=f16 不触发
     CHECK(!has({P::T1_58, P::F16, P::F32, P::F32}),
           "param=t1_58 / compute=f16（optimizer=f32）应静默");
@@ -147,8 +143,7 @@ void test_helper_matrix()
           "非全 f16 不应出现'数值性冻结'（那是全 f16 的形态）");
 
     // 触发：四字段全 f16（★ F2 补进的缺口组合）→ 合并一条更完整的警告
-    const std::string all16 =
-        nn::cli::dangerous_precision_warning(nn::profile_all_f16());
+    const std::string all16 = nn::cli::dangerous_precision_warning(nn::profile_all_f16());
     CHECK(!all16.empty(), "四字段全 f16 必须触发告警");
     CHECK(all16.find("optimizer=f16") != std::string::npos &&
               all16.find("stable=f16") != std::string::npos,
@@ -173,10 +168,8 @@ void test_cli_stderr(const std::string& exe, const std::string& label,
     const std::string err_opt = "nn_precwarn_opt.err";
     const std::string err_all = "nn_precwarn_all.err";
 
-    const int rc_plain = run_capture_stderr(
-        quote_exe(exe) + " " + dataset_arg, err_plain);
-    const int rc_f16 = run_capture_stderr(
-        quote_exe(exe) + " --f16 " + dataset_arg, err_f16);
+    const int rc_plain = run_capture_stderr(quote_exe(exe) + " " + dataset_arg, err_plain);
+    const int rc_f16 = run_capture_stderr(quote_exe(exe) + " --f16 " + dataset_arg, err_f16);
     const int rc_opt = run_capture_stderr(
         quote_exe(exe) + " --precision-stable f16 --precision-optimizer f16 " + dataset_arg,
         err_opt);
@@ -218,18 +211,20 @@ void test_cli_stderr(const std::string& exe, const std::string& label,
 
 int main(int argc, char** argv)
 {
-    g_self = (argc > 0 && argv[0] != nullptr)
-        ? std::filesystem::absolute(argv[0]).string()
-        : "";
+    g_self = (argc > 0 && argv[0] != nullptr) ? std::filesystem::absolute(argv[0]).string() : "";
     std::printf("cli_precision_warning_test（F1：危险精度组合启动期告警）\n");
 
     test_helper_matrix();
 
     bool any_app = false;
     // text_train 数据集是位置参数；mnist_train 用 --dataset <目录>。
-    struct AppCase { const char* name; const char* dataset_arg; };
+    struct AppCase
+    {
+        const char* name;
+        const char* dataset_arg;
+    };
     const AppCase apps[] = {
-        {"text_train",  "./nn_does_not_exist_dir_xyz/missing.nndataset"},
+        {"text_train", "./nn_does_not_exist_dir_xyz/missing.nndataset"},
         {"mnist_train", "--dataset ./nn_does_not_exist_dir_xyz"},
     };
     for (const auto& app : apps)

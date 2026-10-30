@@ -34,9 +34,11 @@ using nn::Scalar;
 
 int g_fail = 0;
 
-namespace {
+namespace
+{
 
-std::mt19937_64 make_rng() { return std::mt19937_64{0xC0FFEEULL}; }
+std::mt19937_64 make_rng()
+{ return std::mt19937_64{0xC0FFEEULL}; }
 
 // 旧签名（无截断）与新签名默认配置的等价性：同 seed 下返回同一下标、
 // 概率向量逐位相同、RNG 状态相同
@@ -70,8 +72,7 @@ void test_default_equals_legacy()
 }
 
 // 多次采样同一 logits：返回出现过的下标集合
-std::vector<std::size_t> draw_support(const std::vector<Scalar>& logits,
-                                      const SamplingConfig& cfg,
+std::vector<std::size_t> draw_support(const std::vector<Scalar>& logits, const SamplingConfig& cfg,
                                       std::size_t draws)
 {
     std::vector<std::size_t> seen;
@@ -82,7 +83,8 @@ std::vector<std::size_t> draw_support(const std::vector<Scalar>& logits,
         std::vector<Scalar> l = logits;
         const std::size_t t = nn::sample_next_token_(l, cfg, rng, dist, {});
         bool found = false;
-        for (const std::size_t s : seen) if (s == t) found = true;
+        for (const std::size_t s : seen)
+            if (s == t) found = true;
         if (!found) seen.push_back(t);
     }
     return seen;
@@ -90,7 +92,8 @@ std::vector<std::size_t> draw_support(const std::vector<Scalar>& logits,
 
 bool in_set(const std::vector<std::size_t>& set, std::size_t v)
 {
-    for (const std::size_t s : set) if (s == v) return true;
+    for (const std::size_t s : set)
+        if (s == v) return true;
     return false;
 }
 
@@ -141,15 +144,15 @@ void test_top_p()
     cfg.top_p = 0.5;
     bool p_ok = true;
     auto seen = draw_support(peaked, cfg, 300);
-    for (const std::size_t s : seen) if (s != 0) p_ok = false;
+    for (const std::size_t s : seen)
+        if (s != 0) p_ok = false;
     CHECK(p_ok, "top_p=0.5 在近 one-hot 上只留峰（核采样）");
 
     // 阈值极小 ⇒ 至少留 1 个（不会空集）
     SamplingConfig tiny;
     tiny.top_p = 1e-9;
     auto seen_tiny = draw_support(peaked, tiny, 50);
-    CHECK(!seen_tiny.empty() && in_set(seen_tiny, 0),
-          "top_p→0 仍保留至少 1 个候选（峰自身）");
+    CHECK(!seen_tiny.empty() && in_set(seen_tiny, 0), "top_p→0 仍保留至少 1 个候选（峰自身）");
 
     // 均匀分布 + top_p=0.5：4 个等概率 ⇒ 留 2 个
     SamplingConfig half;
@@ -188,8 +191,7 @@ void test_repeat_penalty()
     on.repeat_window = 0;
     l = {5.0, 4.0};
     const std::size_t win0 = nn::sample_next_token_(l, on, rng, dist, hist10);
-    CHECK(win1 == 1 && win0 == 0,
-          "repeat_window=1 只看最近一个 token；0 = 全部上下文");
+    CHECK(win1 == 1 && win0 == 0, "repeat_window=1 只看最近一个 token；0 = 全部上下文");
 
     // 负 logit 走乘法分支（HF 语义）：{-1, -5} + 罚下标 1 ⇒ {-1, -50} ⇒ 取 0；
     // 若误用"除法"则为 {-1, -0.5} ⇒ 取 1（本断言语义专属，能区分两者）。
@@ -289,10 +291,8 @@ void test_gpt_model_generate()
     auto eng_owner = nn::CpuEngine::create();
     nn::CpuEngine& eng = *eng_owner;
     const std::size_t vocab = 32, d_model = 16, seq = 8, heads = 2, d_ff = 32;
-    nn::GPTModel model(vocab, d_model, seq, heads, d_ff, /*layers=*/1,
-                       nn::PosEncodingType::Learned,
-                       nn::ActivationType::SwiGLU,
-                       nn::NormType::RMSNorm);
+    nn::GPTModel model(vocab, d_model, seq, heads, d_ff, /*layers=*/1, nn::PosEncodingType::Learned,
+                       nn::ActivationType::SwiGLU, nn::NormType::RMSNorm);
     NN_EXIT(model.init(eng), 1, "GPTModel init 失败: ");
 
     const std::vector<std::size_t> prompt = {1, 2, 3};
@@ -316,8 +316,8 @@ void test_gpt_model_generate()
     SamplingConfig hot = seeded;
     hot.temperature = 5.0;
     std::vector<std::vector<std::size_t>> outs;
-    for (std::uint64_t s : {std::uint64_t{1}, std::uint64_t{2}, std::uint64_t{3},
-                            std::uint64_t{4}, std::uint64_t{5}, std::uint64_t{6}})
+    for (std::uint64_t s : {std::uint64_t{1}, std::uint64_t{2}, std::uint64_t{3}, std::uint64_t{4},
+                            std::uint64_t{5}, std::uint64_t{6}})
     {
         hot.seed = s;
         outs.push_back(run(hot));
@@ -326,7 +326,8 @@ void test_gpt_model_generate()
     for (std::size_t i = 0; i < outs.size(); ++i)
     {
         bool dup = false;
-        for (std::size_t j = 0; j < i; ++j) if (outs[i] == outs[j]) dup = true;
+        for (std::size_t j = 0; j < i; ++j)
+            if (outs[i] == outs[j]) dup = true;
         if (!dup) ++distinct;
     }
     CHECK(distinct >= 2, "不同 seed 在高温下给出不同序列（种子生效）");

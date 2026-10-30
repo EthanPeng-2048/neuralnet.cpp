@@ -90,8 +90,7 @@ enum class PipelineId : std::uint8_t
     count
 };
 
-inline constexpr std::size_t kPipelineCount =
-    static_cast<std::size_t>(PipelineId::count);
+inline constexpr std::size_t kPipelineCount = static_cast<std::size_t>(PipelineId::count);
 
 // 设备能力要求：不满足时**不创建**该 pipeline（调用方看到空句柄后回退）。
 enum class PipelineRequirement : std::uint8_t
@@ -119,40 +118,30 @@ public:
     //   · SPIR-V 未嵌入（纯 CPU 构建）→ 跳过；
     //   · 设备不满足 requirement → 跳过；
     //   · 创建失败 → 跳过（该变体不可用，由上层回退）。
-    void create_all(VkDevice device, const VulkanDevice& caps,
-                    std::span<const PipelineSpec> specs)
+    void create_all(VkDevice device, const VulkanDevice& caps, std::span<const PipelineSpec> specs)
     {
         for (const auto& spec : specs)
         {
-            if (!supports(caps, spec.requirement))
-                continue;
+            if (!supports(caps, spec.requirement)) continue;
             const auto& code = spec.spirv();
-            if (code.empty())
-                continue;
-            auto created = VulkanPipeline::create_generic(
-                device, code, spec.bindings, spec.push_constant_bytes);
-            if (created)
-                entries_[index(spec.id)] = std::move(*created);
+            if (code.empty()) continue;
+            auto created = VulkanPipeline::create_generic(device, code, spec.bindings,
+                                                          spec.push_constant_bytes);
+            if (created) entries_[index(spec.id)] = std::move(*created);
         }
     }
 
     [[nodiscard]] bool has(PipelineId id) const noexcept
-    {
-        return entries_[index(id)].handle() != VK_NULL_HANDLE;
-    }
+    { return entries_[index(id)].handle() != VK_NULL_HANDLE; }
 
     // 调用方契约：先 has(id) 再 get(id)。缺失时返回空句柄的 pipeline，
     // Vulkan 校验层会报"绑定空 pipeline"，不会静默用错变体。
     [[nodiscard]] const VulkanPipeline& get(PipelineId id) const noexcept
-    {
-        return entries_[index(id)];
-    }
+    { return entries_[index(id)]; }
 
 private:
     static constexpr std::size_t index(PipelineId id) noexcept
-    {
-        return static_cast<std::size_t>(id);
-    }
+    { return static_cast<std::size_t>(id); }
 
     static bool supports(const VulkanDevice& caps, PipelineRequirement req) noexcept
     {

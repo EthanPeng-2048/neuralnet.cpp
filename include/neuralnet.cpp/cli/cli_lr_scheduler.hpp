@@ -11,8 +11,8 @@
 
 namespace nn::cli
 {
-using nn::LrScheduleConfig;
-using nn::StepLrScheduleConfig;
 using nn::compute_epoch_lr;
 using nn::compute_step_lr;
+using nn::LrScheduleConfig;
+using nn::StepLrScheduleConfig;
 } // namespace nn::cli

@@ -134,8 +134,7 @@ struct Fixture
 }
 
 [[nodiscard]] nn::TrainingSession make_session(Fixture& f, nn::Scalar lr = 1e-2f,
-                                               nn::Scalar clip = 0,
-                                               std::size_t accum_steps = 1)
+                                               nn::Scalar clip = 0, std::size_t accum_steps = 1)
 {
     auto built = nn::build_gpt_model_from_spec(*f.engine, f.spec);
     NN_ASSERT_ALWAYS(built, "text_trainer_test: 构建小 GPT 失败");
@@ -249,8 +248,7 @@ void test_step_range(const std::string& dir)
         CHECK(r && r->steps_executed == 1, "max_steps=1 只执行 1 步");
         CHECK(out1.str().find("已达 --max-steps=1") != std::string::npos, "max_steps 提前结束文案");
         // P1：--max-steps 提前停时状态必须是"真实下一步"，不能谎报 (epochs,0)
-        CHECK(r && r->final_epoch == 0 && r->final_step_in_epoch == 1,
-              "report 记录真实停止位置");
+        CHECK(r && r->final_epoch == 0 && r->final_step_in_epoch == 1, "report 记录真实停止位置");
         CHECK(t1->train_state().counters.epoch == 0 &&
                   t1->train_state().counters.step_in_epoch == 1 &&
                   t1->train_state().counters.global_step == 1,
@@ -291,11 +289,10 @@ void test_global_batch_accumulation(const std::string& dir)
     std::size_t updates = 0;
     nn::TextTrainerHooks hooks;
     hooks.out = nullptr;
-    hooks.on_batch_ready = [&](nn::TrainingSession&, const nn::TextSampleBatch& batch,
-                               std::size_t) { micro_batches += batch.batch; };
-    hooks.on_update = [&](nn::TrainingSession&, std::size_t, std::size_t, nn::Scalar) {
-        ++updates;
-    };
+    hooks.on_batch_ready = [&](nn::TrainingSession&, const nn::TextSampleBatch& batch, std::size_t)
+    { micro_batches += batch.batch; };
+    hooks.on_update = [&](nn::TrainingSession&, std::size_t, std::size_t, nn::Scalar)
+    { ++updates; };
 
     auto trainer_r = nn::TextTrainer::create(std::move(session), *ds, cfg, hooks);
     CHECK(trainer_r, "accum: create");
@@ -303,12 +300,10 @@ void test_global_batch_accumulation(const std::string& dir)
     CHECK(trainer_r->micro_batch_size() == 2, "accum: micro = global / accum");
     const std::size_t samples = trainer_r->sample_count();
     const std::size_t expected_steps = (samples + 3) / 4;
-    CHECK(trainer_r->steps_per_epoch() == expected_steps,
-          "accum: steps_per_epoch 按 global batch");
+    CHECK(trainer_r->steps_per_epoch() == expected_steps, "accum: steps_per_epoch 按 global batch");
 
     auto report = trainer_r->fit();
-    CHECK(report && report->steps_executed == expected_steps,
-          "accum: update step 数正确");
+    CHECK(report && report->steps_executed == expected_steps, "accum: update step 数正确");
     CHECK(report && report->samples_executed == samples, "accum: 样本数正确");
     CHECK(trainer_r->session().step_count() == expected_steps,
           "accum: Session step_count 按 update 计");
@@ -316,8 +311,7 @@ void test_global_batch_accumulation(const std::string& dir)
     CHECK(micro_batches == samples, "accum: micro-batch 样本列数总和");
     CHECK(trainer_r->train_state().recipe.batch_size_is_global,
           "accum: 状态标记 global batch 语义");
-    CHECK(trainer_r->train_state().recipe.micro_batch_size == 2,
-          "accum: 状态记录派生 micro-batch");
+    CHECK(trainer_r->train_state().recipe.micro_batch_size == 2, "accum: 状态记录派生 micro-batch");
 }
 
 // ── [3b] 高性能入口（CLI 实际路径）：样本集 + nullopt test ─────────────────
@@ -345,8 +339,8 @@ void test_fast_path_sets(const std::string& dir)
     std::ostringstream out;
     nn::TextTrainerHooks hooks;
     hooks.out = &out;
-    auto trainer_r = nn::TextTrainer::create(std::move(session), std::move(*train_r),
-                                             std::nullopt, cfg, hooks);
+    auto trainer_r =
+        nn::TextTrainer::create(std::move(session), std::move(*train_r), std::nullopt, cfg, hooks);
     CHECK(trainer_r, "fast-path: create(session, train_set, nullopt, cfg)");
     if (!trainer_r) return;
     CHECK(trainer_r->test_samples() == nullptr, "fast-path: nullopt test ⇒ 不评估");

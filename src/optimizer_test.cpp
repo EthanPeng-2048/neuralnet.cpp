@@ -37,17 +37,19 @@ namespace
 {
 
 int g_fail = 0;
-#define CHECK(cond, msg)                                                     \
-    do {                                                                     \
-        if (!(cond)) {                                                       \
-            std::printf("[FAIL] %s:%d: %s\n", __FILE__, __LINE__, (msg));    \
-            ++g_fail;                                                        \
-        }                                                                    \
+#define CHECK(cond, msg)                                                  \
+    do                                                                    \
+    {                                                                     \
+        if (!(cond))                                                      \
+        {                                                                 \
+            std::printf("[FAIL] %s:%d: %s\n", __FILE__, __LINE__, (msg)); \
+            ++g_fail;                                                     \
+        }                                                                 \
     } while (0)
 
 // ── 引擎侧工具（M1：Tensor 一律经引擎创建/读写）────────────────────────────
-nn::Tensor make_tensor(nn::CpuEngine& eng, std::size_t rows, std::size_t cols,
-                       float base, float step)
+nn::Tensor make_tensor(nn::CpuEngine& eng, std::size_t rows, std::size_t cols, float base,
+                       float step)
 {
     nn::Tensor t = eng.create_tensor(rows, cols);
     std::vector<Scalar> buf(rows * cols);
@@ -123,8 +125,7 @@ void test_optimizer_table()
         // ① 表内每个 name 都能被工厂构造（名单与构造器不得漂移）
         nn::Tensor p = make_tensor(eng, 2, 3, 0.1f, 0.01f);
         nn::Tensor g = make_tensor(eng, 2, 3, 0.2f, 0.01f);
-        auto opt = nn::create_optimizer(m.name, eng,
-                                        std::vector<nn::TensorRef>{p},
+        auto opt = nn::create_optimizer(m.name, eng, std::vector<nn::TensorRef>{p},
                                         std::vector<nn::TensorRef>{g},
                                         /*lr=*/Scalar{1e-3f}, /*wd=*/Scalar{0.01f});
         CHECK(opt != nullptr, (std::string("工厂可构造: ") + std::string(m.name)).c_str());
@@ -150,9 +151,8 @@ void test_optimizer_table()
 // ── AdamW 单步参考（与 compute_optimizer.hpp::AdamW::step 同一公式）────────
 // decay_first = true  → 先衰减后更新（AdamW 语义，正确）
 // decay_first = false → 先更新后衰减（错误顺序，仅用于证明顺序敏感）
-void adamw_reference(std::vector<Scalar>& p, const std::vector<Scalar>& g,
-                     std::vector<Scalar>& m, std::vector<Scalar>& v,
-                     Scalar lr, Scalar b1, Scalar b2, Scalar eps, Scalar wd,
+void adamw_reference(std::vector<Scalar>& p, const std::vector<Scalar>& g, std::vector<Scalar>& m,
+                     std::vector<Scalar>& v, Scalar lr, Scalar b1, Scalar b2, Scalar eps, Scalar wd,
                      std::size_t t, bool decay_first)
 {
     const Scalar bc1 = Scalar{1} - std::pow(b1, static_cast<Scalar>(t));
@@ -202,8 +202,8 @@ void test_adamw_order()
         const Scalar denom = std::max(std::fabs(ref[i]), Scalar{1e-6f});
         max_rel = std::max(max_rel, d / denom);
     }
-    std::printf("    AdamW 单步 vs 参考: max_abs=%.3e max_rel=%.3e\n",
-                static_cast<double>(max_abs), static_cast<double>(max_rel));
+    std::printf("    AdamW 单步 vs 参考: max_abs=%.3e max_rel=%.3e\n", static_cast<double>(max_abs),
+                static_cast<double>(max_rel));
     CHECK(max_rel < 1e-5f, "AdamW 单步与参考实现一致（wd≠0，先衰减后更新）");
 
     // 负例：同样的超参、只把两次写的顺序对调 → 结果必须明显不同
@@ -214,8 +214,7 @@ void test_adamw_order()
     Scalar swap_diff = 0;
     for (std::size_t i = 0; i < ref.size(); ++i)
         swap_diff = std::max(swap_diff, std::fabs(ref[i] - ref_swapped[i]));
-    std::printf("    顺序对调后的差值: %.3e（应当显著非零）\n",
-                static_cast<double>(swap_diff));
+    std::printf("    顺序对调后的差值: %.3e（应当显著非零）\n", static_cast<double>(swap_diff));
     CHECK(swap_diff > 1e-6f, "decay→update 的顺序确实影响数值（顺序边非形式主义）");
     std::printf("[OK] test_adamw_order\n");
 }
@@ -231,13 +230,12 @@ void test_dst_order_hazard()
 
     nn::ExprGraph graph;
     // 节点 0：p *= 2（写目标 = p）
-    const int n0 = graph.add_node(make_unary_const(nn::ExprOp::Mul, Scalar{2}),
-                                  std::vector<nn::Tensor>{p}, rows, cols, false,
-                                  nn::Precision::F32, p.storage_id());
+    const int n0 =
+        graph.add_node(make_unary_const(nn::ExprOp::Mul, Scalar{2}), std::vector<nn::Tensor>{p},
+                       rows, cols, false, nn::Precision::F32, p.storage_id());
     // 节点 1：p = p + x（读 p、写目标同样 = p）
-    const int n1 = graph.add_node(make_binary(nn::ExprOp::Add),
-                                  std::vector<nn::Tensor>{p, x}, rows, cols, false,
-                                  nn::Precision::F32, p.storage_id());
+    const int n1 = graph.add_node(make_binary(nn::ExprOp::Add), std::vector<nn::Tensor>{p, x}, rows,
+                                  cols, false, nn::Precision::F32, p.storage_id());
 
     // ① 顺序隐患边 (n0, n1)
     const auto edges = nn::dst_order_constraints(graph);
@@ -253,7 +251,11 @@ void test_dst_order_hazard()
     for (const auto& k : kernels)
     {
         bool a = false, b = false;
-        for (const int m : k.members) { a = a || (m == n0); b = b || (m == n1); }
+        for (const int m : k.members)
+        {
+            a = a || (m == n0);
+            b = b || (m == n1);
+        }
         if (a && b) same_kernel = true;
     }
     CHECK(!same_kernel, "两节点未出现在同一 kernel 的成员表里");

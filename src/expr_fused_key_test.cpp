@@ -29,8 +29,7 @@ int g_fail = 0;
 [[nodiscard]] std::string fk_key(const nn::ExprSpec& s)
 { return nn::expr_spec_key(nn::canonicalize_expr_spec(s)); }
 
-void fk_eq(const char* name, const std::string& a, const std::string& b,
-           const char* why)
+void fk_eq(const char* name, const std::string& a, const std::string& b, const char* why)
 {
     if (a == b)
     {
@@ -38,8 +37,8 @@ void fk_eq(const char* name, const std::string& a, const std::string& b,
         return;
     }
     ++g_fail;
-    std::printf("[FAIL] %s：key 应相同但不同（%s）\n        a=%s\n        b=%s\n",
-                name, why, a.c_str(), b.c_str());
+    std::printf("[FAIL] %s：key 应相同但不同（%s）\n        a=%s\n        b=%s\n", name, why,
+                a.c_str(), b.c_str());
 }
 } // namespace
 
@@ -48,46 +47,40 @@ int main()
     auto eng_owner = nn::CpuEngine::create();
     nn::CpuEngine& eng = *eng_owner;
     // 真实实例的操作数（形状/精度都真实）
-    const nn::Tensor x  = eng.create_tensor(8, 4, nn::Precision::F32);
-    const nn::Tensor w  = eng.create_tensor(5, 8, nn::Precision::F32);
-    const nn::Tensor b  = eng.create_tensor(5, 1, nn::Precision::F32);
-    const nn::Tensor g  = eng.create_tensor(5, 4, nn::Precision::F32);
+    const nn::Tensor x = eng.create_tensor(8, 4, nn::Precision::F32);
+    const nn::Tensor w = eng.create_tensor(5, 8, nn::Precision::F32);
+    const nn::Tensor b = eng.create_tensor(5, 1, nn::Precision::F32);
+    const nn::Tensor g = eng.create_tensor(5, 4, nn::Precision::F32);
     const nn::Tensor S{};   // 符号张量（默认构造：未绑定、无存储）
 
     using namespace nn;
 
     // ── ① 符号实例 key ≡ 真实实例 key（FusedAnchor 的全部依据）──────────────
-    struct Pair { const char* name; std::string real; std::string sym; };
+    struct Pair
+    {
+        const char* name;
+        std::string real;
+        std::string sym;
+    };
     const Pair pairs[] = {
-        {"relu_fwd", fk_key(dsl::to_expr_spec(
-                         dsl::max(dsl::leaf(x), Scalar{0})).first),
-                     fk_key(dsl::to_expr_spec(
-                         dsl::max(dsl::leaf(S), Scalar{0})).first)},
+        {"relu_fwd", fk_key(dsl::to_expr_spec(dsl::max(dsl::leaf(x), Scalar{0})).first),
+         fk_key(dsl::to_expr_spec(dsl::max(dsl::leaf(S), Scalar{0})).first)},
         {"linear_fwd(matmul+row_broadcast)",
-                     fk_key(dsl::to_expr_spec(
-                         dsl::matmul(w, x, false, false) + dsl::row_broadcast(b)).first),
-                     fk_key(dsl::to_expr_spec(
-                         dsl::matmul(S, S, false, false) + dsl::row_broadcast(S)).first)},
-        {"matmul_transA",
-                     fk_key(dsl::to_expr_spec(dsl::matmul(w, g, true, false)).first),
-                     fk_key(dsl::to_expr_spec(dsl::matmul(S, S, true, false)).first)},
-        {"matmul_transB",
-                     fk_key(dsl::to_expr_spec(dsl::matmul(g, x, false, true)).first),
-                     fk_key(dsl::to_expr_spec(dsl::matmul(S, S, false, true)).first)},
-        {"row_reduce_sum",
-                     fk_key(dsl::to_expr_spec(dsl::row_reduce_sum(dsl::leaf(g))).first),
-                     fk_key(dsl::to_expr_spec(dsl::row_reduce_sum(dsl::leaf(S))).first)},
+         fk_key(dsl::to_expr_spec(dsl::matmul(w, x, false, false) + dsl::row_broadcast(b)).first),
+         fk_key(dsl::to_expr_spec(dsl::matmul(S, S, false, false) + dsl::row_broadcast(S)).first)},
+        {"matmul_transA", fk_key(dsl::to_expr_spec(dsl::matmul(w, g, true, false)).first),
+         fk_key(dsl::to_expr_spec(dsl::matmul(S, S, true, false)).first)},
+        {"matmul_transB", fk_key(dsl::to_expr_spec(dsl::matmul(g, x, false, true)).first),
+         fk_key(dsl::to_expr_spec(dsl::matmul(S, S, false, true)).first)},
+        {"row_reduce_sum", fk_key(dsl::to_expr_spec(dsl::row_reduce_sum(dsl::leaf(g))).first),
+         fk_key(dsl::to_expr_spec(dsl::row_reduce_sum(dsl::leaf(S))).first)},
         {"grouped_reduce_max",
-                     fk_key(dsl::to_expr_spec(
-                         dsl::grouped_reduce_max(g, 4u) + dsl::rparam(Scalar{0})).first),
-                     fk_key(dsl::to_expr_spec(
-                         dsl::grouped_reduce_max(S, 1u) + dsl::rparam(Scalar{0})).first)},
-        {"rotate_half",
-                     fk_key(dsl::to_expr_spec(dsl::rotate_half(x, 16u)).first),
-                     fk_key(dsl::to_expr_spec(dsl::rotate_half(S, 1u)).first)},
-        {"row_access",
-                     fk_key(dsl::to_expr_spec(dsl::row_access(x, 8u, 8u)).first),
-                     fk_key(dsl::to_expr_spec(dsl::row_access(S, 1u, 1u)).first)},
+         fk_key(dsl::to_expr_spec(dsl::grouped_reduce_max(g, 4u) + dsl::rparam(Scalar{0})).first),
+         fk_key(dsl::to_expr_spec(dsl::grouped_reduce_max(S, 1u) + dsl::rparam(Scalar{0})).first)},
+        {"rotate_half", fk_key(dsl::to_expr_spec(dsl::rotate_half(x, 16u)).first),
+         fk_key(dsl::to_expr_spec(dsl::rotate_half(S, 1u)).first)},
+        {"row_access", fk_key(dsl::to_expr_spec(dsl::row_access(x, 8u, 8u)).first),
+         fk_key(dsl::to_expr_spec(dsl::row_access(S, 1u, 1u)).first)},
     };
     for (const Pair& p : pairs)
         fk_eq(p.name, p.real, p.sym, "符号实例 key ≡ 真实实例 key");
@@ -102,19 +95,18 @@ int main()
     // ── ② 常量池**值**不进 key（只喂个数）────────────────────────────────
     fk_eq("const_value_not_in_key",
           fk_key(dsl::to_expr_spec(dsl::max(dsl::leaf(x), Scalar{1e-6f})).first),
-          fk_key(dsl::to_expr_spec(dsl::max(dsl::leaf(x), Scalar{1e-5f})).first),
-          "常量池只喂个数");
+          fk_key(dsl::to_expr_spec(dsl::max(dsl::leaf(x), Scalar{1e-5f})).first), "常量池只喂个数");
 
     // ── ③ matmul 转置不进 key（运行期 operand layout）─────────────────────
     {
-        const std::string k00 = fk_key(dsl::to_expr_spec(
-            dsl::matmul(w, x, false, false) + dsl::row_broadcast(b)).first);
-        const std::string k01 = fk_key(dsl::to_expr_spec(
-            dsl::matmul(w, x, false, true) + dsl::row_broadcast(b)).first);
-        const std::string k10 = fk_key(dsl::to_expr_spec(
-            dsl::matmul(w, x, true, false) + dsl::row_broadcast(b)).first);
-        const std::string k11 = fk_key(dsl::to_expr_spec(
-            dsl::matmul(w, x, true, true) + dsl::row_broadcast(b)).first);
+        const std::string k00 = fk_key(
+            dsl::to_expr_spec(dsl::matmul(w, x, false, false) + dsl::row_broadcast(b)).first);
+        const std::string k01 =
+            fk_key(dsl::to_expr_spec(dsl::matmul(w, x, false, true) + dsl::row_broadcast(b)).first);
+        const std::string k10 =
+            fk_key(dsl::to_expr_spec(dsl::matmul(w, x, true, false) + dsl::row_broadcast(b)).first);
+        const std::string k11 =
+            fk_key(dsl::to_expr_spec(dsl::matmul(w, x, true, true) + dsl::row_broadcast(b)).first);
         fk_eq("matmul_trans_not_in_key", k00, k01, "4 种转置组合共享一个 shader");
         fk_eq("matmul_trans_not_in_key", k00, k10, "4 种转置组合共享一个 shader");
         fk_eq("matmul_trans_not_in_key", k00, k11, "4 种转置组合共享一个 shader");
@@ -124,19 +116,21 @@ int main()
 
     // ── ④ 分组归约 R 不进 key（运行期视图参数）────────────────────────────
     fk_eq("grouped_reduce_R_not_in_key",
-          fk_key(dsl::to_expr_spec(
-              dsl::grouped_reduce_max(x, 4u) + dsl::rparam(Scalar{0})).first),
-          fk_key(dsl::to_expr_spec(
-              dsl::grouped_reduce_max(x, 9u) + dsl::rparam(Scalar{0})).first),
+          fk_key(dsl::to_expr_spec(dsl::grouped_reduce_max(x, 4u) + dsl::rparam(Scalar{0})).first),
+          fk_key(dsl::to_expr_spec(dsl::grouped_reduce_max(x, 9u) + dsl::rparam(Scalar{0})).first),
           "R 经 vp 槽运行期传入");
     // sum / max 是**两种视图**（结构）→ 必须仍然区分
     {
-        const std::string ks = fk_key(dsl::to_expr_spec(
-            dsl::grouped_reduce_sum(x, 4u) + dsl::rparam(Scalar{0})).first);
-        const std::string km = fk_key(dsl::to_expr_spec(
-            dsl::grouped_reduce_max(x, 4u) + dsl::rparam(Scalar{0})).first);
+        const std::string ks = fk_key(
+            dsl::to_expr_spec(dsl::grouped_reduce_sum(x, 4u) + dsl::rparam(Scalar{0})).first);
+        const std::string km = fk_key(
+            dsl::to_expr_spec(dsl::grouped_reduce_max(x, 4u) + dsl::rparam(Scalar{0})).first);
         if (ks != km) std::printf("[PASS] sum/max 是不同视图（key 不同）\n");
-        else { ++g_fail; std::printf("[FAIL] grouped_reduce sum/max key 应不同\n"); }
+        else
+        {
+            ++g_fail;
+            std::printf("[FAIL] grouped_reduce sum/max key 应不同\n");
+        }
     }
 
     std::printf("\nexpr_fused_key_test: %d failure(s)\n", g_fail);

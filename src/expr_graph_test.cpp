@@ -41,16 +41,18 @@ namespace
 {
 
 int g_fail = 0;
-#define CHECK(cond, msg)                                                     \
-    do {                                                                     \
-        if (!(cond)) {                                                       \
-            std::printf("[FAIL] %s\n", msg);                                 \
-            ++g_fail;                                                        \
-        }                                                                    \
+#define CHECK(cond, msg)                     \
+    do                                       \
+    {                                        \
+        if (!(cond))                         \
+        {                                    \
+            std::printf("[FAIL] %s\n", msg); \
+            ++g_fail;                        \
+        }                                    \
     } while (0)
 
-nn::Tensor make_tensor(nn::CpuEngine& eng, std::size_t rows, std::size_t cols,
-                       float base = 0.0f, float step = 0.01f)
+nn::Tensor make_tensor(nn::CpuEngine& eng, std::size_t rows, std::size_t cols, float base = 0.0f,
+                       float step = 0.01f)
 {
     nn::Tensor t = eng.create_tensor(rows, cols);
     std::vector<Scalar> buf(rows * cols);
@@ -156,8 +158,8 @@ void test_chain_fuse()
 
     const int nA = g.add_node(make_unary_const(nn::ExprOp::Mul, Scalar{2}),
                               std::vector<nn::Tensor>{x}, rows, cols, false);
-    nn::Tensor ytag = make_placeholder(eng, rows, cols,
-                                       g.tag_of_node[static_cast<std::size_t>(nA)]);
+    nn::Tensor ytag =
+        make_placeholder(eng, rows, cols, g.tag_of_node[static_cast<std::size_t>(nA)]);
     const int nB = g.add_node(make_unary_const(nn::ExprOp::Add, Scalar{1}),
                               std::vector<nn::Tensor>{ytag}, rows, cols, false);
     (void)nB;
@@ -173,7 +175,8 @@ void test_chain_fuse()
 
     // 融合 kernel 求值（P2 多输出：主输出 = B，extras = A 写穿物化）
     std::vector<nn::Tensor> kinputs;
-    for (auto& in : kernels[0].inputs) kinputs.push_back(in.external);
+    for (auto& in : kernels[0].inputs)
+        kinputs.push_back(in.external);
     std::vector<nn::Tensor> kouts;
     kouts.push_back(eng.create_tensor(rows, cols));
     kouts.push_back(eng.create_tensor(rows, cols));
@@ -218,20 +221,17 @@ void test_chain3_fuse()
     nn::ExprGraph g;
     nn::Tensor x = make_tensor(eng, rows, cols, 1.0f, 0.3f);
 
-    auto add_node_chain = [&](nn::ExprOp op, Scalar c,
-                              const nn::Tensor& input,
-                              std::size_t r, std::size_t col) -> int
+    auto add_node_chain = [&](nn::ExprOp op, Scalar c, const nn::Tensor& input, std::size_t r,
+                              std::size_t col) -> int
     {
-        const int n = g.add_node(make_unary_const(op, c),
-                                 std::vector<nn::Tensor>{input}, r, col, false);
+        const int n =
+            g.add_node(make_unary_const(op, c), std::vector<nn::Tensor>{input}, r, col, false);
         return n;
     };
     const int nA = add_node_chain(nn::ExprOp::Mul, Scalar{2}, x, rows, cols);
-    nn::Tensor yt = make_placeholder(eng, rows, cols,
-                                     g.tag_of_node[static_cast<std::size_t>(nA)]);
+    nn::Tensor yt = make_placeholder(eng, rows, cols, g.tag_of_node[static_cast<std::size_t>(nA)]);
     const int nB = add_node_chain(nn::ExprOp::Add, Scalar{3}, yt, rows, cols);
-    nn::Tensor zt = make_placeholder(eng, rows, cols,
-                                     g.tag_of_node[static_cast<std::size_t>(nB)]);
+    nn::Tensor zt = make_placeholder(eng, rows, cols, g.tag_of_node[static_cast<std::size_t>(nB)]);
     const int nC = add_node_chain(nn::ExprOp::Sub, Scalar{1}, zt, rows, cols);
     (void)nC;
 
@@ -242,30 +242,28 @@ void test_chain3_fuse()
     CHECK(kernels[0].spec.extras.size() == 2, "P2 写穿：A/B 输出进 extras");
 
     std::vector<nn::Tensor> kinputs;
-    for (auto& in : kernels[0].inputs) kinputs.push_back(in.external);
+    for (auto& in : kernels[0].inputs)
+        kinputs.push_back(in.external);
     // 输出槽序：[0]=tail(C)，[1..]=成员序去尾（A, B）
     std::vector<nn::Tensor> kouts;
-    for (int k = 0; k < 3; ++k) kouts.push_back(eng.create_tensor(rows, cols));
+    for (int k = 0; k < 3; ++k)
+        kouts.push_back(eng.create_tensor(rows, cols));
     auto mul_r = eng.eval_expr_multi_into(kernels[0].spec, kinputs, rows, cols, kouts);
     if (!mul_r || nn::dsl::env_flag("NN_DUMP_GLSL"))
     {
         std::printf("  [diag] multi_into: %s\n", mul_r.error().message.c_str());
         const auto& sp = kernels[0].spec;
         std::printf("  [diag] key=%s instrs=%zu views=%zu num_regs=%u extras=%zu\n",
-                    nn::expr_spec_key(sp).c_str(), sp.instrs.size(),
-                    sp.views.size(), sp.num_regs, sp.extras.size());
+                    nn::expr_spec_key(sp).c_str(), sp.instrs.size(), sp.views.size(), sp.num_regs,
+                    sp.extras.size());
         for (const auto& v : sp.views)
             std::printf("  [diag] view kind=%u\n", static_cast<unsigned>(v.kind));
         for (const auto& ins : sp.instrs)
-            std::printf("  [diag] ins op=%u dst=%u a=(%u,%u)\n",
-                        static_cast<unsigned>(ins.op), static_cast<unsigned>(ins.dst),
-                        static_cast<unsigned>(ins.a.kind), static_cast<unsigned>(ins.a.idx));
+            std::printf("  [diag] ins op=%u dst=%u a=(%u,%u)\n", static_cast<unsigned>(ins.op),
+                        static_cast<unsigned>(ins.dst), static_cast<unsigned>(ins.a.kind),
+                        static_cast<unsigned>(ins.a.idx));
         auto gl = nn::emitter_registry::make("glsl");
-        if (gl)
-        {
-            std::printf("  [diag] ---- GLSL ----\n%s\n",
-                        gl->generate("diag", sp).c_str());
-        }
+        if (gl) { std::printf("  [diag] ---- GLSL ----\n%s\n", gl->generate("diag", sp).c_str()); }
     }
     CHECK(static_cast<bool>(mul_r), "融合 kernel 多输出求值成功");
 
@@ -299,10 +297,10 @@ void test_independent()
     nn::Tensor x = make_tensor(eng, rows, cols, 0.0f, 0.1f);
     nn::Tensor w = make_tensor(eng, rows, cols, 2.0f, 0.2f);
 
-    (void)g.add_node(make_unary_const(nn::ExprOp::Mul, Scalar{2}),
-                     std::vector<nn::Tensor>{x}, rows, cols, false);
-    (void)g.add_node(make_unary_const(nn::ExprOp::Add, Scalar{1}),
-                     std::vector<nn::Tensor>{w}, rows, cols, false);
+    (void)g.add_node(make_unary_const(nn::ExprOp::Mul, Scalar{2}), std::vector<nn::Tensor>{x}, rows,
+                     cols, false);
+    (void)g.add_node(make_unary_const(nn::ExprOp::Add, Scalar{1}), std::vector<nn::Tensor>{w}, rows,
+                     cols, false);
 
     auto kernels = fuse_expr_graph(g);
     CHECK(kernels.size() == 2, "独立节点应各自成 kernel");
@@ -312,9 +310,11 @@ void test_independent()
 
     // 两个 kernel 求值都正确
     std::vector<nn::Tensor> k0in;
-    for (auto& in : kernels[0].inputs) k0in.push_back(in.external);
+    for (auto& in : kernels[0].inputs)
+        k0in.push_back(in.external);
     std::vector<nn::Tensor> k1in;
-    for (auto& in : kernels[1].inputs) k1in.push_back(in.external);
+    for (auto& in : kernels[1].inputs)
+        k1in.push_back(in.external);
     auto r0 = eng.eval_expr(kernels[0].spec, k0in, rows, cols);
     auto r1 = eng.eval_expr(kernels[1].spec, k1in, rows, cols);
     CHECK(static_cast<bool>(r0) && static_cast<bool>(r1), "两个 kernel 求值成功");
@@ -333,14 +333,12 @@ void test_multi_consumer()
     // A: y = x*2（输出 y）；B: z = y+1（消费 y）；C: t = y-1（也消费 y）
     const int nA = g.add_node(make_unary_const(nn::ExprOp::Mul, Scalar{2}),
                               std::vector<nn::Tensor>{x}, rows, cols, false);
-    nn::Tensor yt = make_placeholder(eng, rows, cols,
-                                     g.tag_of_node[static_cast<std::size_t>(nA)]);
-    (void)g.add_node(make_unary_const(nn::ExprOp::Add, Scalar{1}),
-                     std::vector<nn::Tensor>{yt}, rows, cols, false);
-    nn::Tensor yt2 = make_placeholder(eng, rows, cols,
-                                      g.tag_of_node[static_cast<std::size_t>(nA)]);
-    (void)g.add_node(make_unary_const(nn::ExprOp::Sub, Scalar{1}),
-                     std::vector<nn::Tensor>{yt2}, rows, cols, false);
+    nn::Tensor yt = make_placeholder(eng, rows, cols, g.tag_of_node[static_cast<std::size_t>(nA)]);
+    (void)g.add_node(make_unary_const(nn::ExprOp::Add, Scalar{1}), std::vector<nn::Tensor>{yt},
+                     rows, cols, false);
+    nn::Tensor yt2 = make_placeholder(eng, rows, cols, g.tag_of_node[static_cast<std::size_t>(nA)]);
+    (void)g.add_node(make_unary_const(nn::ExprOp::Sub, Scalar{1}), std::vector<nn::Tensor>{yt2},
+                     rows, cols, false);
 
     auto kernels = fuse_expr_graph(g);
     // P2 写穿物化：A 的输出落回张量（extras）→ 多消费者不再是融合边界，
@@ -352,9 +350,11 @@ void test_multi_consumer()
 
     // 数值验证：三输出各自与逐节点参考一致
     std::vector<nn::Tensor> kinputs;
-    for (auto& in : kernels[0].inputs) kinputs.push_back(in.external);
+    for (auto& in : kernels[0].inputs)
+        kinputs.push_back(in.external);
     std::vector<nn::Tensor> kouts;
-    for (int k = 0; k < 3; ++k) kouts.push_back(eng.create_tensor(rows, cols));
+    for (int k = 0; k < 3; ++k)
+        kouts.push_back(eng.create_tensor(rows, cols));
     auto mul_r = eng.eval_expr_multi_into(kernels[0].spec, kinputs, rows, cols, kouts);
     CHECK(static_cast<bool>(mul_r), "多输出求值成功");
     auto a_ref = eng.eval_expr(make_unary_const(nn::ExprOp::Mul, Scalar{2}),
@@ -385,10 +385,8 @@ void test_reduce_boundary()
 
     // A: y = row_sum(x)（归约，输出 (rows,1)）；B: z = y + 1（消费 y，但 B 的
     //   输入 y 形状是 (rows,1)，经 RowBroadcast 视图）→ 不融合（A 是归约）
-    const int nA = g.add_node(make_row_sum(),
-                              std::vector<nn::Tensor>{x}, rows, cols, true);
-    nn::Tensor yt = make_placeholder(eng, rows, 1,
-                                     g.tag_of_node[static_cast<std::size_t>(nA)]);
+    const int nA = g.add_node(make_row_sum(), std::vector<nn::Tensor>{x}, rows, cols, true);
+    nn::Tensor yt = make_placeholder(eng, rows, 1, g.tag_of_node[static_cast<std::size_t>(nA)]);
     nn::ExprSpec sb;
     sb.views.push_back(nn::expr::row_broadcast());  // (rows,1) 按行广播
     nn::ExprInstr in;
@@ -435,12 +433,10 @@ void test_limit_pressure()
     nn::Tensor x = make_tensor(eng, rows, cols, 0.0f, 0.1f);
 
     // A：40 条 abs 指令；B：1 条 → 拼接后 41 ≤ 64 → 融合
-    const int nA = g.add_node(make_abs_chain(40),
-                              std::vector<nn::Tensor>{x}, rows, cols, false);
-    nn::Tensor yt = make_placeholder(eng, rows, cols,
-                                     g.tag_of_node[static_cast<std::size_t>(nA)]);
-    (void)g.add_node(make_unary_const(nn::ExprOp::Add, Scalar{1}),
-                     std::vector<nn::Tensor>{yt}, rows, cols, false);
+    const int nA = g.add_node(make_abs_chain(40), std::vector<nn::Tensor>{x}, rows, cols, false);
+    nn::Tensor yt = make_placeholder(eng, rows, cols, g.tag_of_node[static_cast<std::size_t>(nA)]);
+    (void)g.add_node(make_unary_const(nn::ExprOp::Add, Scalar{1}), std::vector<nn::Tensor>{yt},
+                     rows, cols, false);
 
     auto kernels = fuse_expr_graph(g);
     CHECK(kernels.size() == 1, "40+1 条指令应在 EXPR_MAX_INSTRS=64 内 → 融合");
@@ -448,10 +444,8 @@ void test_limit_pressure()
     // A：60 条 abs；B：5 条 abs 链 → 拼接后 65 > 64 → 不融合
     nn::ExprGraph g2;
     nn::Tensor x2 = make_tensor(eng, rows, cols, 0.0f, 0.1f);
-    const int nC = g2.add_node(make_abs_chain(60),
-                               std::vector<nn::Tensor>{x2}, rows, cols, false);
-    nn::Tensor yt2 = make_placeholder(eng, rows, cols,
-                                      g.tag_of_node[static_cast<std::size_t>(nC)]);
+    const int nC = g2.add_node(make_abs_chain(60), std::vector<nn::Tensor>{x2}, rows, cols, false);
+    nn::Tensor yt2 = make_placeholder(eng, rows, cols, g.tag_of_node[static_cast<std::size_t>(nC)]);
     // B：5 条 abs 链（消费 A 输出）
     nn::ExprSpec sb = make_abs_chain(5);
     (void)g2.add_node(sb, std::vector<nn::Tensor>{yt2}, rows, cols, false);
@@ -473,10 +467,10 @@ void test_determinism()
     {
         const int nA = g.add_node(make_unary_const(nn::ExprOp::Mul, Scalar{2}),
                                   std::vector<nn::Tensor>{x}, rows, cols, false);
-        nn::Tensor yt = make_placeholder(eng, rows, cols,
-                                         g.tag_of_node[static_cast<std::size_t>(nA)]);
-        (void)g.add_node(make_unary_const(nn::ExprOp::Add, Scalar{1}),
-                         std::vector<nn::Tensor>{yt}, rows, cols, false);
+        nn::Tensor yt =
+            make_placeholder(eng, rows, cols, g.tag_of_node[static_cast<std::size_t>(nA)]);
+        (void)g.add_node(make_unary_const(nn::ExprOp::Add, Scalar{1}), std::vector<nn::Tensor>{yt},
+                         rows, cols, false);
     };
 
     nn::ExprGraph g1, g2;
@@ -505,8 +499,7 @@ void test_dep_recognition()
     const int nA = g.add_node(make_unary_const(nn::ExprOp::Mul, Scalar{2}),
                               std::vector<nn::Tensor>{x}, rows, cols, false);
     // 占位带 tag → 依赖识别
-    nn::Tensor yt = make_placeholder(eng, rows, cols,
-                                     g.tag_of_node[static_cast<std::size_t>(nA)]);
+    nn::Tensor yt = make_placeholder(eng, rows, cols, g.tag_of_node[static_cast<std::size_t>(nA)]);
     const int nB = g.add_node(make_unary_const(nn::ExprOp::Add, Scalar{1}),
                               std::vector<nn::Tensor>{yt}, rows, cols, false);
     CHECK(g.nodes[static_cast<std::size_t>(nB)].dep_of_input[0] == nA,
@@ -514,14 +507,12 @@ void test_dep_recognition()
     // 普通输入 → 外部
     const int nC = g.add_node(make_unary_const(nn::ExprOp::Sub, Scalar{1}),
                               std::vector<nn::Tensor>{x}, rows, cols, false);
-    CHECK(g.nodes[static_cast<std::size_t>(nC)].dep_of_input[0] == -1,
-          "C 的输入 0 应为外部输入");
+    CHECK(g.nodes[static_cast<std::size_t>(nC)].dep_of_input[0] == -1, "C 的输入 0 应为外部输入");
     // 未知 tag → 外部
     nn::Tensor fake = make_placeholder(eng, rows, cols, 999);
     const int nD = g.add_node(make_unary_const(nn::ExprOp::Abs, Scalar{0}),
                               std::vector<nn::Tensor>{fake}, rows, cols, false);
-    CHECK(g.nodes[static_cast<std::size_t>(nD)].dep_of_input[0] == -1,
-          "未知 tag 视为外部输入");
+    CHECK(g.nodes[static_cast<std::size_t>(nD)].dep_of_input[0] == -1, "未知 tag 视为外部输入");
     std::printf("[OK] test_dep_recognition\n");
 }
 
@@ -538,11 +529,10 @@ void test_input_order()
     nn::Tensor x3 = make_tensor(eng, rows, cols, 2.0f, 0.1f);
 
     // A: y = x1 * x2
-    const int nA = g.add_node(make_binary(nn::ExprOp::Mul),
-                              std::vector<nn::Tensor>{x1, x2}, rows, cols, false);
+    const int nA = g.add_node(make_binary(nn::ExprOp::Mul), std::vector<nn::Tensor>{x1, x2}, rows,
+                              cols, false);
     // B: z = y + x3（输入 0 = y 依赖 A，输入 1 = x3 外部）
-    nn::Tensor yt = make_placeholder(eng, rows, cols,
-                                     g.tag_of_node[static_cast<std::size_t>(nA)]);
+    nn::Tensor yt = make_placeholder(eng, rows, cols, g.tag_of_node[static_cast<std::size_t>(nA)]);
     nn::ExprSpec sb;
     sb.views.push_back(nn::expr::linear());
     sb.views.push_back(nn::expr::linear());
@@ -570,7 +560,8 @@ void test_input_order()
 
     // 数值验证：z = x1*x2 + x3（P2 多输出：主输出 = B，extras = A 写穿）
     std::vector<nn::Tensor> kinputs;
-    for (auto& in : kernels[0].inputs) kinputs.push_back(in.external);
+    for (auto& in : kernels[0].inputs)
+        kinputs.push_back(in.external);
     std::vector<nn::Tensor> kouts;
     kouts.push_back(eng.create_tensor(rows, cols));
     kouts.push_back(eng.create_tensor(rows, cols));
@@ -613,14 +604,16 @@ void test_matmul_chain_fuse()
 
     // A：matmul(A0,B0) + bias
     nn::ExprSpec sa;
-    sa.views    = {nn::expr::linear(), nn::expr::linear(), nn::expr::linear()};
+    sa.views = {nn::expr::linear(), nn::expr::linear(), nn::expr::linear()};
     sa.num_regs = 1;
-    sa.matmul   = nn::MatmulSpec{0, 1, 0, 0, static_cast<std::uint32_t>(K), 1};
-    sa.instrs.push_back({static_cast<std::uint8_t>(nn::ExprOp::Add), 0,
-                         nn::expr::matmul_op(), nn::expr::input(2), {}});
+    sa.matmul = nn::MatmulSpec{0, 1, 0, 0, static_cast<std::uint32_t>(K), 1};
+    sa.instrs.push_back({static_cast<std::uint8_t>(nn::ExprOp::Add),
+                         0,
+                         nn::expr::matmul_op(),
+                         nn::expr::input(2),
+                         {}});
     const int nA = g.add_node(sa, std::vector<nn::Tensor>{A0, B0, bias}, M, N, false);
-    nn::Tensor yt = make_placeholder(eng, M, N,
-                                     g.tag_of_node[static_cast<std::size_t>(nA)]);
+    nn::Tensor yt = make_placeholder(eng, M, N, g.tag_of_node[static_cast<std::size_t>(nA)]);
     // B：relu（max(y, 0)）消费 A
     const int nB = g.add_node(make_unary_const(nn::ExprOp::Max, Scalar{0}),
                               std::vector<nn::Tensor>{yt}, M, N, false);
@@ -638,7 +631,8 @@ void test_matmul_chain_fuse()
 
     // 融合 kernel 求值 vs 逐节点参考
     std::vector<nn::Tensor> kinputs;
-    for (auto& in : kernels[0].inputs) kinputs.push_back(in.external);
+    for (auto& in : kernels[0].inputs)
+        kinputs.push_back(in.external);
     auto fused = eng.eval_expr(kernels[0].spec, kinputs, M, N);
     CHECK(static_cast<bool>(fused), "融合 kernel 求值成功");
     if (!fused) return;
@@ -668,18 +662,20 @@ void test_matmul_pure_chain_fuse()
 
     // A：纯 matmul（空指令链）
     nn::ExprSpec sa;
-    sa.views    = {nn::expr::linear(), nn::expr::linear()};
+    sa.views = {nn::expr::linear(), nn::expr::linear()};
     sa.num_regs = 0;
-    sa.matmul   = nn::MatmulSpec{0, 1, 0, 0, static_cast<std::uint32_t>(K), 1};
+    sa.matmul = nn::MatmulSpec{0, 1, 0, 0, static_cast<std::uint32_t>(K), 1};
     const int nA = g.add_node(sa, std::vector<nn::Tensor>{A0, B0}, M, N, false);
-    nn::Tensor yt = make_placeholder(eng, M, N,
-                                     g.tag_of_node[static_cast<std::size_t>(nA)]);
+    nn::Tensor yt = make_placeholder(eng, M, N, g.tag_of_node[static_cast<std::size_t>(nA)]);
     // B：Add(y, bias)
     nn::ExprSpec sb;
-    sb.views    = {nn::expr::linear(), nn::expr::linear()};
+    sb.views = {nn::expr::linear(), nn::expr::linear()};
     sb.num_regs = 1;
-    sb.instrs.push_back({static_cast<std::uint8_t>(nn::ExprOp::Add), 0,
-                         nn::expr::input(0), nn::expr::input(1), {}});
+    sb.instrs.push_back({static_cast<std::uint8_t>(nn::ExprOp::Add),
+                         0,
+                         nn::expr::input(0),
+                         nn::expr::input(1),
+                         {}});
     const int nB = g.add_node(sb, std::vector<nn::Tensor>{yt, bias}, M, N, false);
     (void)nB;
 
@@ -695,7 +691,8 @@ void test_matmul_pure_chain_fuse()
     if (!kernels[0].spec.matmul) return;
 
     std::vector<nn::Tensor> kinputs;
-    for (auto& in : kernels[0].inputs) kinputs.push_back(in.external);
+    for (auto& in : kernels[0].inputs)
+        kinputs.push_back(in.external);
     auto fused = eng.eval_expr(kernels[0].spec, kinputs, M, N);
     CHECK(static_cast<bool>(fused), "融合 kernel 求值成功");
     if (!fused) return;
@@ -719,7 +716,7 @@ void test_emitter()
     nn::ExprSpec s = make_unary_const(nn::ExprOp::Mul, Scalar{2});
 
     auto glsl = nn::emitter_registry::make("glsl");
-    auto cpu  = nn::emitter_registry::make("cpu");
+    auto cpu = nn::emitter_registry::make("cpu");
     auto none = nn::emitter_registry::make("nonexistent");
     CHECK(static_cast<bool>(glsl), "GlslEmitter 已注册可创建");
     // CpuEmitter 产物从不参与编译（gen_fused 硬编码 glsl），死代码已清除（docs/17 §1.3）

@@ -64,11 +64,11 @@ namespace nn
 // ── 图 IR 节点 ────────────────────────────────────────────────────────────
 struct ExprGraphNode
 {
-    ExprSpec    spec;          // canonical IR（录制时已 canonicalize）
+    ExprSpec spec;          // canonical IR（录制时已 canonicalize）
     std::size_t rows = 0;      // 输出形状（统一网格 (rows, cols)）
     std::size_t cols = 0;
-    bool        vector_out = false;  // 输出为归约向量（(rows,1)/(1,cols)）
-    Precision   prec = Precision::F32;  // 求值精度（恢复时新增：融合成员须一致）
+    bool vector_out = false;  // 输出为归约向量（(rows,1)/(1,cols)）
+    Precision prec = Precision::F32;  // 求值精度（恢复时新增：融合成员须一致）
     // RV-03：本节点的**写目标存储标识**（Tensor::storage_id()）。0 = 本节点输出
     // 是一块新占位存储（dsl::compute 建的新张量）；非 0 = 目标传递节点
     // （dsl::compute_into / eval_expr_into 写进既有张量）。用于把"同目标的多次写"
@@ -101,28 +101,24 @@ struct ExprGraph
 
     // 录制：把一个表达式加入图，返回节点下标。
     // inputs 中带 virtual_tag 的占位 Tensor 会被识别为前序节点输出（依赖边）。
-    [[nodiscard]] int add_node(const ExprSpec& raw_spec,
-                               std::span<const Tensor> inputs,
-                               std::size_t rows, std::size_t cols,
-                               bool vector_out,
-                               Precision prec = Precision::F32,
-                               std::uintptr_t dst_id = 0)
+    [[nodiscard]] int add_node(const ExprSpec& raw_spec, std::span<const Tensor> inputs,
+                               std::size_t rows, std::size_t cols, bool vector_out,
+                               Precision prec = Precision::F32, std::uintptr_t dst_id = 0)
     {
         const ExprSpec spec = canonicalize_expr_spec(raw_spec);
         const int idx = static_cast<int>(nodes.size());
         ExprGraphNode nd;
-        nd.spec        = spec;
-        nd.rows        = rows;
-        nd.cols        = cols;
-        nd.vector_out  = vector_out;
-        nd.prec        = prec;
-        nd.dst_id      = dst_id;   // RV-03：目标传递节点的写目标（0 = 新占位存储）
+        nd.spec = spec;
+        nd.rows = rows;
+        nd.cols = cols;
+        nd.vector_out = vector_out;
+        nd.prec = prec;
+        nd.dst_id = dst_id;   // RV-03：目标传递节点的写目标（0 = 新占位存储）
         nd.dep_of_input.reserve(spec.views.size());
         nd.input_tensors.reserve(spec.views.size());
         for (std::size_t k = 0; k < spec.views.size(); ++k)
         {
-            const std::uint64_t tag = (k < inputs.size())
-                ? inputs[k].virtual_tag() : 0;
+            const std::uint64_t tag = (k < inputs.size()) ? inputs[k].virtual_tag() : 0;
             const auto it = (tag != 0) ? node_by_tag.find(tag) : node_by_tag.end();
             if (it != node_by_tag.end())
             {
@@ -132,8 +128,7 @@ struct ExprGraph
             else
             {
                 nd.dep_of_input.push_back(-1);
-                nd.input_tensors.push_back(
-                    (k < inputs.size()) ? inputs[k] : Tensor{});
+                nd.input_tensors.push_back((k < inputs.size()) ? inputs[k] : Tensor{});
             }
         }
         nodes.push_back(std::move(nd));
@@ -149,23 +144,23 @@ struct ExprGraph
 // 一个 kernel = 一个（可能为多个节点拼接的）复合 ExprSpec + 外部输入来源。
 struct FusedKernelInput
 {
-    int     node = -1;   // >= 0：该输入是图节点 node 的输出（作为外部 buffer 绑定）
-    Tensor  external;    // node < 0：Layer 外部输入（运行时张量）
+    int node = -1;   // >= 0：该输入是图节点 node 的输出（作为外部 buffer 绑定）
+    Tensor external;    // node < 0：Layer 外部输入（运行时张量）
     // P2-12（图级缓存跨 step 复用）：node < 0 时记录该外部输入的来源，
     // 以便从缓存计划反查当前图对应节点的输入槽（input_tensors[ext_slot]）。
-    int     ext_node = -1;  // 来源原图节点 index
-    int     ext_slot = -1;  // 来源节点输入槽 index
+    int ext_node = -1;  // 来源原图节点 index
+    int ext_slot = -1;  // 来源节点输入槽 index
 };
 
 struct FusedKernel
 {
-    ExprSpec    spec;             // 复合 spec（canonical）
+    ExprSpec spec;             // 复合 spec（canonical）
     std::vector<FusedKernelInput> inputs;  // 与 spec.views 一一对应
     std::size_t rows = 0;
     std::size_t cols = 0;
-    bool        vector_out = false;
-    Precision   prec = Precision::F32;   // 成员共同精度（恢复时新增）
-    int         tail = -1;        // 末尾节点（输出节点）在图中下标
+    bool vector_out = false;
+    Precision prec = Precision::F32;   // 成员共同精度（恢复时新增）
+    int tail = -1;        // 末尾节点（输出节点）在图中下标
     std::vector<int> members;     // kernel 包含的节点（顺序 = 融合顺序）
 };
 
@@ -220,16 +215,14 @@ namespace fused
             const std::uintptr_t id = t.storage_id();
             if (id == 0) continue;             // 无存储（不该发生）
             const auto w = last_writer.find(id);
-            if (w != last_writer.end() && w->second < i)
-                out.emplace_back(w->second, i);
+            if (w != last_writer.end() && w->second < i) out.emplace_back(w->second, i);
             readers[id].push_back(i);
         }
         // ② 写：与上一次写（WAW）、以及上次写之后的所有读者（WAR）建边
         const std::uintptr_t d = n.dst_id;
         if (d == 0) continue;                  // 新占位存储，无写序隐患
         const auto w = last_writer.find(d);
-        if (w != last_writer.end() && w->second < i)
-            out.emplace_back(w->second, i);
+        if (w != last_writer.end() && w->second < i) out.emplace_back(w->second, i);
         const auto r = readers.find(d);
         if (r != readers.end())
         {
@@ -246,8 +239,8 @@ namespace fused
 
 // RV-03 兜底校验：给定**执行序**下的 kernel 列表，检查每条顺序隐患边都保序。
 // 违反 = 静默错值的隐患已经成真 → fail-fast（绝不静默算错）。
-[[nodiscard]] inline Result<void> validate_dst_order(
-    const ExprGraph& g, std::span<const FusedKernel> ordered_kernels)
+[[nodiscard]] inline Result<void> validate_dst_order(const ExprGraph& g,
+                                                     std::span<const FusedKernel> ordered_kernels)
 {
     const std::vector<std::pair<int, int>> edges = dst_order_constraints(g);
     if (edges.empty()) return {};
@@ -257,8 +250,7 @@ namespace fused
         for (std::size_t m = 0; m < ordered_kernels[k].members.size(); ++m)
         {
             const int node = ordered_kernels[k].members[m];
-            if (node < 0 || static_cast<std::size_t>(node) >= g.nodes.size())
-                continue;
+            if (node < 0 || static_cast<std::size_t>(node) >= g.nodes.size()) continue;
             kernel_pos[static_cast<std::size_t>(node)] = static_cast<int>(k);
             member_pos[static_cast<std::size_t>(node)] = static_cast<int>(m);
         }
@@ -269,12 +261,11 @@ namespace fused
         if (pi < 0 || pj < 0) continue;        // 未被任何 kernel 覆盖（不该发生）
         if (pi < pj) continue;                 // i 的 kernel 先执行 → 保序
         // 同一 kernel 内：成员序必须保持 i 在 j 之前
-        if (pi == pj && member_pos[static_cast<std::size_t>(i)] <
-                        member_pos[static_cast<std::size_t>(j)])
+        if (pi == pj &&
+            member_pos[static_cast<std::size_t>(i)] < member_pos[static_cast<std::size_t>(j)])
             continue;
-        NN_FAIL("IR-C 顺序隐患被破坏（同目标写序/WAR 要求节点 i 先于 j 执行）：i="
-                + std::to_string(i) + " j=" + std::to_string(j)
-                + "（分组或重排拆掉了显式顺序边）");
+        NN_FAIL("IR-C 顺序隐患被破坏（同目标写序/WAR 要求节点 i 先于 j 执行）：i=" +
+                std::to_string(i) + " j=" + std::to_string(j) + "（分组或重排拆掉了显式顺序边）");
     }
     return {};
 }
@@ -285,15 +276,13 @@ namespace fused
 [[nodiscard]] inline std::vector<FusedKernel> fuse_expr_graph(const ExprGraph& g)
 {
     std::vector<FusedKernel> kernels;
-    if (g.nodes.empty())
-        return kernels;
+    if (g.nodes.empty()) return kernels;
 
     // 消费者表：节点 j 被哪些节点消费（dep_of_input 引用 j）
     std::vector<std::vector<int>> consumers(g.nodes.size());
     for (std::size_t i = 0; i < g.nodes.size(); ++i)
         for (const int dep : g.nodes[i].dep_of_input)
-            if (dep >= 0)
-                consumers[static_cast<std::size_t>(dep)].push_back(static_cast<int>(i));
+            if (dep >= 0) consumers[static_cast<std::size_t>(dep)].push_back(static_cast<int>(i));
 
     // RV-03：顺序隐患边（同目标写序 / WAR）——有隐患关系的两个节点**不得**合进
     // 同一 kernel：同一 dispatch 内的多次写，其先后不再由 kernel 执行序决定。
@@ -302,8 +291,7 @@ namespace fused
     {
         if (a == b) return false;
         if (a > b) std::swap(a, b);
-        return std::binary_search(order_edges.begin(), order_edges.end(),
-                                  std::make_pair(a, b));
+        return std::binary_search(order_edges.begin(), order_edges.end(), std::make_pair(a, b));
     };
 
     // ── 尝试把节点 bi 并入当前 kernel（cur） ───────────────────────────
@@ -349,8 +337,7 @@ namespace fused
                 other_slots.push_back(static_cast<int>(k));
             }
         }
-        if (tail_slots.empty())
-            return false;
+        if (tail_slots.empty()) return false;
 
         // 3) 拼接（确定性：tail 的 views/consts/instrs 在前，B 的在后）
         // A 纯 matmul（空链，S5）时无输出寄存器：B 对 A 输出的引用替换为
@@ -365,8 +352,7 @@ namespace fused
         // 寄存器空洞（A 的寄存器 0..num_regs-1 之后空出 instrs.size()-num_regs 个号），
         // 浪费寄存器并可能使本可融合的表达式超出 EXPR_MAX_REGS=16 而被放弃。
         for (const auto& ins : Bs.instrs)
-            if (static_cast<std::size_t>(ins.dst) + A.num_regs >= 256)
-                return false;
+            if (static_cast<std::size_t>(ins.dst) + A.num_regs >= 256) return false;
 
         std::vector<ExprView> views = A.views;
         std::vector<int> b_view_map(Bs.views.size(), -1);
@@ -402,20 +388,17 @@ namespace fused
                 if (o.kind == static_cast<std::uint8_t>(ExprOperandKind::Input))
                 {
                     const std::size_t k = o.idx;
-                    const auto it = std::find(tail_slots.begin(), tail_slots.end(),
-                                              static_cast<int>(k));
+                    const auto it =
+                        std::find(tail_slots.begin(), tail_slots.end(), static_cast<int>(k));
                     if (it != tail_slots.end())
                     {
-                        if (a_pure_matmul)
-                            return expr::matmul_op();  // 引用前置 matmul 段输出
+                        if (a_pure_matmul) return expr::matmul_op();  // 引用前置 matmul 段输出
                         return expr::reg(static_cast<std::uint8_t>(out_reg_A));
                     }
-                    return expr::input(static_cast<std::uint8_t>(
-                        b_view_map[k]));
+                    return expr::input(static_cast<std::uint8_t>(b_view_map[k]));
                 }
                 if (o.kind == static_cast<std::uint8_t>(ExprOperandKind::Const))
-                    return expr::cst(static_cast<std::uint8_t>(
-                        o.idx + b_const_base));
+                    return expr::cst(static_cast<std::uint8_t>(o.idx + b_const_base));
                 if (o.kind == static_cast<std::uint8_t>(ExprOperandKind::RParam))
                     return {o.kind, static_cast<std::uint8_t>(o.idx + b_rp_base)};
                 if (o.kind == static_cast<std::uint8_t>(ExprOperandKind::Reg) ||
@@ -424,8 +407,7 @@ namespace fused
                     return {o.kind, static_cast<std::uint8_t>(o.idx + reg_base)};
                 return o;
             };
-            const std::size_t nops =
-                expr_instr_num_operands(static_cast<ExprOp>(ins.op));
+            const std::size_t nops = expr_instr_num_operands(static_cast<ExprOp>(ins.op));
             ni.a = remap_op(ins.a);
             if (nops >= 2) ni.b = remap_op(ins.b);
             if (nops >= 3) ni.c = remap_op(ins.c);
@@ -433,12 +415,12 @@ namespace fused
         }
 
         ExprSpec fused;
-        fused.views   = std::move(views);
-        fused.consts  = std::move(consts);
+        fused.views = std::move(views);
+        fused.consts = std::move(consts);
         fused.rparams = std::move(rparams);
-        fused.instrs  = std::move(instrs);
+        fused.instrs = std::move(instrs);
         fused.num_regs = static_cast<std::uint32_t>(reg_base + Bs.num_regs);
-        fused.matmul  = A.matmul;   // 保留前置 matmul 段（S5：matmul 参与图融合）
+        fused.matmul = A.matmul;   // 保留前置 matmul 段（S5：matmul 参与图融合）
         fused = canonicalize_expr_spec(fused);
         if (auto v = validate_expr_spec(fused, fused.views.size()); !v)
             return false;  // 超限/非法 → 放弃融合（保守）
@@ -449,19 +431,19 @@ namespace fused
         {
             const std::size_t kk = static_cast<std::size_t>(k);
             if (B.dep_of_input[kk] < 0)
-                new_inputs.push_back(FusedKernelInput{
-                    /*node=*/-1, /*external=*/B.input_tensors[kk],
-                    /*ext_node=*/bi, /*ext_slot=*/static_cast<int>(kk)});
+                new_inputs.push_back(FusedKernelInput{/*node=*/-1, /*external=*/B.input_tensors[kk],
+                                                      /*ext_node=*/bi,
+                                                      /*ext_slot=*/static_cast<int>(kk)});
             else
-                new_inputs.push_back(FusedKernelInput{
-                    /*node=*/B.dep_of_input[kk], /*external=*/Tensor{}});
+                new_inputs.push_back(
+                    FusedKernelInput{/*node=*/B.dep_of_input[kk], /*external=*/Tensor{}});
         }
-        cur.spec       = std::move(fused);
-        cur.inputs     = std::move(new_inputs);
-        cur.rows       = B.rows;
-        cur.cols       = B.cols;
-        cur.prec       = B.prec;
-        cur.tail       = bi;
+        cur.spec = std::move(fused);
+        cur.inputs = std::move(new_inputs);
+        cur.rows = B.rows;
+        cur.cols = B.cols;
+        cur.prec = B.prec;
+        cur.tail = bi;
         cur.members.push_back(bi);
         return true;
     };
@@ -474,9 +456,8 @@ namespace fused
     const auto p2_eligible = [&](std::size_t i) -> bool
     {
         const auto& N = g.nodes[i];
-        return !N.vector_out && N.prec == Precision::F32 &&
-               !N.spec.instrs.empty() && !N.spec.matmul && !N.spec.fold &&
-               expr_spec_reduce_axis(N.spec) == -1;
+        return !N.vector_out && N.prec == Precision::F32 && !N.spec.instrs.empty() &&
+               !N.spec.matmul && !N.spec.fold && expr_spec_reduce_axis(N.spec) == -1;
     };
     std::vector<int> uf_parent(g.nodes.size());
     for (std::size_t i = 0; i < uf_parent.size(); ++i)
@@ -486,32 +467,27 @@ namespace fused
         while (uf_parent[static_cast<std::size_t>(x)] != x)
         {
             uf_parent[static_cast<std::size_t>(x)] =
-                uf_parent[static_cast<std::size_t>(
-                    uf_parent[static_cast<std::size_t>(x)])];
+                uf_parent[static_cast<std::size_t>(uf_parent[static_cast<std::size_t>(x)])];
             x = uf_parent[static_cast<std::size_t>(x)];
         }
         return x;
     };
     for (std::size_t i = 0; i < g.nodes.size(); ++i)
     {
-        if (!p2_eligible(i))
-            continue;
+        if (!p2_eligible(i)) continue;
         for (const int d : g.nodes[i].dep_of_input)
         {
-            if (d < 0 || !p2_eligible(static_cast<std::size_t>(d)))
-                continue;
+            if (d < 0 || !p2_eligible(static_cast<std::size_t>(d))) continue;
             const auto& A = g.nodes[static_cast<std::size_t>(d)];
             const auto& B = g.nodes[i];
-            if (A.rows != B.rows || A.cols != B.cols || A.prec != B.prec)
-                continue;
+            if (A.rows != B.rows || A.cols != B.cols || A.prec != B.prec) continue;
             const int ra = uf_find(d);
             const int rb = uf_find(static_cast<int>(i));
             if (ra != rb)
             {
                 // RV-03：先检查顺序隐患——有隐患的节点不得进入同一分量
                 // （同一 kernel 内的写序不再由 kernel 执行序决定）
-                if (has_hazard(d, static_cast<int>(i)))
-                    continue;
+                if (has_hazard(d, static_cast<int>(i))) continue;
                 uf_parent[static_cast<std::size_t>(std::max(ra, rb))] =
                     std::min(ra, rb);   // 小根为根：确定性
             }
@@ -529,30 +505,29 @@ namespace fused
     {
         const auto& N = g.nodes[i];
         FusedKernel k;
-        k.spec       = N.spec;
-        k.rows       = N.rows;
-        k.cols       = N.cols;
+        k.spec = N.spec;
+        k.rows = N.rows;
+        k.cols = N.cols;
         k.vector_out = N.vector_out;
-        k.prec       = N.prec;
-        k.tail       = static_cast<int>(i);
+        k.prec = N.prec;
+        k.tail = static_cast<int>(i);
         k.members.push_back(static_cast<int>(i));
         for (std::size_t kk = 0; kk < N.spec.views.size(); ++kk)
         {
             if (kk >= N.dep_of_input.size() || N.dep_of_input[kk] < 0)
                 k.inputs.push_back(FusedKernelInput{
                     /*node=*/-1,
-                    /*external=*/(kk < N.input_tensors.size()) ? N.input_tensors[kk]
-                                                               : Tensor{},
+                    /*external=*/(kk < N.input_tensors.size()) ? N.input_tensors[kk] : Tensor{},
                     /*ext_node=*/static_cast<int>(i), /*ext_slot=*/static_cast<int>(kk)});
             else
-                k.inputs.push_back(FusedKernelInput{
-                    /*node=*/N.dep_of_input[kk], /*external=*/Tensor{}});
+                k.inputs.push_back(
+                    FusedKernelInput{/*node=*/N.dep_of_input[kk], /*external=*/Tensor{}});
         }
         kernels.push_back(std::move(k));
         k_members.push_back({static_cast<int>(i)});
         k_out_reg.push_back(N.spec.instrs.empty()
-            ? std::vector<std::uint8_t>{}
-            : std::vector<std::uint8_t>{N.spec.instrs.back().dst});
+                                ? std::vector<std::uint8_t>{}
+                                : std::vector<std::uint8_t>{N.spec.instrs.back().dst});
         k_is_comp.push_back(comp ? 1 : 0);
         return kernels.size() - 1;
     };
@@ -569,16 +544,14 @@ namespace fused
         const auto& outs0 = k_out_reg[ki];
         const ExprGraphNode& B = g.nodes[bi];
         const ExprSpec& Bs = B.spec;
-        if (Bs.instrs.empty() || Bs.matmul || Bs.fold)
-            return false;
+        if (Bs.instrs.empty() || Bs.matmul || Bs.fold) return false;
         // RV-03：同目标写序 / WAR 隐患的两端不合组（见 has_hazard 的说明）
         for (const int m : mem0)
             if (has_hazard(m, static_cast<int>(bi))) return false;
         const auto member_idx = [&](int dep) -> int
         {
             for (std::size_t m = 0; m < mem0.size(); ++m)
-                if (mem0[m] == dep)
-                    return static_cast<int>(m);
+                if (mem0[m] == dep) return static_cast<int>(m);
             return -1;
         };
 
@@ -605,27 +578,19 @@ namespace fused
                 if (dep < 0)
                     inputs.push_back(FusedKernelInput{
                         /*node=*/-1,
-                        /*external=*/(k < B.input_tensors.size()) ? B.input_tensors[k]
-                                                                 : Tensor{},
+                        /*external=*/(k < B.input_tensors.size()) ? B.input_tensors[k] : Tensor{},
                         /*ext_node=*/static_cast<int>(bi),
                         /*ext_slot=*/static_cast<int>(k)});
-                else
-                    inputs.push_back(FusedKernelInput{
-                        /*node=*/dep, /*external=*/Tensor{}});
+                else inputs.push_back(FusedKernelInput{/*node=*/dep, /*external=*/Tensor{}});
             }
         }
 
         // 预算预检（保守：按拼接后原始计数；上限 = validate_expr_spec 同源）
-        if (cur.spec.instrs.size() + Bs.instrs.size() > EXPR_MAX_INSTRS)
-            return false;
-        if (cur.spec.num_regs + Bs.num_regs > 255)
-            return false;
-        if (cur.spec.consts.size() + Bs.consts.size() > EXPR_MAX_CONSTS)
-            return false;
-        if (cur.spec.rparams.size() + Bs.rparams.size() > EXPR_MAX_CONSTS)
-            return false;
-        if (views.size() > EXPR_MAX_INPUTS)
-            return false;
+        if (cur.spec.instrs.size() + Bs.instrs.size() > EXPR_MAX_INSTRS) return false;
+        if (cur.spec.num_regs + Bs.num_regs > 255) return false;
+        if (cur.spec.consts.size() + Bs.consts.size() > EXPR_MAX_CONSTS) return false;
+        if (cur.spec.rparams.size() + Bs.rparams.size() > EXPR_MAX_CONSTS) return false;
+        if (views.size() > EXPR_MAX_INPUTS) return false;
 
         std::vector<Scalar> consts = cur.spec.consts;
         const std::size_t b_const_base = consts.size();
@@ -654,8 +619,7 @@ namespace fused
                     return expr::input(static_cast<std::uint8_t>(slot_map[k]));
                 }
                 if (o.kind == static_cast<std::uint8_t>(ExprOperandKind::Const))
-                    return expr::cst(static_cast<std::uint8_t>(
-                        o.idx + b_const_base));
+                    return expr::cst(static_cast<std::uint8_t>(o.idx + b_const_base));
                 if (o.kind == static_cast<std::uint8_t>(ExprOperandKind::RParam))
                     return {o.kind, static_cast<std::uint8_t>(o.idx + b_rp_base)};
                 if (o.kind == static_cast<std::uint8_t>(ExprOperandKind::Reg) ||
@@ -664,8 +628,7 @@ namespace fused
                     return {o.kind, static_cast<std::uint8_t>(o.idx + reg_base)};
                 return o;
             };
-            const std::size_t nops =
-                expr_instr_num_operands(static_cast<ExprOp>(ins.op));
+            const std::size_t nops = expr_instr_num_operands(static_cast<ExprOp>(ins.op));
             ni.a = remap(ins.a);
             if (nops >= 2) ni.b = remap(ins.b);
             if (nops >= 3) ni.c = remap(ins.c);
@@ -673,27 +636,27 @@ namespace fused
         }
 
         ExprSpec fused;
-        fused.views   = std::move(views);
-        fused.consts  = std::move(consts);
+        fused.views = std::move(views);
+        fused.consts = std::move(consts);
         fused.rparams = std::move(rparams);
-        fused.instrs  = std::move(instrs);
+        fused.instrs = std::move(instrs);
         fused.num_regs = static_cast<std::uint32_t>(reg_base + Bs.num_regs);
         outs.push_back(static_cast<std::uint8_t>(Bs.instrs.back().dst + reg_base));
         fused.extras.assign(outs.begin(), outs.end() - 1);
         if (auto v = validate_expr_spec(fused, fused.views.size()); !v)
             return false;   // 超限/非法 → 放弃并入（保守）
 
-        cur.spec       = std::move(fused);
-        cur.inputs     = std::move(inputs);
-        cur.rows       = B.rows;
-        cur.cols       = B.cols;
-        cur.prec       = B.prec;
-        cur.tail       = static_cast<int>(bi);
+        cur.spec = std::move(fused);
+        cur.inputs = std::move(inputs);
+        cur.rows = B.rows;
+        cur.cols = B.cols;
+        cur.prec = B.prec;
+        cur.tail = static_cast<int>(bi);
         cur.members.push_back(static_cast<int>(bi));
         mem.push_back(static_cast<int>(bi));   // 簿记同步（供后续成员的依赖查找）
-        kernels[ki]    = std::move(cur);
-        k_members[ki]  = std::move(mem);
-        k_out_reg[ki]  = std::move(outs);
+        kernels[ki] = std::move(cur);
+        k_members[ki] = std::move(mem);
+        k_out_reg[ki] = std::move(outs);
         return true;
     };
 
@@ -704,8 +667,8 @@ namespace fused
     //    按 P1 链语义。分量 kernel 与 P1 kernel 互不混拼。
     for (std::size_t i = 0; i < g.nodes.size(); ++i)
     {
-        if (!kernels.empty() && kernels.back().spec.matmul &&
-            !k_is_comp.back() && try_append(kernels.back(), static_cast<int>(i)))
+        if (!kernels.empty() && kernels.back().spec.matmul && !k_is_comp.back() &&
+            try_append(kernels.back(), static_cast<int>(i)))
         {
             k_members.back().push_back(static_cast<int>(i));
             k_out_reg.back().clear();   // P1 单输出（不写穿）
@@ -721,8 +684,7 @@ namespace fused
                 comp_kernel.emplace(root, open_kernel(i, /*comp=*/true));
                 continue;
             }
-            if (comp_append(it->second, i))
-                continue;
+            if (comp_append(it->second, i)) continue;
             // 预算不足：分裂——同分量余下成员进新 kernel（跨 kernel 依赖经
             // 写穿输出读取），映射顶替为新 kernel
             it->second = open_kernel(i, /*comp=*/true);
@@ -757,15 +719,15 @@ namespace fused
 // 缓存的 kernel 计划（不含运行时张量）
 struct FusedKernelPlan
 {
-    ExprSpec           spec;             // 复合 spec（canonical）
-    std::vector<int>   input_node;       // 每输入槽：来源节点 idx（>=0）或 -1（外部）
-    std::vector<int>   input_ext_node;   // 外部时：来源原图节点 idx
-    std::vector<int>   input_ext_slot;   // 外部时：来源节点输入槽 index
-    std::size_t        rows = 0, cols = 0;
-    bool               vector_out = false;
-    Precision          prec = Precision::F32;
-    int                tail = -1;
-    std::vector<int>   members;
+    ExprSpec spec;             // 复合 spec（canonical）
+    std::vector<int> input_node;       // 每输入槽：来源节点 idx（>=0）或 -1（外部）
+    std::vector<int> input_ext_node;   // 外部时：来源原图节点 idx
+    std::vector<int> input_ext_slot;   // 外部时：来源节点输入槽 index
+    std::size_t rows = 0, cols = 0;
+    bool vector_out = false;
+    Precision prec = Precision::F32;
+    int tail = -1;
+    std::vector<int> members;
 };
 
 // 整图结构 key（FNV-1a）：覆盖节点 spec key、形状、vector_out、精度、依赖拓扑。
@@ -807,8 +769,8 @@ struct FusedKernelPlan
             int grp = 0;
             if (n.dst_id != 0)
             {
-                const auto [it, inserted] = dst_group.emplace(
-                    n.dst_id, static_cast<int>(dst_group.size()) + 1);
+                const auto [it, inserted] =
+                    dst_group.emplace(n.dst_id, static_cast<int>(dst_group.size()) + 1);
                 (void)inserted;
                 grp = it->second;
             }
@@ -826,13 +788,13 @@ struct FusedKernelPlan
 [[nodiscard]] inline FusedKernelPlan plan_from_kernel(const FusedKernel& k)
 {
     FusedKernelPlan p;
-    p.spec        = k.spec;
-    p.rows        = k.rows;
-    p.cols        = k.cols;
-    p.vector_out  = k.vector_out;
-    p.prec        = k.prec;
-    p.tail        = k.tail;
-    p.members     = k.members;
+    p.spec = k.spec;
+    p.rows = k.rows;
+    p.cols = k.cols;
+    p.vector_out = k.vector_out;
+    p.prec = k.prec;
+    p.tail = k.tail;
+    p.members = k.members;
     p.input_node.reserve(k.inputs.size());
     p.input_ext_node.reserve(k.inputs.size());
     p.input_ext_slot.reserve(k.inputs.size());
@@ -849,13 +811,13 @@ struct FusedKernelPlan
 [[nodiscard]] inline FusedKernel instantiate_plan(const FusedKernelPlan& p, const ExprGraph& g)
 {
     FusedKernel k;
-    k.spec        = p.spec;
-    k.rows        = p.rows;
-    k.cols        = p.cols;
-    k.vector_out  = p.vector_out;
-    k.prec        = p.prec;
-    k.tail        = p.tail;
-    k.members     = p.members;
+    k.spec = p.spec;
+    k.rows = p.rows;
+    k.cols = p.cols;
+    k.vector_out = p.vector_out;
+    k.prec = p.prec;
+    k.tail = p.tail;
+    k.members = p.members;
     k.inputs.reserve(p.input_node.size());
     for (std::size_t i = 0; i < p.input_node.size(); ++i)
     {
@@ -866,9 +828,9 @@ struct FusedKernelPlan
             in.ext_node = p.input_ext_node[i];
             in.ext_slot = p.input_ext_slot[i];
             in.external = (in.ext_node >= 0 && in.ext_slot >= 0)
-                ? g.nodes[static_cast<std::size_t>(in.ext_node)]
-                      .input_tensors[static_cast<std::size_t>(in.ext_slot)]
-                : Tensor{};
+                              ? g.nodes[static_cast<std::size_t>(in.ext_node)]
+                                    .input_tensors[static_cast<std::size_t>(in.ext_slot)]
+                              : Tensor{};
         }
         k.inputs.push_back(std::move(in));
     }
@@ -896,12 +858,10 @@ struct FusedKernelPlan
 namespace fused
 {
 
-[[nodiscard]] inline std::unordered_map<std::uint64_t,
-                                        std::vector<FusedKernelPlan>>&
+[[nodiscard]] inline std::unordered_map<std::uint64_t, std::vector<FusedKernelPlan>>&
 graph_plan_cache()
 {
-    static thread_local std::unordered_map<std::uint64_t,
-                                           std::vector<FusedKernelPlan>> c;
+    static thread_local std::unordered_map<std::uint64_t, std::vector<FusedKernelPlan>> c;
     return c;
 }
 inline constexpr std::size_t GRAPH_PLAN_CACHE_MAX = 512;

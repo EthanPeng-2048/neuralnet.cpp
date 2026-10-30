@@ -51,12 +51,14 @@ int g_fail = 0;
 // Tensor 不再保存引擎指针；测试里的 matrix_of 按张量设备选择对应引擎。
 nn::CpuEngine* g_cpu_engine = nullptr;
 nn::GpuEngine* g_gpu_engine = nullptr;
-#define CHECK(cond, msg)                                                     \
-    do {                                                                     \
-        if (!(cond)) {                                                       \
-            std::printf("[FAIL] %s\n", msg);                                 \
-            ++g_fail;                                                        \
-        }                                                                    \
+#define CHECK(cond, msg)                     \
+    do                                       \
+    {                                        \
+        if (!(cond))                         \
+        {                                    \
+            std::printf("[FAIL] %s\n", msg); \
+            ++g_fail;                        \
+        }                                    \
     } while (0)
 
 nn::Tensor make_cpu_tensor(nn::CpuEngine& cpu, std::size_t rows, std::size_t cols,
@@ -64,7 +66,8 @@ nn::Tensor make_cpu_tensor(nn::CpuEngine& cpu, std::size_t rows, std::size_t col
 {
     std::uniform_real_distribution<Scalar> dist(-1.0f, 1.0f);
     nn::Matrix m(rows, cols);
-    for (auto& v : m.span()) v = dist(rng);
+    for (auto& v : m.span())
+        v = dist(rng);
     auto t = cpu.from_matrix(m);
     if (!t)
     {
@@ -95,9 +98,8 @@ nn::Matrix matrix_of(const nn::Tensor& t)
         ++g_fail;
         return nn::Matrix(0, 0);
     }
-    nn::ComputeEngine& engine = t.is_gpu()
-        ? static_cast<nn::ComputeEngine&>(*g_gpu_engine)
-        : static_cast<nn::ComputeEngine&>(*g_cpu_engine);
+    nn::ComputeEngine& engine = t.is_gpu() ? static_cast<nn::ComputeEngine&>(*g_gpu_engine)
+                                           : static_cast<nn::ComputeEngine&>(*g_cpu_engine);
     auto m = engine.to_matrix(t);
     if (!m)
     {
@@ -137,7 +139,11 @@ int run_chain3(nn::CpuEngine& cpu, nn::GpuEngine& gpu)
     auto c1 = nn::test_fuse::chain3_a(cpu, x, R, C);
     auto c2 = nn::test_fuse::chain3_b(cpu, *c1, R, C);
     auto c3 = nn::test_fuse::chain3_c(cpu, *c2, g, R, C);
-    if (!c1 || !c2 || !c3) { std::printf("[FAIL] CPU 参考求值失败\n"); return 1; }
+    if (!c1 || !c2 || !c3)
+    {
+        std::printf("[FAIL] CPU 参考求值失败\n");
+        return 1;
+    }
 
     // GPU：begin_expr 录制 → 三表达式 → end_expr 融合执行
     CHECK(static_cast<bool>(gpu.begin_expr()), "begin_expr 成功");
@@ -156,8 +162,8 @@ int run_chain3(nn::CpuEngine& cpu, nn::GpuEngine& gpu)
 
     const Scalar err = max_abs_diff(matrix_of(*c3), matrix_of(*g3));
     const bool ok = err < 1e-4f;
-    std::printf("[%s] 3 节点链融合（begin_expr/end_expr）  err=%.2e\n",
-                ok ? "PASS" : "FAIL", static_cast<double>(err));
+    std::printf("[%s] 3 节点链融合（begin_expr/end_expr）  err=%.2e\n", ok ? "PASS" : "FAIL",
+                static_cast<double>(err));
     if (!ok) return 1;
 
     // P2-12：重复录制（同结构 → 图级缓存命中），新输入仍正确
@@ -175,8 +181,8 @@ int run_chain3(nn::CpuEngine& cpu, nn::GpuEngine& gpu)
     if (!d3 || !h3) return 1;
     const Scalar err2 = max_abs_diff(matrix_of(*d3), matrix_of(*h3));
     const bool ok2 = err2 < 1e-4f;
-    std::printf("[%s] 重复录制（P2-12 图级缓存命中）  err=%.2e\n",
-                ok2 ? "PASS" : "FAIL", static_cast<double>(err2));
+    std::printf("[%s] 重复录制（P2-12 图级缓存命中）  err=%.2e\n", ok2 ? "PASS" : "FAIL",
+                static_cast<double>(err2));
     return (ok && ok2) ? 0 : 1;
 }
 
@@ -192,7 +198,11 @@ int run_independent(nn::CpuEngine& cpu, nn::GpuEngine& gpu)
 
     auto c1 = nn::test_fuse::chain3_a(cpu, x, R, C);
     auto c2 = nn::test_fuse::indep_b(cpu, w, R, C);
-    if (!c1 || !c2) { std::printf("[FAIL] CPU 参考求值失败\n"); return 1; }
+    if (!c1 || !c2)
+    {
+        std::printf("[FAIL] CPU 参考求值失败\n");
+        return 1;
+    }
 
     CHECK(static_cast<bool>(gpu.begin_expr()), "begin_expr 成功");
     auto g1 = nn::test_fuse::chain3_a(gpu, xg, R, C);
@@ -203,9 +213,8 @@ int run_independent(nn::CpuEngine& cpu, nn::GpuEngine& gpu)
     const Scalar e1 = max_abs_diff(matrix_of(*c1), matrix_of(*g1));
     const Scalar e2 = max_abs_diff(matrix_of(*c2), matrix_of(*g2));
     const bool ok = e1 < 1e-4f && e2 < 1e-4f;
-    std::printf("[%s] 独立分支各自物化（2 kernel）  err=%.2e/%.2e\n",
-                ok ? "PASS" : "FAIL", static_cast<double>(e1),
-                static_cast<double>(e2));
+    std::printf("[%s] 独立分支各自物化（2 kernel）  err=%.2e/%.2e\n", ok ? "PASS" : "FAIL",
+                static_cast<double>(e1), static_cast<double>(e2));
     return ok ? 0 : 1;
 }
 
@@ -223,7 +232,11 @@ int run_matmul_chain(nn::CpuEngine& cpu, nn::GpuEngine& gpu)
 
     auto c1 = nn::test_fuse::mm_a(cpu, a0, b0, bias, M, N);
     auto c2 = nn::test_fuse::mm_b(cpu, *c1, M, N);
-    if (!c1 || !c2) { std::printf("[FAIL] CPU 参考求值失败\n"); return 1; }
+    if (!c1 || !c2)
+    {
+        std::printf("[FAIL] CPU 参考求值失败\n");
+        return 1;
+    }
 
     CHECK(static_cast<bool>(gpu.begin_expr()), "begin_expr 成功");
     auto g1 = nn::test_fuse::mm_a(gpu, a0g, b0g, biasg, M, N);
@@ -233,8 +246,8 @@ int run_matmul_chain(nn::CpuEngine& cpu, nn::GpuEngine& gpu)
 
     const Scalar err = max_abs_diff(matrix_of(*c2), matrix_of(*g2));
     const bool ok = err < 1e-4f;
-    std::printf("[%s] S5 matmul 链融合（matmul+bias → relu）  err=%.2e\n",
-                ok ? "PASS" : "FAIL", static_cast<double>(err));
+    std::printf("[%s] S5 matmul 链融合（matmul+bias → relu）  err=%.2e\n", ok ? "PASS" : "FAIL",
+                static_cast<double>(err));
     return ok ? 0 : 1;
 }
 
@@ -243,8 +256,7 @@ int run_non_recording(nn::CpuEngine& cpu, nn::GpuEngine& gpu)
 {
     const std::size_t R = 4;
     int fail = 0;
-    for (const std::size_t C : {std::size_t{6}, std::size_t{4},
-                                std::size_t{8}, std::size_t{12}})
+    for (const std::size_t C : {std::size_t{6}, std::size_t{4}, std::size_t{8}, std::size_t{12}})
     {
         std::mt19937 rng(42 + static_cast<unsigned>(C));
         const nn::Tensor x = make_cpu_tensor(cpu, R, C, rng);
@@ -261,9 +273,8 @@ int run_non_recording(nn::CpuEngine& cpu, nn::GpuEngine& gpu)
         }
         const Scalar err = max_abs_diff(matrix_of(*cr), matrix_of(*gr));
         const bool ok = err < 1e-4f;
-        std::printf("[%s] 未录制路径 cols=%zu%s  err=%.2e\n", ok ? "PASS" : "FAIL",
-                    C, (C % 4 == 0) ? "（vec4）" : "（标量）",
-                    static_cast<double>(err));
+        std::printf("[%s] 未录制路径 cols=%zu%s  err=%.2e\n", ok ? "PASS" : "FAIL", C,
+                    (C % 4 == 0) ? "（vec4）" : "（标量）", static_cast<double>(err));
         if (!ok) ++fail;
     }
     return fail == 0 ? 0 : 1;
@@ -278,11 +289,11 @@ int run_adam_diamond(nn::CpuEngine& cpu, nn::GpuEngine& gpu)
     std::mt19937 rng(55);
     const nn::Tensor m0 = make_cpu_tensor(cpu, R, C, rng);
     const nn::Tensor v0 = make_cpu_tensor(cpu, R, C, rng);
-    const nn::Tensor g  = make_cpu_tensor(cpu, R, C, rng);
+    const nn::Tensor g = make_cpu_tensor(cpu, R, C, rng);
     nn::Tensor p0 = make_cpu_tensor(cpu, R, C, rng);
     const nn::Tensor m0g = to_gpu(gpu, m0);
     const nn::Tensor v0g = to_gpu(gpu, v0);
-    const nn::Tensor gg  = to_gpu(gpu, g);
+    const nn::Tensor gg = to_gpu(gpu, g);
     nn::Tensor pg = to_gpu(gpu, p0);
     nn::Tensor pu = to_gpu(gpu, p0);   // GPU 未融合参考的目标（与融合同源）
 
@@ -329,8 +340,8 @@ int run_adam_diamond(nn::CpuEngine& cpu, nn::GpuEngine& gpu)
     auto g2 = nn::test_fuse::adam_b(gpu, v0g, gg, R, C);
     auto g3 = nn::test_fuse::adam_c(gpu, *g1, *g2, R, C);
     auto gd = nn::test_fuse::adam_d_into(gpu, pg, *g3);
-    CHECK(static_cast<bool>(g1) && static_cast<bool>(g2) && static_cast<bool>(g3)
-              && static_cast<bool>(gd),
+    CHECK(static_cast<bool>(g1) && static_cast<bool>(g2) && static_cast<bool>(g3) &&
+              static_cast<bool>(gd),
           "录制期金刚石求值返回占位");
     CHECK(static_cast<bool>(gpu.end_expr()), "end_expr 融合执行成功");
     if (!g1 || !g2 || !g3) return 1;
@@ -341,8 +352,8 @@ int run_adam_diamond(nn::CpuEngine& cpu, nn::GpuEngine& gpu)
     const Scalar ep = max_abs_diff(matrix_of(p0), matrix_of(pg));     // p 目标传递
     const bool ok = e1 < 1e-4f && e2 < 1e-4f && e3 < 1e-4f && ep < 1e-4f;
     std::printf("[%s] Adam 金刚石单 kernel 4 输出（m/v/d 写穿 + p 目标）"
-                "  err=%.2e/%.2e/%.2e/%.2e\n", ok ? "PASS" : "FAIL",
-                static_cast<double>(e1), static_cast<double>(e2),
+                "  err=%.2e/%.2e/%.2e/%.2e\n",
+                ok ? "PASS" : "FAIL", static_cast<double>(e1), static_cast<double>(e2),
                 static_cast<double>(e3), static_cast<double>(ep));
     if (!ok) return 1;
 
@@ -353,9 +364,8 @@ int run_adam_diamond(nn::CpuEngine& cpu, nn::GpuEngine& gpu)
     const Scalar bp = max_abs_diff(matrix_of(pu), matrix_of(pg));
     const bool okb = b1 == 0.0f && b2 == 0.0f && b3 == 0.0f && bp == 0.0f;
     std::printf("[%s] 融合 vs 未融合 GPU 逐位一致  diff=%.2e/%.2e/%.2e/%.2e\n",
-                okb ? "PASS" : "FAIL", static_cast<double>(b1),
-                static_cast<double>(b2), static_cast<double>(b3),
-                static_cast<double>(bp));
+                okb ? "PASS" : "FAIL", static_cast<double>(b1), static_cast<double>(b2),
+                static_cast<double>(b3), static_cast<double>(bp));
     return okb ? 0 : 1;
 }
 
@@ -377,8 +387,8 @@ int run_contract_guard(nn::CpuEngine& cpu, nn::GpuEngine& gpu)
     if (!ref) return 1;
     const Scalar err = max_abs_diff(matrix_of(*ref), matrix_of(dst_r));
     const bool ok2 = err < 1e-4f;
-    std::printf("[%s] 目标传递 dst 写穿 = x*2  err=%.2e\n",
-                ok2 ? "PASS" : "FAIL", static_cast<double>(err));
+    std::printf("[%s] 目标传递 dst 写穿 = x*2  err=%.2e\n", ok2 ? "PASS" : "FAIL",
+                static_cast<double>(err));
     return ok2 ? 0 : 1;
 }
 
@@ -388,7 +398,8 @@ void set_env_flag(const char* name, bool on)
 #ifdef _MSC_VER
     _putenv_s(name, on ? "1" : "");
 #else
-    if (on) ::setenv(name, "1", 1); else ::unsetenv(name);
+    if (on) ::setenv(name, "1", 1);
+    else ::unsetenv(name);
 #endif
 }
 
@@ -396,8 +407,7 @@ void set_env_flag(const char* name, bool on)
 bool byte_equal(const nn::Matrix& a, const nn::Matrix& b)
 {
     const auto as = a.span(), bs = b.span();
-    return as.size() == bs.size() &&
-           std::memcmp(as.data(), bs.data(), as.size_bytes()) == 0;
+    return as.size() == bs.size() && std::memcmp(as.data(), bs.data(), as.size_bytes()) == 0;
 }
 
 // ── 用例 8（P3 跨链批量派发）：批量 vs 逐个逐字节一致 ─────────────────────
@@ -411,7 +421,8 @@ bool byte_equal(const nn::Matrix& a, const nn::Matrix& b)
 // CPU 逐节点参考按既有容差断言；并断言批量派发恰 2 组（否则 A/B 自比恒真）。
 int run_batch_dispatch(nn::CpuEngine& cpu, nn::GpuEngine& gpu)
 {
-    struct Shape { std::size_t R, C; };
+    struct Shape
+    { std::size_t R, C; };
     const Shape sh[3] = {{3, 5}, {4, 7}, {2, 11}};
     const std::size_t CR = 3, CC = 5;   // P1 链形状
     std::mt19937 rng(20261006);
@@ -492,8 +503,7 @@ int run_batch_dispatch(nn::CpuEngine& cpu, nn::GpuEngine& gpu)
         std::vector<nn::Result<void>> pd(3);
         CHECK(static_cast<bool>(gpu.begin_expr()), "批量用例 begin_expr 成功");
         for (int i = 0; i < 3; ++i)
-            s1[i] = nn::test_fuse::one_shot_rb2(gpu, xg[i], gsg[i],
-                                                sh[i].R, sh[i].C);
+            s1[i] = nn::test_fuse::one_shot_rb2(gpu, xg[i], gsg[i], sh[i].R, sh[i].C);
         for (int i = 0; i < 3; ++i)
         {
             ma[i] = nn::test_fuse::adam_a(gpu, m0g[i], ggg[i], sh[i].R, sh[i].C);
@@ -531,30 +541,26 @@ int run_batch_dispatch(nn::CpuEngine& cpu, nn::GpuEngine& gpu)
     };
 
     const std::uint64_t b0 = backend.fused_batch_dispatches();
-    if (!run_gpu(false, outs[0]))
-        return 1;
+    if (!run_gpu(false, outs[0])) return 1;
     const std::uint64_t b1 = backend.fused_batch_dispatches();
-    if (!run_gpu(true, outs[1]))
-        return 1;
+    if (!run_gpu(true, outs[1])) return 1;
 
     // ① 批量 vs 逐个：逐字节相等（memcmp/哈希口径）
     bool same = outs[0].size() == outs[1].size();
     for (std::size_t i = 0; same && i < outs[0].size(); ++i)
         same = byte_equal(outs[0][i], outs[1][i]);
-    std::printf("[%s] 批量 vs 逐个逐字节一致（%zu 张量，memcmp）\n",
-                same ? "PASS" : "FAIL", outs[0].size());
-    if (!same)
-        return 1;
+    std::printf("[%s] 批量 vs 逐个逐字节一致（%zu 张量，memcmp）\n", same ? "PASS" : "FAIL",
+                outs[0].size());
+    if (!same) return 1;
 
     // ② CPU 对照（容差口径同既有用例）
     Scalar worst = 0.0f;
     for (std::size_t i = 0; i < cpu_out.size() && i < outs[0].size(); ++i)
         worst = std::max(worst, max_abs_diff(cpu_out[i], outs[0][i]));
     const bool cpu_ok = worst < 1e-4f;
-    std::printf("[%s] CPU 逐节点对照  max_err=%.2e\n",
-                cpu_ok ? "PASS" : "FAIL", static_cast<double>(worst));
-    if (!cpu_ok)
-        return 1;
+    std::printf("[%s] CPU 逐节点对照  max_err=%.2e\n", cpu_ok ? "PASS" : "FAIL",
+                static_cast<double>(worst));
+    if (!cpu_ok) return 1;
 
     // ③ 批量路径确实走到（否则 ① 是静默降级后的自比恒真）：两个批量组
     //    = **2 次派发**（3× 同签名单节点 + 3× 金刚石各自成组）——断言恰为 2
@@ -563,11 +569,9 @@ int run_batch_dispatch(nn::CpuEngine& cpu, nn::GpuEngine& gpu)
     //    次派发或①字节比较失配。设备无 BDA 时 `#b` 不注册、合法逐 kernel
     //    降级 → 跳过该断言（A/B 一致性仍成立）。
     const std::uint64_t batched = b1 - b0;
-    std::printf("[info] 批量派发次数 = %llu%s\n",
-                static_cast<unsigned long long>(batched),
+    std::printf("[info] 批量派发次数 = %llu%s\n", static_cast<unsigned long long>(batched),
                 backend.device().bda_available() ? "" : "（无 BDA：预期 0）");
-    if (backend.device().bda_available())
-        CHECK(batched == 2, "批量派发恰 2 组（同组混形状：3+3）");
+    if (backend.device().bda_available()) CHECK(batched == 2, "批量派发恰 2 组（同组混形状：3+3）");
     return 0;
 }
 

@@ -15,12 +15,12 @@
 #include <optional>
 
 #include "compute_engine.hpp"
-#include <neuralnet.cpp/core_parallel.hpp>   // nn::for_each / parallel_for_blocks / parallel_for_samples
+#include <neuralnet.cpp/core_parallel.hpp> // nn::for_each / parallel_for_blocks / parallel_for_samples
 #include "expr_opt.hpp"
 #include "expr_op_table.hpp" // 算子元数据单一真源（CPU 标量语义 / GLSL 形态，RV-07）
 #include "expr_registry.hpp" // scan 模式融合 kernel 登记（NN_EXPR_SCAN）
-#include "expr_dsl.hpp"      // matmul_with_bias 经 DSL 融合（单一事实源）
-#include "ternary_pack.hpp"  // 三值打包布局（trit_pack / matmul_q，P2）
+#include "expr_dsl.hpp" // matmul_with_bias 经 DSL 融合（单一事实源）
+#include "ternary_pack.hpp" // 三值打包布局（trit_pack / matmul_q，P2）
 
 namespace nn
 {
@@ -44,9 +44,7 @@ private:
 public:
     // 引擎必须由 shared_ptr 管理：Layer / Model / Optimizer 会保存强引用。
     [[nodiscard]] static std::shared_ptr<CpuEngine> create()
-    {
-        return std::shared_ptr<CpuEngine>(new CpuEngine());
-    }
+    { return std::shared_ptr<CpuEngine>(new CpuEngine()); }
 
     [[nodiscard]] Device device() const noexcept override { return Device::CPU; }
 
@@ -65,8 +63,7 @@ public:
     {
 #ifdef NN_EXPR_SCAN
         auto& owner = fused::recording_graph_owner();
-        if (owner)
-            NN_FAIL("begin_expr: 嵌套录制（已有未结束的 begin_expr）");
+        if (owner) NN_FAIL("begin_expr: 嵌套录制（已有未结束的 begin_expr）");
         owner = std::make_unique<ExprGraph>();
         owner->owner = weak_from_this().lock();
 #endif
@@ -77,8 +74,7 @@ public:
     {
 #ifdef NN_EXPR_SCAN
         auto& owner = fused::recording_graph_owner();
-        if (!owner)
-            return {};
+        if (!owner) return {};
         ExprGraph g = std::move(*owner);
         owner.reset();
         auto kernels = fuse_expr_graph(g);
@@ -101,15 +97,13 @@ public:
                 // 内部依赖输入（node>=0）此时未绑定张量 → 该视图按 f32 记；
                 // 纯逐元素复合的成员引用经寄存器直替、不进 views，故正常构图
                 // 下这里的每个槽都是外部输入。
-                if (slot < 32u && in.external.valid() &&
-                    in.external.precision() == Precision::F16)
+                if (slot < 32u && in.external.valid() && in.external.precision() == Precision::F16)
                     in_bits |= (1u << slot);
                 ++slot;
             }
             if (k.members.size() > 1)
                 fused::global_registry().add_variant(
-                    k.spec, expr_prec_sig_make(in_bits,
-                                               k.prec == Precision::F16));
+                    k.spec, expr_prec_sig_make(in_bits, k.prec == Precision::F16));
         }
 #endif
         return {};
@@ -120,13 +114,15 @@ public:
     // dsl::compute 的 scan_register，必须在引擎入口补记——注意力 fold、CE 的
     // online-softmax fold、归约链都走这里；漏记 = 这些结构拿不到特化 shader，
     // 运行时退回带 `prec` 三元的 `#x`（实测注意力 kernel 慢 18%）。
-    static void scan_record_variant_(const ExprSpec& spec,
-                                     std::span<const Tensor> inputs, Precision P)
+    static void scan_record_variant_(const ExprSpec& spec, std::span<const Tensor> inputs,
+                                     Precision P)
     {
 #ifdef NN_EXPR_SCAN
         fused::global_registry().add_variant(spec, expr_prec_sig_of(inputs, P));
 #else
-        (void)spec; (void)inputs; (void)P;
+        (void)spec;
+        (void)inputs;
+        (void)P;
 #endif
     }
 
@@ -135,10 +131,9 @@ public:
     // RV-02：分配在宿主直配上不会失败（失败 = bad_alloc → abort），故恒成功；
     // 仍按 Result 形态返回以统一协议。
     [[nodiscard]] Result<Tensor> create_tensor_impl(std::size_t rows, std::size_t cols,
-                                                   Precision P) override
+                                                    Precision P) override
     {
-        if (P == Precision::F16)
-            return Tensor::cpu<Precision::F16>(rows, cols);
+        if (P == Precision::F16) return Tensor::cpu<Precision::F16>(rows, cols);
         return Tensor::cpu(rows, cols);
     }
 
@@ -151,17 +146,16 @@ public:
             const auto src = m.span();
             auto dst = m16.span();
             for (std::size_t i = 0; i < src.size(); ++i)
-                dst[i] = src[i];  // RHE 舍入
+                dst[i] = src[i]; // RHE 舍入
             return Tensor::from_matrix(std::move(m16));
         }
-        return Tensor::from_matrix(Matrix(m));  // f32 拷贝
+        return Tensor::from_matrix(Matrix(m)); // f32 拷贝
     }
 
     [[nodiscard]] Result<Matrix> to_matrix(const Tensor& t, Precision P = Precision::F32) override
     {
         NN_PROF_OP("to_matrix");
-        if (!t.is_cpu())
-            NN_FAIL("to_matrix: tensor is not CPU");
+        if (!t.is_cpu()) NN_FAIL("to_matrix: tensor is not CPU");
         if (P == Precision::F16)
         {
             // 下载为 f16 → cast 到 f32（升 cast，精确无损）
@@ -202,17 +196,15 @@ public:
                 dst[i] = static_cast<float>(src[i]);
             return m32;
         }
-        return Matrix(t.cpu_matrix());  // f32 拷贝
+        return Matrix(t.cpu_matrix()); // f32 拷贝
     }
 
     // ── cast 原语（§7.5，唯一"变精度"算子）──────────────────────────────
     [[nodiscard]] Result<Tensor> cast_impl(const Tensor& src, Precision dst) override
     {
-        if (src.precision() == dst)
-            return src;
+        if (src.precision() == dst) return src;
 
-        if (!src.is_cpu())
-            NN_FAIL("cast: CPU engine only supports CPU tensors");
+        if (!src.is_cpu()) NN_FAIL("cast: CPU engine only supports CPU tensors");
         if (src.precision() == Precision::F16 && dst == Precision::F32)
         {
             const auto& m16 = src.cpu_matrix<Precision::F16>();
@@ -249,19 +241,20 @@ public:
             NN_FAIL("copy_into: CPU engine only supports CPU tensors");
         if (dst.rows() != src.rows() || dst.cols() != src.cols())
             NN_FAIL("copy_into: shape mismatch");
-        if (dst.precision() != src.precision())
-            NN_FAIL("copy_into: precision mismatch");
+        if (dst.precision() != src.precision()) NN_FAIL("copy_into: precision mismatch");
         if (dst.precision() == Precision::F16)
         {
             const auto s = src.cpu_matrix<Precision::F16>().span();
             auto d = dst.cpu_matrix<Precision::F16>().span();
-            for (std::size_t i = 0; i < s.size(); ++i) d[i] = s[i];
+            for (std::size_t i = 0; i < s.size(); ++i)
+                d[i] = s[i];
         }
         else
         {
             const auto s = src.cpu_matrix().span();
             auto d = dst.cpu_matrix().span();
-            for (std::size_t i = 0; i < s.size(); ++i) d[i] = s[i];
+            for (std::size_t i = 0; i < s.size(); ++i)
+                d[i] = s[i];
         }
         return {};
     }
@@ -274,14 +267,13 @@ public:
             NN_FAIL("cast_into: CPU engine only supports CPU tensors");
         if (dst.rows() != src.rows() || dst.cols() != src.cols())
             NN_FAIL("cast_into: shape mismatch");
-        if (src.precision() == dst.precision())
-            return copy_into(dst, src);
+        if (src.precision() == dst.precision()) return copy_into(dst, src);
         if (src.precision() == Precision::F16 && dst.precision() == Precision::F32)
         {
             const auto s = src.cpu_matrix<Precision::F16>().span();
             auto d = dst.cpu_matrix().span();
             for (std::size_t i = 0; i < s.size(); ++i)
-                d[i] = static_cast<float>(s[i]);   // 升 cast：精确无损
+                d[i] = static_cast<float>(s[i]); // 升 cast：精确无损
             return {};
         }
         if (src.precision() == Precision::F32 && dst.precision() == Precision::F16)
@@ -289,7 +281,7 @@ public:
             const auto s = src.cpu_matrix().span();
             auto d = dst.cpu_matrix<Precision::F16>().span();
             for (std::size_t i = 0; i < s.size(); ++i)
-                d[i] = s[i];                       // 降 cast：round-half-to-even
+                d[i] = s[i]; // 降 cast：round-half-to-even
             return {};
         }
         NN_FAIL("cast_into: unsupported precision conversion");
@@ -299,60 +291,56 @@ public:
                                               bool /*fresh_dst*/) override
     {
         // fresh_dst 是 GPU 录制窗口排空的跳过声明，CPU 直拷无此概念。
-        if (!dst.is_cpu())
-            NN_FAIL("copy_from: dst tensor is not CPU");
+        if (!dst.is_cpu()) NN_FAIL("copy_from: dst tensor is not CPU");
         if (dst.rows() != src.rows() || dst.cols() != src.cols())
             NN_FAIL("copy_from: shape mismatch");
-        dst.cpu_matrix() = src;  // 拷贝赋值
+        dst.cpu_matrix() = src; // 拷贝赋值
         return {};
     }
 
     [[nodiscard]] Result<Tensor> clone_impl(const Tensor& src) override
     {
-        if (!src.is_cpu())
-            NN_FAIL("clone: src tensor is not CPU");
+        if (!src.is_cpu()) NN_FAIL("clone: src tensor is not CPU");
         // CPU 原语基于 f32 Matrix → 非 f32 输入走通用边界 cast（抬 f32 拷贝 →
         // 落回源精度）；f32 直通。精度策略在此实现，基类入口不做能力分支。
-        return move_(src, [](const Tensor& s) -> Result<Tensor>
-        {
-            return Tensor::from_matrix(Matrix(s.cpu_matrix()));  // 深拷贝
-        });
+        return move_(src,
+                     [](const Tensor& s) -> Result<Tensor>
+                     {
+                         return Tensor::from_matrix(Matrix(s.cpu_matrix())); // 深拷贝
+                     });
     }
 
     // ── 行切片：拷贝 src 的行 [start_row, start_row + count) 到新 Tensor ──
-    [[nodiscard]] Result<Tensor> slice_rows_impl(
-        const Tensor& src, std::size_t start_row, std::size_t count) override
+    [[nodiscard]] Result<Tensor> slice_rows_impl(const Tensor& src, std::size_t start_row,
+                                                 std::size_t count) override
     {
-        if (!src.is_cpu())
-            NN_FAIL("slice_rows: src tensor is not CPU");
-        return move_(src, [start_row, count](const Tensor& s) -> Result<Tensor>
-        {
-            const Matrix& m = s.cpu_matrix();
-            if (start_row + count > m.rows())
-                NN_FAIL("slice_rows: range out of bounds");
-            Matrix result(count, m.cols());
-            const auto src_span = m.span();
-            auto dst_span = result.span();
-            const std::size_t cols = m.cols();
-            for (std::size_t r = 0; r < count; ++r)
-                std::copy_n(src_span.begin() + (start_row + r) * cols, cols,
-                            dst_span.begin() + r * cols);
-            return Tensor::from_matrix(std::move(result));
-        });
+        if (!src.is_cpu()) NN_FAIL("slice_rows: src tensor is not CPU");
+        return move_(src,
+                     [start_row, count](const Tensor& s) -> Result<Tensor>
+                     {
+                         const Matrix& m = s.cpu_matrix();
+                         if (start_row + count > m.rows())
+                             NN_FAIL("slice_rows: range out of bounds");
+                         Matrix result(count, m.cols());
+                         const auto src_span = m.span();
+                         auto dst_span = result.span();
+                         const std::size_t cols = m.cols();
+                         for (std::size_t r = 0; r < count; ++r)
+                             std::copy_n(src_span.begin() + (start_row + r) * cols, cols,
+                                         dst_span.begin() + r * cols);
+                         return Tensor::from_matrix(std::move(result));
+                     });
     }
 
     // ── 行插入：将 src 的所有行写入 dst 的行 [dst_start_row, ...) ──
-    [[nodiscard]] Result<void> insert_rows_impl(
-        Tensor& dst, std::size_t dst_start_row, const Tensor& src) override
+    [[nodiscard]] Result<void> insert_rows_impl(Tensor& dst, std::size_t dst_start_row,
+                                                const Tensor& src) override
     {
-        if (!dst.is_cpu() || !src.is_cpu())
-            NN_FAIL("insert_rows: tensors are not CPU");
+        if (!dst.is_cpu() || !src.is_cpu()) NN_FAIL("insert_rows: tensors are not CPU");
         if (dst.precision() != Precision::F32 || src.precision() != Precision::F32)
             return insert_rows_cast_(dst, dst_start_row, src);
-        if (dst.cols() != src.cols())
-            NN_FAIL("insert_rows: column count mismatch");
-        if (dst_start_row + src.rows() > dst.rows())
-            NN_FAIL("insert_rows: range out of bounds");
+        if (dst.cols() != src.cols()) NN_FAIL("insert_rows: column count mismatch");
+        if (dst_start_row + src.rows() > dst.rows()) NN_FAIL("insert_rows: range out of bounds");
         Matrix& d = dst.cpu_matrix();
         const Matrix& s = src.cpu_matrix();
         const auto dst_span = d.span();
@@ -373,27 +361,23 @@ public:
     //   - num * D >= PARALLEL_THRESHOLD 时启用行块并行
     //   - 否则串行（小批量查表的 D 通常较小，并行调度开销不划算）
     //   - 行块并行避免跨行数据竞争（每行独立写入）
-    [[nodiscard]] Result<Tensor> gather_rows_impl(
-        const Tensor& table, const Tensor& indices) override
+    [[nodiscard]] Result<Tensor> gather_rows_impl(const Tensor& table,
+                                                  const Tensor& indices) override
     {
         // 输出精度 = 源精度（表）→ 非 f32 表走边界 cast 助手。
         return move_(table, [this, &indices](const Tensor& t) -> Result<Tensor>
-        {
-            return gather_rows_f32_(t, indices);
-        });
+                     { return gather_rows_f32_(t, indices); });
     }
 
 private:
-    [[nodiscard]] Result<Tensor> gather_rows_f32_(
-        const Tensor& table, const Tensor& indices)
+    [[nodiscard]] Result<Tensor> gather_rows_f32_(const Tensor& table, const Tensor& indices)
     {
-        if (!table.is_cpu() || !indices.is_cpu())
-            NN_FAIL("gather_rows: tensors are not CPU");
+        if (!table.is_cpu() || !indices.is_cpu()) NN_FAIL("gather_rows: tensors are not CPU");
         const Matrix& tbl = table.cpu_matrix();
         const Matrix& idx = indices.cpu_matrix();
         const std::size_t vocab = tbl.rows();
         const std::size_t D = tbl.cols();
-        const std::size_t num = idx.size();  // 遍历 indices 所有元素（支持任意形状）
+        const std::size_t num = idx.size(); // 遍历 indices 所有元素（支持任意形状）
 
         Matrix result(num, D);
         auto dst_span = result.span();
@@ -406,18 +390,19 @@ private:
             // 行块并行：每行独立查表，无数据竞争
             auto row_indices = std::views::iota(std::size_t{0}, num);
             nn::for_each(row_indices.begin(), row_indices.end(),
-                [dst_span, tbl_span, idx_span, vocab, D](std::size_t i) noexcept {
-                    const auto row_idx = static_cast<std::size_t>(idx_span[i]);
-                    if (row_idx < vocab)
-                    {
-                        std::copy_n(tbl_span.begin() + row_idx * D, D,
-                                    dst_span.begin() + i * D);
-                    }
-                    else
-                    {
-                        std::fill_n(dst_span.begin() + i * D, D, Scalar{0});
-                    }
-                });
+                         [dst_span, tbl_span, idx_span, vocab, D](std::size_t i) noexcept
+                         {
+                             const auto row_idx = static_cast<std::size_t>(idx_span[i]);
+                             if (row_idx < vocab)
+                             {
+                                 std::copy_n(tbl_span.begin() + row_idx * D, D,
+                                             dst_span.begin() + i * D);
+                             }
+                             else
+                             {
+                                 std::fill_n(dst_span.begin() + i * D, D, Scalar{0});
+                             }
+                         });
         }
         else
         {
@@ -427,8 +412,7 @@ private:
                 const auto row_idx = static_cast<std::size_t>(idx_span[i]);
                 if (row_idx < vocab)
                 {
-                    std::copy_n(tbl_span.begin() + row_idx * D, D,
-                                dst_span.begin() + i * D);
+                    std::copy_n(tbl_span.begin() + row_idx * D, D, dst_span.begin() + i * D);
                 }
                 else
                 {
@@ -443,8 +427,8 @@ public:
     // ── scatter_add_rows: 按 indices 把 grad 的行原子累加到 dst ──
     //   dst: (vocab, D) 原地修改, indices: 任意形状（按 flat 遍历）, grad: (num_indices, D)
     //   语义: dst[flat_indices[i]] += grad[i]
-    [[nodiscard]] Result<void> scatter_add_rows_impl(
-        Tensor& dst, const Tensor& indices, const Tensor& grad) override
+    [[nodiscard]] Result<void> scatter_add_rows_impl(Tensor& dst, const Tensor& indices,
+                                                     const Tensor& grad) override
     {
         if (dst.precision() != Precision::F32 || grad.precision() != Precision::F32)
             return scatter_add_rows_cast_(dst, indices, grad);
@@ -452,19 +436,18 @@ public:
     }
 
 private:
-    [[nodiscard]] Result<void> scatter_add_rows_f32_(
-        Tensor& dst, const Tensor& indices, const Tensor& grad)
+    [[nodiscard]] Result<void> scatter_add_rows_f32_(Tensor& dst, const Tensor& indices,
+                                                     const Tensor& grad)
     {
         if (!dst.is_cpu() || !indices.is_cpu() || !grad.is_cpu())
             NN_FAIL("scatter_add_rows: tensors are not CPU");
-        if (dst.cols() != grad.cols())
-            NN_FAIL("scatter_add_rows: column count mismatch");
+        if (dst.cols() != grad.cols()) NN_FAIL("scatter_add_rows: column count mismatch");
         Matrix& d = dst.cpu_matrix();
         const Matrix& idx = indices.cpu_matrix();
         const Matrix& g = grad.cpu_matrix();
         const std::size_t vocab = d.rows();
         const std::size_t D = d.cols();
-        const std::size_t num = idx.size();  // 遍历 indices 所有元素（支持任意形状）
+        const std::size_t num = idx.size(); // 遍历 indices 所有元素（支持任意形状）
 
         auto dst_span = d.span();
         const auto idx_span = idx.span();
@@ -494,22 +477,17 @@ public:
     //   - total >= PARALLEL_THRESHOLD 时启用块级并行
     //   - 每块仅一次 std::copy_n(N)，cache 友好
     //   - 典型场景：MHA 中 d_model=128, batch=32, seq=256 → 1M 元素，明显受益
-    [[nodiscard]] Result<Tensor> rearrange_3d_impl(
-        const Tensor& x, std::size_t M, std::size_t B, std::size_t N,
-        bool inverse) override
+    [[nodiscard]] Result<Tensor> rearrange_3d_impl(const Tensor& x, std::size_t M, std::size_t B,
+                                                   std::size_t N, bool inverse) override
     {
         // 非 f32：边界 cast（抬 f32 → 重入本函数 → 落回源精度）
         if (x.precision() != Precision::F32)
             return move_(x, [this, M, B, N, inverse](const Tensor& t) -> Result<Tensor>
-            {
-                return rearrange_3d_impl(t, M, B, N, inverse);
-            });
-        if (x.is_gpu())
-            NN_FAIL("CpuEngine: GPU tensor on CPU engine");
+                         { return rearrange_3d_impl(t, M, B, N, inverse); });
+        if (x.is_gpu()) NN_FAIL("CpuEngine: GPU tensor on CPU engine");
         const Matrix& m = x.cpu_matrix();
         const std::size_t total = M * B * N;
-        if (m.size() != total)
-            NN_FAIL("rearrange_3d: element count mismatch");
+        if (m.size() != total) NN_FAIL("rearrange_3d: element count mismatch");
         Matrix out(inverse ? M : (B * M), inverse ? (B * N) : N);
         const auto src = m.span();
         const auto dst = out.span();
@@ -517,7 +495,8 @@ public:
         // (b, m) 组合索引：bm_idx = b * M + m，总块数 = B * M
         // 每块独立处理 N 个元素
         const std::size_t n_blocks = B * M;
-        auto block_kernel = [src, dst, M, B, N, inverse](std::size_t bm_idx) noexcept {
+        auto block_kernel = [src, dst, M, B, N, inverse](std::size_t bm_idx) noexcept
+        {
             const std::size_t b = bm_idx / M;
             const std::size_t mi = bm_idx % M;
             if (!inverse)
@@ -525,24 +504,21 @@ public:
                 // out[b*M + m, n] = in[m, b*N + n]
                 const std::size_t dst_off = (b * M + mi) * N;
                 const std::size_t src_off = mi * (B * N) + b * N;
-                std::copy_n(src.begin() + src_off, N,
-                            dst.begin() + dst_off);
+                std::copy_n(src.begin() + src_off, N, dst.begin() + dst_off);
             }
             else
             {
                 // out[m, b*N + n] = in[b*M + m, n]
                 const std::size_t src_off = (b * M + mi) * N;
                 const std::size_t dst_off = mi * (B * N) + b * N;
-                std::copy_n(src.begin() + src_off, N,
-                            dst.begin() + dst_off);
+                std::copy_n(src.begin() + src_off, N, dst.begin() + dst_off);
             }
         };
 
         if (total >= PARALLEL_THRESHOLD && n_blocks > 1)
         {
             auto block_indices = std::views::iota(std::size_t{0}, n_blocks);
-            nn::parallel_for_blocks(block_indices.begin(), block_indices.end(),
-                                       block_kernel);
+            nn::parallel_for_blocks(block_indices.begin(), block_indices.end(), block_kernel);
         }
         else
         {
@@ -557,36 +533,29 @@ public:
     [[nodiscard]] Result<Tensor> transpose_impl(const Tensor& A) override
     {
         if (A.precision() != Precision::F32)
-            return move_(A, [this](const Tensor& t) -> Result<Tensor>
-            {
-                return transpose_impl(t);
-            });
-        if (A.is_gpu())
-            NN_FAIL("CpuEngine: GPU tensor on CPU engine");
+            return move_(A,
+                         [this](const Tensor& t) -> Result<Tensor> { return transpose_impl(t); });
+        if (A.is_gpu()) NN_FAIL("CpuEngine: GPU tensor on CPU engine");
         return Tensor::from_matrix(A.cpu_matrix().transpose());
     }
 
     // ── 卷积/池化窗口展开（详见 compute_engine.hpp 契约）───────────────
     // 并行策略：按输出行（im2col 的 r / col2im 的输入像素行）切块，块间无竞争；
     //   两个方向的写入都是**连续行**，读取按窗口散布。
-    [[nodiscard]] Result<Tensor> im2col_impl(
-        const Tensor& x,
-        std::size_t C, std::size_t H, std::size_t W,
-        std::size_t k, std::size_t stride, std::size_t pad,
-        std::size_t OH, std::size_t OW) override
+    [[nodiscard]] Result<Tensor> im2col_impl(const Tensor& x, std::size_t C, std::size_t H,
+                                             std::size_t W, std::size_t k, std::size_t stride,
+                                             std::size_t pad, std::size_t OH,
+                                             std::size_t OW) override
     {
         if (x.precision() != Precision::F32)
-            return move_(x, [this, C, H, W, k, stride, pad, OH, OW](const Tensor& t) -> Result<Tensor>
-            {
-                return im2col_impl(t, C, H, W, k, stride, pad, OH, OW);
-            });
-        if (x.is_gpu())
-            NN_FAIL("CpuEngine: GPU tensor on CPU engine");
+            return move_(x,
+                         [this, C, H, W, k, stride, pad, OH, OW](const Tensor& t) -> Result<Tensor>
+                         { return im2col_impl(t, C, H, W, k, stride, pad, OH, OW); });
+        if (x.is_gpu()) NN_FAIL("CpuEngine: GPU tensor on CPU engine");
         if (C == 0 || H == 0 || W == 0 || k == 0 || stride == 0 || OH == 0 || OW == 0)
             NN_FAIL("im2col: C/H/W/k/stride/OH/OW must be > 0");
         const std::size_t B = x.cols();
-        if (x.rows() != C * H * W)
-            NN_FAIL("im2col: x must be (C*H*W, B)");
+        if (x.rows() != C * H * W) NN_FAIL("im2col: x must be (C*H*W, B)");
         const std::size_t kk = k * k;
         const std::size_t P = OH * OW;
         const std::size_t rows = C * kk;
@@ -597,7 +566,8 @@ public:
         const auto dst = out.span();
 
         // 每行 r=(ci,kh,kw) 独立；列序为位置优先 (p, b)，内层对 b 连续
-        auto row_kernel = [&, src, dst](std::size_t r) noexcept {
+        auto row_kernel = [&, src, dst](std::size_t r) noexcept
+        {
             const std::size_t ci = r / kk;
             const std::size_t kh = (r / k) % k;
             const std::size_t kw = r % k;
@@ -605,21 +575,19 @@ public:
             Scalar* outrow = dst.data() + r * cols;
             for (std::size_t oh = 0; oh < OH; ++oh)
             {
-                const long ih = static_cast<long>(oh * stride + kh)
-                              - static_cast<long>(pad);
+                const long ih = static_cast<long>(oh * stride + kh) - static_cast<long>(pad);
                 const bool h_ok = (ih >= 0 && ih < static_cast<long>(H));
                 for (std::size_t ow = 0; ow < OW; ++ow)
                 {
-                    const long iw = static_cast<long>(ow * stride + kw)
-                                  - static_cast<long>(pad);
+                    const long iw = static_cast<long>(ow * stride + kw) - static_cast<long>(pad);
                     const bool ok = h_ok && iw >= 0 && iw < static_cast<long>(W);
                     Scalar* outp = outrow + (oh * OW + ow) * B;
                     if (ok)
                     {
                         // 源 (row, b) 行主序 → row*B + b
-                        const Scalar* inp = src.data() +
-                            (base + static_cast<std::size_t>(ih) * W +
-                             static_cast<std::size_t>(iw)) * B;
+                        const Scalar* inp = src.data() + (base + static_cast<std::size_t>(ih) * W +
+                                                          static_cast<std::size_t>(iw)) *
+                                                             B;
                         std::copy_n(inp, B, outp);
                     }
                     else
@@ -637,24 +605,22 @@ public:
         }
         else
         {
-            for (std::size_t r = 0; r < rows; ++r) row_kernel(r);
+            for (std::size_t r = 0; r < rows; ++r)
+                row_kernel(r);
         }
         return Tensor::from_matrix(std::move(out));
     }
 
-    [[nodiscard]] Result<Tensor> col2im_impl(
-        const Tensor& col,
-        std::size_t C, std::size_t H, std::size_t W,
-        std::size_t k, std::size_t stride, std::size_t pad,
-        std::size_t OH, std::size_t OW) override
+    [[nodiscard]] Result<Tensor> col2im_impl(const Tensor& col, std::size_t C, std::size_t H,
+                                             std::size_t W, std::size_t k, std::size_t stride,
+                                             std::size_t pad, std::size_t OH,
+                                             std::size_t OW) override
     {
         if (col.precision() != Precision::F32)
-            return move_(col, [this, C, H, W, k, stride, pad, OH, OW](const Tensor& t) -> Result<Tensor>
-            {
-                return col2im_impl(t, C, H, W, k, stride, pad, OH, OW);
-            });
-        if (col.is_gpu())
-            NN_FAIL("CpuEngine: GPU tensor on CPU engine");
+            return move_(col,
+                         [this, C, H, W, k, stride, pad, OH, OW](const Tensor& t) -> Result<Tensor>
+                         { return col2im_impl(t, C, H, W, k, stride, pad, OH, OW); });
+        if (col.is_gpu()) NN_FAIL("CpuEngine: GPU tensor on CPU engine");
         if (C == 0 || H == 0 || W == 0 || k == 0 || stride == 0 || OH == 0 || OW == 0)
             NN_FAIL("col2im: C/H/W/k/stride/OH/OW must be > 0");
         const std::size_t kk = k * k;
@@ -670,7 +636,8 @@ public:
         // 每个输入像素 (ci, ih, iw) 独立：
         // 对每个 tap (kh,kw)，至多存在一个窗口 (oh,ow) 覆盖该像素；整除性与
         // 范围检查通过则累加 col 对应行 r=(ci*k+kh)*k+kw 的 (oh,ow) 位置（内层 b 连续）。
-        auto pixel_kernel = [&, src, dst](std::size_t row) noexcept {
+        auto pixel_kernel = [&, src, dst](std::size_t row) noexcept
+        {
             const std::size_t ci = row / (H * W);
             const std::size_t rem = row % (H * W);
             const std::size_t ih = rem / W;
@@ -690,10 +657,11 @@ public:
                     const long ow = s / static_cast<long>(stride);
                     if (ow >= static_cast<long>(OW)) continue;
                     const std::size_t r = (ci * k + kh) * k + kw;
-                    const Scalar* inp = src.data() + r * (B * P) +
-                        (static_cast<std::size_t>(oh) * OW +
-                         static_cast<std::size_t>(ow)) * B;
-                    for (std::size_t b = 0; b < B; ++b) outp[b] += inp[b];
+                    const Scalar* inp =
+                        src.data() + r * (B * P) +
+                        (static_cast<std::size_t>(oh) * OW + static_cast<std::size_t>(ow)) * B;
+                    for (std::size_t b = 0; b < B; ++b)
+                        outp[b] += inp[b];
                 }
             }
         };
@@ -706,7 +674,8 @@ public:
         }
         else
         {
-            for (std::size_t r = 0; r < in_rows; ++r) pixel_kernel(r);
+            for (std::size_t r = 0; r < in_rows; ++r)
+                pixel_kernel(r);
         }
         return Tensor::from_matrix(std::move(out));
     }
@@ -737,11 +706,9 @@ public:
     // 解码只在"逐存储行"上做一次（一行 16 个权重共享一个 32-bit 字，解码一遍
     // 进小缓冲，之后按标量 FMA 复用）—— 既不物化 4 B/权重的 f32 副本，也不
     // 让内层循环反复移位。
-    [[nodiscard]] Result<Tensor> trit_pack_impl(const Tensor& w,
-                                                const Tensor& scale) override
+    [[nodiscard]] Result<Tensor> trit_pack_impl(const Tensor& w, const Tensor& scale) override
     {
-        if (!w.is_cpu() || !scale.is_cpu())
-            NN_FAIL("trit_pack: tensors are not CPU");
+        if (!w.is_cpu() || !scale.is_cpu()) NN_FAIL("trit_pack: tensors are not CPU");
         if (w.precision() != Precision::F32 || scale.precision() != Precision::F32)
             NN_FAIL("trit_pack: 需要 f32 权重 + f32 尺度");
         if (scale.rows() != w.rows() || scale.cols() != 1)
@@ -767,9 +734,8 @@ public:
         return out;
     }
 
-    [[nodiscard]] Result<Tensor> matmul_q_impl(const Tensor& packed,
-                                               const Tensor& scale, const Tensor& B,
-                                               bool transA, std::size_t out_rows,
+    [[nodiscard]] Result<Tensor> matmul_q_impl(const Tensor& packed, const Tensor& scale,
+                                               const Tensor& B, bool transA, std::size_t out_rows,
                                                Precision P) override
     {
         if (!packed.is_cpu() || !scale.is_cpu() || !B.is_cpu())
@@ -780,11 +746,10 @@ public:
         {
             // 注：to_f32/to_prec 是基类**私有**助手（只有基类入口可用）→ 这里
             // 用公共 cast（与 matmul_impl 的 CPU 边界 cast 同款）。
-            auto b32 = (B.precision() == Precision::F32) ? Result<Tensor>{B}
-                                                         : cast(B, Precision::F32);
+            auto b32 =
+                (B.precision() == Precision::F32) ? Result<Tensor>{B} : cast(B, Precision::F32);
             NN_TRY_CHECK(b32);
-            NN_TRY(r, matmul_q_impl(packed, scale, *b32, transA, out_rows,
-                                    Precision::F32));
+            NN_TRY(r, matmul_q_impl(packed, scale, *b32, transA, out_rows, Precision::F32));
             if (P == Precision::F32) return r;
             // 递归产物是 `*_impl` 直构；v3 起设备域从存储派生，进公共 cast
             // （内含 bind_check_）无需补任何身份。
@@ -805,8 +770,7 @@ public:
             if (out_rows == 0) NN_FAIL("matmul_q_t: out_rows 必须显式给出");
             if (B.rows() != K) NN_FAIL("matmul_q_t: B 行数 != 打包 A 的行数 K");
         }
-        else if (B.rows() != K)
-            NN_FAIL("matmul_q: B 行数 != A 的列数 K");
+        else if (B.rows() != K) NN_FAIL("matmul_q: B 行数 != A 的列数 K");
         if (nn::trit_pack::words_per_row(a_len) != packed.cols())
             NN_FAIL("matmul_q: 打包容器列数与 (K/M) 不匹配");
         if (scale.rows() != packed.rows() || scale.cols() != 1)
@@ -829,7 +793,7 @@ public:
         // （与稠密路径读一遍权重同量级），故正确做法是把它与乘加**分开**：
         // 解码一个行块到 f32 scratch，再交给代数层的分块微内核
         // （`multiply_to` / `transpose_multiply_to`：SIMD + 寄存器分块）。
-        constexpr std::size_t RB = 64;   // 行块（scratch = RB × a_len × 4B）
+        constexpr std::size_t RB = 64; // 行块（scratch = RB × a_len × 4B）
         if (!transA)
         {
             // C[m,n] = τ_m · Σ_k trit(m,k)·B[k,n]
@@ -845,11 +809,10 @@ public:
                     float* dst = ab.data() + i * a_len;
                     for (std::size_t j = 0; j < a_len; ++j)
                     {
-                        const std::uint32_t word = std::bit_cast<std::uint32_t>(
-                            pw[j / nn::trit_pack::kPerWord]);
+                        const std::uint32_t word =
+                            std::bit_cast<std::uint32_t>(pw[j / nn::trit_pack::kPerWord]);
                         const std::uint32_t code =
-                            (word >> (nn::trit_pack::kBits *
-                                      (j % nn::trit_pack::kPerWord))) &
+                            (word >> (nn::trit_pack::kBits * (j % nn::trit_pack::kPerWord))) &
                             nn::trit_pack::kMask;
                         dst[j] = tau * nn::trit_pack::value_of(code);
                     }
@@ -877,11 +840,10 @@ public:
                     for (std::size_t i = 0; i < nr; ++i)
                     {
                         const std::size_t m = m0 + i;
-                        const std::uint32_t word = std::bit_cast<std::uint32_t>(
-                            pw[m / nn::trit_pack::kPerWord]);
+                        const std::uint32_t word =
+                            std::bit_cast<std::uint32_t>(pw[m / nn::trit_pack::kPerWord]);
                         const std::uint32_t code =
-                            (word >> (nn::trit_pack::kBits *
-                                      (m % nn::trit_pack::kPerWord))) &
+                            (word >> (nn::trit_pack::kBits * (m % nn::trit_pack::kPerWord))) &
                             nn::trit_pack::kMask;
                         dst[i] = tau * nn::trit_pack::value_of(code);
                     }
@@ -895,21 +857,17 @@ public:
         return out;
     }
 
-    [[nodiscard]] Result<Tensor> matmul_impl(
-        const Tensor& A, const Tensor& B,
-        bool transA, bool transB,
-        Precision P = Precision::F32) override
+    [[nodiscard]] Result<Tensor> matmul_impl(const Tensor& A, const Tensor& B, bool transA,
+                                             bool transB, Precision P = Precision::F32) override
     {
-        if (A.is_gpu() || B.is_gpu())
-            NN_FAIL("CpuEngine: GPU tensor on CPU engine");
+        if (A.is_gpu() || B.is_gpu()) NN_FAIL("CpuEngine: GPU tensor on CPU engine");
         // ── 精度与存储不匹配时不可直读（cpu_matrix<P> 对错位存储返回空 → UB；
         //    实测 CPU f16 训练 step0 即 NaN）→ 先统一到 f32 空间计算，输出按 P
         //    舍入（§7.2 f32 参考语义）。两端同 f16 才走下方原生 f16 GEMM。
         {
             const bool a16 = A.precision() == Precision::F16;
             const bool b16 = B.precision() == Precision::F16;
-            if ((P == Precision::F32 && (a16 || b16)) ||
-                (P == Precision::F16 && !(a16 && b16)))
+            if ((P == Precision::F32 && (a16 || b16)) || (P == Precision::F16 && !(a16 && b16)))
             {
                 auto a32 = a16 ? cast(A, Precision::F32) : Result<Tensor>{A};
                 NN_TRY_CHECK(a32);
@@ -928,26 +886,23 @@ public:
             const Matrix& a = A.cpu_matrix();
             const Matrix& b = B.cpu_matrix();
 
-            const std::size_t M  = transA ? a.cols() : a.rows();
-            const std::size_t K  = transA ? a.rows() : a.cols();
+            const std::size_t M = transA ? a.cols() : a.rows();
+            const std::size_t K = transA ? a.rows() : a.cols();
             const std::size_t K2 = transB ? b.cols() : b.rows();
-            const std::size_t N  = transB ? b.rows() : b.cols();
+            const std::size_t N = transB ? b.rows() : b.cols();
             if (K != K2)
-                NN_FAIL("matmul: dimension mismatch A=" +
-                    std::to_string(a.rows()) + "x" + std::to_string(a.cols()) +
-                    " transA=" + (transA ? "1" : "0") +
-                    " B=" + std::to_string(b.rows()) + "x" + std::to_string(b.cols()) +
-                    " transB=" + (transB ? "1" : "0") +
-                    " K=" + std::to_string(K) + " K2=" + std::to_string(K2));
+                NN_FAIL("matmul: dimension mismatch A=" + std::to_string(a.rows()) + "x" +
+                        std::to_string(a.cols()) + " transA=" + (transA ? "1" : "0") +
+                        " B=" + std::to_string(b.rows()) + "x" + std::to_string(b.cols()) +
+                        " transB=" + (transB ? "1" : "0") + " K=" + std::to_string(K) +
+                        " K2=" + std::to_string(K2));
             // 构造函数里的全尺寸零填充是**重复**的（本机单线程写满一遍 6MB ~2ms）
             Matrix result = Matrix::make_uninitialized(M, N);
-            if (!transA && !transB) {
-                a.multiply_to(result, b);
-            } else if (!transA && transB) {
-                a.multiply_transposed_to(result, b);
-            } else if (transA && !transB) {
-                a.transpose_multiply_to(result, b);
-            } else {
+            if (!transA && !transB) { a.multiply_to(result, b); }
+            else if (!transA && transB) { a.multiply_transposed_to(result, b); }
+            else if (transA && !transB) { a.transpose_multiply_to(result, b); }
+            else
+            {
                 Matrix a_t = a.transpose();
                 a_t.multiply_transposed_to(result, b);
             }
@@ -961,21 +916,18 @@ public:
             const auto& a = A.cpu_matrix<Precision::F16>();
             const auto& b = B.cpu_matrix<Precision::F16>();
 
-            const std::size_t M  = transA ? a.cols() : a.rows();
-            const std::size_t K  = transA ? a.rows() : a.cols();
+            const std::size_t M = transA ? a.cols() : a.rows();
+            const std::size_t K = transA ? a.rows() : a.cols();
             const std::size_t K2 = transB ? b.cols() : b.rows();
-            const std::size_t N  = transB ? b.rows() : b.cols();
-            if (K != K2)
-                NN_FAIL("matmul(f16): dimension mismatch");
+            const std::size_t N = transB ? b.rows() : b.cols();
+            if (K != K2) NN_FAIL("matmul(f16): dimension mismatch");
             MatrixT<Precision::F16> result(M, N);
             // f16 无原生 x86 SIMD → 向量化失败是预期行为（§7.2 兼容路径）
-            if (!transA && !transB) {
-                a.multiply_to(result, b);
-            } else if (!transA && transB) {
-                a.multiply_transposed_to(result, b);
-            } else if (transA && !transB) {
-                a.transpose_multiply_to(result, b);
-            } else {
+            if (!transA && !transB) { a.multiply_to(result, b); }
+            else if (!transA && transB) { a.multiply_transposed_to(result, b); }
+            else if (transA && !transB) { a.transpose_multiply_to(result, b); }
+            else
+            {
                 auto a_t = a.transpose();
                 a_t.multiply_transposed_to(result, b);
             }
@@ -989,52 +941,44 @@ public:
     // 覆盖基类默认的"matmul + host 端 to_matrix 往返加 bias"：CPU 走模板求值，
     // GPU 走 AOT 融合 shader；scan_exprs dry-run 经本路径收集该结构 → gen_fused
     // 生成融合 kernel（结构没被收集 = GPU 闭合世界里没有对应 key）。
-    [[nodiscard]] Result<Tensor> matmul_with_bias_impl(
-        const Tensor& A, const Tensor& B, const Tensor& bias,
-        bool transA = false, bool transB = false,
-        Precision P = Precision::F32) override
+    [[nodiscard]] Result<Tensor> matmul_with_bias_impl(const Tensor& A, const Tensor& B,
+                                                       const Tensor& bias, bool transA = false,
+                                                       bool transB = false,
+                                                       Precision P = Precision::F32) override
     {
-        if (A.is_gpu() || B.is_gpu())
-            NN_FAIL("CpuEngine: GPU tensor on CPU engine");
+        if (A.is_gpu() || B.is_gpu()) NN_FAIL("CpuEngine: GPU tensor on CPU engine");
         const std::size_t rows = transA ? A.cols() : A.rows();
         const std::size_t cols = transB ? B.rows() : B.cols();
         // P 必须下传（不可丢弃）：scan 的 f16 dry-run 靠 dsl::compute 的
         // NN_EXPR_SCAN 钩子按**真实操作数精度 + P** 登记 (结构, 签名)——丢掉 P
         // 就会只登记全 f32 签名，GPU 侧带类型 matmul 段变体永远发现不到
         // （Linear::forward 每个 Linear 一次，是 cast 临时量最大的单一来源）。
-        return nn::dsl::compute(*this,
-            nn::dsl::matmul(A, B, transA, transB, 1)
-                + nn::dsl::row_broadcast(bias),
-            rows, cols, P);
+        return nn::dsl::compute(
+            *this, nn::dsl::matmul(A, B, transA, transB, 1) + nn::dsl::row_broadcast(bias), rows,
+            cols, P);
     }
 
     // ── 批量矩阵乘法：按 batch 切分行块，逐 batch 矩阵乘 ──
     // C_b = alpha * op(A_b, B_b)（alpha 为 cuBLAS sgemm 语义的输出缩放系数）
     // P: 计算精度（§8.1，同 matmul）
-    [[nodiscard]] Result<Tensor> batched_matmul_impl(
-        const Tensor& A, const Tensor& B,
-        std::size_t batch,
-        bool transA, bool transB,
-        Scalar alpha,
-        Precision P = Precision::F32) override
+    [[nodiscard]] Result<Tensor> batched_matmul_impl(const Tensor& A, const Tensor& B,
+                                                     std::size_t batch, bool transA, bool transB,
+                                                     Scalar alpha,
+                                                     Precision P = Precision::F32) override
     {
-        if (A.is_gpu() || B.is_gpu())
-            NN_FAIL("CpuEngine: GPU tensor on CPU engine");
-        if (batch == 0)
-            NN_FAIL("batched_matmul: batch must be > 0");
+        if (A.is_gpu() || B.is_gpu()) NN_FAIL("CpuEngine: GPU tensor on CPU engine");
+        if (batch == 0) NN_FAIL("batched_matmul: batch must be > 0");
         // ── 精度与存储不匹配：统一到 f32 空间计算 + 按 P 舍入（同 matmul）──
         {
             const bool a16 = A.precision() == Precision::F16;
             const bool b16 = B.precision() == Precision::F16;
-            if ((P == Precision::F32 && (a16 || b16)) ||
-                (P == Precision::F16 && !(a16 && b16)))
+            if ((P == Precision::F32 && (a16 || b16)) || (P == Precision::F16 && !(a16 && b16)))
             {
                 auto a32 = a16 ? cast(A, Precision::F32) : Result<Tensor>{A};
                 NN_TRY_CHECK(a32);
                 auto b32 = b16 ? cast(B, Precision::F32) : Result<Tensor>{B};
                 NN_TRY_CHECK(b32);
-                auto r = batched_matmul(*a32, *b32, batch, transA, transB, alpha,
-                                        Precision::F32);
+                auto r = batched_matmul(*a32, *b32, batch, transA, transB, alpha, Precision::F32);
                 NN_TRY_CHECK(r);
                 if (P == Precision::F32) return r;
                 return cast(*r, Precision::F16);
@@ -1066,20 +1010,17 @@ public:
 
                 MatrixT<Precision::F16> c_view(M, N);
                 // f16 无原生 x86 SIMD → 向量化失败是预期行为（§7.2 兼容路径）
-                if (!transA && !transB)
-                    a_view.multiply_to(c_view, b_view);
-                else if (!transA && transB)
-                    a_view.multiply_transposed_to(c_view, b_view);
-                else if (transA && !transB)
-                    a_view.transpose_multiply_to(c_view, b_view);
-                else {
+                if (!transA && !transB) a_view.multiply_to(c_view, b_view);
+                else if (!transA && transB) a_view.multiply_transposed_to(c_view, b_view);
+                else if (transA && !transB) a_view.transpose_multiply_to(c_view, b_view);
+                else
+                {
                     auto a_t = a_view.transpose();
                     a_t.multiply_transposed_to(c_view, b_view);
                 }
 
                 // 写入结果的对应 batch 行块
-                std::copy_n(c_view.span().begin(), M * N,
-                    result.span().data() + bi * M * N);
+                std::copy_n(c_view.span().begin(), M * N, result.span().data() + bi * M * N);
             }
 
             // alpha 缩放
@@ -1087,7 +1028,7 @@ public:
             {
                 auto dst = result.span();
                 for (std::size_t i = 0; i < dst.size(); ++i)
-                    dst[i] = dst[i] * alpha;  // f16 * float → f16
+                    dst[i] = dst[i] * alpha; // f16 * float → f16
             }
             return Tensor::from_matrix(std::move(result));
         }
@@ -1107,12 +1048,11 @@ public:
         //   transA=true:  A_b 视为 (a.cols(), a_rows_per)（按 A_b^T 使用），M=a.cols(), K=a_rows_per
         //   transB=false: B_b 视为 (b_rows_per, b.cols())，K2=b_rows_per, N=b.cols()
         //   transB=true:  B_b 视为 (b.cols(), b_rows_per)（按 B_b^T 使用），K2=b.cols(), N=b_rows_per
-        const std::size_t M  = transA ? a.cols() : a_rows_per;
-        const std::size_t K  = transA ? a_rows_per : a.cols();
+        const std::size_t M = transA ? a.cols() : a_rows_per;
+        const std::size_t K = transA ? a_rows_per : a.cols();
         const std::size_t K2 = transB ? b.cols() : b_rows_per;
-        const std::size_t N  = transB ? b_rows_per : b.cols();
-        if (K != K2)
-            NN_FAIL("batched_matmul: K dimension mismatch");
+        const std::size_t N = transB ? b_rows_per : b.cols();
+        if (K != K2) NN_FAIL("batched_matmul: K dimension mismatch");
         Matrix result(batch * M, N);
         auto result_span = result.span();
         const auto a_span = a.span();
@@ -1127,19 +1067,23 @@ public:
             auto b_sub = std::span<const Scalar>(b_span.data() + b_off, b_rows_per * b.cols());
             auto c_sub = std::span<Scalar>(result_span.data() + bi * M * N, M * N);
 
-            if (!transA && !transB) {
-                Matrix::multiply_to_span(c_sub, M, N,
-                    a_sub, a_rows_per, a.cols(),
-                    b_sub, b_rows_per, b.cols());
-            } else if (!transA && transB) {
-                Matrix::multiply_transposed_to_span(c_sub, M, N,
-                    a_sub, a_rows_per, a.cols(),
-                    b_sub, b_rows_per, b.cols());
-            } else if (transA && !transB) {
-                Matrix::transpose_multiply_to_span(c_sub, M, N,
-                    a_sub, a_rows_per, a.cols(),
-                    b_sub, b_rows_per, b.cols());
-            } else {
+            if (!transA && !transB)
+            {
+                Matrix::multiply_to_span(c_sub, M, N, a_sub, a_rows_per, a.cols(), b_sub,
+                                         b_rows_per, b.cols());
+            }
+            else if (!transA && transB)
+            {
+                Matrix::multiply_transposed_to_span(c_sub, M, N, a_sub, a_rows_per, a.cols(), b_sub,
+                                                    b_rows_per, b.cols());
+            }
+            else if (transA && !transB)
+            {
+                Matrix::transpose_multiply_to_span(c_sub, M, N, a_sub, a_rows_per, a.cols(), b_sub,
+                                                   b_rows_per, b.cols());
+            }
+            else
+            {
                 // 双转置：先转置 A 子块，再做 A^T × B^T
                 // 等价于 (B × A)^T，用 span 暂不支持，fallback 到临时矩阵
                 Matrix a_view(a_rows_per, a.cols());
@@ -1170,11 +1114,8 @@ public:
     {
         if (A.precision() != Precision::F32 || B.precision() != Precision::F32)
             return inplace2_(A, B, [this](Tensor& a, const Tensor& b) -> Result<void>
-            {
-                return add_inplace_impl(a, b);
-            });
-        if (A.rows() != B.rows() || A.cols() != B.cols())
-            NN_FAIL("add_inplace: shape mismatch");
+                             { return add_inplace_impl(a, b); });
+        if (A.rows() != B.rows() || A.cols() != B.cols()) NN_FAIL("add_inplace: shape mismatch");
         A.cpu_matrix().add_inplace(B.cpu_matrix());
         return {};
     }
@@ -1183,9 +1124,7 @@ public:
     {
         if (A.precision() != Precision::F32)
             return inplace1_(A, [this, s](Tensor& a) -> Result<void>
-            {
-                return scale_inplace_impl(a, s);
-            });
+                             { return scale_inplace_impl(a, s); });
         A.cpu_matrix().scale_inplace(s);
         return {};
     }
@@ -1193,10 +1132,7 @@ public:
     [[nodiscard]] Result<void> zero_impl(Tensor& A) override
     {
         if (A.precision() != Precision::F32)
-            return inplace1_(A, [this](Tensor& a) -> Result<void>
-            {
-                return zero_impl(a);
-            });
+            return inplace1_(A, [this](Tensor& a) -> Result<void> { return zero_impl(a); });
         A.cpu_matrix().zero();
         return {};
     }
@@ -1210,44 +1146,38 @@ public:
     // ══════════════════════════════════════════════════════════════════════
 
     // ── 前缀扫描（forward / backward pass 1 / forward_step）──────────────
-    [[nodiscard]] Result<Tensor> scan_prefix_outer_impl(
-        const Tensor& K, const Tensor& V, const Tensor& P, const Tensor& R,
-        const Tensor& A0, const Tensor& B0, bool has_state,
-        std::size_t dk, std::size_t heads, bool causal,
-        const Tensor& boundary, bool has_bnd,
-        Precision prec = Precision::F32) override
+    [[nodiscard]] Result<Tensor>
+    scan_prefix_outer_impl(const Tensor& K, const Tensor& V, const Tensor& P, const Tensor& R,
+                           const Tensor& A0, const Tensor& B0, bool has_state, std::size_t dk,
+                           std::size_t heads, bool causal, const Tensor& boundary, bool has_bnd,
+                           Precision prec = Precision::F32) override
     {
         const std::vector<Tensor> ts{K, V, P, R, A0, B0, boundary};
         if (prec == Precision::F32 && all_f32(ts))
-            return scan_prefix_outer_f32_(K, V, P, R, A0, B0, has_state, dk, heads,
-                                          causal, boundary, has_bnd);
+            return scan_prefix_outer_f32_(K, V, P, R, A0, B0, has_state, dk, heads, causal,
+                                          boundary, has_bnd);
         // 边界 cast：全部操作数抬 f32 → 算 → 输出按 prec 落回
         auto c = to_f32_all(ts);
         NN_TRY_CHECK(c);
-        auto r = scan_prefix_outer_f32_((*c)[0], (*c)[1], (*c)[2], (*c)[3],
-                                        (*c)[4], (*c)[5], has_state, dk, heads,
-                                        causal, (*c)[6], has_bnd);
+        auto r = scan_prefix_outer_f32_((*c)[0], (*c)[1], (*c)[2], (*c)[3], (*c)[4], (*c)[5],
+                                        has_state, dk, heads, causal, (*c)[6], has_bnd);
         NN_TRY_CHECK(r);
         return to_prec(std::move(*r), prec);
     }
 
 private:
-    [[nodiscard]] Result<Tensor> scan_prefix_outer_f32_(
-        const Tensor& K, const Tensor& V, const Tensor& P, const Tensor& R,
-        const Tensor& A0, const Tensor& B0, bool has_state,
-        std::size_t dk, std::size_t heads, bool causal,
-        const Tensor& boundary, bool has_bnd)
+    [[nodiscard]] Result<Tensor>
+    scan_prefix_outer_f32_(const Tensor& K, const Tensor& V, const Tensor& P, const Tensor& R,
+                           const Tensor& A0, const Tensor& B0, bool has_state, std::size_t dk,
+                           std::size_t heads, bool causal, const Tensor& boundary, bool has_bnd)
     {
         for (const auto& t : {K, V, P, R, A0, B0, boundary})
-            if (t.is_gpu())
-                NN_FAIL("CpuEngine: GPU tensor on CPU engine");
-        if (dk == 0 || heads == 0)
-            NN_FAIL("scan_prefix_outer: dk/heads must be > 0");
+            if (t.is_gpu()) NN_FAIL("CpuEngine: GPU tensor on CPU engine");
+        if (dk == 0 || heads == 0) NN_FAIL("scan_prefix_outer: dk/heads must be > 0");
         const Matrix& Km = K.cpu_matrix();
         const std::size_t rows = Km.rows();
-        const std::size_t seq  = Km.cols();
-        if (rows % (dk * heads) != 0)
-            NN_FAIL("scan_prefix_outer: K rows not divisible by H*dk");
+        const std::size_t seq = Km.cols();
+        if (rows % (dk * heads) != 0) NN_FAIL("scan_prefix_outer: K rows not divisible by H*dk");
         for (const auto* m : {&V.cpu_matrix(), &P.cpu_matrix(), &R.cpu_matrix()})
             if (m->rows() != rows || m->cols() != seq)
                 NN_FAIL("scan_prefix_outer: K/V/P/R shape mismatch");
@@ -1276,13 +1206,12 @@ private:
         {
             const std::size_t r0 = bh * dk;
             const std::size_t batch = bh / heads;
-            const std::size_t h     = bh % heads;
-            const auto doc_reset = [bdm, batch, seq, has_bnd](std::size_t t) {
-                return has_bnd && bdm.at_unchecked(0, batch * seq + t) != Scalar{0};
-            };
+            const std::size_t h = bh % heads;
+            const auto doc_reset = [bdm, batch, seq, has_bnd](std::size_t t)
+            { return has_bnd && bdm.at_unchecked(0, batch * seq + t) != Scalar{0}; };
 
-            std::vector<Scalar> A(dk * dk, Scalar{0}), B(dk * dk, Scalar{0}),
-                                qv(dk), kv(dk), vv(dk), num(dk), Aq(dk);
+            std::vector<Scalar> A(dk * dk, Scalar{0}), B(dk * dk, Scalar{0}), qv(dk), kv(dk),
+                vv(dk), num(dk), Aq(dk);
             if (has_state)
             {
                 const Matrix& a0m = A0.cpu_matrix();
@@ -1294,7 +1223,7 @@ private:
                         B[a * dk + b2] = b0m.at_unchecked(h * dk + a, b2);
                     }
             }
-            if (!causal)  // 双向：先求全集 A, B
+            if (!causal) // 双向：先求全集 A, B
             {
                 for (std::size_t t = 0; t < seq; ++t)
                 {
@@ -1319,7 +1248,7 @@ private:
                     kv[j] = Km.at_unchecked(r0 + j, t);
                     vv[j] = Vm.at_unchecked(r0 + j, t);
                 }
-                if (causal)  // 前缀和含自身 i<=t；文档边界处重置
+                if (causal) // 前缀和含自身 i<=t；文档边界处重置
                 {
                     if (doc_reset(t))
                     {
@@ -1339,11 +1268,11 @@ private:
                     Scalar acc{0}, acc2{0};
                     for (std::size_t j = 0; j < dk; ++j)
                     {
-                        acc  += B[i * dk + j] * qv[j];
+                        acc += B[i * dk + j] * qv[j];
                         acc2 += A[i * dk + j] * qv[j];
                     }
                     num[i] = acc;
-                    Aq[i]  = acc2;
+                    Aq[i] = acc2;
                 }
                 Scalar s{0};
                 for (std::size_t j = 0; j < dk; ++j)
@@ -1380,39 +1309,36 @@ private:
 
 public:
     // ── 后缀扫描（backward pass 2：gK/gV）────────────────────────────────
-    [[nodiscard]] Result<Tensor> scan_suffix_outer_impl(
-        const Tensor& D, const Tensor& X, const Tensor& Y,
-        std::size_t dk, std::size_t heads, bool causal,
-        const Tensor& boundary, bool has_bnd,
-        Precision prec = Precision::F32) override
+    [[nodiscard]] Result<Tensor> scan_suffix_outer_impl(const Tensor& D, const Tensor& X,
+                                                        const Tensor& Y, std::size_t dk,
+                                                        std::size_t heads, bool causal,
+                                                        const Tensor& boundary, bool has_bnd,
+                                                        Precision prec = Precision::F32) override
     {
         const std::vector<Tensor> ts{D, X, Y, boundary};
         if (prec == Precision::F32 && all_f32(ts))
             return scan_suffix_outer_f32_(D, X, Y, dk, heads, causal, boundary, has_bnd);
         auto c = to_f32_all(ts);
         NN_TRY_CHECK(c);
-        auto r = scan_suffix_outer_f32_((*c)[0], (*c)[1], (*c)[2], dk, heads,
-                                        causal, (*c)[3], has_bnd);
+        auto r =
+            scan_suffix_outer_f32_((*c)[0], (*c)[1], (*c)[2], dk, heads, causal, (*c)[3], has_bnd);
         NN_TRY_CHECK(r);
         return to_prec(std::move(*r), prec);
     }
 
 private:
-    [[nodiscard]] Result<Tensor> scan_suffix_outer_f32_(
-        const Tensor& D, const Tensor& X, const Tensor& Y,
-        std::size_t dk, std::size_t heads, bool causal,
-        const Tensor& boundary, bool has_bnd)
+    [[nodiscard]] Result<Tensor> scan_suffix_outer_f32_(const Tensor& D, const Tensor& X,
+                                                        const Tensor& Y, std::size_t dk,
+                                                        std::size_t heads, bool causal,
+                                                        const Tensor& boundary, bool has_bnd)
     {
         for (const auto& t : {D, X, Y, boundary})
-            if (t.is_gpu())
-                NN_FAIL("CpuEngine: GPU tensor on CPU engine");
-        if (dk == 0 || heads == 0)
-            NN_FAIL("scan_suffix_outer: dk/heads must be > 0");
+            if (t.is_gpu()) NN_FAIL("CpuEngine: GPU tensor on CPU engine");
+        if (dk == 0 || heads == 0) NN_FAIL("scan_suffix_outer: dk/heads must be > 0");
         const Matrix& Xm = X.cpu_matrix();
         const std::size_t rows = Xm.rows();
-        const std::size_t seq  = Xm.cols();
-        if (rows % (dk * heads) != 0)
-            NN_FAIL("scan_suffix_outer: X rows not divisible by H*dk");
+        const std::size_t seq = Xm.cols();
+        if (rows % (dk * heads) != 0) NN_FAIL("scan_suffix_outer: X rows not divisible by H*dk");
         const Matrix& Dm = D.cpu_matrix();
         if (Dm.rows() != rows * dk || Dm.cols() != seq)
             NN_FAIL("scan_suffix_outer: D must be (B*H*dk*dk, seq)");
@@ -1436,9 +1362,8 @@ private:
             const std::size_t r0 = bh * dk;
             const std::size_t dbase = bh * dk * dk;
             const std::size_t batch = bh / heads;
-            const auto doc_reset = [bdm, batch, seq, has_bnd](std::size_t t) {
-                return has_bnd && bdm.at_unchecked(0, batch * seq + t) != Scalar{0};
-            };
+            const auto doc_reset = [bdm, batch, seq, has_bnd](std::size_t t)
+            { return has_bnd && bdm.at_unchecked(0, batch * seq + t) != Scalar{0}; };
 
             std::vector<Scalar> S(dk * dk, Scalar{0}), xv(dk), yv(dk);
             for (std::size_t i = seq; i-- > 0;)
@@ -1446,8 +1371,7 @@ private:
                 if (causal)
                 {
                     // 后缀和：S = Σ_{t>=i} D_t；跨入前一文档时重置
-                    if (i + 1 < seq && doc_reset(i + 1))
-                        std::fill(S.begin(), S.end(), Scalar{0});
+                    if (i + 1 < seq && doc_reset(i + 1)) std::fill(S.begin(), S.end(), Scalar{0});
                     for (std::size_t idx = 0; idx < dk * dk; ++idx)
                         S[idx] += Dm.at_unchecked(dbase + idx, i);
                 }
@@ -1491,14 +1415,12 @@ private:
 
 public:
     // ── 逐列外积（backward 的 dL/dA、dL/dB 物化）─────────────────────────
-    [[nodiscard]] Result<Tensor> outer_col_impl(
-        const Tensor& P, const Tensor& R, const Tensor& S,
-        std::size_t dk, bool has_scale,
-        Precision prec = Precision::F32) override
+    [[nodiscard]] Result<Tensor> outer_col_impl(const Tensor& P, const Tensor& R, const Tensor& S,
+                                                std::size_t dk, bool has_scale,
+                                                Precision prec = Precision::F32) override
     {
         const std::vector<Tensor> ts{P, R, S};
-        if (prec == Precision::F32 && all_f32(ts))
-            return outer_col_f32_(P, R, S, dk, has_scale);
+        if (prec == Precision::F32 && all_f32(ts)) return outer_col_f32_(P, R, S, dk, has_scale);
         auto c = to_f32_all(ts);
         NN_TRY_CHECK(c);
         auto r = outer_col_f32_((*c)[0], (*c)[1], (*c)[2], dk, has_scale);
@@ -1507,24 +1429,19 @@ public:
     }
 
 private:
-    [[nodiscard]] Result<Tensor> outer_col_f32_(
-        const Tensor& P, const Tensor& R, const Tensor& S,
-        std::size_t dk, bool has_scale)
+    [[nodiscard]] Result<Tensor> outer_col_f32_(const Tensor& P, const Tensor& R, const Tensor& S,
+                                                std::size_t dk, bool has_scale)
     {
         for (const auto& t : {P, R, S})
-            if (t.is_gpu())
-                NN_FAIL("CpuEngine: GPU tensor on CPU engine");
-        if (dk == 0)
-            NN_FAIL("outer_col: dk must be > 0");
+            if (t.is_gpu()) NN_FAIL("CpuEngine: GPU tensor on CPU engine");
+        if (dk == 0) NN_FAIL("outer_col: dk must be > 0");
         const Matrix& Pm = P.cpu_matrix();
         const std::size_t rows = Pm.rows();
-        const std::size_t seq  = Pm.cols();
-        if (rows % dk != 0)
-            NN_FAIL("outer_col: rows not divisible by dk");
+        const std::size_t seq = Pm.cols();
+        if (rows % dk != 0) NN_FAIL("outer_col: rows not divisible by dk");
         if (R.cpu_matrix().rows() != rows || R.cpu_matrix().cols() != seq)
             NN_FAIL("outer_col: P/R shape mismatch");
-        if (has_scale &&
-            (S.cpu_matrix().rows() != rows || S.cpu_matrix().cols() != seq))
+        if (has_scale && (S.cpu_matrix().rows() != rows || S.cpu_matrix().cols() != seq))
             NN_FAIL("outer_col: S must be (B*H*dk, seq)");
         const Matrix& Rm = R.cpu_matrix();
         const Matrix& Sm = S.cpu_matrix();
@@ -1557,83 +1474,78 @@ public:
     // 归约原语
     // ══════════════════════════════════════════════════════════════════════
 
-    [[nodiscard]] Result<Tensor> row_reduce_sum_impl(const Tensor& A, Precision P = Precision::F32) override
+    [[nodiscard]] Result<Tensor> row_reduce_sum_impl(const Tensor& A,
+                                                     Precision P = Precision::F32) override
     {
         // 非 f32 输入 / 非 f32 输出精度 → 通用边界 cast（归约恒 f32 累加）
         if (A.precision() != Precision::F32 || P != Precision::F32)
             return unary_(A, P, [this](const Tensor& a) -> Result<Tensor>
-            {
-                return row_reduce_sum_impl(a, Precision::F32);
-            });
+                          { return row_reduce_sum_impl(a, Precision::F32); });
         const Matrix& m = A.cpu_matrix();
-        Matrix result = m.row_reduce(Scalar{0},
-            [](Scalar a, Scalar b) noexcept { return a + b; },
+        Matrix result = m.row_reduce(
+            Scalar{0}, [](Scalar a, Scalar b) noexcept { return a + b; },
             [](Scalar x) noexcept { return x; });
         return Tensor::from_matrix(std::move(result));
     }
 
-    [[nodiscard]] Result<Tensor> col_reduce_sum_impl(const Tensor& A, Precision P = Precision::F32) override
+    [[nodiscard]] Result<Tensor> col_reduce_sum_impl(const Tensor& A,
+                                                     Precision P = Precision::F32) override
     {
         if (A.precision() != Precision::F32 || P != Precision::F32)
             return unary_(A, P, [this](const Tensor& a) -> Result<Tensor>
-            {
-                return col_reduce_sum_impl(a, Precision::F32);
-            });
-        const Matrix& m = A.cpu_matrix();
-        Matrix result = m.col_reduce(Scalar{0},
-            [](Scalar a, Scalar b) noexcept { return a + b; },
-            [](Scalar x) noexcept { return x; });
-        return Tensor::from_matrix(std::move(result));
-    }
-
-    [[nodiscard]] Result<Tensor> col_reduce_max_impl(const Tensor& A, Precision P = Precision::F32) override
-    {
-        if (A.precision() != Precision::F32 || P != Precision::F32)
-            return unary_(A, P, [this](const Tensor& a) -> Result<Tensor>
-            {
-                return col_reduce_max_impl(a, Precision::F32);
-            });
+                          { return col_reduce_sum_impl(a, Precision::F32); });
         const Matrix& m = A.cpu_matrix();
         Matrix result = m.col_reduce(
-            std::numeric_limits<Scalar>::lowest(),
-            [](Scalar a, Scalar b) noexcept { return std::max(a, b); },
+            Scalar{0}, [](Scalar a, Scalar b) noexcept { return a + b; },
             [](Scalar x) noexcept { return x; });
+        return Tensor::from_matrix(std::move(result));
+    }
+
+    [[nodiscard]] Result<Tensor> col_reduce_max_impl(const Tensor& A,
+                                                     Precision P = Precision::F32) override
+    {
+        if (A.precision() != Precision::F32 || P != Precision::F32)
+            return unary_(A, P, [this](const Tensor& a) -> Result<Tensor>
+                          { return col_reduce_max_impl(a, Precision::F32); });
+        const Matrix& m = A.cpu_matrix();
+        Matrix result = m.col_reduce(
+            std::numeric_limits<Scalar>::lowest(), [](Scalar a, Scalar b) noexcept
+            { return std::max(a, b); }, [](Scalar x) noexcept { return x; });
         return Tensor::from_matrix(std::move(result));
     }
 
     // ── 分组归约（契约见 compute_engine.hpp）───────────────────────────
     // 按组并行（组间无竞争），组内沿 R 行累加、内层对列连续（可向量化）。
     template <bool IsMax>
-    [[nodiscard]] Result<Tensor> grouped_reduce_cpu_(
-        const Tensor& x, std::size_t G, std::size_t R)
+    [[nodiscard]] Result<Tensor> grouped_reduce_cpu_(const Tensor& x, std::size_t G, std::size_t R)
     {
-        if (x.is_gpu())
-            NN_FAIL("CpuEngine: GPU tensor on CPU engine");
-        if (G == 0 || R == 0)
-            NN_FAIL("grouped_reduce: G/R must be > 0");
-        if (x.rows() != G * R)
-            NN_FAIL("grouped_reduce: x must be (G*R, N)");
+        if (x.is_gpu()) NN_FAIL("CpuEngine: GPU tensor on CPU engine");
+        if (G == 0 || R == 0) NN_FAIL("grouped_reduce: G/R must be > 0");
+        if (x.rows() != G * R) NN_FAIL("grouped_reduce: x must be (G*R, N)");
         const std::size_t N = x.cols();
-        if (N == 0)
-            NN_FAIL("grouped_reduce: N must be > 0");
+        if (N == 0) NN_FAIL("grouped_reduce: N must be > 0");
         Matrix out(G, N);
         const auto src = x.cpu_matrix().span();
         const auto dst = out.span();
         const Scalar init = IsMax ? std::numeric_limits<Scalar>::lowest() : Scalar{0};
 
-        auto group_kernel = [&, src, dst, init](std::size_t g) noexcept {
+        auto group_kernel = [&, src, dst, init](std::size_t g) noexcept
+        {
             Scalar* o = dst.data() + g * N;
-            for (std::size_t n = 0; n < N; ++n) o[n] = init;
+            for (std::size_t n = 0; n < N; ++n)
+                o[n] = init;
             for (std::size_t i = 0; i < R; ++i)
             {
                 const Scalar* row = src.data() + (g * R + i) * N;
                 if constexpr (IsMax)
                 {
-                    for (std::size_t n = 0; n < N; ++n) o[n] = std::max(o[n], row[n]);
+                    for (std::size_t n = 0; n < N; ++n)
+                        o[n] = std::max(o[n], row[n]);
                 }
                 else
                 {
-                    for (std::size_t n = 0; n < N; ++n) o[n] += row[n];
+                    for (std::size_t n = 0; n < N; ++n)
+                        o[n] += row[n];
                 }
             }
         };
@@ -1645,32 +1557,29 @@ public:
         }
         else
         {
-            for (std::size_t g = 0; g < G; ++g) group_kernel(g);
+            for (std::size_t g = 0; g < G; ++g)
+                group_kernel(g);
         }
         return Tensor::from_matrix(std::move(out));
     }
 
-    [[nodiscard]] Result<Tensor> grouped_reduce_sum_impl(
-        const Tensor& x, std::size_t G, std::size_t R,
-        Precision P = Precision::F32) override
+    [[nodiscard]] Result<Tensor> grouped_reduce_sum_impl(const Tensor& x, std::size_t G,
+                                                         std::size_t R,
+                                                         Precision P = Precision::F32) override
     {
         if (x.precision() != Precision::F32 || P != Precision::F32)
             return unary_(x, P, [this, G, R](const Tensor& t) -> Result<Tensor>
-            {
-                return grouped_reduce_sum_impl(t, G, R, Precision::F32);
-            });
+                          { return grouped_reduce_sum_impl(t, G, R, Precision::F32); });
         return grouped_reduce_cpu_<false>(x, G, R);
     }
 
-    [[nodiscard]] Result<Tensor> grouped_reduce_max_impl(
-        const Tensor& x, std::size_t G, std::size_t R,
-        Precision P = Precision::F32) override
+    [[nodiscard]] Result<Tensor> grouped_reduce_max_impl(const Tensor& x, std::size_t G,
+                                                         std::size_t R,
+                                                         Precision P = Precision::F32) override
     {
         if (x.precision() != Precision::F32 || P != Precision::F32)
             return unary_(x, P, [this, G, R](const Tensor& t) -> Result<Tensor>
-            {
-                return grouped_reduce_max_impl(t, G, R, Precision::F32);
-            });
+                          { return grouped_reduce_max_impl(t, G, R, Precision::F32); });
         return grouped_reduce_cpu_<true>(x, G, R);
     }
 
@@ -1682,19 +1591,17 @@ public:
     // 纯索引映射，无物化。性能与等价手写循环一致。
     // ══════════════════════════════════════════════════════════════════════
 
-    [[nodiscard]] Result<Tensor> eval_expr_impl(
-        const ExprSpec& spec,
-        std::span<const Tensor> inputs,
-        std::size_t rows, std::size_t cols,
-        Precision P = Precision::F32) override
+    [[nodiscard]] Result<Tensor> eval_expr_impl(const ExprSpec& spec,
+                                                std::span<const Tensor> inputs, std::size_t rows,
+                                                std::size_t cols,
+                                                Precision P = Precision::F32) override
     {
         scan_record_variant_(spec, inputs, P);
         trace_variant_(spec, inputs, P);
         // CPU 无带类型融合变体：任何非 f32（输入或输出精度）都走边界 cast
         if (P != Precision::F32 || !all_f32(inputs))
         {
-            if (prec_trace_enabled_())
-                trace_miss_(spec, inputs, P);
+            if (prec_trace_enabled_()) trace_miss_(spec, inputs, P);
             auto in32 = to_f32_all(inputs);
             NN_TRY_CHECK(in32);
             auto r = eval_expr_impl(spec, *in32, rows, cols, Precision::F32);
@@ -1714,29 +1621,26 @@ public:
     //   行归约轴 → (rows,1)，列归约轴 → (1,cols)（而非广播到 (rows,cols)）。
     // 要求：表达式归约轴为 0/1；末指令为归约时直接取归约向量，否则按代表
     //   元素求值（所有 Input 须经归约/广播视图访问，保证沿归约轴恒定）。
-    [[nodiscard]] Result<Tensor> eval_expr_reduce_impl(
-        const ExprSpec& spec,
-        std::span<const Tensor> inputs,
-        std::size_t rows, std::size_t cols,
-        Precision P = Precision::F32) override
+    [[nodiscard]] Result<Tensor> eval_expr_reduce_impl(const ExprSpec& spec,
+                                                       std::span<const Tensor> inputs,
+                                                       std::size_t rows, std::size_t cols,
+                                                       Precision P = Precision::F32) override
     {
         scan_record_variant_(spec, inputs, P);
         trace_variant_(spec, inputs, P);
         if (P != Precision::F32 || !all_f32(inputs))
         {
-            if (prec_trace_enabled_())
-                trace_miss_(spec, inputs, P);
+            if (prec_trace_enabled_()) trace_miss_(spec, inputs, P);
             auto in32 = to_f32_all(inputs);
             NN_TRY_CHECK(in32);
             auto r = eval_expr_reduce_impl(spec, *in32, rows, cols, Precision::F32);
             NN_TRY_CHECK(r);
             return to_prec(std::move(*r), P);
         }
-        const bool vec_is_row =
-            (expr_spec_reduce_axis(canonicalize_expr_spec(spec)) == 0);
+        const bool vec_is_row = (expr_spec_reduce_axis(canonicalize_expr_spec(spec)) == 0);
         // 归约向量输出同样被完整写满 → 未初始化构造
-        Tensor out = vec_is_row ? Tensor::cpu_uninitialized(rows, 1)
-                                : Tensor::cpu_uninitialized(1, cols);
+        Tensor out =
+            vec_is_row ? Tensor::cpu_uninitialized(rows, 1) : Tensor::cpu_uninitialized(1, cols);
         auto r = eval_expr_impl(spec, inputs, rows, cols, /*vector_out=*/true, out);
         NN_TRY_CHECK(r);
         return out;
@@ -1751,10 +1655,9 @@ public:
     // （就地安全前提：每个元素先读完全部输入再写 out[i]；GPU 同一 buffer 绑定为
     // readonly 输入 + writeonly 输出的逐元素同索引读写亦无跨调用危害）。
     // 仅支持逐元素表达式（无归约）；归约向量输出用 eval_expr_reduce。
-    [[nodiscard]] Result<void> eval_expr_into_impl(
-        const ExprSpec& spec,
-        std::span<const Tensor> inputs,
-        std::size_t rows, std::size_t cols, Tensor& dst) override
+    [[nodiscard]] Result<void> eval_expr_into_impl(const ExprSpec& spec,
+                                                   std::span<const Tensor> inputs, std::size_t rows,
+                                                   std::size_t cols, Tensor& dst) override
     {
         scan_record_variant_(spec, inputs, dst.precision());
         // 目标传递：out 可能是 f16 —— 在 f32 空间求值后 cast_into 写回原存储
@@ -1762,8 +1665,7 @@ public:
         if (dst.precision() != Precision::F32 || !all_f32(inputs))
         {
             trace_variant_(spec, inputs, dst.precision());
-            if (prec_trace_enabled_())
-                trace_miss_(spec, inputs, dst.precision());
+            if (prec_trace_enabled_()) trace_miss_(spec, inputs, dst.precision());
             auto in32 = to_f32_all(inputs);
             NN_TRY_CHECK(in32);
             auto tmp = create_tensor(rows, cols, Precision::F32);
@@ -1772,8 +1674,7 @@ public:
             return cast_into(tmp, dst);
         }
         trace_variant_(spec, inputs, Precision::F32);
-        if (dst.rows() != rows || dst.cols() != cols)
-            NN_FAIL("eval_expr_into: dst shape mismatch");
+        if (dst.rows() != rows || dst.cols() != cols) NN_FAIL("eval_expr_into: dst shape mismatch");
         if (expr_spec_reduce_axis(canonicalize_expr_spec(spec)) != -1)
             NN_FAIL("eval_expr_into: 仅支持逐元素表达式（无归约）");
         return eval_expr_impl(spec, inputs, rows, cols, /*vector_out=*/false, dst);
@@ -1784,14 +1685,14 @@ public:
     // 把目标寄存器提升为主输出（解释器单输出写回；Neg∘Neg 逐位恒等——含 -0
     // 与 NaN；末指令是输出 ⇒ simplify 的输出指令豁免不折叠该链）。CPU 无
     // 运行时图录制，本路径仅测试/工具使用，重复求值可接受。
-    [[nodiscard]] Result<void> eval_expr_multi_into_impl(
-        const ExprSpec& raw_spec, std::span<const Tensor> inputs,
-        std::size_t rows, std::size_t cols, std::span<Tensor> outs) override
+    [[nodiscard]] Result<void> eval_expr_multi_into_impl(const ExprSpec& raw_spec,
+                                                         std::span<const Tensor> inputs,
+                                                         std::size_t rows, std::size_t cols,
+                                                         std::span<Tensor> outs) override
     {
-        if (raw_spec.instrs.empty())
-            NN_FAIL("eval_expr_multi_into: 空指令表");
+        if (raw_spec.instrs.empty()) NN_FAIL("eval_expr_multi_into: 空指令表");
         auto r0 = eval_expr_impl(raw_spec, inputs, rows, cols,
-                                /*vector_out=*/false, outs[0]);
+                                 /*vector_out=*/false, outs[0]);
         NN_TRY_CHECK(r0);
         for (std::size_t k = 0; k < raw_spec.extras.size(); ++k)
         {
@@ -1801,18 +1702,18 @@ public:
                 NN_FAIL("eval_expr_multi_into: extras 复制链超出寄存器上限");
             ExprSpec s = raw_spec;
             ExprInstr n1;
-            n1.op  = static_cast<std::uint8_t>(ExprOp::Neg);
+            n1.op = static_cast<std::uint8_t>(ExprOp::Neg);
             n1.dst = static_cast<std::uint8_t>(s.num_regs);
-            n1.a   = expr::reg(raw_spec.extras[k]);
+            n1.a = expr::reg(raw_spec.extras[k]);
             s.instrs.push_back(n1);
             ExprInstr n2;
-            n2.op  = static_cast<std::uint8_t>(ExprOp::Neg);
+            n2.op = static_cast<std::uint8_t>(ExprOp::Neg);
             n2.dst = static_cast<std::uint8_t>(s.num_regs + 1);
-            n2.a   = expr::reg(static_cast<std::uint8_t>(s.num_regs));
+            n2.a = expr::reg(static_cast<std::uint8_t>(s.num_regs));
             s.instrs.push_back(n2);
             s.num_regs += 2;
             auto r = eval_expr_impl(s, inputs, rows, cols,
-                                   /*vector_out=*/false, outs[k + 1]);
+                                    /*vector_out=*/false, outs[k + 1]);
             NN_TRY_CHECK(r);
         }
         return {};
@@ -1828,17 +1729,14 @@ public:
     //   - 键域每块：[mm 段预计算 tile] → body 指令 →（块尾）vecacc 更新行向量态
     //   - 块内有效列 valid = min(BLOCK, K-k0) 天然 gate 尾块越界
     //   - 向量域：finalize 逐 (row, d∈[0,out_cols)) 求值 → 输出
-    [[nodiscard]] Result<void> eval_fold_impl(
-        const ExprSpec& spec,
-        std::span<const Tensor> inputs,
-        std::size_t rows, std::size_t cols, bool vector_out, Tensor& output)
+    [[nodiscard]] Result<void> eval_fold_impl(const ExprSpec& spec, std::span<const Tensor> inputs,
+                                              std::size_t rows, std::size_t cols, bool vector_out,
+                                              Tensor& output)
     {
-        if (vector_out)
-            NN_FAIL("eval_fold: vector_out not expected (fold outputs via eval_expr)");
+        if (vector_out) NN_FAIL("eval_fold: vector_out not expected (fold outputs via eval_expr)");
         const FoldSpec& f = *spec.fold;
         const std::size_t K = f.k;
-        const std::size_t out_cols =
-            (f.vec_state_len > 0) ? f.vec_state_len : 1;
+        const std::size_t out_cols = (f.vec_state_len > 0) ? f.vec_state_len : 1;
         if (cols != out_cols)
             NN_FAIL("eval_fold: cols must equal fold output width (vec_state_len or 1)");
         // 输入：分 fold.matmul 的 A/B（按 trans 布局）与普通输入（视图校验）
@@ -1847,40 +1745,33 @@ public:
         for (std::size_t k = 0; k < inputs.size(); ++k)
         {
             const Tensor& t = inputs[k];
-            if (!t.is_cpu())
-                NN_FAIL("eval_fold: input not CPU");
+            if (!t.is_cpu()) NN_FAIL("eval_fold: input not CPU");
             const ExprViewKind vk = static_cast<ExprViewKind>(spec.views[k].kind);
             // vecacc.b（(K, vec) 独立校验于下方）与掩码小表（BatchMod/BatchCol
             //   为 (1, *) 标签/斜率向量，行主序平坦读、不占 (rows,K) 网格）
             //   豁免普通输入的 (rows, K) 形状假设
-            const bool is_vecb = f.vecacc &&
-                (k == static_cast<std::size_t>(f.vecacc->b_input));
+            const bool is_vecb = f.vecacc && (k == static_cast<std::size_t>(f.vecacc->b_input));
             const bool is_tag_table =
                 (vk == ExprViewKind::BatchMod || vk == ExprViewKind::BatchCol);
-            const bool is_rowvec = (vk == ExprViewKind::RowBroadcast);  // (rows,1) 行参数
+            const bool is_rowvec = (vk == ExprViewKind::RowBroadcast); // (rows,1) 行参数
             if (!is_vecb && !is_tag_table && !is_rowvec && f.matmul &&
                 (k == static_cast<std::size_t>(f.matmul->a_input) ||
                  k == static_cast<std::size_t>(f.matmul->b_input)))
             {
                 const bool is_a = (k == static_cast<std::size_t>(f.matmul->a_input));
-                const bool tr = is_a ? (f.matmul->transA != 0)
-                                     : (f.matmul->transB != 0);
+                const bool tr = is_a ? (f.matmul->transA != 0) : (f.matmul->transB != 0);
                 const std::size_t batch = f.matmul->batch;
                 const std::size_t mm_k = f.matmul->k;
-                const std::size_t m_per =
-                    (batch > 0 && rows % batch == 0) ? rows / batch : rows;
+                const std::size_t m_per = (batch > 0 && rows % batch == 0) ? rows / batch : rows;
                 // 形状按 MatmulSpec 布局核对（同 eval_expr_impl 的 matmul 分支）：
                 //   A: trans0 → (rows, mm_k)；trans1 → (batch*mm_k, m_per)
                 //   B: trans0 → (batch*mm_k, K)；trans1 → (batch*K, mm_k)
                 //   其中 mm_k=内层收缩、K=fold 收缩轴=网格列数
                 const std::size_t nb_a = batch / gqa_ratio_of(spec, f.matmul->a_input);
                 const std::size_t nb_b = batch / gqa_ratio_of(spec, f.matmul->b_input);
-                const std::size_t er = is_a
-                    ? (tr ? nb_a * mm_k : rows)
-                    : (tr ? nb_b * K : nb_b * mm_k);
-                const std::size_t ec = is_a
-                    ? (tr ? m_per : mm_k)
-                    : (tr ? mm_k : K);
+                const std::size_t er =
+                    is_a ? (tr ? nb_a * mm_k : rows) : (tr ? nb_b * K : nb_b * mm_k);
+                const std::size_t ec = is_a ? (tr ? m_per : mm_k) : (tr ? mm_k : K);
                 if (t.rows() != er || t.cols() != ec)
                     NN_FAIL("eval_fold: fold matmul input shape mismatch");
                 spans.push_back(t.cpu_matrix().span());
@@ -1889,11 +1780,9 @@ public:
             // 视图白名单（与 expr_spec 的 fold validate **同步维护**——两处清单
             //   必须一致，否则合法视图在一侧被拒、fold forward 直接报错）
             if (vk != ExprViewKind::Linear && vk != ExprViewKind::HeadGroup &&
-                vk != ExprViewKind::RowMod &&
-                vk != ExprViewKind::RowBroadcast &&
+                vk != ExprViewKind::RowMod && vk != ExprViewKind::RowBroadcast &&
                 vk != ExprViewKind::Transpose &&
-                !((vk == ExprViewKind::BatchMod || vk == ExprViewKind::BatchCol) &&
-                  f.matmul))
+                !((vk == ExprViewKind::BatchMod || vk == ExprViewKind::BatchCol) && f.matmul))
                 NN_FAIL("eval_fold: view outside supported scope");
             const bool is_trans = (vk == ExprViewKind::Transpose);
             if (!is_vecb && !is_tag_table && !is_rowvec && !is_trans &&
@@ -1916,12 +1805,11 @@ public:
             if (is_tag_table)
             {
                 const std::uint32_t vparam = spec.views[k].param;
-                if (vparam == 0)
-                    NN_FAIL("eval_fold: BatchMod/BatchCol param must be > 0");
+                if (vparam == 0) NN_FAIL("eval_fold: BatchMod/BatchCol param must be > 0");
                 const std::size_t batch_n = f.matmul ? f.matmul->batch : 1;
                 const std::size_t need = vk == ExprViewKind::BatchMod
-                    ? static_cast<std::size_t>(vparam)
-                    : (batch_n - 1) * static_cast<std::size_t>(vparam) + K;
+                                             ? static_cast<std::size_t>(vparam)
+                                             : (batch_n - 1) * static_cast<std::size_t>(vparam) + K;
                 if (t.cols() < need)
                     NN_FAIL("eval_fold: tag table cols out of range (BatchMod/BatchCol)");
             }
@@ -1936,12 +1824,11 @@ public:
             const Tensor& tb = inputs[f.vecacc->b_input];
             // GQA：V_t 只存 n_head_kv 个头 → 行数按头分组比缩小
             const std::size_t vb =
-                (f.matmul ? f.matmul->batch : 1) /
-                gqa_ratio_of(spec, f.vecacc->b_input);
-            const std::size_t want_rows =
-                (vb ? vb : 1) * K;
+                (f.matmul ? f.matmul->batch : 1) / gqa_ratio_of(spec, f.vecacc->b_input);
+            const std::size_t want_rows = (vb ? vb : 1) * K;
             if (tb.rows() != want_rows || tb.cols() != f.vec_state_len)
-                NN_FAIL("eval_fold: vecacc b_input shape mismatch (expect (batch*k, vec_state_len))");
+                NN_FAIL(
+                    "eval_fold: vecacc b_input shape mismatch (expect (batch*k, vec_state_len))");
         }
 
         auto cls_r = expr_fold_classify(f, spec.num_regs);
@@ -1951,34 +1838,32 @@ public:
         // fold matmul 上下文（掩码网格索引与 mm 段求值共用）
         const MatmulSpec* fmm = f.matmul ? &*f.matmul : nullptr;
         const std::size_t mm_batch = fmm ? fmm->batch : 1;
-        const std::size_t m_per = (fmm && mm_batch > 0 && rows % mm_batch == 0)
-            ? rows / mm_batch : rows;
+        const std::size_t m_per =
+            (fmm && mm_batch > 0 && rows % mm_batch == 0) ? rows / mm_batch : rows;
 
         // 输入视图读（列 = 全局收缩下标 gk；双域 fold 加 BatchMod/BatchCol 掩码钩子）
         const auto view_read = [&](std::size_t k, std::size_t r, std::size_t gk) -> Scalar
         {
             const ExprView& v = spec.views[k];
             const auto vk = static_cast<ExprViewKind>(v.kind);
-            if (vk == ExprViewKind::RowMod && v.param > 0)
-                return spans[k][(r % v.param) * K + gk];
+            if (vk == ExprViewKind::RowMod && v.param > 0) return spans[k][(r % v.param) * K + gk];
             if (vk == ExprViewKind::BatchMod)
-                return spans[k][(r / m_per) % v.param];       // b[batch % param]
+                return spans[k][(r / m_per) % v.param]; // b[batch % param]
             if (vk == ExprViewKind::BatchCol)
-                return spans[k][(r / m_per) * v.param + gk];  // b[batch*param + col]
-            if (vk == ExprViewKind::RowBroadcast)
-                return spans[k][r];                           // (rows,1)：b[row]
+                return spans[k][(r / m_per) * v.param + gk]; // b[batch*param + col]
+            if (vk == ExprViewKind::RowBroadcast) return spans[k][r]; // (rows,1)：b[row]
             if (vk == ExprViewKind::Transpose)
-                return spans[k][gk * static_cast<std::size_t>(v.param) + r];  // b[col*stride+row]
+                return spans[k][gk * static_cast<std::size_t>(v.param) + r]; // b[col*stride+row]
             return spans[k][r * K + gk];
         };
 
-        std::vector<Scalar> reg(spec.num_regs, Scalar{0});   // 状态 + 标量类临时
+        std::vector<Scalar> reg(spec.num_regs, Scalar{0}); // 状态 + 标量类临时
         std::vector<std::vector<Scalar>> elem(spec.num_regs); // 元素类临时（BLOCK 槽）
         for (std::uint32_t r = 0; r < spec.num_regs; ++r)
             if (is_elem[r]) elem[r].resize(EXPR_FOLD_BLOCK);
-        std::vector<Scalar> red(spec.num_regs, Scalar{0});    // 块归约 dst（行标量）
+        std::vector<Scalar> red(spec.num_regs, Scalar{0}); // 块归约 dst（行标量）
         std::vector<Scalar> vecd(f.vec_state_len, Scalar{0}); // 行向量态（累加初值 0）
-        std::size_t cur_d = 0;   // 向量域当前输出列（eval_op 的 VecState 读）
+        std::size_t cur_d = 0; // 向量域当前输出列（eval_op 的 VecState 读）
 
         // fold matmul 段：网格 (row, gk) 上 C = Σ_d opA·opB（惰性求值——
         //   CPU 正确性基准不追性能；GPU 侧由生成器块内预计算 tile）。
@@ -1997,20 +1882,18 @@ public:
             Scalar acc = 0;
             for (std::size_t d = 0; d < mm_k; ++d)
             {
-                const Scalar av = fmm->transA
-                    ? as[(bA * mm_k + d) * m_per + row_in]
-                    : as[(bA * m_per + row_in) * mm_k + d];
-                const Scalar bv = fmm->transB
-                    ? bs[(bB * K + gk) * mm_k + d]
-                    : bs[(bB * mm_k + d) * K + gk];
+                const Scalar av = fmm->transA ? as[(bA * mm_k + d) * m_per + row_in]
+                                              : as[(bA * m_per + row_in) * mm_k + d];
+                const Scalar bv =
+                    fmm->transB ? bs[(bB * K + gk) * mm_k + d] : bs[(bB * mm_k + d) * K + gk];
                 acc += av * bv;
             }
             return acc;
         };
 
         // 操作数求值：kb = 块内下标（元素类临时槽），gk = 全局列（Input/Col 读）
-        const auto eval_op = [&](const ExprOperand& op, std::size_t r,
-                                 std::size_t kb, std::size_t gk) -> Scalar
+        const auto eval_op = [&](const ExprOperand& op, std::size_t r, std::size_t kb,
+                                 std::size_t gk) -> Scalar
         {
             switch (op.kind)
             {
@@ -2018,11 +1901,16 @@ public:
             case static_cast<uint8_t>(ExprOperandKind::Reg):
             case static_cast<uint8_t>(ExprOperandKind::Fanout):
                 return is_elem[op.idx] ? elem[op.idx][kb] : reg[op.idx];
-            case static_cast<uint8_t>(ExprOperandKind::Const):  return spec.consts[op.idx];
-            case static_cast<uint8_t>(ExprOperandKind::RParam): return spec.rparams[op.idx];
-            case static_cast<uint8_t>(ExprOperandKind::Reduce): return red[op.idx];
-            case static_cast<uint8_t>(ExprOperandKind::Input):  return view_read(op.idx, r, gk);
-            case static_cast<uint8_t>(ExprOperandKind::Matmul): return mm_at(r, gk);
+            case static_cast<uint8_t>(ExprOperandKind::Const):
+                return spec.consts[op.idx];
+            case static_cast<uint8_t>(ExprOperandKind::RParam):
+                return spec.rparams[op.idx];
+            case static_cast<uint8_t>(ExprOperandKind::Reduce):
+                return red[op.idx];
+            case static_cast<uint8_t>(ExprOperandKind::Input):
+                return view_read(op.idx, r, gk);
+            case static_cast<uint8_t>(ExprOperandKind::Matmul):
+                return mm_at(r, gk);
             case static_cast<uint8_t>(ExprOperandKind::Row):
                 return fmm ? static_cast<Scalar>(r % m_per) : Scalar{0};
             case static_cast<uint8_t>(ExprOperandKind::Col):
@@ -2037,12 +1925,10 @@ public:
         // 非归约指令求值（标量语义唯一来源 = expr_op_table 的 CPU 函数指针对；
         //  va 已取自 a、vb 取自 b；Select 由 eval_full 单独处理，归约不进本函数）
         const auto exec_alu = [](ExprOp op, Scalar va, Scalar vb) -> Scalar
-        {
-            return detail::expr_alu_scalar(op, va, vb, Scalar{0});
-        };
+        { return detail::expr_alu_scalar(op, va, vb, Scalar{0}); };
         // Select：三元（fold body 允许，validate 未禁——按主链语义）
-        const auto eval_full = [&](const ExprInstr& ins, std::size_t r,
-                                   std::size_t kb, std::size_t gk) -> Scalar
+        const auto eval_full = [&](const ExprInstr& ins, std::size_t r, std::size_t kb,
+                                   std::size_t gk) -> Scalar
         {
             const ExprOp op = static_cast<ExprOp>(ins.op);
             const Scalar va = eval_op(ins.a, r, kb, gk);
@@ -2079,8 +1965,7 @@ public:
                     if (expr_op_is_reduce(op))
                     {
                         const bool is_max = (op == ExprOp::RowMax || op == ExprOp::ColMax);
-                        Scalar acc = is_max
-                            ? std::numeric_limits<Scalar>::lowest() : Scalar{0};
+                        Scalar acc = is_max ? std::numeric_limits<Scalar>::lowest() : Scalar{0};
                         for (std::size_t kb = 0; kb < valid; ++kb)
                         {
                             const Scalar v = eval_op(ins.a, r, kb, k0 + kb);
@@ -2111,14 +1996,13 @@ public:
                     const ConstSpan& bs = spans[va.b_input];
                     // GQA：V_t 的行块号按其视图的头分组比取
                     const std::size_t b_of_row =
-                        fmm ? (static_cast<std::size_t>(r / m_per) /
-                               gqa_ratio_of(spec, va.b_input))
-                           : 0;
+                        fmm ? (static_cast<std::size_t>(r / m_per) / gqa_ratio_of(spec, va.b_input))
+                            : 0;
                     for (std::size_t kb = 0; kb < valid; ++kb)
                     {
-                        const Scalar w = is_elem[va.weight_reg]
-                            ? elem[va.weight_reg][kb] : reg[va.weight_reg];
-                        const std::size_t jr = b_of_row * K + (k0 + kb);  // 全局键行
+                        const Scalar w =
+                            is_elem[va.weight_reg] ? elem[va.weight_reg][kb] : reg[va.weight_reg];
+                        const std::size_t jr = b_of_row * K + (k0 + kb); // 全局键行
                         for (std::size_t d = 0; d < f.vec_state_len; ++d)
                             vecd[d] += w * bs[jr * f.vec_state_len + d];
                     }
@@ -2141,23 +2025,20 @@ public:
     // ── eval_expr / eval_expr_reduce / eval_expr_into 共用实现 ────────────
     // output：调用方预分配的输出张量，形状须与输出一致
     //   （vector_out=false → (rows,cols)；true → (rows,1)/(1,cols)）。
-    [[nodiscard]] Result<void> eval_expr_impl(
-        const ExprSpec& raw_spec,
-        std::span<const Tensor> inputs,
-        std::size_t rows, std::size_t cols, bool vector_out, Tensor& output)
+    [[nodiscard]] Result<void> eval_expr_impl(const ExprSpec& raw_spec,
+                                              std::span<const Tensor> inputs, std::size_t rows,
+                                              std::size_t cols, bool vector_out, Tensor& output)
     {
         // canonical IR：canonicalize 为引擎内部优化（IR-A/IR-B），Layer 无感知；
         // 结构统一在 canonical 形态上，与 scan/gen_fused 两端一致。
         NN_TRY(v, validate_expr_spec(raw_spec, inputs.size()));
         // fold 段：独立执行路径——跳过 canonicalize（IR-A/B 不作用于
         //   body/finalize 序列）与空指令表检查（fold 的 finalize 即尾链）
-        if (raw_spec.fold)
-            return eval_fold_impl(raw_spec, inputs, rows, cols, vector_out, output);
+        if (raw_spec.fold) return eval_fold_impl(raw_spec, inputs, rows, cols, vector_out, output);
         const ExprSpec spec = canonicalize_expr_spec(raw_spec);
         NN_TRY(v2, validate_expr_spec(spec, inputs.size()));
         // 空指令表仅允许"纯 matmul"（输出 = matmul 结果本身）
-        if (spec.instrs.empty() && !spec.matmul)
-            NN_FAIL("eval_expr: empty instruction list");
+        if (spec.instrs.empty() && !spec.matmul) NN_FAIL("eval_expr: empty instruction list");
         // vector_out：要求表达式为纯行/列归约（归约轴 0/1），输出取向量形状
         const int raxis = vector_out ? expr_spec_reduce_axis(spec) : -1;
         if (vector_out && raxis != 0 && raxis != 1)
@@ -2174,17 +2055,17 @@ public:
         const MatmulSpec* mm = spec.matmul ? &*spec.matmul : nullptr;
         const std::size_t mm_k = mm ? mm->k : 0;
         const std::size_t mm_batch = mm ? mm->batch : 1;
-        const std::size_t m_per = (mm && mm->batch > 0 && rows % mm->batch == 0)
-            ? rows / mm->batch : rows;
+        const std::size_t m_per =
+            (mm && mm->batch > 0 && rows % mm->batch == 0) ? rows / mm->batch : rows;
         for (std::size_t k = 0; k < inputs.size(); ++k)
         {
             const Tensor& t = inputs[k];
-            if (!t.is_cpu())
-                NN_FAIL("eval_expr: input not CPU");
+            if (!t.is_cpu()) NN_FAIL("eval_expr: input not CPU");
             // CPU 解释器按 f32 存储读取 span：f16 输入直读 = 空指针 UB →
             // 响亮报错，让误用立刻暴露。
             if (t.precision() != Precision::F32)
-                NN_FAIL("eval_expr: CPU 解释器仅支持 f32 输入（f16 须由基类 NVI 入口先抬到 f32（直调 eval_expr_impl 才会到这里））");
+                NN_FAIL("eval_expr: CPU 解释器仅支持 f32 输入（f16 须由基类 NVI 入口先抬到 "
+                        "f32（直调 eval_expr_impl 才会到这里））");
             const ExprView& v = spec.views[k];
             if (mm && (k == static_cast<std::size_t>(mm->a_input) ||
                        k == static_cast<std::size_t>(mm->b_input)))
@@ -2195,12 +2076,10 @@ public:
                 // GQA：操作数只存 mm_batch/kv_ratio 份行块（1 = 恒等）
                 const std::size_t nb =
                     mm_batch / gqa_ratio_of(spec, is_a ? mm->a_input : mm->b_input);
-                const std::size_t er = is_a
-                    ? (tr ? nb * mm_k : nb * m_per)          // A 存储行数期望
-                    : (tr ? nb * cols : nb * mm_k);
-                const std::size_t ec = is_a
-                    ? (tr ? m_per : mm_k)                    // A 存储列数期望
-                    : (tr ? mm_k : cols);
+                const std::size_t er = is_a ? (tr ? nb * mm_k : nb * m_per) // A 存储行数期望
+                                            : (tr ? nb * cols : nb * mm_k);
+                const std::size_t ec = is_a ? (tr ? m_per : mm_k) // A 存储列数期望
+                                            : (tr ? mm_k : cols);
                 if (t.rows() != er || t.cols() != ec)
                     NN_FAIL("eval_expr: matmul input shape mismatch");
                 spans.push_back(t.cpu_matrix().span());
@@ -2218,12 +2097,11 @@ public:
             case static_cast<uint8_t>(ExprViewKind::RowReduceMax):
             case static_cast<uint8_t>(ExprViewKind::RowGather):
                 // 按标签行收集：主输入行数任意（读取经 label 索引），列数须一致
-                if (t.cols() != cols)
-                    NN_FAIL("eval_expr: RowGather input cols mismatch");
+                if (t.cols() != cols) NN_FAIL("eval_expr: RowGather input cols mismatch");
                 break;
             case static_cast<uint8_t>(ExprViewKind::RotateHalf):
-                if (t.rows() != rows || t.cols() != cols || v.param == 0 ||
-                    rows % v.param != 0 || v.param % 2 != 0)
+                if (t.rows() != rows || t.cols() != cols || v.param == 0 || rows % v.param != 0 ||
+                    v.param % 2 != 0)
                     NN_FAIL("eval_expr: RotateHalf shape/param invalid");
                 break;
             case static_cast<uint8_t>(ExprViewKind::RowMod):
@@ -2254,8 +2132,7 @@ public:
                 break;
             case static_cast<uint8_t>(ExprViewKind::BatchMod):
                 // 输入 (1,modulo 相关)：按批次取模索引的小向量
-                if (t.rows() != 1)
-                    NN_FAIL("eval_expr: BatchMod input must be (1,cols)");
+                if (t.rows() != 1) NN_FAIL("eval_expr: BatchMod input must be (1,cols)");
                 break;
             case static_cast<uint8_t>(ExprViewKind::BatchCol):
                 // 输入 (1, batch*param)：按 (batch, col) 切片（doc_ids 等）
@@ -2278,8 +2155,7 @@ public:
             NN_FAIL("eval_expr: CPU 解释器输出须为 f32 存储（f16 输出须由基类 NVI 入口落回）");
         Span out = output.cpu_matrix().span();
         const std::size_t n = rows * cols;
-        if (n == 0)
-            return {};
+        if (n == 0) return {};
 
         // ── 归约视图预计算：每行/每列一个标量，供广播读取 ──────────────
         // 仅在 views[k] 为归约视图时填充 view_reduce[k]（长度 rows 或 cols）。
@@ -2290,12 +2166,10 @@ public:
         for (std::size_t k = 0; k < inputs.size(); ++k)
         {
             const ExprView& v = spec.views[k];
-            if (!expr_view_is_reduce(static_cast<ExprViewKind>(v.kind)))
-                continue;
+            if (!expr_view_is_reduce(static_cast<ExprViewKind>(v.kind))) continue;
             const bool is_row = expr_view_reduces_rows(static_cast<ExprViewKind>(v.kind));
-            const bool is_max =
-                (v.kind == static_cast<uint8_t>(ExprViewKind::RowReduceMax) ||
-                 v.kind == static_cast<uint8_t>(ExprViewKind::ColReduceMax));
+            const bool is_max = (v.kind == static_cast<uint8_t>(ExprViewKind::RowReduceMax) ||
+                                 v.kind == static_cast<uint8_t>(ExprViewKind::ColReduceMax));
             const ConstSpan& s = spans[k];
             const std::size_t len = is_row ? rows : cols;
             std::vector<Scalar>& acc = view_reduce[k];
@@ -2346,12 +2220,12 @@ public:
             const std::size_t mm_batch = mm->batch;
             const bool trA = (mm->transA != 0);
             const bool trB = (mm->transB != 0);
-            const std::size_t M = m_per;          // 每批输出行
+            const std::size_t M = m_per; // 每批输出行
             const std::size_t N = cols;
             const std::size_t K = mm_k;
             const ConstSpan& as = spans[mm->a_input];
             const ConstSpan& bs = spans[mm->b_input];
-            matmul_out = Matrix(rows, N);   // 零初始化：span 内核为累加语义（r += A*B）
+            matmul_out = Matrix(rows, N); // 零初始化：span 内核为累加语义（r += A*B）
             auto out = matmul_out.span();
             for (std::size_t b = 0; b < mm_batch; ++b)
             {
@@ -2368,21 +2242,15 @@ public:
                 auto c_sub = std::span<Scalar>(out.data() + b * M * N, M * N);
                 if (!trA && !trB)
                 {
-                    Matrix::multiply_to_span(c_sub, M, N,
-                        a_sub, M, K,
-                        b_sub, K, N);
+                    Matrix::multiply_to_span(c_sub, M, N, a_sub, M, K, b_sub, K, N);
                 }
                 else if (!trA && trB)
                 {
-                    Matrix::multiply_transposed_to_span(c_sub, M, N,
-                        a_sub, M, K,
-                        b_sub, N, K);
+                    Matrix::multiply_transposed_to_span(c_sub, M, N, a_sub, M, K, b_sub, N, K);
                 }
                 else if (trA && !trB)
                 {
-                    Matrix::transpose_multiply_to_span(c_sub, M, N,
-                        a_sub, K, M,
-                        b_sub, K, N);
+                    Matrix::transpose_multiply_to_span(c_sub, M, N, a_sub, K, M, b_sub, K, N);
                 }
                 else
                 {
@@ -2404,8 +2272,7 @@ public:
         // ── 纯 matmul（无逐元素链）：输出 = matmul 结果本身 ─────────────
         if (spec.instrs.empty())
         {
-            if (!mm)
-                NN_FAIL("eval_expr: empty instruction list without matmul");
+            if (!mm) NN_FAIL("eval_expr: empty instruction list without matmul");
             const auto ms = matmul_out.span();
             for (std::size_t i = 0; i < n; ++i)
                 out[i] = ms[i];
@@ -2427,11 +2294,10 @@ public:
             {
                 const std::size_t block = v.param;
                 const std::size_t rl = r % block;
-                const std::size_t rr = (r / block) * block
-                    + ((rl < block / 2) ? (rl + block / 2) : (rl - block / 2));
+                const std::size_t rr =
+                    (r / block) * block + ((rl < block / 2) ? (rl + block / 2) : (rl - block / 2));
                 Scalar val = s[rr * cols + c];
-                if (v.negate_first_half && rl < block / 2)
-                    return -val;
+                if (v.negate_first_half && rl < block / 2) return -val;
                 return val;
             }
             case static_cast<uint8_t>(ExprViewKind::RowMod):
@@ -2449,22 +2315,21 @@ public:
             case static_cast<uint8_t>(ExprViewKind::ColReduceMax):
                 return view_reduce[k][c];
             case static_cast<uint8_t>(ExprViewKind::RowBroadcast):
-                return s[r];           // 输入 (rows,1)
+                return s[r]; // 输入 (rows,1)
             case static_cast<uint8_t>(ExprViewKind::ColBroadcast):
-                return s[c];           // 输入 (1,cols)
+                return s[c]; // 输入 (1,cols)
             case static_cast<uint8_t>(ExprViewKind::RowGather):
             {
                 // 按标签行收集：data[label[c] * cols + c]（标签槽 = v.param）；
                 // 越界守卫按主输入行数（s.size()/cols），label 越界返回 0
                 const ConstSpan& ls = spans[v.param];
-                const std::size_t lbl = (ls[c] >= Scalar{0})
-                    ? static_cast<std::size_t>(ls[c]) : 0;
+                const std::size_t lbl = (ls[c] >= Scalar{0}) ? static_cast<std::size_t>(ls[c]) : 0;
                 return (lbl < (s.size() / cols)) ? s[lbl * cols + c] : Scalar{0};
             }
             case static_cast<uint8_t>(ExprViewKind::BatchMod):
-                return s[b_idx % v.param];  // 按批次取模索引（ALiBi 斜率等）
+                return s[b_idx % v.param]; // 按批次取模索引（ALiBi 斜率等）
             case static_cast<uint8_t>(ExprViewKind::BatchCol):
-                return s[b_idx * v.param + c];  // 按 (batch, col) 切片（doc_ids 等）
+                return s[b_idx * v.param + c]; // 按 (batch, col) 切片（doc_ids 等）
             case static_cast<uint8_t>(ExprViewKind::GroupedReduceSum):
             case static_cast<uint8_t>(ExprViewKind::GroupedReduceMax):
             {
@@ -2502,8 +2367,7 @@ public:
         {
             const ExprInstr& R = spec.instrs[ri];
             const ExprOp rop = static_cast<ExprOp>(R.op);
-            if (!expr_op_is_reduce(rop))
-                continue;
+            if (!expr_op_is_reduce(rop)) continue;
 
             const bool is_col = expr_op_reduces_cols(rop);
             const bool is_max = (rop == ExprOp::ColMax || rop == ExprOp::RowMax);
@@ -2528,16 +2392,20 @@ public:
                     {
                     default:
                     case static_cast<uint8_t>(ExprOperandKind::Reg):
-                    case static_cast<uint8_t>(ExprOperandKind::Fanout): return regs[op.idx];
-                    case static_cast<uint8_t>(ExprOperandKind::Const): return spec.consts[op.idx];
-                    case static_cast<uint8_t>(ExprOperandKind::RParam): return spec.rparams[op.idx];
-                    case static_cast<uint8_t>(ExprOperandKind::Input): return read_input(op.idx, r, c);
+                    case static_cast<uint8_t>(ExprOperandKind::Fanout):
+                        return regs[op.idx];
+                    case static_cast<uint8_t>(ExprOperandKind::Const):
+                        return spec.consts[op.idx];
+                    case static_cast<uint8_t>(ExprOperandKind::RParam):
+                        return spec.rparams[op.idx];
+                    case static_cast<uint8_t>(ExprOperandKind::Input):
+                        return read_input(op.idx, r, c);
                     case static_cast<uint8_t>(ExprOperandKind::Reduce):
                         return reduce_vec[op.idx][reduce_axis[op.idx] ? c : r];
                     case static_cast<uint8_t>(ExprOperandKind::Matmul):
-                        return matmul_out.span()[r * cols + c];  // matmul 段输出（虚拟寄存器 0）
+                        return matmul_out.span()[r * cols + c]; // matmul 段输出（虚拟寄存器 0）
                     case static_cast<uint8_t>(ExprOperandKind::Row):
-                        return static_cast<Scalar>(r % m_per);   // batch 内行号
+                        return static_cast<Scalar>(r % m_per); // batch 内行号
                     case static_cast<uint8_t>(ExprOperandKind::Col):
                         return static_cast<Scalar>(c);
                     case static_cast<uint8_t>(ExprOperandKind::Batch):
@@ -2549,17 +2417,15 @@ public:
                 {
                     const ExprInstr& J = spec.instrs[j];
                     if (expr_op_is_reduce(static_cast<ExprOp>(J.op)))
-                        continue;  // 归约指令已在上方处理中完整计算
+                        continue; // 归约指令已在上方处理中完整计算
                     const Scalar va = eval_op(J.a);
                     const ExprOp op = static_cast<ExprOp>(J.op);
                     // 算子语义查表（expr_op_table）——一元/二元/三元分流
                     const detail::ExprOpInfo& info = detail::expr_op_info(op);
                     if (info.arity == 3)
                         regs[J.dst] = (va != Scalar{0}) ? eval_op(J.b) : eval_op(J.c);
-                    else if (info.arity == 2)
-                        regs[J.dst] = info.binary(va, eval_op(J.b));
-                    else
-                        regs[J.dst] = info.unary(va);
+                    else if (info.arity == 2) regs[J.dst] = info.binary(va, eval_op(J.b));
+                    else regs[J.dst] = info.unary(va);
                 }
 
                 return eval_op(R.a);
@@ -2617,16 +2483,20 @@ public:
                 {
                 default:
                 case static_cast<uint8_t>(ExprOperandKind::Reg):
-                case static_cast<uint8_t>(ExprOperandKind::Fanout): return regs[op.idx];
-                case static_cast<uint8_t>(ExprOperandKind::Const): return spec.consts[op.idx];
-                case static_cast<uint8_t>(ExprOperandKind::RParam): return spec.rparams[op.idx];
-                case static_cast<uint8_t>(ExprOperandKind::Input): return read_input(op.idx, r, c);
+                case static_cast<uint8_t>(ExprOperandKind::Fanout):
+                    return regs[op.idx];
+                case static_cast<uint8_t>(ExprOperandKind::Const):
+                    return spec.consts[op.idx];
+                case static_cast<uint8_t>(ExprOperandKind::RParam):
+                    return spec.rparams[op.idx];
+                case static_cast<uint8_t>(ExprOperandKind::Input):
+                    return read_input(op.idx, r, c);
                 case static_cast<uint8_t>(ExprOperandKind::Reduce):
                     return reduce_vec[op.idx][reduce_axis[op.idx] ? c : r];
                 case static_cast<uint8_t>(ExprOperandKind::Matmul):
-                    return matmul_out.span()[r * cols + c];  // matmul 段输出（虚拟寄存器 0）
+                    return matmul_out.span()[r * cols + c]; // matmul 段输出（虚拟寄存器 0）
                 case static_cast<uint8_t>(ExprOperandKind::Row):
-                    return static_cast<Scalar>(r % m_per);   // batch 内行号
+                    return static_cast<Scalar>(r % m_per); // batch 内行号
                 case static_cast<uint8_t>(ExprOperandKind::Col):
                     return static_cast<Scalar>(c);
                 case static_cast<uint8_t>(ExprOperandKind::Batch):
@@ -2636,17 +2506,15 @@ public:
             for (const auto& ins : spec.instrs)
             {
                 if (expr_op_is_reduce(static_cast<ExprOp>(ins.op)))
-                    continue;  // 归约指令已预计算（隐式向量，不经寄存器）
+                    continue; // 归约指令已预计算（隐式向量，不经寄存器）
                 const Scalar va = eval_op(ins.a);
                 const ExprOp op = static_cast<ExprOp>(ins.op);
                 // 算子语义查表（expr_op_table）——一元/二元/三元分流
                 const detail::ExprOpInfo& info = detail::expr_op_info(op);
                 if (info.arity == 3)
                     regs[ins.dst] = (va != Scalar{0}) ? eval_op(ins.b) : eval_op(ins.c);
-                else if (info.arity == 2)
-                    regs[ins.dst] = info.binary(va, eval_op(ins.b));
-                else
-                    regs[ins.dst] = info.unary(va);
+                else if (info.arity == 2) regs[ins.dst] = info.binary(va, eval_op(ins.b));
+                else regs[ins.dst] = info.unary(va);
             }
             return regs[last.dst];
         };
@@ -2655,7 +2523,7 @@ public:
         {
             // 归约向量原生形状输出：(rows,1)（行归约轴）或 (1,cols)（列归约轴）
             const std::size_t len = vec_is_row ? rows : cols;
-            Span o = out;   // 调用方已按归约向量形状分配（见 eval_expr_reduce）
+            Span o = out; // 调用方已按归约向量形状分配（见 eval_expr_reduce）
             if (last_is_reduce)
             {
                 // 末指令为归约 → 直接取归约向量
@@ -2679,17 +2547,15 @@ public:
             // 与寄存器复用无关（execution 本身按指令序写 regs[]，复用是正确的）。
             {
                 std::vector<uint8_t> instr_needed(spec.instrs.size(), 0);
-                instr_needed[spec.instrs.size() - 1] = 1;  // 输出 = instrs.back().dst
+                instr_needed[spec.instrs.size() - 1] = 1; // 输出 = instrs.back().dst
                 for (std::size_t ii = spec.instrs.size(); ii-- > 0;)
                 {
-                    if (!instr_needed[ii])
-                        continue;
+                    if (!instr_needed[ii]) continue;
                     const ExprInstr& ins = spec.instrs[ii];
                     if (expr_op_is_reduce(static_cast<ExprOp>(ins.op)))
-                        continue;  // 归约指令：源全网格求值，不经输出链
+                        continue; // 归约指令：源全网格求值，不经输出链
                     // 只遍历该算子实际使用的操作数（c 默认 {0,0} 会被误当作 Reg(0)）
-                    const std::size_t nops =
-                        expr_instr_num_operands(static_cast<ExprOp>(ins.op));
+                    const std::size_t nops = expr_instr_num_operands(static_cast<ExprOp>(ins.op));
                     const ExprOperand* ops[3] = {&ins.a, &ins.b, &ins.c};
                     for (std::size_t oi = 0; oi < nops; ++oi)
                     {
@@ -2699,7 +2565,8 @@ public:
                             const ExprViewKind vk =
                                 static_cast<ExprViewKind>(spec.views[op.idx].kind);
                             if (!expr_view_is_reduce(vk) && !expr_view_is_broadcast(vk))
-                                NN_FAIL("eval_expr_reduce: 输出链经 Linear/视图直接访问输入，"                                     "输出不沿归约轴恒定");
+                                NN_FAIL("eval_expr_reduce: 输出链经 Linear/视图直接访问输入，"
+                                        "输出不沿归约轴恒定");
                         }
                         else if (op.kind == static_cast<uint8_t>(ExprOperandKind::Matmul))
                         {
@@ -2712,7 +2579,8 @@ public:
                         {
                             // 索引操作数沿归约轴的恒定性由生成器/引擎按轴判定；
                             // 这里保守拒绝（实际表达式不触发此路径）
-                            NN_FAIL("eval_expr_reduce: 输出链经 Row/Col/Batch 索引，输出不沿归约轴恒定");
+                            NN_FAIL("eval_expr_reduce: 输出链经 Row/Col/Batch "
+                                    "索引，输出不沿归约轴恒定");
                         }
                         else if (op.kind == static_cast<uint8_t>(ExprOperandKind::Reg) ||
                                  op.kind == static_cast<uint8_t>(ExprOperandKind::Fanout) ||
@@ -2791,7 +2659,6 @@ public:
 
         return {};
     }
-
 };
 
 } // namespace nn

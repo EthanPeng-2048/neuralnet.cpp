@@ -68,20 +68,20 @@
 //    所有 get_<name>_spirv() 由列表统一展开（见 GpuBackend 内）。
 #define NN_SPV_FN_MISSING nn::detail::spirv_missing
 
-#define NN_SPV_GETTER_LIST(X) \
-X(matmul) X(matmul_tiled) X(matmul_gemv) X(matmul_gemv_f16)\
-X(batched_matmul) X(batched_matmul_f16) X(matmul_tiled_f16)\
-X(matmul_tiled_fine) X(rearrange_3d) X(elementwise_v2) X(reduce)\
-X(reduce_f16) X(transpose) X(im2col) X(im2col_f16) X(col2im)\
-X(col2im_f16) X(group_reduce) X(group_reduce_f16) X(gather)\
-X(transpose_f16) X(rearrange_3d_f16) X(gather_f16) X(elementwise_v2_f16)\
-X(scatter_add) X(scatter_add_f16) X(scan_prefix_outer)\
-X(scan_prefix_outer_f16) X(scan_suffix_outer) X(scan_suffix_outer_f16)\
-X(scan_prefix_outer_d32) X(scan_prefix_outer_d32_f16)\
-X(scan_prefix_outer_gen) X(scan_prefix_outer_gen_f16)\
-X(scan_suffix_outer_gen) X(scan_suffix_outer_gen_f16) X(outer_col)\
-X(outer_col_f16) X(cast) X(trit_pack) X(matmul_q) X(matmul_q_f16)\
-X(matmul_q_gemv) X(matmul_q_gemv_f16)
+#define NN_SPV_GETTER_LIST(X)                                                                      \
+    X(matmul)                                                                                      \
+    X(matmul_tiled) X(matmul_gemv) X(matmul_gemv_f16) X(batched_matmul) X(batched_matmul_f16)      \
+        X(matmul_tiled_f16) X(matmul_tiled_fine) X(rearrange_3d) X(elementwise_v2) X(reduce)       \
+            X(reduce_f16) X(transpose) X(im2col) X(im2col_f16) X(col2im) X(col2im_f16)             \
+                X(group_reduce) X(group_reduce_f16) X(gather) X(transpose_f16) X(rearrange_3d_f16) \
+                    X(gather_f16) X(elementwise_v2_f16) X(scatter_add) X(scatter_add_f16)          \
+                        X(scan_prefix_outer) X(scan_prefix_outer_f16) X(scan_suffix_outer)         \
+                            X(scan_suffix_outer_f16) X(scan_prefix_outer_d32)                      \
+                                X(scan_prefix_outer_d32_f16) X(scan_prefix_outer_gen)              \
+                                    X(scan_prefix_outer_gen_f16) X(scan_suffix_outer_gen)          \
+                                        X(scan_suffix_outer_gen_f16) X(outer_col) X(outer_col_f16) \
+                                            X(cast) X(trit_pack) X(matmul_q) X(matmul_q_f16)       \
+                                                X(matmul_q_gemv) X(matmul_q_gemv_f16)
 #if __has_include("matmul_spv.hpp")
 #include "matmul_spv.hpp"
 #define NN_SPV_FN_matmul nn_matmul_spirv_bytecode
@@ -456,10 +456,10 @@ namespace detail
 struct FusedBatchInst
 {
     std::vector<const GpuBuffer*> inputs;      // 与 spec.views 同序
-    const GpuBuffer*              out = nullptr;    // 主输出（槽 n_in）
+    const GpuBuffer* out = nullptr;    // 主输出（槽 n_in）
     std::vector<const GpuBuffer*> extra_outs;  // extras 输出（槽 n_in+1+k）
-    std::uint32_t                 count = 0;   // rows*cols（元素数）
-    std::uint32_t                 cols = 0;    // 每实例列数（row/col 推导）
+    std::uint32_t count = 0;   // rows*cols（元素数）
+    std::uint32_t cols = 0;    // 每实例列数（row/col 推导）
 };
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -685,11 +685,9 @@ private:
     // ── SPIR-V 字节码 getter（由文件头的单一注册表展开；RV-08）────────────
     // 每个 shader 的字节码访问函数在文件头绑定为 NN_SPV_FN_<name>（有嵌入头 = 真实
     // 函数；纯 CPU 构建 = 占位空向量）；此处由列表统一展开为 get_<name>_spirv()。
-#define NN_SPV_GETTER(NAME)                                                    \
-    [[nodiscard]] static const std::vector<uint32_t>& get_##NAME##_spirv()     \
-    {                                                                         \
-        return NN_SPV_FN_##NAME();                                            \
-    }
+#define NN_SPV_GETTER(NAME)                                                \
+    [[nodiscard]] static const std::vector<uint32_t>& get_##NAME##_spirv() \
+    { return NN_SPV_FN_##NAME(); }
     NN_SPV_GETTER_LIST(NN_SPV_GETTER)
 #undef NN_SPV_GETTER
 
@@ -715,8 +713,7 @@ public:
             // 释放帧环 fences（环内 command buffers 随 command pool 一起释放）
             for (auto& f : frames_)
             {
-                if (f.fence != VK_NULL_HANDLE)
-                    vkDestroyFence(device_.device(), f.fence, nullptr);
+                if (f.fence != VK_NULL_HANDLE) vkDestroyFence(device_.device(), f.fence, nullptr);
             }
 
             // 独立模式复用 fence（solo command buffer 随 command pool 释放）
@@ -728,8 +725,7 @@ public:
 
             if (gpu_tensor_pool_ != VK_NULL_HANDLE)
                 vkDestroyDescriptorPool(device_.device(), gpu_tensor_pool_, nullptr);
-            if (ts_pool_ != VK_NULL_HANDLE)
-                vkDestroyQueryPool(device_.device(), ts_pool_, nullptr);
+            if (ts_pool_ != VK_NULL_HANDLE) vkDestroyQueryPool(device_.device(), ts_pool_, nullptr);
             if (command_pool_ != VK_NULL_HANDLE)
                 vkDestroyCommandPool(device_.device(), command_pool_, nullptr);
         }
@@ -754,10 +750,7 @@ public:
 
     // 设备域标识（生命周期 v3）：backend 对象地址。GpuBuffer 持 keepalive ⇒
     // 张量存活期内该地址不会被新 backend 复用（P3 改 weak 缓存后依然成立）。
-    [[nodiscard]] DomainId identity() const noexcept
-    {
-        return reinterpret_cast<DomainId>(this);
-    }
+    [[nodiscard]] DomainId identity() const noexcept { return reinterpret_cast<DomainId>(this); }
 
     // 进程共享 backend（生命周期 v3 / D5）：weak 缓存 + mutex。
     //   · 有活使用者（GpuEngine / GpuBuffer / 调用方句柄）时共享同一实例；
@@ -770,8 +763,7 @@ public:
         static std::mutex mu;
         static std::weak_ptr<GpuBackend> weak;
         std::lock_guard<std::mutex> lock(mu);
-        if (auto alive = weak.lock())
-            return alive;
+        if (auto alive = weak.lock()) return alive;
         std::shared_ptr<GpuBackend> backend(new GpuBackend());
         weak = backend;
         return backend;
@@ -779,14 +771,10 @@ public:
 
     // 独立实例（测试/多设备）：由调用方决定生命周期。
     [[nodiscard]] static std::shared_ptr<GpuBackend> create()
-    {
-        return std::shared_ptr<GpuBackend>(new GpuBackend());
-    }
+    { return std::shared_ptr<GpuBackend>(new GpuBackend()); }
 
     [[nodiscard]] std::shared_ptr<GpuBackend> keepalive() noexcept
-    {
-        return weak_from_this().lock();
-    }
+    { return weak_from_this().lock(); }
 
     // ── 成员定义按主题拆分为 4 段（RV-08 物理拆分；纯移动，顺序即成员序）──
 #include "compute_vk_backend_destroy.inc"      // 延迟销毁 / reap / 收帧 / 显存回收
@@ -806,8 +794,7 @@ public:
 // ══════════════════════════════════════════════════════════════════════
 inline GpuBuffer::~GpuBuffer()
 {
-    if (buffer_ == VK_NULL_HANDLE)
-        return;
+    if (buffer_ == VK_NULL_HANDLE) return;
 
     // 本 keepalive 保证 backend 在析构全程存活；不再经全局 instance() 取
     // 一个可能已经销毁的单例。
@@ -833,8 +820,7 @@ inline GpuBuffer::~GpuBuffer()
     {
         // 无在飞帧引用：立即销毁 + 归还内存
         vkDestroyBuffer(device_, buffer_, nullptr);
-        if (pool_ && alloc_.valid())
-            pool_->free(alloc_);
+        if (pool_ && alloc_.valid()) pool_->free(alloc_);
     }
 
     buffer_ = VK_NULL_HANDLE;

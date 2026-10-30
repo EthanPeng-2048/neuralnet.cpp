@@ -22,14 +22,15 @@ namespace nn_example
 //   out = exp(|x| * alpha) / (sqrt(|y|) + alpha)
 // 两个运行时标量参数（alpha）→ 值不进 key，同结构共享 shader。
 // 入参只读：`dsl::leaf` 按值收 Tensor（句柄拷贝），表达式不写输入。
-[[nodiscard]] inline nn::Result<nn::Tensor> fused_custom_op(
-    nn::ComputeEngine& engine, const nn::Tensor& x, const nn::Tensor& y, float alpha,
-    nn::Precision P = nn::Precision::F32)
+[[nodiscard]] inline nn::Result<nn::Tensor> fused_custom_op(nn::ComputeEngine& engine,
+                                                            const nn::Tensor& x,
+                                                            const nn::Tensor& y, float alpha,
+                                                            nn::Precision P = nn::Precision::F32)
 {
-    return nn::dsl::compute(engine,
-        nn::dsl::exp(nn::dsl::abs(nn::dsl::leaf(x)) * nn::dsl::rparam(alpha))
-            / (nn::dsl::sqrt(nn::dsl::abs(nn::dsl::leaf(y)))
-               + nn::dsl::rparam(alpha)),
+    return nn::dsl::compute(
+        engine,
+        nn::dsl::exp(nn::dsl::abs(nn::dsl::leaf(x)) * nn::dsl::rparam(alpha)) /
+            (nn::dsl::sqrt(nn::dsl::abs(nn::dsl::leaf(y))) + nn::dsl::rparam(alpha)),
         x.rows(), x.cols(), P);
 }
 
@@ -39,13 +40,15 @@ namespace nn_example
 // 25 条之一——即**锚点的符号实例与运行期实例折叠出不同结构**。
 // 库外自定义层没有 dry-run/模型 pass，因此本函数是对 `nn_enable_gpu_fusion`
 // **可靠性**的直接检验：注册表若漏了运行期那一条，GPU 会闭合世界硬报错。
-[[nodiscard]] inline nn::Result<nn::Tensor> fused_custom_norm(
-    nn::ComputeEngine& engine, const nn::Tensor& x, float inv_cols, float eps,
-    nn::Precision P = nn::Precision::F32)
+[[nodiscard]] inline nn::Result<nn::Tensor> fused_custom_norm(nn::ComputeEngine& engine,
+                                                              const nn::Tensor& x, float inv_cols,
+                                                              float eps,
+                                                              nn::Precision P = nn::Precision::F32)
 {
-    return nn::dsl::compute(engine,
-        nn::dsl::rsqrt(nn::dsl::col_reduce_sum(nn::dsl::leaf(x))
-                           * nn::dsl::rparam(inv_cols) + nn::dsl::rparam(eps)),
+    return nn::dsl::compute(
+        engine,
+        nn::dsl::rsqrt(nn::dsl::col_reduce_sum(nn::dsl::leaf(x)) * nn::dsl::rparam(inv_cols) +
+                       nn::dsl::rparam(eps)),
         x.rows(), x.cols(), P);
 }
 

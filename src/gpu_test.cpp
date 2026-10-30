@@ -32,11 +32,11 @@ int main()
 #else
 #include <neuralnet.cpp/backend/compute_vk_backend.hpp>
 
-using nn::Matrix;
 using nn::ComputeEngine;
 using nn::CpuEngine;
-using nn::GpuEngine;
 using nn::GpuBackend;
+using nn::GpuEngine;
+using nn::Matrix;
 using nn::Tensor;
 
 void print_usage(const char* prog)
@@ -67,9 +67,8 @@ Scalar max_abs_diff(const Matrix& a, const Matrix& b)
 }
 
 // ── 辅助：通过 engine 执行 matmul 并下载结果 ───────────────────────────────
-nn::Result<Matrix> engine_matmul(
-    ComputeEngine& engine, const Matrix& A, const Matrix& B,
-    bool transA = false, bool transB = false)
+nn::Result<Matrix> engine_matmul(ComputeEngine& engine, const Matrix& A, const Matrix& B,
+                                 bool transA = false, bool transB = false)
 {
     auto a_t = engine.from_matrix(A);
     NN_TRY_CHECK(a_t);
@@ -81,8 +80,7 @@ nn::Result<Matrix> engine_matmul(
 }
 
 // 数字解析辅助：解析失败时打印错误并退出（替代会抛异常的 std::stoi/stod）
-template <typename T>
-T parse_num_or_die(const char* s, const char* opt)
+template <typename T> T parse_num_or_die(const char* s, const char* opt)
 {
     auto v = nn::parse_number<T>(s);
     if (!v)
@@ -102,25 +100,40 @@ int main(int argc, char* argv[])
     for (int i = 1; i < argc; ++i)
     {
         std::string arg = argv[i];
-        if (arg == "--help") { print_usage(argv[0]); return 0; }
+        if (arg == "--help")
+        {
+            print_usage(argv[0]);
+            return 0;
+        }
         else if (arg == "--size" && i + 1 < argc)
         {
             int v = parse_num_or_die<int>(argv[++i], "--size");
-            if (v <= 0) { std::cerr << "--size 必须为正整数\n"; return 1; }
+            if (v <= 0)
+            {
+                std::cerr << "--size 必须为正整数\n";
+                return 1;
+            }
             N = static_cast<std::size_t>(v);
         }
         else if (arg == "--iters" && i + 1 < argc)
         {
             iters = parse_num_or_die<int>(argv[++i], "--iters");
-            if (iters <= 0) { std::cerr << "--iters 必须为正整数\n"; return 1; }
+            if (iters <= 0)
+            {
+                std::cerr << "--iters 必须为正整数\n";
+                return 1;
+            }
         }
-        else if (auto dev = nn::cli::parse_gpu_option(
-                     argc, argv, i, /*allow_name_value=*/true))
+        else if (auto dev = nn::cli::parse_gpu_option(argc, argv, i, /*allow_name_value=*/true))
         {
             // 本程序无位置参数，空格形式也可直接给名称子串
             gpu_device = *dev;
         }
-        else { std::cerr << "未知参数: " << arg << "\n"; return 1; }
+        else
+        {
+            std::cerr << "未知参数: " << arg << "\n";
+            return 1;
+        }
     }
 
     std::size_t failures = 0;  // ✅/❌ 检查计数，决定退出码（CI 必须反映 GPU 状态）
@@ -151,8 +164,7 @@ int main(int argc, char* argv[])
     auto gpu_engine = GpuEngine::create(backend);
     // 打印所选物理设备：选错卡（例如把独显老卡当目标）会直接表现为
     // 能力不足 / 驱动死锁，先让"跑在哪块卡上"可见。
-    std::cout << " 成功 (CpuEngine + GpuEngine, GPU: "
-              << backend.device().device_name() << ")\n";
+    std::cout << " 成功 (CpuEngine + GpuEngine, GPU: " << backend.device().device_name() << ")\n";
 
     // ── 2. 生成随机测试数据 ────────────────────────────────────────
     std::cout << "[2/6] 生成 " << N << "×" << N << " 随机矩阵..." << std::flush;
@@ -160,8 +172,10 @@ int main(int argc, char* argv[])
     std::uniform_real_distribution<Scalar> dist(-1.0f, 1.0f);
 
     Matrix A(N, N), B(N, N);
-    for (auto& v : A.span()) v = dist(rng);
-    for (auto& v : B.span()) v = dist(rng);
+    for (auto& v : A.span())
+        v = dist(rng);
+    for (auto& v : B.span())
+        v = dist(rng);
     std::cout << " 完成\n";
 
     // ── 3. matmul 正确性验证 (CpuEngine vs GpuEngine) ─────────────
@@ -188,7 +202,8 @@ int main(int argc, char* argv[])
     Scalar nrmse = (sum_sq_ref > 0) ? std::sqrt(sum_sq_err / sum_sq_ref) : 0.0f;
 
     std::cout << "\n";
-    std::cout << "  最大绝对误差: " << std::scientific << std::setprecision(4) << matmul_err << "\n";
+    std::cout << "  最大绝对误差: " << std::scientific << std::setprecision(4) << matmul_err
+              << "\n";
     std::cout << "  RMSE:         " << std::scientific << std::setprecision(4) << rmse << "\n";
     std::cout << "  NRMSE:        " << std::scientific << std::setprecision(4) << nrmse << "\n";
 
@@ -210,7 +225,11 @@ int main(int argc, char* argv[])
             std::cout << "\n  A^T * B 最大误差: " << std::scientific << std::setprecision(4) << err
                       << (err < 1e-2f ? " ✅" : " ❌") << "\n";
         }
-        else { std::cout << "\n  ❌ A^T * B 失败\n"; ++failures; }
+        else
+        {
+            std::cout << "\n  ❌ A^T * B 失败\n";
+            ++failures;
+        }
 
         // A * B^T
         auto cpu_r2 = engine_matmul(*cpu_engine, A, B, false, true);
@@ -222,7 +241,11 @@ int main(int argc, char* argv[])
             std::cout << "  A * B^T 最大误差: " << std::scientific << std::setprecision(4) << err
                       << (err < 1e-2f ? " ✅" : " ❌") << "\n";
         }
-        else { std::cout << "  ❌ A * B^T 失败\n"; ++failures; }
+        else
+        {
+            std::cout << "  ❌ A * B^T 失败\n";
+            ++failures;
+        }
     }
 
     // ── 3c. 小 N matmul（GEMV 快路径，N ≤ 8 → matmul_gemv）────────────
@@ -230,26 +253,32 @@ int main(int argc, char* argv[])
     // transA=1（沿 m vec4）、transB=1（沿 k vec4）及其标量回退组合。
     std::cout << "[3c] 小 N matmul（GEMV 路径）...\n";
     {
-        struct GemvCase { std::size_t Am, Ak, Bk, Bn; bool tA, tB; };
+        struct GemvCase
+        {
+            std::size_t Am, Ak, Bk, Bn;
+            bool tA, tB;
+        };
         // 字段 = 存储形状（行×列）。维度反推：tA ⇒ M=A.cols, K=A.rows；
         // tB ⇒ N=B.rows, K=B.cols。故非转置需 Ak==Bk，tA 需 Am==Bk，
         // tB 需 Bn==Ak。以下用例均已按此校验。
         const GemvCase cases[] = {
-            {256, 512, 512,  1, false, false},  // N=1 纯 GEMV（B 沿 k 扁平 vec4）
-            {256, 512, 512,  5, false, false},  // N%4≠0 → 扁平 vec4 拆分
-            {256, 512, 512,  8, false, false},  // N%4==0 → 按行 vec4
-            {255, 513, 513,  7, false, false},  // 奇数 M/K：行尾 + k 尾块标量
-            {256,  64, 256,  8, true,  false},  // tA：M=64,K=256（M%4==0 → 沿 m vec4）
-            {257,  65, 257,  6, true,  false},  // tA：M=65,K=257 奇数 → 标量回退
-            {128, 384,   8, 384, false, true},  // tB：N=8,K=384（K%4==0 → 沿 k vec4）
-            {130, 386,   3, 386, false, true},  // tB：N=3,K=386 奇数 K → 标量回退
-            {257,  64,   4, 257, true,  true},   // 双转置：M=64,K=257,N=4
+            {256, 512, 512, 1, false, false},  // N=1 纯 GEMV（B 沿 k 扁平 vec4）
+            {256, 512, 512, 5, false, false},  // N%4≠0 → 扁平 vec4 拆分
+            {256, 512, 512, 8, false, false},  // N%4==0 → 按行 vec4
+            {255, 513, 513, 7, false, false},  // 奇数 M/K：行尾 + k 尾块标量
+            {256, 64, 256, 8, true, false},  // tA：M=64,K=256（M%4==0 → 沿 m vec4）
+            {257, 65, 257, 6, true, false},  // tA：M=65,K=257 奇数 → 标量回退
+            {128, 384, 8, 384, false, true},  // tB：N=8,K=384（K%4==0 → 沿 k vec4）
+            {130, 386, 3, 386, false, true},  // tB：N=3,K=386 奇数 K → 标量回退
+            {257, 64, 4, 257, true, true},   // 双转置：M=64,K=257,N=4
         };
         for (const auto& c : cases)
         {
             Matrix a(c.Am, c.Ak), b(c.Bk, c.Bn);
-            for (auto& v : a.span()) v = dist(rng);
-            for (auto& v : b.span()) v = dist(rng);
+            for (auto& v : a.span())
+                v = dist(rng);
+            for (auto& v : b.span())
+                v = dist(rng);
 
             auto cpu_r = engine_matmul(*cpu_engine, a, b, c.tA, c.tB);
             auto gpu_r = engine_matmul(*gpu_engine, a, b, c.tA, c.tB);
@@ -261,11 +290,15 @@ int main(int argc, char* argv[])
                 // N 由存储形状反推：tB ⇒ N=B.rows，否则 N=B.cols
                 const std::size_t n_out = c.tB ? c.Bk : c.Bn;
                 std::cout << "  A(" << c.Am << "x" << c.Ak << ") B(" << c.Bk << "x" << c.Bn
-                          << ") tA=" << c.tA << " tB=" << c.tB
-                          << " N=" << n_out << " err=" << std::scientific << std::setprecision(4) << err
+                          << ") tA=" << c.tA << " tB=" << c.tB << " N=" << n_out
+                          << " err=" << std::scientific << std::setprecision(4) << err
                           << (ok ? " ✅" : " ❌") << "\n";
             }
-            else { std::cout << "  ❌ GEMV case 执行失败\n"; ++failures; }
+            else
+            {
+                std::cout << "  ❌ GEMV case 执行失败\n";
+                ++failures;
+            }
         }
     }
 
@@ -277,11 +310,12 @@ int main(int argc, char* argv[])
     // 奇数边界（513、1000 非 tile 整倍数）/ 非方阵。
     std::cout << "[3d] transpose 正确性 (GPU vs CPU 参考, 逐元素)...\n";
     {
-        struct TpCase { std::size_t R, C; };
+        struct TpCase
+        { std::size_t R, C; };
         const TpCase cases[] = {
-            {  64,   64}, { 512,  512}, { 513,  513},   // 方阵 / 奇数边界
-            { 256, 1024}, {1024,  256},                  // 单边 ≤512
-            { 512, 1024}, {1024,  512},                  // 单边恰好 512
+            {64, 64},     {512, 512},   {513, 513},   // 方阵 / 奇数边界
+            {256, 1024},  {1024, 256},                  // 单边 ≤512
+            {512, 1024},  {1024, 512},                  // 单边恰好 512
             {1000, 2000}, {2000, 1000},                  // 非 tile 整倍数双边 >512
             {1024, 1024}, {1024, 4096}, {4096, 1024},    // 双边 >512
             {2048, 2048}, {4096, 4096},                  // 大方阵
@@ -289,15 +323,18 @@ int main(int argc, char* argv[])
         for (const auto& c : cases)
         {
             Matrix a(c.R, c.C);
-            for (auto& v : a.span()) v = dist(rng);
+            for (auto& v : a.span())
+                v = dist(rng);
 
             auto a_t = gpu_engine->from_matrix(a);
-            auto r_t = a_t ? gpu_engine->transpose(*a_t) : nn::Result<Tensor>{std::unexpected(a_t.error())};
-            auto out_r = r_t ? gpu_engine->to_matrix(*r_t) : nn::Result<Matrix>{std::unexpected(r_t.error())};
+            auto r_t = a_t ? gpu_engine->transpose(*a_t)
+                           : nn::Result<Tensor>{std::unexpected(a_t.error())};
+            auto out_r = r_t ? gpu_engine->to_matrix(*r_t)
+                             : nn::Result<Matrix>{std::unexpected(r_t.error())};
             if (!out_r)
             {
-                std::cout << "  " << c.R << "x" << c.C << " 执行失败: "
-                          << out_r.error().message << "\n";
+                std::cout << "  " << c.R << "x" << c.C << " 执行失败: " << out_r.error().message
+                          << "\n";
                 ++failures;
                 continue;
             }
@@ -315,19 +352,26 @@ int main(int argc, char* argv[])
                     for (std::size_t col = 0; col < c.C; ++col)
                         if (os[col * c.R + r] != as[r * c.C + col])
                         {
-                            if (!found_first) { first_r = r; first_c = col; found_first = true; }
+                            if (!found_first)
+                            {
+                                first_r = r;
+                                first_c = col;
+                                found_first = true;
+                            }
                             ++bad;
                         }
             }
             const std::size_t total = c.R * c.C;
-            const double pct = total ? 100.0 * static_cast<double>(bad) / static_cast<double>(total) : 0.0;
+            const double pct =
+                total ? 100.0 * static_cast<double>(bad) / static_cast<double>(total) : 0.0;
             const bool ok = shape_ok && bad == 0;
             if (!ok) ++failures;
             std::cout << "  " << c.R << "x" << c.C
-                      << (shape_ok ? "" : " 形状错误(out=" + std::to_string(out.rows()) + "x" + std::to_string(out.cols()) + ")")
+                      << (shape_ok ? ""
+                                   : " 形状错误(out=" + std::to_string(out.rows()) + "x" +
+                                         std::to_string(out.cols()) + ")")
                       << " 失配 " << std::fixed << std::setprecision(1) << pct << "%";
-            if (found_first)
-                std::cout << " 首个错误下标 r=" << first_r << " c=" << first_c;
+            if (found_first) std::cout << " 首个错误下标 r=" << first_r << " c=" << first_c;
             std::cout << (ok ? " ✅" : " ❌") << "\n";
         }
     }
@@ -344,13 +388,20 @@ int main(int argc, char* argv[])
             {
                 Scalar err = max_abs_diff(A, *a_back_r);
                 if (err != 0.0f) ++failures;
-                std::cout << "  Upload→Download roundtrip 最大误差: "
-                          << std::scientific << std::setprecision(4) << err
-                          << (err == 0.0f ? " ✅" : " ❌") << "\n";
+                std::cout << "  Upload→Download roundtrip 最大误差: " << std::scientific
+                          << std::setprecision(4) << err << (err == 0.0f ? " ✅" : " ❌") << "\n";
             }
-            else { std::cout << "  ❌ roundtrip download 失败: " << a_back_r.error().message << "\n"; ++failures; }
+            else
+            {
+                std::cout << "  ❌ roundtrip download 失败: " << a_back_r.error().message << "\n";
+                ++failures;
+            }
         }
-        else { std::cout << "  ❌ roundtrip upload 失败\n"; ++failures; }
+        else
+        {
+            std::cout << "  ❌ roundtrip upload 失败\n";
+            ++failures;
+        }
 
         // 4b. CPU/GPU 张量准备（元素级表达式对拍见 expr_gpu_test）
         auto a_cpu_t = cpu_engine->from_matrix(A);
@@ -369,12 +420,16 @@ int main(int argc, char* argv[])
                 {
                     Scalar err = max_abs_diff(*sc, *sg);
                     if (err >= 1e-3f) ++failures;
-                    std::cout << "  col_reduce_sum(A) 最大误差: "
-                              << std::scientific << std::setprecision(4) << err
-                              << (err < 1e-3f ? " ✅" : " ❌") << "\n";
+                    std::cout << "  col_reduce_sum(A) 最大误差: " << std::scientific
+                              << std::setprecision(4) << err << (err < 1e-3f ? " ✅" : " ❌")
+                              << "\n";
                 }
             }
-            else { std::cout << "  ❌ col_reduce_sum 失败\n"; ++failures; }
+            else
+            {
+                std::cout << "  ❌ col_reduce_sum 失败\n";
+                ++failures;
+            }
 
             // 4e. 归约: col_reduce_max(A) → (1, N)
             auto cmax_cpu_r = cpu_engine->col_reduce_max(*a_cpu_t);
@@ -387,12 +442,16 @@ int main(int argc, char* argv[])
                 {
                     Scalar err = max_abs_diff(*mc2, *mg2);
                     if (err >= 1e-5f) ++failures;
-                    std::cout << "  col_reduce_max(A) 最大误差: "
-                              << std::scientific << std::setprecision(4) << err
-                              << (err < 1e-5f ? " ✅" : " ❌") << "\n";
+                    std::cout << "  col_reduce_max(A) 最大误差: " << std::scientific
+                              << std::setprecision(4) << err << (err < 1e-5f ? " ✅" : " ❌")
+                              << "\n";
                 }
             }
-            else { std::cout << "  ❌ col_reduce_max 失败\n"; ++failures; }
+            else
+            {
+                std::cout << "  ❌ col_reduce_max 失败\n";
+                ++failures;
+            }
         }
     }
 
@@ -407,7 +466,8 @@ int main(int argc, char* argv[])
         NN_EXIT(r, 1, "CPU matmul 性能测试失败\n");
     }
     auto t_cpu_end = std::chrono::high_resolution_clock::now();
-    double cpu_ms = std::chrono::duration<double, std::milli>(t_cpu_end - t_cpu_start).count() / iters;
+    double cpu_ms =
+        std::chrono::duration<double, std::milli>(t_cpu_end - t_cpu_start).count() / iters;
 
     // GPU 性能（含上传/下载开销，反映端到端延迟）
     auto t_gpu_start = std::chrono::high_resolution_clock::now();
@@ -417,17 +477,22 @@ int main(int argc, char* argv[])
         NN_EXIT(r, 1, "GPU matmul 性能测试失败\n");
     }
     auto t_gpu_end = std::chrono::high_resolution_clock::now();
-    double gpu_ms = std::chrono::duration<double, std::milli>(t_gpu_end - t_gpu_start).count() / iters;
+    double gpu_ms =
+        std::chrono::duration<double, std::milli>(t_gpu_end - t_gpu_start).count() / iters;
 
     // 防御：计时为 0 时（极小矩阵/低精度时钟）避免除零输出 inf
     const double speedup = (gpu_ms > 0.0) ? cpu_ms / gpu_ms : 0.0;
     const double gflops = (gpu_ms > 0.0) ? (2.0 * N * N * N) / (gpu_ms * 1e6) : 0.0;
 
     std::cout << "\n";
-    std::cout << "  CPU 时间 (含上传/下载):  " << std::fixed << std::setprecision(2) << cpu_ms << " ms\n";
-    std::cout << "  GPU 时间 (含上传/下载):  " << std::fixed << std::setprecision(2) << gpu_ms << " ms\n";
-    std::cout << "  加速比:                  " << std::fixed << std::setprecision(2) << speedup << "×\n";
-    std::cout << "  GPU GFLOPS (含传输开销): " << std::fixed << std::setprecision(1) << gflops << "\n\n";
+    std::cout << "  CPU 时间 (含上传/下载):  " << std::fixed << std::setprecision(2) << cpu_ms
+              << " ms\n";
+    std::cout << "  GPU 时间 (含上传/下载):  " << std::fixed << std::setprecision(2) << gpu_ms
+              << " ms\n";
+    std::cout << "  加速比:                  " << std::fixed << std::setprecision(2) << speedup
+              << "×\n";
+    std::cout << "  GPU GFLOPS (含传输开销): " << std::fixed << std::setprecision(1) << gflops
+              << "\n\n";
 
     // ── 6. batch 模式测试 ─────────────────────────────────────────
     std::cout << "[6/6] batch 模式 + 链式 matmul 测试...\n";
@@ -451,17 +516,33 @@ int main(int argc, char* argv[])
                         {
                             Scalar err = max_abs_diff(*cpu_c_r, *c_res);
                             if (err >= 1e-2f) ++failures;
-                            std::cout << "  Batch+matmul 最大误差: "
-                                      << std::scientific << std::setprecision(4) << err
+                            std::cout << "  Batch+matmul 最大误差: " << std::scientific
+                                      << std::setprecision(4) << err
                                       << (err < 1e-2f ? " ✅" : " ❌") << "\n";
                         }
-                        else { std::cout << "  ❌ download failed: " << c_res.error().message << "\n"; ++failures; }
+                        else
+                        {
+                            std::cout << "  ❌ download failed: " << c_res.error().message << "\n";
+                            ++failures;
+                        }
                     }
-                    else { std::cout << "  ❌ end_batch failed: " << end_r.error().message << "\n"; ++failures; }
+                    else
+                    {
+                        std::cout << "  ❌ end_batch failed: " << end_r.error().message << "\n";
+                        ++failures;
+                    }
                 }
-                else { std::cout << "  ❌ matmul failed: " << c_t.error().message << "\n"; ++failures; }
+                else
+                {
+                    std::cout << "  ❌ matmul failed: " << c_t.error().message << "\n";
+                    ++failures;
+                }
             }
-            else { std::cout << "  ❌ begin_batch failed: " << batch_r.error().message << "\n"; ++failures; }
+            else
+            {
+                std::cout << "  ❌ begin_batch failed: " << batch_r.error().message << "\n";
+                ++failures;
+            }
         }
 
         // 链式: matmul(A, B) → col_reduce_sum
@@ -491,15 +572,16 @@ int main(int argc, char* argv[])
                     Scalar c_min = std::numeric_limits<Scalar>::max();
                     Scalar c_max = std::numeric_limits<Scalar>::lowest();
                     Scalar c_abs_max = 0;
-                    for (auto v : c_cpu_m->span()) {
+                    for (auto v : c_cpu_m->span())
+                    {
                         c_min = std::min(c_min, v);
                         c_max = std::max(c_max, v);
                         c_abs_max = std::max(c_abs_max, std::fabs(v));
                     }
                     std::cout << "  [1] matmul 输出范围: [" << std::fixed << std::setprecision(2)
                               << c_min << ", " << c_max << "]  |max|=" << c_abs_max << "\n";
-                    std::cout << "      matmul CPU vs GPU 最大误差: " << std::scientific << std::setprecision(4)
-                              << mm_err << "\n";
+                    std::cout << "      matmul CPU vs GPU 最大误差: " << std::scientific
+                              << std::setprecision(4) << mm_err << "\n";
 
                     // ── Step 2: 直接复用 matmul 输出 ──
                     auto exp_t = c_t;
@@ -515,15 +597,17 @@ int main(int argc, char* argv[])
                             Scalar e_min = std::numeric_limits<Scalar>::max();
                             Scalar e_max = std::numeric_limits<Scalar>::lowest();
                             Scalar e_abs_max = 0;
-                            for (auto v : exp_cpu_m->span()) {
+                            for (auto v : exp_cpu_m->span())
+                            {
                                 e_min = std::min(e_min, v);
                                 e_max = std::max(e_max, v);
                                 e_abs_max = std::max(e_abs_max, std::fabs(v));
                             }
-                            std::cout << "  [2] matmul 输出范围: [" << std::scientific << std::setprecision(4)
-                                      << e_min << ", " << e_max << "]  |max|=" << e_abs_max << "\n";
-                            std::cout << "      matmul CPU vs GPU 最大误差: " << std::scientific << std::setprecision(4)
-                                      << exp_err << "\n";
+                            std::cout << "  [2] matmul 输出范围: [" << std::scientific
+                                      << std::setprecision(4) << e_min << ", " << e_max
+                                      << "]  |max|=" << e_abs_max << "\n";
+                            std::cout << "      matmul CPU vs GPU 最大误差: " << std::scientific
+                                      << std::setprecision(4) << exp_err << "\n";
 
                             // ── Step 3: col_reduce_sum(matmul) on GPU ──
                             auto sum_t = gpu_engine->col_reduce_sum(*exp_t);
@@ -537,23 +621,29 @@ int main(int argc, char* argv[])
                                     // 统计 reduce 输出范围
                                     Scalar s_min = std::numeric_limits<Scalar>::max();
                                     Scalar s_max = std::numeric_limits<Scalar>::lowest();
-                                    for (auto v : res_cpu->span()) {
+                                    for (auto v : res_cpu->span())
+                                    {
                                         s_min = std::min(s_min, v);
                                         s_max = std::max(s_max, v);
                                     }
-                                    std::cout << "  [3] col_reduce_sum 输出范围: [" << std::scientific << std::setprecision(4)
-                                              << s_min << ", " << s_max << "]\n";
-                                    std::cout << "      最终绝对误差: " << std::scientific << std::setprecision(4)
-                                              << final_err << "\n";
+                                    std::cout << "  [3] col_reduce_sum 输出范围: ["
+                                              << std::scientific << std::setprecision(4) << s_min
+                                              << ", " << s_max << "]\n";
+                                    std::cout << "      最终绝对误差: " << std::scientific
+                                              << std::setprecision(4) << final_err << "\n";
 
                                     // 相对误差（更合理的评判标准）
                                     Scalar ref_abs_max = 0;
-                                    for (auto v : res_cpu->span()) ref_abs_max = std::max(ref_abs_max, std::fabs(v));
-                                    Scalar rel_err = (ref_abs_max > 0) ? (final_err / ref_abs_max) : 0;
-                                    std::cout << "      相对误差: " << std::scientific << std::setprecision(4)
-                                              << rel_err << (rel_err < 1e-3f ? " OK" : " FAIL") << "\n";
-                                    std::cout << "  结论: 归约链最终误差 " << std::scientific << std::setprecision(2)
-                                              << final_err << "（Exp 级已随逐元素算子移除）\n";
+                                    for (auto v : res_cpu->span())
+                                        ref_abs_max = std::max(ref_abs_max, std::fabs(v));
+                                    Scalar rel_err =
+                                        (ref_abs_max > 0) ? (final_err / ref_abs_max) : 0;
+                                    std::cout << "      相对误差: " << std::scientific
+                                              << std::setprecision(4) << rel_err
+                                              << (rel_err < 1e-3f ? " OK" : " FAIL") << "\n";
+                                    std::cout << "  结论: 归约链最终误差 " << std::scientific
+                                              << std::setprecision(2) << final_err
+                                              << "（Exp 级已随逐元素算子移除）\n";
                                 }
                             }
                         }
@@ -574,8 +664,20 @@ int main(int argc, char* argv[])
         std::mt19937 rng(2026);
         std::uniform_real_distribution<Scalar> cop(-1.0f, 1.0f);
         std::uniform_real_distribution<Scalar> cog(-0.1f, 0.1f);
-        const Matrix p0 = [&]{ Matrix m(R, C); for (auto& v : m.span()) v = cop(rng); return m; }();
-        const Matrix g0 = [&]{ Matrix m(R, C); for (auto& v : m.span()) v = cog(rng); return m; }();
+        const Matrix p0 = [&]
+        {
+            Matrix m(R, C);
+            for (auto& v : m.span())
+                v = cop(rng);
+            return m;
+        }();
+        const Matrix g0 = [&]
+        {
+            Matrix m(R, C);
+            for (auto& v : m.span())
+                v = cog(rng);
+            return m;
+        }();
 
         for (const char* name : {"adam", "adamw"})
         {
@@ -588,12 +690,12 @@ int main(int argc, char* argv[])
             std::unique_ptr<nn::Optimizer> opt_cpu, opt_gpu;
             if (ok)
             {
-                opt_cpu = nn::create_optimizer(name, *cpu_engine,
-                    std::vector<nn::TensorRef>{*p_cpu_r}, std::vector<nn::TensorRef>{*g_cpu_r},
-                    Scalar{1e-3f});
-                opt_gpu = nn::create_optimizer(name, *gpu_engine,
-                    std::vector<nn::TensorRef>{*p_gpu_r}, std::vector<nn::TensorRef>{*g_gpu_r},
-                    Scalar{1e-3f});
+                opt_cpu =
+                    nn::create_optimizer(name, *cpu_engine, std::vector<nn::TensorRef>{*p_cpu_r},
+                                         std::vector<nn::TensorRef>{*g_cpu_r}, Scalar{1e-3f});
+                opt_gpu =
+                    nn::create_optimizer(name, *gpu_engine, std::vector<nn::TensorRef>{*p_gpu_r},
+                                         std::vector<nn::TensorRef>{*g_gpu_r}, Scalar{1e-3f});
             }
             if (!ok || !opt_cpu || !opt_gpu)
             {
@@ -607,15 +709,25 @@ int main(int argc, char* argv[])
                 // 每步用同一梯度（两引擎一致），先后向 zero_grad 再 step
                 step_ok = opt_cpu->step() && opt_gpu->step();
             }
-            if (!step_ok) { std::cout << "  ❌ " << name << " step 失败\n"; ++failures; continue; }
+            if (!step_ok)
+            {
+                std::cout << "  ❌ " << name << " step 失败\n";
+                ++failures;
+                continue;
+            }
 
             auto p_cpu_m = cpu_engine->to_matrix(*p_cpu_r);
             auto p_gpu_m = gpu_engine->to_matrix(*p_gpu_r);
-            if (!p_cpu_m || !p_gpu_m) { std::cout << "  ❌ " << name << " 下载失败\n"; ++failures; continue; }
+            if (!p_cpu_m || !p_gpu_m)
+            {
+                std::cout << "  ❌ " << name << " 下载失败\n";
+                ++failures;
+                continue;
+            }
             Scalar err = max_abs_diff(*p_cpu_m, *p_gpu_m);
             bool pass = err < 2e-3f;
-            std::cout << "  " << (pass ? "[PASS]" : "[FAIL]") << " " << name << " p_err="
-                      << std::scientific << std::setprecision(2) << err << "\n";
+            std::cout << "  " << (pass ? "[PASS]" : "[FAIL]") << " " << name
+                      << " p_err=" << std::scientific << std::setprecision(2) << err << "\n";
             if (!pass) ++failures;
         }
     }
@@ -632,33 +744,51 @@ int main(int argc, char* argv[])
 
         std::mt19937 rng(777);
         std::normal_distribution<Scalar> cop(0.0f, 0.5f);
-        auto fill = [&](Matrix& m) { for (auto& v : m.span()) v = cop(rng); };
+        auto fill = [&](Matrix& m)
+        {
+            for (auto& v : m.span())
+                v = cop(rng);
+        };
         Matrix Kv(rows, seq), Vv(rows, seq), Pv(rows, seq), Rv(rows, seq);
         Matrix Dm(BH * dk * dk, seq), Xs(rows, seq), Ys(rows, seq);
         Matrix A0v(H * dk, dk), B0v(H * dk, dk), bnd(1, B * seq);
-        fill(Kv); fill(Vv); fill(Pv); fill(Rv); fill(Dm); fill(Xs); fill(Ys);
-        (void)A0v; (void)B0v; (void)bnd;
+        fill(Kv);
+        fill(Vv);
+        fill(Pv);
+        fill(Rv);
+        fill(Dm);
+        fill(Xs);
+        fill(Ys);
+        (void)A0v;
+        (void)B0v;
+        (void)bnd;
 
         auto run_prefix = [&](ComputeEngine& e, const Matrix& Ki, const Matrix& Vi,
-                              const Matrix& Pi, const Matrix& Ri) -> nn::Result<Matrix> {
+                              const Matrix& Pi, const Matrix& Ri) -> nn::Result<Matrix>
+        {
             NN_TRY(k, e.from_matrix(Ki));
             NN_TRY(v, e.from_matrix(Vi));
             NN_TRY(p, e.from_matrix(Pi));
             NN_TRY(r, e.from_matrix(Ri));
-            auto a0 = e.from_matrix(A0v); const auto& a0r = *a0;
-            auto b0 = e.from_matrix(B0v); const auto& b0r = *b0;
-            auto bd = e.from_matrix(bnd); const auto& bdr = *bd;
-            auto out = e.scan_prefix_outer(*k, *v, *p, *r, a0r, b0r, false,
-                                           dk, H, /*causal=*/true, bdr, false);
+            auto a0 = e.from_matrix(A0v);
+            const auto& a0r = *a0;
+            auto b0 = e.from_matrix(B0v);
+            const auto& b0r = *b0;
+            auto bd = e.from_matrix(bnd);
+            const auto& bdr = *bd;
+            auto out = e.scan_prefix_outer(*k, *v, *p, *r, a0r, b0r, false, dk, H, /*causal=*/true,
+                                           bdr, false);
             NN_TRY_CHECK(out);
             return e.to_matrix(*out);
         };
         auto run_suffix = [&](ComputeEngine& e, const Matrix& Di, const Matrix& Xi,
-                              const Matrix& Yi) -> nn::Result<Matrix> {
+                              const Matrix& Yi) -> nn::Result<Matrix>
+        {
             NN_TRY(d, e.from_matrix(Di));
             NN_TRY(x, e.from_matrix(Xi));
             NN_TRY(y, e.from_matrix(Yi));
-            auto bd = e.from_matrix(bnd); const auto& bdr = *bd;
+            auto bd = e.from_matrix(bnd);
+            const auto& bdr = *bd;
             auto out = e.scan_suffix_outer(*d, *x, *y, dk, H, /*causal=*/true, bdr, false);
             NN_TRY_CHECK(out);
             return e.to_matrix(*out);
@@ -678,8 +808,8 @@ int main(int argc, char* argv[])
             Scalar err = max_abs_diff(*cpu_p, *gpu_p);
             bool pass = err < 2e-3f;
             std::cout << "  " << (pass ? "[PASS]" : "[FAIL]")
-                      << " prefix_outer(dk=128) err="
-                      << std::scientific << std::setprecision(2) << err << "\n";
+                      << " prefix_outer(dk=128) err=" << std::scientific << std::setprecision(2)
+                      << err << "\n";
             if (!pass) ++failures;
         }
 
@@ -697,8 +827,8 @@ int main(int argc, char* argv[])
             Scalar err = max_abs_diff(*cpu_s, *gpu_s);
             bool pass = err < 2e-3f;
             std::cout << "  " << (pass ? "[PASS]" : "[FAIL]")
-                      << " suffix_outer(dk=128) err="
-                      << std::scientific << std::setprecision(2) << err << "\n";
+                      << " suffix_outer(dk=128) err=" << std::scientific << std::setprecision(2)
+                      << err << "\n";
             if (!pass) ++failures;
         }
     }

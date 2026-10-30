@@ -31,14 +31,13 @@ namespace nn::expr
 {
 
 // 末指令 = 状态自复制（dst 自身 Add 常量 0），把"输出 = 末指令 dst"落到状态上
-[[nodiscard]] inline ExprInstr fold_emit_state(std::uint8_t state_reg,
-                                               std::uint8_t const_zero_slot)
+[[nodiscard]] inline ExprInstr fold_emit_state(std::uint8_t state_reg, std::uint8_t const_zero_slot)
 {
     ExprInstr ins;
-    ins.op  = static_cast<uint8_t>(ExprOp::Add);
+    ins.op = static_cast<uint8_t>(ExprOp::Add);
     ins.dst = state_reg;
-    ins.a   = reg(state_reg);
-    ins.b   = cst(const_zero_slot);
+    ins.a = reg(state_reg);
+    ins.b = cst(const_zero_slot);
     return ins;
 }
 
@@ -50,25 +49,25 @@ namespace nn::expr
 {
     ExprSpec s;
     FoldSpec f;
-    f.k          = k;
-    f.num_state  = 1;
-    f.inits      = { -std::numeric_limits<Scalar>::infinity() };
+    f.k = k;
+    f.num_state = 1;
+    f.inits = {-std::numeric_limits<Scalar>::infinity()};
     ExprInstr b0;                    // blk = RowMax(input 0)
-    b0.op  = static_cast<uint8_t>(ExprOp::RowMax);
+    b0.op = static_cast<uint8_t>(ExprOp::RowMax);
     b0.dst = 1;
-    b0.a   = input(0);
-    b0.b   = {};
+    b0.a = input(0);
+    b0.b = {};
     ExprInstr b1;                    // m = max(m, Reduce(blk))
-    b1.op  = static_cast<uint8_t>(ExprOp::Max);
+    b1.op = static_cast<uint8_t>(ExprOp::Max);
     b1.dst = 0;
-    b1.a   = reg(0);
-    b1.b   = reduce(1);
-    f.body     = { b0, b1 };
-    f.finalize = { fold_emit_state(0, 0) };
-    s.fold     = std::move(f);
-    s.consts   = { Scalar{0} };
+    b1.a = reg(0);
+    b1.b = reduce(1);
+    f.body = {b0, b1};
+    f.finalize = {fold_emit_state(0, 0)};
+    s.fold = std::move(f);
+    s.consts = {Scalar{0}};
     s.num_regs = 2;                  // 状态 0 + 临时 1
-    s.views    = { linear() };
+    s.views = {linear()};
     return s;
 }
 
@@ -77,24 +76,24 @@ namespace nn::expr
 {
     ExprSpec s;
     FoldSpec f;
-    f.k          = k;
-    f.num_state  = 1;
-    f.inits      = { Scalar{0} };
+    f.k = k;
+    f.num_state = 1;
+    f.inits = {Scalar{0}};
     ExprInstr b0;
-    b0.op  = static_cast<uint8_t>(ExprOp::RowSum);
+    b0.op = static_cast<uint8_t>(ExprOp::RowSum);
     b0.dst = 1;
-    b0.a   = input(0);
+    b0.a = input(0);
     ExprInstr b1;
-    b1.op  = static_cast<uint8_t>(ExprOp::Add);
+    b1.op = static_cast<uint8_t>(ExprOp::Add);
     b1.dst = 0;
-    b1.a   = reg(0);
-    b1.b   = reduce(1);
-    f.body     = { b0, b1 };
-    f.finalize = { fold_emit_state(0, 0) };
-    s.fold     = std::move(f);
-    s.consts   = { Scalar{0} };
+    b1.a = reg(0);
+    b1.b = reduce(1);
+    f.body = {b0, b1};
+    f.finalize = {fold_emit_state(0, 0)};
+    s.fold = std::move(f);
+    s.consts = {Scalar{0}};
     s.num_regs = 2;
-    s.views    = { linear() };
+    s.views = {linear()};
     return s;
 }
 
@@ -115,37 +114,37 @@ namespace nn::expr
 // 参考语义：l_final = Σ_k exp(x(row,k) − max_k x)（浮点结合序容差内等价）。
 [[nodiscard]] inline ExprSpec make_fold_softmax_denom(std::uint32_t k)
 {
-    const auto ins = [](ExprOp op, std::uint8_t dst, ExprOperand a,
-                        ExprOperand b = {}) {
+    const auto ins = [](ExprOp op, std::uint8_t dst, ExprOperand a, ExprOperand b = {})
+    {
         ExprInstr i;
-        i.op  = static_cast<uint8_t>(op);
+        i.op = static_cast<uint8_t>(op);
         i.dst = dst;
-        i.a   = a;
-        i.b   = b;
+        i.a = a;
+        i.b = b;
         return i;
     };
     ExprSpec s;
     FoldSpec f;
-    f.k         = k;
+    f.k = k;
     f.num_state = 2;
-    f.inits     = { -std::numeric_limits<Scalar>::infinity(), Scalar{0} };
+    f.inits = {-std::numeric_limits<Scalar>::infinity(), Scalar{0}};
     f.body = {
-        ins(ExprOp::Add,    2, reg(0), cst(0)),   // m_old 拷贝
+        ins(ExprOp::Add, 2, reg(0), cst(0)),   // m_old 拷贝
         ins(ExprOp::RowMax, 3, input(0)),         // 块内 blk_m
-        ins(ExprOp::Max,    0, reg(2), reduce(3)),// m' ← 状态更新
-        ins(ExprOp::Sub,    4, reg(2), reg(0)),   // m_old − m'
-        ins(ExprOp::Exp,    5, reg(4)),           // α
-        ins(ExprOp::Sub,    7, input(0), reg(0)), // x − m'
-        ins(ExprOp::Exp,    8, reg(7)),           // exp(x − m')
+        ins(ExprOp::Max, 0, reg(2), reduce(3)),// m' ← 状态更新
+        ins(ExprOp::Sub, 4, reg(2), reg(0)),   // m_old − m'
+        ins(ExprOp::Exp, 5, reg(4)),           // α
+        ins(ExprOp::Sub, 7, input(0), reg(0)), // x − m'
+        ins(ExprOp::Exp, 8, reg(7)),           // exp(x − m')
         ins(ExprOp::RowSum, 6, reg(8)),           // 块内 blk_l
-        ins(ExprOp::Mul,    9, reg(1), reg(5)),   // l · α
-        ins(ExprOp::Add,    1, reg(9), reduce(6)),// l' ← 状态更新
+        ins(ExprOp::Mul, 9, reg(1), reg(5)),   // l · α
+        ins(ExprOp::Add, 1, reg(9), reduce(6)),// l' ← 状态更新
     };
-    f.finalize = { fold_emit_state(1, 0) };
-    s.fold     = std::move(f);
-    s.consts   = { Scalar{0} };
+    f.finalize = {fold_emit_state(1, 0)};
+    s.fold = std::move(f);
+    s.consts = {Scalar{0}};
     s.num_regs = 10;                             // 状态 0..1 + 临时 2..9
-    s.views    = { linear() };
+    s.views = {linear()};
     return s;
 }
 
@@ -159,17 +158,16 @@ namespace nn::expr
 //     l ≥ 1 ⇒ log l 有限；dst 用临时寄存器，不覆写被读状态）
 // 参考语义：lse_final = log Σ_k exp(x(row,k) − max_k x) + max_k x
 //   （浮点结合序容差内等价于直接 logsumexp）。
-[[nodiscard]] inline ExprSpec make_fold_logsumexp(std::uint32_t k,
-                                                  ExprView input_view = linear())
+[[nodiscard]] inline ExprSpec make_fold_logsumexp(std::uint32_t k, ExprView input_view = linear())
 {
     ExprSpec s = make_fold_softmax_denom(k);     // body/states/inits/consts 同源
-    const auto ins = [](ExprOp op, std::uint8_t dst, ExprOperand a,
-                        ExprOperand b = {}) {
+    const auto ins = [](ExprOp op, std::uint8_t dst, ExprOperand a, ExprOperand b = {})
+    {
         ExprInstr i;
-        i.op  = static_cast<uint8_t>(op);
+        i.op = static_cast<uint8_t>(op);
         i.dst = dst;
-        i.a   = a;
-        i.b   = b;
+        i.a = a;
+        i.b = b;
         return i;
     };
     // finalize：lse = m + log(l)——寄存器 10/11 为 finalize 专用临时
@@ -178,7 +176,7 @@ namespace nn::expr
         ins(ExprOp::Add, 11, reg(0), reg(10)),
     };
     s.num_regs = 12;                             // 状态 0..1 + body 临时 2..9 + finalize 10..11
-    s.views    = { input_view };
+    s.views = {input_view};
     return s;
 }
 
@@ -200,9 +198,9 @@ namespace nn::expr
 // k（= 本头的唯一形状参数）不进 key → 一个代表值覆盖所有收缩长度。
 inline const bool g_fold_sample_anchors = []
 {
-    (void)dsl::FoldAnchor{ make_fold_rowmax(64) };
-    (void)dsl::FoldAnchor{ make_fold_rowsum(64) };
-    (void)dsl::FoldAnchor{ make_fold_softmax_denom(64) };
+    (void)dsl::FoldAnchor{make_fold_rowmax(64)};
+    (void)dsl::FoldAnchor{make_fold_rowsum(64)};
+    (void)dsl::FoldAnchor{make_fold_softmax_denom(64)};
     return true;
 }();
 } // namespace nn::expr

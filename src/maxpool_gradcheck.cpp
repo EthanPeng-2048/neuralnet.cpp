@@ -24,13 +24,14 @@
 #include <random>
 #include <string>
 
-using nn::Scalar;
-using nn::Matrix;
-using nn::Tensor;
 using nn::ComputeEngine;
+using nn::Matrix;
 using nn::MaxPool2D;
+using nn::Scalar;
+using nn::Tensor;
 
-namespace {
+namespace
+{
 
 // 独立参考：窗口 max + argmax 散射（不依赖层内任何实现）。
 // 平局取"先出现者"，与层的 `if (v > best)` 判据一致。
@@ -40,9 +41,7 @@ struct PoolRef
     Matrix x;   // (C*H*W, B)
 
     Scalar xv(std::size_t c, std::size_t ih, std::size_t iw, std::size_t b) const
-    {
-        return x.at_unchecked(c * H * W + ih * W + iw, b);
-    }
+    { return x.at_unchecked(c * H * W + ih * W + iw, b); }
     Matrix fwd() const
     {
         Matrix out(C * OH * OW, B);
@@ -79,8 +78,7 @@ struct PoolRef
                                 if (xv(c, oh * S + dh, ow * S + dw, b) == best) ++cnt;
                         if (cnt == 0) continue;
                         const std::size_t orr = c * OH * OW + oh * OW + ow;
-                        const Scalar share =
-                            go.at_unchecked(orr, b) / static_cast<Scalar>(cnt);
+                        const Scalar share = go.at_unchecked(orr, b) / static_cast<Scalar>(cnt);
                         for (std::size_t dh = 0; dh < P; ++dh)
                             for (std::size_t dw = 0; dw < P; ++dw)
                             {
@@ -129,7 +127,8 @@ int main(int argc, char* argv[])
     std::cout << "  MaxPool2D 正确性检查（独立参考实现比对）\n";
     std::cout << "========================================\n";
 
-    struct Case { std::size_t C, H, W, P, S, B; };
+    struct Case
+    { std::size_t C, H, W, P, S, B; };
     const Case cases[] = {
         {2, 6, 6, 2, 2, 2},   // 标准（stride == pool）
         {2, 6, 6, 2, 1, 2},   // 重叠窗口（梯度在同一位置累加）
@@ -151,22 +150,29 @@ int main(int argc, char* argv[])
     {
         const std::size_t OH = (cs.H - cs.P) / cs.S + 1;
         const std::size_t OW = (cs.W - cs.P) / cs.S + 1;
-        std::printf("── C=%zu H=%zu W=%zu pool=%zu stride=%zu B=%zu (out %zux%zu) ──\n",
-                    cs.C, cs.H, cs.W, cs.P, cs.S, cs.B, OH, OW);
+        std::printf("── C=%zu H=%zu W=%zu pool=%zu stride=%zu B=%zu (out %zux%zu) ──\n", cs.C, cs.H,
+                    cs.W, cs.P, cs.S, cs.B, OH, OW);
 
         MaxPool2D pool(cs.C, cs.H, cs.W, cs.P, cs.S);
         (void)pool.init(eng);   // M6 段 C：层由 init 绑定引擎
         Matrix xm(cs.C * cs.H * cs.W, cs.B);
-        for (std::size_t i = 0; i < xm.size(); ++i) xm.span()[i] = dist(rng);
+        for (std::size_t i = 0; i < xm.size(); ++i)
+            xm.span()[i] = dist(rng);
         Matrix gom(cs.C * OH * OW, cs.B);
-        for (std::size_t i = 0; i < gom.size(); ++i) gom.span()[i] = dist(rng);
+        for (std::size_t i = 0; i < gom.size(); ++i)
+            gom.span()[i] = dist(rng);
         PoolRef ref{cs.C, cs.H, cs.W, cs.P, cs.S, OH, OW, cs.B, xm};
 
         auto x = eng.from_matrix(xm);
         auto go = eng.from_matrix(gom);
-        if (!x || !go) { std::cerr << "  上传失败\n"; return 1; }
+        if (!x || !go)
+        {
+            std::cerr << "  上传失败\n";
+            return 1;
+        }
 
-        const auto report = [&](const char* what, const Matrix& got, const Matrix& want) {
+        const auto report = [&](const char* what, const Matrix& got, const Matrix& want)
+        {
             const Scalar e = max_abs_diff(got, want);
             const bool ok = e < tol;
             std::printf("  %-22s %s  max_abs_diff=%.3e\n", what, ok ? "OK" : "FAIL",
@@ -198,8 +204,7 @@ int main(int argc, char* argv[])
         auto out3 = pool.forward(*x);
         NN_EXIT(out3, 1, "  ckpt forward 失败\n");
         auto gx3 = pool.backward(*go);
-        std::printf("  %-22s %s\n", "ckpt→backward",
-                    gx3 ? "FAIL（未拦截）" : "OK（已拒绝）");
+        std::printf("  %-22s %s\n", "ckpt→backward", gx3 ? "FAIL（未拦截）" : "OK（已拒绝）");
         if (gx3) ++failures;
 
         auto rec = pool.forward_recompute(*x);
@@ -228,12 +233,19 @@ int main(int argc, char* argv[])
         MaxPool2D pool(C, H, W, P, S);
         (void)pool.init(eng);   // M6 段 C：层由 init 绑定引擎
         Matrix xm(C * H * W, B);
-        xm.span()[0] = 1; xm.span()[1] = 1; xm.span()[2] = 1; xm.span()[3] = 0;
+        xm.span()[0] = 1;
+        xm.span()[1] = 1;
+        xm.span()[2] = 1;
+        xm.span()[3] = 0;
         Matrix gom(C * 1 * 1, B);
         gom.span()[0] = 2;
         auto x = eng.from_matrix(xm);
         auto go = eng.from_matrix(gom);
-        if (!x || !go) { std::cerr << "  上传失败\n"; return 1; }
+        if (!x || !go)
+        {
+            std::cerr << "  上传失败\n";
+            return 1;
+        }
 
         auto out = pool.forward(*x);
         if (!out)
@@ -260,10 +272,10 @@ int main(int argc, char* argv[])
                                 std::fabs(gm->at_unchecked(2, 0) - want) < 1e-6f &&
                                 std::fabs(gm->at_unchecked(3, 0)) < 1e-6f;
                 Scalar sum = 0;
-                for (std::size_t i = 0; i < gm->size(); ++i) sum += gm->span()[i];
+                for (std::size_t i = 0; i < gm->size(); ++i)
+                    sum += gm->span()[i];
                 const bool conserved = std::fabs(sum - Scalar{2}) < 1e-6f;
-                std::printf("  %-22s %s（期望 [2/3,2/3,2/3,0]）\n", "并列均分",
-                            ok ? "OK" : "FAIL");
+                std::printf("  %-22s %s（期望 [2/3,2/3,2/3,0]）\n", "并列均分", ok ? "OK" : "FAIL");
                 std::printf("  %-22s %s（Σgrad=%.6f，期望 2）\n", "总梯度守恒",
                             conserved ? "OK" : "FAIL", double(sum));
                 if (!ok || !conserved) ++failures;

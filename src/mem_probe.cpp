@@ -60,11 +60,10 @@ namespace
 [[nodiscard]] long long smi_used_mb()
 {
 #ifdef _WIN32
-    FILE* f = _popen(
-        "nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>nul", "r");
+    FILE* f = _popen("nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>nul", "r");
 #else
-    FILE* f = popen(
-        "nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null", "r");
+    FILE* f =
+        popen("nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null", "r");
 #endif
     if (!f) return -1;
     long long best = -1;
@@ -84,9 +83,7 @@ namespace
 }
 
 [[nodiscard]] double to_mb(std::size_t bytes)
-{
-    return static_cast<double>(bytes) / (1024.0 * 1024.0);
-}
+{ return static_cast<double>(bytes) / (1024.0 * 1024.0); }
 
 // ── 采样点 ────────────────────────────────────────────────────────────────
 struct Sample
@@ -120,7 +117,12 @@ void print_top_allocs(const char* name, const std::vector<VkDeviceSize>& sizes,
     {
         bool found = false;
         for (auto& a : agg)
-            if (a.first == sz) { ++a.second; found = true; break; }
+            if (a.first == sz)
+            {
+                ++a.second;
+                found = true;
+                break;
+            }
         if (!found) agg.push_back({sz, 1});
     }
     std::sort(agg.begin(), agg.end(),
@@ -134,14 +136,25 @@ void print_top_allocs(const char* name, const std::vector<VkDeviceSize>& sizes,
     std::size_t b1 = 0, b2 = 0, b3 = 0, c1 = 0, c2 = 0, c3 = 0;
     for (auto sz : sizes)
     {
-        if (sz >= 100ull * 1024 * 1024) { b1 += sz; ++c1; }
-        else if (sz >= 10ull * 1024 * 1024) { b2 += sz; ++c2; }
-        else { b3 += sz; ++c3; }
+        if (sz >= 100ull * 1024 * 1024)
+        {
+            b1 += sz;
+            ++c1;
+        }
+        else if (sz >= 10ull * 1024 * 1024)
+        {
+            b2 += sz;
+            ++c2;
+        }
+        else
+        {
+            b3 += sz;
+            ++c3;
+        }
     }
-    std::cout << "\n      " << name << " 桶: ≥100MB " << c1 << "项/"
-              << (b1 / (1024.0 * 1024.0)) << "MB  10-100MB " << c2 << "项/"
-              << (b2 / (1024.0 * 1024.0)) << "MB  <10MB " << c3 << "项/"
-              << (b3 / (1024.0 * 1024.0)) << "MB\n";
+    std::cout << "\n      " << name << " 桶: ≥100MB " << c1 << "项/" << (b1 / (1024.0 * 1024.0))
+              << "MB  10-100MB " << c2 << "项/" << (b2 / (1024.0 * 1024.0)) << "MB  <10MB " << c3
+              << "项/" << (b3 / (1024.0 * 1024.0)) << "MB\n";
     std::cout << std::setprecision(1);
 }
 } // namespace
@@ -192,9 +205,9 @@ void take_sample(const std::string& label)
         {
             std::cout << "    " << std::left << std::setw(9) << name << std::right
                       << " committed=" << std::fixed << std::setprecision(1)
-                      << to_mb(static_cast<std::size_t>(ps.total_bytes))
-                      << "MB (dev " << to_mb(static_cast<std::size_t>(ps.device_bytes))
-                      << " + host " << to_mb(static_cast<std::size_t>(ps.host_bytes)) << ")"
+                      << to_mb(static_cast<std::size_t>(ps.total_bytes)) << "MB (dev "
+                      << to_mb(static_cast<std::size_t>(ps.device_bytes)) << " + host "
+                      << to_mb(static_cast<std::size_t>(ps.host_bytes)) << ")"
                       << "  live=" << to_mb(static_cast<std::size_t>(ps.allocated_bytes))
                       << "MB  free=" << to_mb(static_cast<std::size_t>(ps.free_bytes))
                       << "MB  frag=" << std::setprecision(2) << ps.fragmentation
@@ -203,16 +216,14 @@ void take_sample(const std::string& label)
             {
                 std::cout << "  Δlive=" << std::showpos << std::setprecision(1)
                           << (d_live / (1024.0 * 1024.0))
-                          << "MB Δcommit=" << (d_commit / (1024.0 * 1024.0))
-                          << "MB" << std::noshowpos;
+                          << "MB Δcommit=" << (d_commit / (1024.0 * 1024.0)) << "MB"
+                          << std::noshowpos;
             }
             std::cout << "\n";
             // 池账本计数器（累计值；相邻采样点相减得该阶段的开销）
             std::cout << "              calls=" << ps.c_alloc_calls
-                      << "  blk_new/free=" << ps.c_blocks_created << "/"
-                      << ps.c_blocks_released
-                      << "  scans=" << ps.c_block_scans << "blk/"
-                      << ps.c_region_scans << "reg"
+                      << "  blk_new/free=" << ps.c_blocks_created << "/" << ps.c_blocks_released
+                      << "  scans=" << ps.c_block_scans << "blk/" << ps.c_region_scans << "reg"
                       << "  vkalloc=" << std::setprecision(1) << ps.vkalloc_ms << "ms\n";
         };
         pool_line("persist", s.persist, d_live, d_commit, has_prev);
@@ -220,13 +231,12 @@ void take_sample(const std::string& label)
         std::cout << std::resetiosflags(std::ios_base::floatfield);
         if (s.pending_bytes > 0)
             std::cout << std::fixed << std::setprecision(0)
-                      << "    延迟销毁未归还(pending) = "
-                      << (s.pending_bytes / (1024.0 * 1024.0)) << " MB\n";
+                      << "    延迟销毁未归还(pending) = " << (s.pending_bytes / (1024.0 * 1024.0))
+                      << " MB\n";
         print_top_allocs("persist", s.p_allocs, 16);
         print_top_allocs("transient", s.t_allocs, 16);
     }
-    if (s.smi >= 0)
-        std::cout << "    nvidia-smi used = " << s.smi << " MiB\n";
+    if (s.smi >= 0) std::cout << "    nvidia-smi used = " << s.smi << " MiB\n";
 
     g_samples.push_back(std::move(s));
 }
@@ -241,13 +251,13 @@ void take_sample(const std::string& label)
 [[nodiscard]] std::size_t sum_tensor_bytes(std::vector<nn::TensorRef>& refs)
 {
     std::size_t total = 0;
-    for (auto& r : refs) total += tensor_bytes(r.get());
+    for (auto& r : refs)
+        total += tensor_bytes(r.get());
     return total;
 }
 
 // 解析命令行数字
-template <typename T>
-[[nodiscard]] T parse_num(const char* s, const char* opt)
+template <typename T> [[nodiscard]] T parse_num(const char* s, const char* opt)
 {
     auto v = nn::parse_number<T>(s);
     if (!v)
@@ -278,8 +288,7 @@ void print_usage(const char* prog)
     help.opt("--no-kv", "跳过 KV cache 推理阶段");
     help.opt("--kv-steps <n>", "KV 阶段 forward_step 次数 (默认: 32)");
     // RV-04：名单文本由 nn::optimizer_table()（唯一真源）生成（此前此处漏了 adamwquant）
-    help.opt("--optimizer <name>",
-             "优化器: " + nn::optimizer_names("/") + " (默认: adam)");
+    help.opt("--optimizer <name>", "优化器: " + nn::optimizer_names("/") + " (默认: adam)");
     help.opt("--help, -h", "显示此帮助信息");
 
     help.section("模型尺寸");
@@ -317,7 +326,8 @@ int main(int argc, char* argv[])
     for (int i = 1; i < argc; ++i)
     {
         const std::string arg = argv[i];
-        const auto need = [&](const char* name) -> const char* {
+        const auto need = [&](const char* name) -> const char*
+        {
             if (i + 1 >= argc)
             {
                 std::cerr << "--" << name << " 缺少值\n";
@@ -325,9 +335,17 @@ int main(int argc, char* argv[])
             }
             return argv[++i];
         };
-        if (arg == "--help" || arg == "-h") { print_usage(argv[0]); return 0; }
+        if (arg == "--help" || arg == "-h")
+        {
+            print_usage(argv[0]);
+            return 0;
+        }
         else if (arg == "--f16") f16 = true;
-        else if (arg == "--f16-all") { f16 = true; f16_all = true; }
+        else if (arg == "--f16-all")
+        {
+            f16 = true;
+            f16_all = true;
+        }
         else if (arg == "--activation-offload") activation_offload = true;
         else if (arg == "--no-kv") do_kv = false;
         else if (arg == "--doc-mask") doc_mask = true;
@@ -335,13 +353,20 @@ int main(int argc, char* argv[])
         else if (arg == "--seq") seq = parse_num<std::size_t>(need("seq"), "--seq");
         else if (arg == "--vocab") vocab = parse_num<std::size_t>(need("vocab"), "--vocab");
         else if (arg == "--d-model") d_model = parse_num<std::size_t>(need("d-model"), "--d-model");
-        else if (arg == "--num-heads") heads = parse_num<std::size_t>(need("num-heads"), "--num-heads");
-        else if (arg == "--num-layers") layers = parse_num<std::size_t>(need("num-layers"), "--num-layers");
+        else if (arg == "--num-heads")
+            heads = parse_num<std::size_t>(need("num-heads"), "--num-heads");
+        else if (arg == "--num-layers")
+            layers = parse_num<std::size_t>(need("num-layers"), "--num-layers");
         else if (arg == "--d-ff") d_ff = parse_num<std::size_t>(need("d-ff"), "--d-ff");
-        else if (arg == "--steps") steps = std::max<std::size_t>(1, parse_num<std::size_t>(need("steps"), "--steps"));
-        else if (arg == "--kv-steps") kv_steps = parse_num<std::size_t>(need("kv-steps"), "--kv-steps");
-        else if (arg == "--checkpoint-every") checkpoint_every = parse_num<std::size_t>(need("checkpoint-every"), "--checkpoint-every");
-        else if (arg == "--flush-interval") flush_interval = parse_num<std::size_t>(need("flush-interval"), "--flush-interval");
+        else if (arg == "--steps")
+            steps = std::max<std::size_t>(1, parse_num<std::size_t>(need("steps"), "--steps"));
+        else if (arg == "--kv-steps")
+            kv_steps = parse_num<std::size_t>(need("kv-steps"), "--kv-steps");
+        else if (arg == "--checkpoint-every")
+            checkpoint_every =
+                parse_num<std::size_t>(need("checkpoint-every"), "--checkpoint-every");
+        else if (arg == "--flush-interval")
+            flush_interval = parse_num<std::size_t>(need("flush-interval"), "--flush-interval");
         else if (arg == "--optimizer") opt_name = need("optimizer");
         else if (auto g = nn::cli::parse_gpu_option(argc, argv, i, /*allow_name_value=*/true))
         {
@@ -359,10 +384,10 @@ int main(int argc, char* argv[])
               << "  mem_probe — 运行时显存分项探针\n"
               << "========================================\n"
               << "  配置: vocab=" << vocab << " d_model=" << d_model << " heads=" << heads
-              << " layers=" << layers << " d_ff=" << d_ff << " seq=" << seq
-              << " batch=" << batch << "\n"
-              << "  优化器: " << opt_name << "  精度: "
-              << (f16 ? (f16_all ? "全f16" : "f16存储") : "f32")
+              << " layers=" << layers << " d_ff=" << d_ff << " seq=" << seq << " batch=" << batch
+              << "\n"
+              << "  优化器: " << opt_name
+              << "  精度: " << (f16 ? (f16_all ? "全f16" : "f16存储") : "f32")
               << "  checkpoint-every=" << checkpoint_every
               << "  offload=" << (activation_offload ? "on" : "off") << "\n"
               << "========================================\n\n";
@@ -400,10 +425,10 @@ int main(int argc, char* argv[])
     nn::ComputeEngine* engine = raw_engine.get();
 
     // ── 构建模型 ────────────────────────────────────────────────────────
-    auto model_r = nn::build_gpt_model(*engine, nn::GptConfig{
-        vocab, d_model, seq, heads, d_ff, layers,
-        nn::PosEncodingType::Learned, nn::ActivationType::GeLU,
-        nn::NormType::LayerNorm, prof});
+    auto model_r = nn::build_gpt_model(*engine, nn::GptConfig{vocab, d_model, seq, heads, d_ff,
+                                                              layers, nn::PosEncodingType::Learned,
+                                                              nn::ActivationType::GeLU,
+                                                              nn::NormType::LayerNorm, prof});
     NN_EXIT(model_r, 1, "构建模型失败: ");
     nn::Model model = std::move(*model_r);
     model.set_flush_interval(flush_interval);  // 与 text_train 默认一致
@@ -417,7 +442,8 @@ int main(int argc, char* argv[])
     const std::size_t param_bytes = sum_tensor_bytes(params);
     const std::size_t grad_bytes = sum_tensor_bytes(grads);
     std::size_t param_elems = 0;
-    for (auto& r : params) param_elems += r.get().rows() * r.get().cols();
+    for (auto& r : params)
+        param_elems += r.get().rows() * r.get().cols();
 
     // ── 优化器（状态在构造期分配）──────────────────────────────────────
     auto optimizer = nn::create_optimizer(opt_name, *engine, params, grads,
@@ -432,18 +458,17 @@ int main(int argc, char* argv[])
         const auto& b = g_samples.back();                 // optimizer-created
         if (a.pools_valid && b.pools_valid)
         {
-            const long long d = static_cast<long long>(
-                (b.persist.allocated_bytes + b.transient.allocated_bytes)
-                - (a.persist.allocated_bytes + a.transient.allocated_bytes));
+            const long long d =
+                static_cast<long long>((b.persist.allocated_bytes + b.transient.allocated_bytes) -
+                                       (a.persist.allocated_bytes + a.transient.allocated_bytes));
             if (d > 0) opt_measured_bytes = static_cast<std::size_t>(d);
         }
     }
     // 逻辑估算（RV-04：查 nn::optimizer_table()，唯一真源）：
     //   state_bufs = 每权重全尺寸状态缓冲数；half_state（AdamWQuant）= 每缓冲 2 B
-    const auto *opt_meta = nn::find_optimizer(opt_name);
+    const auto* opt_meta = nn::find_optimizer(opt_name);
     const std::size_t opt_buffers = (opt_meta != nullptr) ? opt_meta->state_bufs : 0;
-    const std::size_t opt_state_bytes =
-        (opt_meta != nullptr && opt_meta->half_state) ? 2u : 4u;
+    const std::size_t opt_state_bytes = (opt_meta != nullptr && opt_meta->half_state) ? 2u : 4u;
     const std::size_t opt_logical_bytes = param_elems * opt_state_bytes * opt_buffers;
 
     // ── 训练阶段采样（镜像 text_train 顺序）────────────────────────────
@@ -511,9 +536,9 @@ int main(int argc, char* argv[])
             act_bytes_fwd = static_cast<std::size_t>(g_samples.back().transient.allocated_bytes);
 
         std::size_t num_valid = 0;
-        auto loss_r = ce.forward_sparse_sum(*engine, logits,
-            std::span<const std::size_t>(flat_targets),
-            std::span<const Scalar>(flat_mask), vocab, num_valid);
+        auto loss_r =
+            ce.forward_sparse_sum(*engine, logits, std::span<const std::size_t>(flat_targets),
+                                  std::span<const Scalar>(flat_mask), vocab, num_valid);
         NN_EXIT(loss_r, 1, "loss 失败: ");
         take_sample(tag + "loss-fwd");
 
@@ -554,10 +579,7 @@ int main(int argc, char* argv[])
     if (do_kv)
     {
         auto* gpt = dynamic_cast<nn::GPTModel*>(&model.layer_at(0));
-        if (!gpt)
-        {
-            std::cout << "[KV] layer_at(0) 不是 GPTModel，跳过\n";
-        }
+        if (!gpt) { std::cout << "[KV] layer_at(0) 不是 GPTModel，跳过\n"; }
         else
         {
             take_sample("kv/pre");
@@ -582,7 +604,11 @@ int main(int argc, char* argv[])
             for (std::size_t t = 0; t < kv_steps && cur < seq; ++t, ++cur)
             {
                 auto r = gpt->forward_step(*engine, uid(rng), cur, kc, vc, cur);
-                if (!r) { std::cerr << "forward_step 失败: " << r.error().message << "\n"; break; }
+                if (!r)
+                {
+                    std::cerr << "forward_step 失败: " << r.error().message << "\n";
+                    break;
+                }
                 last_logits = std::move(*r);
             }
             take_sample("kv/after-steps(batch内)");
@@ -610,16 +636,16 @@ int main(int argc, char* argv[])
         peak_t_commit = std::max(peak_t_commit, static_cast<std::size_t>(s.transient.total_bytes));
         peak_p_dev = std::max(peak_p_dev, static_cast<std::size_t>(s.persist.device_bytes));
         peak_t_dev = std::max(peak_t_dev, static_cast<std::size_t>(s.transient.device_bytes));
-        peak_live = std::max(peak_live, static_cast<std::size_t>(
-            s.persist.allocated_bytes + s.transient.allocated_bytes));
+        peak_live = std::max(peak_live, static_cast<std::size_t>(s.persist.allocated_bytes +
+                                                                 s.transient.allocated_bytes));
     }
     // 稳态（最后一个采样点）
     const Sample& last = g_samples.back();
-    const std::size_t slack = (last.pools_valid)
-        ? static_cast<std::size_t>(
-              (last.persist.total_bytes - last.persist.allocated_bytes)
-              + (last.transient.total_bytes - last.transient.allocated_bytes))
-        : 0;
+    const std::size_t slack =
+        (last.pools_valid) ? static_cast<std::size_t>(
+                                 (last.persist.total_bytes - last.persist.allocated_bytes) +
+                                 (last.transient.total_bytes - last.transient.allocated_bytes))
+                           : 0;
     const std::size_t dev_commit = peak_p_dev + peak_t_dev;
 
     const double MB = 1.0 / (1024.0 * 1024.0);
@@ -635,8 +661,9 @@ int main(int argc, char* argv[])
               << "; 实测 Δlive=" << to_mb(opt_measured_bytes) << " MB)\n";
     std::cout << "  激活 activations      " << std::setw(9) << to_mb(act_bytes_fwd)
               << " MB   (实测 transient.live @forward)\n";
-    std::cout << "  logits                " << std::setw(9) << to_mb(logits_seen ? logits_seen : logits_bytes)
-              << " MB   (vocab×seq×batch×elem" << (f16 ? ", f16" : ", f32") << ")\n";
+    std::cout << "  logits                " << std::setw(9)
+              << to_mb(logits_seen ? logits_seen : logits_bytes) << " MB   (vocab×seq×batch×elem"
+              << (f16 ? ", f16" : ", f32") << ")\n";
     std::cout << "  CE 梯度 (同 logits 形) " << std::setw(9) << to_mb(logits_bytes)
               << " MB   (loss-fwd 期与 logits 短暂共存)\n";
     if (do_kv)
@@ -651,8 +678,7 @@ int main(int argc, char* argv[])
     std::cout << "  稳态池空闲(高水位/碎片) " << std::setw(9) << to_mb(slack) << " MB\n";
     if (peak_smi >= 0)
     {
-        std::cout << "  nvidia-smi 整卡峰值     " << std::setw(9) << peak_smi
-                  << " MB\n";
+        std::cout << "  nvidia-smi 整卡峰值     " << std::setw(9) << peak_smi << " MB\n";
         std::cout << "  驱动/池外开销          " << std::setw(9)
                   << (peak_smi - static_cast<long long>(dev_commit * MB))
                   << " MB   (= 整卡峰值 − 池 device 提交)\n";

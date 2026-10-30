@@ -135,13 +135,15 @@ struct Ne
 
 struct Max
 {
-    [[nodiscard]] static constexpr Scalar apply(Scalar a, Scalar b) noexcept { return std::max(a, b); }
+    [[nodiscard]] static constexpr Scalar apply(Scalar a, Scalar b) noexcept
+    { return std::max(a, b); }
     static constexpr ExprOp op_id() noexcept { return ExprOp::Max; }
 };
 
 struct Min
 {
-    [[nodiscard]] static constexpr Scalar apply(Scalar a, Scalar b) noexcept { return std::min(a, b); }
+    [[nodiscard]] static constexpr Scalar apply(Scalar a, Scalar b) noexcept
+    { return std::min(a, b); }
     static constexpr ExprOp op_id() noexcept { return ExprOp::Min; }
 };
 

@@ -63,8 +63,8 @@ struct ResumeStateAdoption
     bool shape_adopted = false;// 形状/架构已按文件 spec 改写（两种角色都成立）
 };
 
-[[nodiscard]] inline nn::Result<ResumeStateAdoption> adopt_resume_state(
-    TrainConfig& cfg, std::ostream& out, std::ostream& err)
+[[nodiscard]] inline nn::Result<ResumeStateAdoption>
+adopt_resume_state(TrainConfig& cfg, std::ostream& out, std::ostream& err)
 {
     ResumeStateAdoption result;
     if (!cfg.load_existing) return result;
@@ -107,8 +107,7 @@ struct ResumeStateAdoption
 
     uint32_t version = 0;
     auto role_r = nn::peek_model_role(cfg.resume_path, &version);
-    const bool is_checkpoint =
-        role_r && version >= 7 && *role_r == nn::ModelRole::Checkpoint;
+    const bool is_checkpoint = role_r && version >= 7 && *role_r == nn::ModelRole::Checkpoint;
     if (role_r && version >= 7 && *role_r == nn::ModelRole::Model)
     {
         out << "从推理模型 warm start（.nnmodel）：配方与步计数由命令行给出，优化器冷启动"
@@ -142,14 +141,15 @@ struct ResumeStateAdoption
             if (!given.empty()) given += " ";
             given += f;
         }
-        NN_FAIL("错误: --resume " + cfg.resume_path +
-                " 是训练断点（.nnckpt，带训练状态段）⇒ 形状/配方/计数器一律由断点决定，"
-                "不得再由命令行给出。\n  检测到显式输入: " + given +
-                "\n  · 禁止（A/B 类：形状 / 配方 / 计数器）: " + forbidden_resume_flags_text() +
-                "\n  · 仍允许（不改变训练）: --save / --save-interval / --log-interval / "
-                "--max-steps / --gpu / --grad-log / --checkpoint-every / --activation-offload / "
-                "--flush-interval\n"
-                "  · 要改配方 / 换数据集 ⇒ 从推理模型（.nnmodel）开新一轮（CLI 全权、优化器冷启动）。");
+        NN_FAIL(
+            "错误: --resume " + cfg.resume_path +
+            " 是训练断点（.nnckpt，带训练状态段）⇒ 形状/配方/计数器一律由断点决定，"
+            "不得再由命令行给出。\n  检测到显式输入: " +
+            given + "\n  · 禁止（A/B 类：形状 / 配方 / 计数器）: " + forbidden_resume_flags_text() +
+            "\n  · 仍允许（不改变训练）: --save / --save-interval / --log-interval / "
+            "--max-steps / --gpu / --grad-log / --checkpoint-every / --activation-offload / "
+            "--flush-interval\n"
+            "  · 要改配方 / 换数据集 ⇒ 从推理模型（.nnmodel）开新一轮（CLI 全权、优化器冷启动）。");
     }
 
     // ── 按状态段改写 cfg（A/B 类全量）────────────────────────────────────
@@ -174,20 +174,16 @@ struct ResumeStateAdoption
         // docs/internal/30：旧状态的 batch_size 是 micro-batch；还原成等效 global。
         // 旧断点若落在累积中间，pending gradients 不在文件里，只能从最近的
         // 已完成 update 边界继续。
-        if (s.recipe.accum_steps == 0)
-            NN_FAIL("旧断点的 accum_steps=0，无法转换 batch_size 语义");
-        cfg.batch_size = static_cast<std::size_t>(
-            s.recipe.batch_size * s.recipe.accum_steps);
-        if (s.recipe.accum_steps > 0)
-            s.counters.step_in_epoch /= s.recipe.accum_steps;
+        if (s.recipe.accum_steps == 0) NN_FAIL("旧断点的 accum_steps=0，无法转换 batch_size 语义");
+        cfg.batch_size = static_cast<std::size_t>(s.recipe.batch_size * s.recipe.accum_steps);
+        if (s.recipe.accum_steps > 0) s.counters.step_in_epoch /= s.recipe.accum_steps;
         s.recipe.batch_size = static_cast<std::uint64_t>(cfg.batch_size);
-        s.recipe.micro_batch_size = static_cast<std::uint64_t>(s.recipe.batch_size /
-                                                               s.recipe.accum_steps);
+        s.recipe.micro_batch_size =
+            static_cast<std::uint64_t>(s.recipe.batch_size / s.recipe.accum_steps);
         s.recipe.batch_size_is_global = true;
         if (s.dataset.num_samples > 0)
             s.dataset.steps_per_epoch =
-                (s.dataset.num_samples + s.recipe.batch_size - 1) /
-                s.recipe.batch_size;
+                (s.dataset.num_samples + s.recipe.batch_size - 1) / s.recipe.batch_size;
     }
     cfg.stride = static_cast<std::size_t>(s.stride);
     cfg.lr_per_epoch.clear();
@@ -208,12 +204,9 @@ struct ResumeStateAdoption
         << "  精度=" << nn::precision_name(s.recipe.precision.param) << "/"
         << nn::precision_name(s.recipe.precision.compute) << "/"
         << nn::precision_name(s.recipe.precision.stable) << "/"
-        << nn::precision_name(s.recipe.precision.optimizer)
-        << "  优化器=" << s.recipe.optimizer
-        << "  global_batch=" << s.recipe.batch_size
-        << " micro_batch=" << s.recipe.micro_batch_size
-        << " accum=" << s.recipe.accum_steps
-        << "  epochs=" << s.recipe.epochs << "\n";
+        << nn::precision_name(s.recipe.precision.optimizer) << "  优化器=" << s.recipe.optimizer
+        << "  global_batch=" << s.recipe.batch_size << " micro_batch=" << s.recipe.micro_batch_size
+        << " accum=" << s.recipe.accum_steps << "  epochs=" << s.recipe.epochs << "\n";
     return result;
 }
 
@@ -221,15 +214,15 @@ struct ResumeStateAdoption
 // 数据集一变 ⇒ 窗口数变 ⇒ steps_per_epoch 变 ⇒ step 级调度的 total_steps、
 // `global_step` 的语义、epoch 边界**同时**改变 ⇒ "同一断点 + 不同数据集"
 // 不存在正确的续训语义。合法出口 = 从 `.nnmodel` 开新一轮。
-[[nodiscard]] inline nn::Result<void> verify_dataset_identity(
-    const nn::DatasetIdentity& saved, const nn::DatasetIdentity& current,
-    const std::string& resume_path)
+[[nodiscard]] inline nn::Result<void> verify_dataset_identity(const nn::DatasetIdentity& saved,
+                                                              const nn::DatasetIdentity& current,
+                                                              const std::string& resume_path)
 {
     const std::string why = nn::dataset_mismatch_reason(saved, current);
     if (why.empty()) return {};
     NN_FAIL("错误: --resume 的数据集与断点不一致（内容身份变了 ⇒ 窗口网格 / step 号语义 / "
-            "lr 曲线形状全变，续训不存在正确语义）:\n" + why +
-            "\n  断点记录的路径: " + saved.path + "\n  本次使用的路径: " + current.path +
+            "lr 曲线形状全变，续训不存在正确语义）:\n" +
+            why + "\n  断点记录的路径: " + saved.path + "\n  本次使用的路径: " + current.path +
             "\n  断点文件: " + resume_path +
             "\n  · 换数据集 = 新任务 ⇒ 请从推理模型（.nnmodel）重开一轮（CLI 全权、优化器冷启动）；"
             "\n  · 仍要用这个断点 ⇒ 请提供与断点**内容完全一致**的 .nndataset。");
@@ -239,16 +232,17 @@ struct ResumeStateAdoption
 // ── 载入优化器状态（续训路径；建优化器之后调用）──────────────────────────
 // 优化器身份（种类/超参）已由状态段写回 cfg ⇒ 张量数量与形状必须对上，
 // 对不上由 `Optimizer::load_state` 明确报错（不静默冷启动）。
-[[nodiscard]] inline nn::Result<void> load_optimizer_state(
-    nn::ComputeEngine& engine, const std::string& path, nn::Optimizer& optimizer,
-    std::ostream& out)
+[[nodiscard]] inline nn::Result<void> load_optimizer_state(nn::ComputeEngine& engine,
+                                                           const std::string& path,
+                                                           nn::Optimizer& optimizer,
+                                                           std::ostream& out)
 {
     NN_TRY(loaded, nn::load_train_state(engine, path));
     optimizer.set_state_step(loaded->state->optimizer_step);
     NN_TRY_CHECK(optimizer.load_state(loaded->optimizer_blobs));
     out << "已恢复优化器状态: " << loaded->optimizer_blobs.size() << " 个张量"
-        << "，步计数 " << loaded->state->optimizer_step
-        << "（" << loaded->state->recipe.optimizer << "）\n";
+        << "，步计数 " << loaded->state->optimizer_step << "（" << loaded->state->recipe.optimizer
+        << "）\n";
     return {};
 }
 
@@ -262,16 +256,15 @@ struct TextTrainResume
 
 // ── 恢复流程：角色门禁 → 读规格 → 按规格重建模型 → 载入参数 ──────────────
 // out/err 语义与旧 main 一致（进度走 out，提示与警告走 err）。
-[[nodiscard]] inline nn::Result<TextTrainResume> resume_text_train(
-    nn::ComputeEngine& engine, const TrainConfig& cfg, nn::Model& model,
-    nn::ModelSpec& spec, std::ostream& out, std::ostream& err)
+[[nodiscard]] inline nn::Result<TextTrainResume>
+resume_text_train(nn::ComputeEngine& engine, const TrainConfig& cfg, nn::Model& model,
+                  nn::ModelSpec& spec, std::ostream& out, std::ostream& err)
 {
     TextTrainResume result;
     auto spec_result = nn::peek_model_spec(cfg.resume_path);
     if (!spec_result)
     {
-        err << "加载模型失败: " << spec_result.error().message << "，将从头训练。\n"
-            << std::endl;
+        err << "加载模型失败: " << spec_result.error().message << "，将从头训练。\n" << std::endl;
         return result;
     }
 
@@ -281,8 +274,7 @@ struct TextTrainResume
     // （P1-7），dense / `.nnckpt` 路径与逐位不变（意图只影响打包载荷那一条分支）。
     uint32_t file_version = 0;
     const auto role_r = nn::peek_model_role(cfg.resume_path, &file_version);
-    const bool model_role =
-        role_r && file_version >= 7 && *role_r == nn::ModelRole::Model;
+    const bool model_role = role_r && file_version >= 7 && *role_r == nn::ModelRole::Model;
     // RAPT 独立构建路径
     if (file_spec.is_rapt())
     {
@@ -302,37 +294,33 @@ struct TextTrainResume
             out << "从模型文件读取 ALiBi GPT 规格\n";
         else if (fg->pos_encoding == nn::PosEncodingType::RoPE)
             out << "从模型文件读取 RoPE GPT 规格\n";
-        else
-            out << "从模型文件读取 GPT 规格\n";
+        else out << "从模型文件读取 GPT 规格\n";
         NN_TRY_MSG(build_result, "从断点重建 GPT 模型失败",
                    nn::build_gpt_model_from_spec(engine, file_spec, cfg.precision));
         model = std::move(*build_result);
         spec = file_spec;
         result.spec_restored = true;
     }
-    else
-        out << "旧格式模型文件，使用命令行参数\n";
+    else out << "旧格式模型文件，使用命令行参数\n";
 
-    auto load_result = nn::load_model(cfg.resume_path, model, nullptr, nullptr,
-                                      nn::WeightLoadIntent::Trainable);
+    auto load_result =
+        nn::load_model(cfg.resume_path, model, nullptr, nullptr, nn::WeightLoadIntent::Trainable);
     if (!load_result)
     {
-        err << "加载模型失败: " << load_result.error().message << "，将从头训练。\n"
-            << std::endl;
+        err << "加载模型失败: " << load_result.error().message << "，将从头训练。\n" << std::endl;
         return result;
     }
     result.weights_loaded = true;
     result.vocab_bytes = load_result->size();
-    const nn::WeightQuant file_wq =
-        file_spec.is_gpt()   ? file_spec.as<nn::GptSpec>()->weight_quant
-        : file_spec.is_rapt() ? file_spec.as<nn::RaptSpec>()->weight_quant
-                              : nn::WeightQuant::None;
+    const nn::WeightQuant file_wq = file_spec.is_gpt() ? file_spec.as<nn::GptSpec>()->weight_quant
+                                    : file_spec.is_rapt()
+                                        ? file_spec.as<nn::RaptSpec>()->weight_quant
+                                        : nn::WeightQuant::None;
     if (model_role && file_wq == nn::WeightQuant::T1_58)
         out << "三值（T1_58）推理模型：按文件 τ 反量化打包权重为 f32 latent ⇒ 可续训"
                "（首次 forward 与推理文件逐位一致）\n";
     out << "已加载模型: " << cfg.resume_path;
-    if (!load_result->empty())
-        out << " (含嵌入词表 " << load_result->size() << " 字节)";
+    if (!load_result->empty()) out << " (含嵌入词表 " << load_result->size() << " 字节)";
     out << "\n" << std::endl;
     return result;
 }

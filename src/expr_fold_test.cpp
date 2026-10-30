@@ -33,8 +33,8 @@
 #include <neuralnet.cpp/compute_tensor.hpp>
 #include <neuralnet.cpp/compute_cpu_engine.hpp>
 #include <neuralnet.cpp/expr_fold.hpp>
-#include <neuralnet.cpp/compute_layer_attention.hpp>   // 注意力 fold 构造（定义于 Layer：表达式文本只写在 Layer）
-#include "test_common.hpp"                            // M1：upload/download（库外经引擎进出张量）
+#include <neuralnet.cpp/compute_layer_attention.hpp> // 注意力 fold 构造（定义于 Layer：表达式文本只写在 Layer）
+#include "test_common.hpp" // M1：upload/download（库外经引擎进出张量）
 
 using nn::Scalar;
 
@@ -50,8 +50,9 @@ int test_expr_fold()
     //   IEEE fmax(err, NaN) = err 会静默吞掉 NaN diff——若无此守卫，被测端
     //   输出 NaN 时对拍仍可能 PASS，故此处直接把非有限 diff 记为 inf。
     const auto err_of = [](Scalar err, Scalar diff) -> Scalar
-    { return std::isfinite(diff) ? std::fmax(err, diff)
-                                 : std::numeric_limits<Scalar>::infinity(); };
+    {
+        return std::isfinite(diff) ? std::fmax(err, diff) : std::numeric_limits<Scalar>::infinity();
+    };
 
     auto engine_owner = nn::CpuEngine::create();
     nn::CpuEngine& engine = *engine_owner;
@@ -59,14 +60,15 @@ int test_expr_fold()
     std::uniform_real_distribution<Scalar> dist(-2.0f, 2.0f);
     constexpr Scalar kTol = Scalar{1e-4};
 
-    for (const std::size_t K : {std::size_t{1}, std::size_t{7}, std::size_t{32},
-                                std::size_t{33}, std::size_t{100}, std::size_t{1000}})
+    for (const std::size_t K : {std::size_t{1}, std::size_t{7}, std::size_t{32}, std::size_t{33},
+                                std::size_t{100}, std::size_t{1000}})
     {
         const std::size_t rows = 5;
         nn::Matrix mx(rows, K);
         {
             auto sp = mx.span();
-            for (auto& v : sp) v = dist(rng);
+            for (auto& v : sp)
+                v = dist(rng);
         }
         nn::Tensor x = upload(engine, mx);
         const std::array<nn::Tensor, 1> ins{x};
@@ -77,7 +79,10 @@ int test_expr_fold()
             check(nn::validate_expr_spec(spec, 1).has_value(),
                   "rowmax validate K=" + std::to_string(K));
             auto out = engine.eval_expr(spec, ins, rows, 1);
-            if (!out) { check(false, "rowmax eval K=" + std::to_string(K) + ": " + out.error().message); }
+            if (!out)
+            {
+                check(false, "rowmax eval K=" + std::to_string(K) + ": " + out.error().message);
+            }
             else
             {
                 const auto om = download(engine, *out);
@@ -92,8 +97,8 @@ int test_expr_fold()
                         ref = std::fmax(ref, xs[r * K + k]);
                     err = err_of(err, std::fabs(os[r] - ref));
                 }
-                check(err <= kTol, "rowmax vs ref K=" + std::to_string(K) +
-                       " err=" + std::to_string(err));
+                check(err <= kTol,
+                      "rowmax vs ref K=" + std::to_string(K) + " err=" + std::to_string(err));
             }
         }
 
@@ -103,7 +108,10 @@ int test_expr_fold()
             check(nn::validate_expr_spec(spec, 1).has_value(),
                   "rowsum validate K=" + std::to_string(K));
             auto out = engine.eval_expr(spec, ins, rows, 1);
-            if (!out) { check(false, "rowsum eval K=" + std::to_string(K) + ": " + out.error().message); }
+            if (!out)
+            {
+                check(false, "rowsum eval K=" + std::to_string(K) + ": " + out.error().message);
+            }
             else
             {
                 const auto om = download(engine, *out);
@@ -114,11 +122,13 @@ int test_expr_fold()
                 for (std::size_t r = 0; r < rows; ++r)
                 {
                     Scalar ref = 0;
-                    for (std::size_t k = 0; k < K; ++k) ref += xs[r * K + k];
-                    err = err_of(err, std::fabs(os[r] - ref) / std::fmax(Scalar{1}, std::fabs(ref)));
+                    for (std::size_t k = 0; k < K; ++k)
+                        ref += xs[r * K + k];
+                    err =
+                        err_of(err, std::fabs(os[r] - ref) / std::fmax(Scalar{1}, std::fabs(ref)));
                 }
-                check(err <= kTol, "rowsum vs ref K=" + std::to_string(K) +
-                       " err=" + std::to_string(err));
+                check(err <= kTol,
+                      "rowsum vs ref K=" + std::to_string(K) + " err=" + std::to_string(err));
             }
         }
 
@@ -128,7 +138,11 @@ int test_expr_fold()
             check(nn::validate_expr_spec(spec, 1).has_value(),
                   "softmax_denom validate K=" + std::to_string(K));
             auto out = engine.eval_expr(spec, ins, rows, 1);
-            if (!out) { check(false, "softmax_denom eval K=" + std::to_string(K) + ": " + out.error().message); }
+            if (!out)
+            {
+                check(false,
+                      "softmax_denom eval K=" + std::to_string(K) + ": " + out.error().message);
+            }
             else
             {
                 const auto om = download(engine, *out);
@@ -144,10 +158,11 @@ int test_expr_fold()
                     Scalar ref = 0;
                     for (std::size_t k = 0; k < K; ++k)
                         ref += std::exp(xs[r * K + k] - m);
-                    err = err_of(err, std::fabs(os[r] - ref) / std::fmax(Scalar{1}, std::fabs(ref)));
+                    err =
+                        err_of(err, std::fabs(os[r] - ref) / std::fmax(Scalar{1}, std::fabs(ref)));
                 }
                 check(err <= kTol, "softmax_denom vs ref K=" + std::to_string(K) +
-                       " err=" + std::to_string(err));
+                                       " err=" + std::to_string(err));
             }
         }
     }
@@ -164,29 +179,32 @@ int test_expr_fold()
             nn::ExprSpec s = nn::expr::make_fold_rowsum(16);
             s.fold->body = {};
             nn::ExprInstr b;
-            b.op  = static_cast<uint8_t>(nn::ExprOp::Add);
+            b.op = static_cast<uint8_t>(nn::ExprOp::Add);
             b.dst = 0;
-            b.a   = nn::expr::input(0);
-            b.b   = nn::expr::cst(0);
-            s.fold->body = { b };
+            b.a = nn::expr::input(0);
+            b.b = nn::expr::cst(0);
+            s.fold->body = {b};
             rejects(s, "state written from element source");
         }
         // (b) fold + 顶层 instrs 非空
         {
             nn::ExprSpec s = nn::expr::make_fold_rowsum(16);
             nn::ExprInstr t;
-            t.op  = static_cast<uint8_t>(nn::ExprOp::Add);
+            t.op = static_cast<uint8_t>(nn::ExprOp::Add);
             t.dst = 1;
-            t.a   = nn::expr::reg(0);
-            t.b   = nn::expr::cst(0);
-            s.instrs = { t };
+            t.a = nn::expr::reg(0);
+            t.b = nn::expr::cst(0);
+            s.instrs = {t};
             rejects(s, "fold + non-empty top-level instrs");
         }
         // (c) fold + matmul 段互斥
         {
             nn::ExprSpec s = nn::expr::make_fold_rowsum(16);
             nn::MatmulSpec mm;
-            mm.a_input = 0; mm.b_input = 0; mm.k = 16; mm.batch = 1;
+            mm.a_input = 0;
+            mm.b_input = 0;
+            mm.k = 16;
+            mm.batch = 1;
             s.matmul = mm;
             rejects(s, "fold + matmul segment");
         }
@@ -195,11 +213,11 @@ int test_expr_fold()
             nn::ExprSpec s = nn::expr::make_fold_rowsum(16);
             s.fold->finalize = {};
             nn::ExprInstr t;
-            t.op  = static_cast<uint8_t>(nn::ExprOp::Add);
+            t.op = static_cast<uint8_t>(nn::ExprOp::Add);
             t.dst = 0;
-            t.a   = nn::expr::reg(0);
-            t.b   = nn::expr::input(0);
-            s.fold->finalize = { t };
+            t.a = nn::expr::reg(0);
+            t.b = nn::expr::input(0);
+            s.fold->finalize = {t};
             rejects(s, "finalize reading inputs");
         }
     }
@@ -214,7 +232,8 @@ int test_expr_fold()
         nn::Tensor Q = upload(engine, mQ);
         nn::Tensor K = upload(engine, mK);
         nn::Tensor Vt = upload(engine, mVt);
-        nn::ExprSpec sp = nn::expr::make_fold_attn_o(1, 1, 1, nn::expr::AttnMaskKind::Plain, /*score_bias=*/false);
+        nn::ExprSpec sp = nn::expr::make_fold_attn_o(1, 1, 1, nn::expr::AttnMaskKind::Plain,
+                                                     /*score_bias=*/false);
         const std::vector<nn::Tensor> ii{Q, K, Vt};
         auto o = engine.eval_expr(sp, ii, 1, 1);
         Scalar got = Scalar{-999};
@@ -224,8 +243,8 @@ int test_expr_fold()
             got = om.span()[0];
         }
         check(o.has_value() && std::fabs(got - Scalar{5}) < Scalar{1e-5},
-              "attn fold mini(1x1) O=" + std::to_string(got) + " expect 5"
-              + (o ? "" : (" err=" + o.error().message)));
+              "attn fold mini(1x1) O=" + std::to_string(got) + " expect 5" +
+                  (o ? "" : (" err=" + o.error().message)));
         // 分辨"多 j"vs"多行"：
         //   A 单行多 j：bh=1 seq=4 dk=1；B 多行单 j：bh=2 seq=1 dk=1
         for (int ab = 0; ab < 2; ++ab)
@@ -244,7 +263,8 @@ int test_expr_fold()
             nn::Tensor Q2 = upload(engine, mQ2);
             nn::Tensor K2 = upload(engine, mK2);
             nn::Tensor V2 = upload(engine, mV2);
-            nn::ExprSpec sp2 = nn::expr::make_fold_attn_o(seq2, 1, bh2, nn::expr::AttnMaskKind::Plain, /*score_bias=*/false);
+            nn::ExprSpec sp2 = nn::expr::make_fold_attn_o(
+                seq2, 1, bh2, nn::expr::AttnMaskKind::Plain, /*score_bias=*/false);
             const std::vector<nn::Tensor> i2{Q2, K2, V2};
             auto o2 = engine.eval_expr(sp2, i2, bh2 * seq2, 1);
             std::string vals = "?";
@@ -257,8 +277,8 @@ int test_expr_fold()
                     vals += " " + std::to_string(sp2o[i]);
             }
             // 常数 Q=2,K=3 → 每行 softmax=1 → O = V = 5（所有行）
-            check(o2.has_value(), std::string("mini-") + (ab ? "B" : "A")
-                  + " eval" + (o2 ? "" : (": " + o2.error().message)));
+            check(o2.has_value(), std::string("mini-") + (ab ? "B" : "A") + " eval" +
+                                      (o2 ? "" : (": " + o2.error().message)));
             if (o2)
             {
                 bool okv = true;
@@ -266,27 +286,29 @@ int test_expr_fold()
                 const auto sp2o = om2.span();
                 for (std::size_t i = 0; i < bh2 * seq2; ++i)
                     if (std::fabs(sp2o[i] - Scalar{5}) > Scalar{1e-5}) okv = false;
-                check(okv, std::string("mini-") + (ab ? "B(bh2seq1)" : "A(seq4)")
-                      + " O=" + vals + " expect 5×" + std::to_string(bh2 * seq2));
+                check(okv, std::string("mini-") + (ab ? "B(bh2seq1)" : "A(seq4)") + " O=" + vals +
+                               " expect 5×" + std::to_string(bh2 * seq2));
             }
         }
         // C: 非均匀 Vt、Q=K=0（s 全 0 → p=1/4 均匀）→ 手算期望：
         //   d0 = 0.25·(10+20+30+40) = 25；d1 = 0.25·(1+2+3+4) = 2.5
         {
-            nn::Matrix mQ3(2, 4), mK3(2, 4),
-                       mV3(4, 2);   // Q/K: (bh·dk, seq)=(2,4)
-            for (auto& v : mQ3.span()) v = 0;
-            for (auto& v : mK3.span()) v = 0;
+            nn::Matrix mQ3(2, 4), mK3(2, 4), mV3(4, 2); // Q/K: (bh·dk, seq)=(2,4)
+            for (auto& v : mQ3.span())
+                v = 0;
+            for (auto& v : mK3.span())
+                v = 0;
             const Scalar vv[8] = {10, 1, 20, 2, 30, 3, 40, 4};
-            for (int i = 0; i < 8; ++i) mV3.span()[i] = vv[i];
+            for (int i = 0; i < 8; ++i)
+                mV3.span()[i] = vv[i];
             nn::Tensor Q3 = upload(engine, mQ3);
             nn::Tensor K3 = upload(engine, mK3);
             nn::Tensor V3 = upload(engine, mV3);
-            nn::ExprSpec sp3 = nn::expr::make_fold_attn_o(4, 2, 1, nn::expr::AttnMaskKind::Plain, /*score_bias=*/false);
+            nn::ExprSpec sp3 = nn::expr::make_fold_attn_o(4, 2, 1, nn::expr::AttnMaskKind::Plain,
+                                                          /*score_bias=*/false);
             const std::vector<nn::Tensor> i3{Q3, K3, V3};
             auto o3 = engine.eval_expr(sp3, i3, 4, 2);
-            check(o3.has_value(), "mini-C eval"
-                  + (o3 ? "" : (": " + o3.error().message)));
+            check(o3.has_value(), "mini-C eval" + (o3 ? "" : (": " + o3.error().message)));
             if (o3)
             {
                 const auto om3 = download(engine, *o3);
@@ -307,20 +329,25 @@ int test_expr_fold()
         }
     }
 
-    struct Mk { nn::expr::AttnMaskKind mask; bool score_bias; const char* name; };
+    struct Mk
+    {
+        nn::expr::AttnMaskKind mask;
+        bool score_bias;
+        const char* name;
+    };
     for (const Mk mk : {Mk{nn::expr::AttnMaskKind::Plain, false, "plain"},
-                         Mk{nn::expr::AttnMaskKind::Causal, false, "causal"},
-                         Mk{nn::expr::AttnMaskKind::Causal, true, "alibi"},
-                         Mk{nn::expr::AttnMaskKind::CausalDoc, false, "doc"},
-                         Mk{nn::expr::AttnMaskKind::CausalDoc, true, "alibidoc"}})
+                        Mk{nn::expr::AttnMaskKind::Causal, false, "causal"},
+                        Mk{nn::expr::AttnMaskKind::Causal, true, "alibi"},
+                        Mk{nn::expr::AttnMaskKind::CausalDoc, false, "doc"},
+                        Mk{nn::expr::AttnMaskKind::CausalDoc, true, "alibidoc"}})
     {
         const char* mname = mk.name;
-        struct Sh { std::uint32_t bh, seq, dk; };
+        struct Sh
+        { std::uint32_t bh, seq, dk; };
         // {2,133,4}：seq > EXPR_FOLD_BLOCK(128) → 跨块流式（m/l 进位 + vecacc
         //   rescale）与 causal 整块跳过分支（k0>qt 空块）首次被执行；
         //   其余形状覆盖单块与奇数行（clamp + row_ok）
-        for (const Sh sh : {Sh{2, 9, 4}, Sh{1, 33, 8}, Sh{3, 5, 2},
-                            Sh{2, 133, 4}})
+        for (const Sh sh : {Sh{2, 9, 4}, Sh{1, 33, 8}, Sh{3, 5, 2}, Sh{2, 133, 4}})
         {
             const std::size_t rows_out = static_cast<std::size_t>(sh.bh) * sh.seq;
             nn::Matrix mQ(static_cast<std::size_t>(sh.bh) * sh.dk, sh.seq);
@@ -333,8 +360,7 @@ int test_expr_fold()
             //   (1, batch*seq) 会越界（AGENTS 教训 #2）
             const std::uint32_t sseq = sh.seq;
             nn::Matrix mdoc_col(rows_out, 1);
-            nn::Matrix mdoc_ids_t(
-                1, static_cast<std::size_t>(sh.bh) * sh.seq);
+            nn::Matrix mdoc_ids_t(1, static_cast<std::size_t>(sh.bh) * sh.seq);
             // doc 分段边界：seq > EXPR_FOLD_BLOCK(128) 时放在 **128 之后**
             //   （如 133 → 129），使查询位置 i ≥ 边界的行其首个 fold 块
             //   (j<128) 被文档掩码**全部**屏蔽——触发首块全屏蔽的分支
@@ -342,21 +368,22 @@ int test_expr_fold()
             //   边界若落在 128 之内（如 seq/2），首块永远留有有效项，
             //   该分支测不到。seq ≤ 128 时用 seq/2 二分段。
             const std::uint32_t doc_boundary =
-                sseq > nn::EXPR_FOLD_BLOCK ? nn::EXPR_FOLD_BLOCK + 1u
-                                           : sseq / 2u;
+                sseq > nn::EXPR_FOLD_BLOCK ? nn::EXPR_FOLD_BLOCK + 1u : sseq / 2u;
             const auto doc_of = [doc_boundary](std::uint32_t pos) -> Scalar
             { return pos < doc_boundary ? Scalar{1} : Scalar{2}; };
             for (std::size_t r = 0; r < rows_out; ++r)
-                mdoc_col.span()[r] =
-                    doc_of(static_cast<std::uint32_t>(r % sh.seq));
+                mdoc_col.span()[r] = doc_of(static_cast<std::uint32_t>(r % sh.seq));
             for (std::uint32_t blk = 0; blk < sh.bh; ++blk)
                 for (std::uint32_t j = 0; j < sh.seq; ++j)
-                    mdoc_ids_t.span()
-                        [static_cast<std::size_t>(blk) * sh.seq + j] = doc_of(j);
-            for (auto& v : mQ.span()) v = dist(rng);
-            for (auto& v : mK.span()) v = dist(rng);
-            for (auto& v : mVt.span()) v = dist(rng);
-            for (auto& v : mslopes.span()) v = dist(rng) * Scalar{0.1};
+                    mdoc_ids_t.span()[static_cast<std::size_t>(blk) * sh.seq + j] = doc_of(j);
+            for (auto& v : mQ.span())
+                v = dist(rng);
+            for (auto& v : mK.span())
+                v = dist(rng);
+            for (auto& v : mVt.span())
+                v = dist(rng);
+            for (auto& v : mslopes.span())
+                v = dist(rng) * Scalar{0.1};
             // 宿主矩阵全部写完后经引擎上传（出生绑定同一 engine）
             nn::Tensor Q = upload(engine, mQ);
             nn::Tensor K = upload(engine, mK);
@@ -368,20 +395,23 @@ int test_expr_fold()
             const bool docm = (mk.mask == nn::expr::AttnMaskKind::CausalDoc);
             std::vector<nn::Tensor> ins{Q, K, Vt};
             if (alibi) ins.push_back(slopes);
-            if (docm) { ins.push_back(doc_col); ins.push_back(doc_ids_t); }
+            if (docm)
+            {
+                ins.push_back(doc_col);
+                ins.push_back(doc_ids_t);
+            }
 
-            nn::ExprSpec spec = nn::expr::make_fold_attn_o(sh.seq, sh.dk, sh.bh, mk.mask, mk.score_bias);
+            nn::ExprSpec spec =
+                nn::expr::make_fold_attn_o(sh.seq, sh.dk, sh.bh, mk.mask, mk.score_bias);
             if (auto v = nn::validate_expr_spec(spec, ins.size()); !v)
             {
-                check(false, std::string("attn fold ") + mname + " validate: "
-                      + v.error().message);
+                check(false, std::string("attn fold ") + mname + " validate: " + v.error().message);
                 continue;
             }
             auto out = engine.eval_expr(spec, ins, rows_out, sh.dk);
             if (!out)
             {
-                check(false, std::string("attn fold ") + mname + " eval: "
-                      + out.error().message);
+                check(false, std::string("attn fold ") + mname + " eval: " + out.error().message);
                 continue;
             }
 
@@ -409,8 +439,8 @@ int test_expr_fold()
                     {
                         Scalar acc = 0;
                         for (std::uint32_t d = 0; d < sh.dk; ++d)
-                            acc += qs[(b * sh.dk + d) * sh.seq + i] *
-                                   ks[(b * sh.dk + d) * sh.seq + j];
+                            acc +=
+                                qs[(b * sh.dk + d) * sh.seq + i] * ks[(b * sh.dk + d) * sh.seq + j];
                         if (mk.mask != nn::expr::AttnMaskKind::Plain && j > i)
                             acc = -std::numeric_limits<Scalar>::infinity();
                         // 文档块对角：跨文档 -inf（fold body 内 causal→doc→alibi
@@ -418,8 +448,8 @@ int test_expr_fold()
                         if (docm && ((i < doc_boundary) != (j < doc_boundary)))
                             acc = -std::numeric_limits<Scalar>::infinity();
                         if (alibi)
-                            acc += sl[b] * static_cast<Scalar>(
-                                static_cast<int>(j) - static_cast<int>(i));
+                            acc += sl[b] *
+                                   static_cast<Scalar>(static_cast<int>(j) - static_cast<int>(i));
                         srow[j] = acc;
                         m = std::fmax(m, acc);
                     }
@@ -435,18 +465,16 @@ int test_expr_fold()
                         for (std::uint32_t j = 0; j < sh.seq; ++j)
                             acc += prow[j] * vs[(b * sh.seq + j) * sh.dk + d];
                         const Scalar ref = acc / l;
-                        const std::size_t oi =
-                            static_cast<std::size_t>(b) * sh.seq + i;
+                        const std::size_t oi = static_cast<std::size_t>(b) * sh.seq + i;
                         ref_out[oi * sh.dk + d] = ref;
                         err = err_of(err, std::fabs(os[oi * sh.dk + d] - ref) /
-                                             std::fmax(Scalar{1}, std::fabs(ref)));
+                                              std::fmax(Scalar{1}, std::fabs(ref)));
                     }
                 }
             }
-            check(err <= kTol,
-                  std::string("attn fold ") + mname + " bh=" + std::to_string(sh.bh)
-                  + " seq=" + std::to_string(sh.seq) + " dk=" + std::to_string(sh.dk)
-                  + " err=" + std::to_string(err));
+            check(err <= kTol, std::string("attn fold ") + mname + " bh=" + std::to_string(sh.bh) +
+                                   " seq=" + std::to_string(sh.seq) +
+                                   " dk=" + std::to_string(sh.dk) + " err=" + std::to_string(err));
             if (err > kTol)
             {
                 std::cout << "      out[0..5]:";
@@ -466,15 +494,15 @@ int test_expr_fold()
     // 注册表自身的两条不变量：① 同结构重复 add 只留一条；② tri_skip 进 key。
     {
         nn::fused::ExprRegistry reg;
-        const nn::ExprSpec sk = nn::expr::make_fold_attn_o(
-            64, 4, 2, nn::expr::AttnMaskKind::Causal, /*score_bias=*/false);   // tri_skip=true
-        const nn::ExprSpec pl = nn::expr::make_fold_attn_o(
-            64, 4, 2, nn::expr::AttnMaskKind::Plain, /*score_bias=*/false);    // tri_skip=false
+        const nn::ExprSpec sk = nn::expr::make_fold_attn_o(64, 4, 2, nn::expr::AttnMaskKind::Causal,
+                                                           /*score_bias=*/false); // tri_skip=true
+        const nn::ExprSpec pl = nn::expr::make_fold_attn_o(64, 4, 2, nn::expr::AttnMaskKind::Plain,
+                                                           /*score_bias=*/false); // tri_skip=false
         reg.add(sk);
         reg.add(pl);
         reg.add(nn::expr::make_fold_rowsum(64));
         const std::size_t n1 = reg.specs.size();
-        reg.add(sk);   // 重复 add → 按 key 去重
+        reg.add(sk); // 重复 add → 按 key 去重
         check(n1 == 3 && reg.specs.size() == 3,
               "registry add 去重 n=" + std::to_string(reg.specs.size()));
         // tri_skip 进 key 必须**只翻该字段**来验：Causal vs Plain 的 body 本就
@@ -485,12 +513,12 @@ int test_expr_fold()
             nn::ExprSpec b = sk;
             b.fold->tri_skip = !a.fold->tri_skip;
             check(nn::expr_spec_key(nn::canonicalize_expr_spec(a)) !=
-                  nn::expr_spec_key(nn::canonicalize_expr_spec(b)),
+                      nn::expr_spec_key(nn::canonicalize_expr_spec(b)),
                   "fold tri_skip 进 key：同结构仅翻 tri_skip 位后 key 必须不同");
         }
         // 顺带锁死"不同掩码 = 不同结构"（body 差异进 key）
         check(nn::expr_spec_key(nn::canonicalize_expr_spec(sk)) !=
-              nn::expr_spec_key(nn::canonicalize_expr_spec(pl)),
+                  nn::expr_spec_key(nn::canonicalize_expr_spec(pl)),
               "Causal vs Plain 掩码 body 不同 → key 不同");
         bool saw_skip = false;
         for (const auto& s : reg.specs)
@@ -507,31 +535,29 @@ int test_expr_fold()
     //   ② 10 个组合（掩码清单 × {无偏置, 位置偏置} −"Plain+偏置"，× {MHA,GQA}）
     //      两两不同（登记少一条 = GPU 硬报错）。
     {
-        const auto key_of = [](nn::expr::AttnMaskKind m, bool sb,
-                               std::uint32_t kv_ratio, std::uint32_t seq,
-                               std::uint32_t dk, std::uint32_t bh)
+        const auto key_of = [](nn::expr::AttnMaskKind m, bool sb, std::uint32_t kv_ratio,
+                               std::uint32_t seq, std::uint32_t dk, std::uint32_t bh)
         {
             return nn::expr_spec_key(nn::canonicalize_expr_spec(
                 nn::expr::make_fold_attn_o(seq, dk, bh, m, sb, kv_ratio)));
         };
-        const auto combo_name = [](nn::expr::AttnMaskKind m, bool sb,
-                                   std::uint32_t kv_ratio)
+        const auto combo_name = [](nn::expr::AttnMaskKind m, bool sb, std::uint32_t kv_ratio)
         {
-            std::string n = m == nn::expr::AttnMaskKind::Plain      ? "plain"
-                          : m == nn::expr::AttnMaskKind::Causal     ? "causal"
-                                                                    : "doc";
+            std::string n = m == nn::expr::AttnMaskKind::Plain    ? "plain"
+                            : m == nn::expr::AttnMaskKind::Causal ? "causal"
+                                                                  : "doc";
             if (sb) n += "+alibi";
             n += kv_ratio > 1 ? " gqa" : " mha";
             return n;
         };
         std::vector<std::string> keys;
-        for (const nn::expr::AttnMaskKind m : {nn::expr::AttnMaskKind::Plain,
-                                              nn::expr::AttnMaskKind::Causal,
-                                              nn::expr::AttnMaskKind::CausalDoc})
+        for (const nn::expr::AttnMaskKind m :
+             {nn::expr::AttnMaskKind::Plain, nn::expr::AttnMaskKind::Causal,
+              nn::expr::AttnMaskKind::CausalDoc})
             for (const bool sb : {false, true})
             {
                 if (m == nn::expr::AttnMaskKind::Plain && sb)
-                    continue;   // 本仓不构造该组合（与自登记表同规则）
+                    continue; // 本仓不构造该组合（与自登记表同规则）
                 for (const std::uint32_t kv_ratio : {1u, 2u})
                 {
                     const std::string k = key_of(m, sb, kv_ratio, 64, 2, 2);
@@ -545,9 +571,8 @@ int test_expr_fold()
             }
         std::sort(keys.begin(), keys.end());
         keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
-        check(keys.size() == 10,
-              "attn fold 10 个组合（掩码 × 偏置 × {MHA,GQA}）互不相同 n=" +
-                  std::to_string(keys.size()));
+        check(keys.size() == 10, "attn fold 10 个组合（掩码 × 偏置 × {MHA,GQA}）互不相同 n=" +
+                                     std::to_string(keys.size()));
     }
 
     return fail;

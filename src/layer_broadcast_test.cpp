@@ -14,33 +14,26 @@
 #include <vector>
 
 int g_fail = 0;
-#define CHECK(cond, msg)                                                     \
-    do {                                                                     \
-        if (!(cond)) {                                                       \
-            std::cout << "[FAIL] " << __FILE__ << ":" << __LINE__ << ": "    \
-                      << msg << "\n";                                        \
-            ++g_fail;                                                        \
-        }                                                                    \
+#define CHECK(cond, msg)                                                                  \
+    do                                                                                    \
+    {                                                                                     \
+        if (!(cond))                                                                      \
+        {                                                                                 \
+            std::cout << "[FAIL] " << __FILE__ << ":" << __LINE__ << ": " << msg << "\n"; \
+            ++g_fail;                                                                     \
+        }                                                                                 \
     } while (0)
 
-namespace {
+namespace
+{
 
 // 记录型叶子层：捕获三个广播开关的到达情况
 class RecordingLayer final : public nn::Layer
 {
 public:
-    [[nodiscard]] nn::Result<nn::Tensor> forward(const nn::Tensor& x) override
-    {
-        return x;
-    }
-    [[nodiscard]] nn::Result<nn::Tensor> backward(const nn::Tensor& g) override
-    {
-        return g;
-    }
-    [[nodiscard]] const char* layer_name() const noexcept override
-    {
-        return "RecordingLayer";
-    }
+    [[nodiscard]] nn::Result<nn::Tensor> forward(const nn::Tensor& x) override { return x; }
+    [[nodiscard]] nn::Result<nn::Tensor> backward(const nn::Tensor& g) override { return g; }
+    [[nodiscard]] const char* layer_name() const noexcept override { return "RecordingLayer"; }
 
     void set_training(bool t) override
     {
@@ -63,38 +56,21 @@ class CompositeOnlyChildren final : public nn::Layer
 public:
     RecordingLayer a, b;
 
-    [[nodiscard]] nn::Result<nn::Tensor> forward(const nn::Tensor& x) override
-    {
-        return x;
-    }
-    [[nodiscard]] nn::Result<nn::Tensor> backward(const nn::Tensor& g) override
-    {
-        return g;
-    }
+    [[nodiscard]] nn::Result<nn::Tensor> forward(const nn::Tensor& x) override { return x; }
+    [[nodiscard]] nn::Result<nn::Tensor> backward(const nn::Tensor& g) override { return g; }
     [[nodiscard]] const char* layer_name() const noexcept override
-    {
-        return "CompositeOnlyChildren";
-    }
+    { return "CompositeOnlyChildren"; }
 
 protected:
-    [[nodiscard]] std::vector<nn::Layer*> param_children() noexcept override
-    {
-        return {&a, &b};
-    }
+    [[nodiscard]] std::vector<nn::Layer*> param_children() noexcept override { return {&a, &b}; }
 };
 
 // 叶子复合层（无子层）：默认实现应为安全 no-op
 class NoChildrenLayer final : public nn::Layer
 {
 public:
-    [[nodiscard]] nn::Result<nn::Tensor> forward(const nn::Tensor& x) override
-    {
-        return x;
-    }
-    [[nodiscard]] nn::Result<nn::Tensor> backward(const nn::Tensor& g) override
-    {
-        return g;
-    }
+    [[nodiscard]] nn::Result<nn::Tensor> forward(const nn::Tensor& x) override { return x; }
+    [[nodiscard]] nn::Result<nn::Tensor> backward(const nn::Tensor& g) override { return g; }
 };
 
 } // namespace
@@ -117,8 +93,7 @@ int main()
 
         // clear_cache 广播
         c.clear_cache();
-        CHECK(c.a.clear_cache_calls == 1 && c.b.clear_cache_calls == 1,
-              "clear_cache 到达全部子层");
+        CHECK(c.a.clear_cache_calls == 1 && c.b.clear_cache_calls == 1, "clear_cache 到达全部子层");
 
         // set_precision_profile 广播（未 init 的子层接收不 fail-fast）
         nn::PrecisionProfile prof;
@@ -131,8 +106,7 @@ int main()
         CHECK(c.b.precision_profile().param == nn::Precision::F16,
               "set_precision_profile 到达子层 b");
         // 复合层自身也记录（基类语义不变）
-        CHECK(c.precision_profile().param == nn::Precision::F16,
-              "复合层自身 profile 已记录");
+        CHECK(c.precision_profile().param == nn::Precision::F16, "复合层自身 profile 已记录");
     }
 
     // [3] 无子层的叶子：默认实现安全 no-op

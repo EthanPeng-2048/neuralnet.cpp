@@ -27,12 +27,14 @@
 #include <neuralnet.cpp/training_session.hpp>
 
 static int g_fail = 0;
-#define CHECK(cond, msg)                                                          \
-    do {                                                                          \
-        if (!(cond)) {                                                            \
-            std::cout << "    [FAIL] " << (msg) << "  (" << #cond << ")\n";       \
-            ++g_fail;                                                             \
-        }                                                                         \
+#define CHECK(cond, msg)                                                    \
+    do                                                                      \
+    {                                                                       \
+        if (!(cond))                                                        \
+        {                                                                   \
+            std::cout << "    [FAIL] " << (msg) << "  (" << #cond << ")\n"; \
+            ++g_fail;                                                       \
+        }                                                                   \
     } while (0)
 
 namespace
@@ -77,8 +79,8 @@ struct Recorder
     nn::RunHooks make_hooks()
     {
         nn::RunHooks h;
-        h.do_update = [this](nn::TrainingSession&, const nn::UpdateRequest& r)
-            -> nn::Result<nn::UpdateOutcome>
+        h.do_update = [this](nn::TrainingSession&,
+                             const nn::UpdateRequest& r) -> nn::Result<nn::UpdateOutcome>
         {
             reqs.push_back(r);
             const std::size_t call = do_update_calls++;
@@ -94,8 +96,7 @@ struct Recorder
             }
             return o;
         };
-        h.on_checkpoint = [this](nn::TrainingSession&, const nn::TrainState& st)
-            -> nn::Result<void>
+        h.on_checkpoint = [this](nn::TrainingSession&, const nn::TrainState& st) -> nn::Result<void>
         {
             if (fail_ckpt) NN_FAIL("模拟断点失败");
             ++ckpt_calls;
@@ -121,11 +122,14 @@ nn::IndexedBatchSource make_source(std::size_t n, std::size_t bs, std::uint64_t 
 {
     auto r = nn::IndexedBatchSource::create(
         n, bs, seed,
-        [](std::span<const std::size_t> ix)
-            -> nn::Result<std::pair<std::any, std::size_t>>
+        [](std::span<const std::size_t> ix) -> nn::Result<std::pair<std::any, std::size_t>>
         { return std::make_pair(std::any(), ix.size()); });
     // create 对合法参数必成功
-    if (!r) { std::cout << "    [FATAL] 源创建失败\n"; std::abort(); }
+    if (!r)
+    {
+        std::cout << "    [FATAL] 源创建失败\n";
+        std::abort();
+    }
     return std::move(*r);
 }
 
@@ -141,18 +145,16 @@ public:
         b.epoch_done = false;
         return b;
     }
-    [[nodiscard]] nn::Result<void> rewind(std::size_t, std::size_t) override
-    {
-        return {};
-    }
+    [[nodiscard]] nn::Result<void> rewind(std::size_t, std::size_t) override { return {}; }
 };
 
 // 空步钩子（0 步运行时不会被调用，但 fit 要求存在）
 static nn::RunHooks rec_empty_hooks()
 {
     nn::RunHooks h;
-    h.do_update = [](nn::TrainingSession&, const nn::UpdateRequest&)
-        -> nn::Result<nn::UpdateOutcome> { return nn::UpdateOutcome{}; };
+    h.do_update = [](nn::TrainingSession&,
+                     const nn::UpdateRequest&) -> nn::Result<nn::UpdateOutcome>
+    { return nn::UpdateOutcome{}; };
     return h;
 }
 
@@ -169,8 +171,7 @@ void test_epoch_loop()
     cfg.epochs = 2;
     auto rec = Recorder{};
 
-    auto drv = nn::RunDriver::create(*fx.session, src,
-                                     std::make_unique<nn::TextTrainState>(), cfg);
+    auto drv = nn::RunDriver::create(*fx.session, src, std::make_unique<nn::TextTrainState>(), cfg);
     CHECK(drv.has_value(), "RunDriver::create");
     if (!drv) return;
     drv->set_hooks(rec.make_hooks());
@@ -189,8 +190,7 @@ void test_epoch_loop()
     // epoch/step 网格
     CHECK(rec.reqs[0].epoch == 0 && rec.reqs[0].step == 0, "首步 (0,0)");
     CHECK(rec.reqs[3].epoch == 1 && rec.reqs[3].step == 0, "第 4 步 (1,0)");
-    CHECK(rep->final_epoch == 2 && rep->final_step_in_epoch == 0,
-          "正常跑完 = (epochs,0)");
+    CHECK(rep->final_epoch == 2 && rep->final_step_in_epoch == 0, "正常跑完 = (epochs,0)");
     CHECK(rep->abort_code == 0, "无中止");
 }
 
@@ -210,8 +210,8 @@ void test_lr_wiring()
         cfg.lr = 0.1f;
         cfg.min_lr = 0.01f;
         auto rec = Recorder{};
-        auto drv = nn::RunDriver::create(*fx.session, src,
-                                         std::make_unique<nn::TextTrainState>(), cfg);
+        auto drv =
+            nn::RunDriver::create(*fx.session, src, std::make_unique<nn::TextTrainState>(), cfg);
         if (drv)
         {
             drv->set_hooks(rec.make_hooks());
@@ -234,8 +234,8 @@ void test_lr_wiring()
         cfg.lr = 0.1f;
         cfg.min_lr = 0.01f;
         auto rec = Recorder{};
-        auto drv = nn::RunDriver::create(*fx.session, src,
-                                         std::make_unique<nn::TextTrainState>(), cfg);
+        auto drv =
+            nn::RunDriver::create(*fx.session, src, std::make_unique<nn::TextTrainState>(), cfg);
         if (drv)
         {
             drv->set_hooks(rec.make_hooks());
@@ -260,8 +260,8 @@ void test_checkpoint_cadence()
         nn::RunDriverConfig cfg;
         cfg.epochs = 2;
         auto rec = Recorder{};
-        auto drv = nn::RunDriver::create(*fx.session, src,
-                                         std::make_unique<nn::TextTrainState>(), cfg);
+        auto drv =
+            nn::RunDriver::create(*fx.session, src, std::make_unique<nn::TextTrainState>(), cfg);
         if (drv)
         {
             drv->set_hooks(rec.make_hooks());
@@ -282,8 +282,8 @@ void test_checkpoint_cadence()
         cfg.epochs = 2;
         cfg.save_interval = 1;
         auto rec = Recorder{};
-        auto drv = nn::RunDriver::create(*fx.session, src,
-                                         std::make_unique<nn::TextTrainState>(), cfg);
+        auto drv =
+            nn::RunDriver::create(*fx.session, src, std::make_unique<nn::TextTrainState>(), cfg);
         if (drv)
         {
             drv->set_hooks(rec.make_hooks());
@@ -298,8 +298,8 @@ void test_checkpoint_cadence()
         cfg.epochs = 2;
         auto rec = Recorder{};
         rec.fail_ckpt = true;
-        auto drv = nn::RunDriver::create(*fx.session, src,
-                                         std::make_unique<nn::TextTrainState>(), cfg);
+        auto drv =
+            nn::RunDriver::create(*fx.session, src, std::make_unique<nn::TextTrainState>(), cfg);
         if (drv)
         {
             drv->set_hooks(rec.make_hooks());
@@ -322,8 +322,7 @@ void test_max_steps()
     cfg.epochs = 10;
     cfg.max_steps = 4;
     auto rec = Recorder{};
-    auto drv = nn::RunDriver::create(*fx.session, src,
-                                     std::make_unique<nn::TextTrainState>(), cfg);
+    auto drv = nn::RunDriver::create(*fx.session, src, std::make_unique<nn::TextTrainState>(), cfg);
     CHECK(drv.has_value(), "epochs>max_steps 时 create 仍合法");
     if (!drv) return;
     drv->set_hooks(rec.make_hooks());
@@ -348,8 +347,7 @@ void test_stop_after_epoch()
     cfg.epochs = 5;
     cfg.stop_after_epoch = 2;   // 训到 epoch 2（1-based，不含）→ 跑 2 个 epoch
     auto rec = Recorder{};
-    auto drv = nn::RunDriver::create(*fx.session, src,
-                                     std::make_unique<nn::TextTrainState>(), cfg);
+    auto drv = nn::RunDriver::create(*fx.session, src, std::make_unique<nn::TextTrainState>(), cfg);
     if (!drv) return;
     drv->set_hooks(rec.make_hooks());
     auto rep = drv->fit();
@@ -371,8 +369,7 @@ void test_abort()
     cfg.epochs = 3;
     auto rec = Recorder{};
     rec.abort_at = 4;   // 第 5 次 do_update 中止
-    auto drv = nn::RunDriver::create(*fx.session, src,
-                                     std::make_unique<nn::TextTrainState>(), cfg);
+    auto drv = nn::RunDriver::create(*fx.session, src, std::make_unique<nn::TextTrainState>(), cfg);
     if (!drv) return;
     drv->set_hooks(rec.make_hooks());
     auto rep = drv->fit();
@@ -394,8 +391,7 @@ void test_step_driven()
     cfg.epochs = 0;          // 步进驱动
     cfg.max_steps = 7;
     auto rec = Recorder{};
-    auto drv = nn::RunDriver::create(*fx.session, src,
-                                     std::make_unique<nn::TextTrainState>(), cfg);
+    auto drv = nn::RunDriver::create(*fx.session, src, std::make_unique<nn::TextTrainState>(), cfg);
     CHECK(drv.has_value(), "epochs=0 + max_steps → create 合法");
     if (!drv) return;
     drv->set_hooks(rec.make_hooks());
@@ -419,13 +415,11 @@ void test_validation()
     if (!fx.session) return;
     auto src = make_source(10, 4, 7);
 
-    CHECK(!nn::RunDriver::create(*fx.session, src, nullptr, {}).has_value(),
-          "state 为空 → 报错");
+    CHECK(!nn::RunDriver::create(*fx.session, src, nullptr, {}).has_value(), "state 为空 → 报错");
     {
         nn::RunDriverConfig bad;
         bad.epochs = -1;
-        CHECK(!nn::RunDriver::create(*fx.session, src,
-                                     std::make_unique<nn::TextTrainState>(), bad)
+        CHECK(!nn::RunDriver::create(*fx.session, src, std::make_unique<nn::TextTrainState>(), bad)
                    .has_value(),
               "epochs=-1 → 报错");
     }
@@ -434,8 +428,8 @@ void test_validation()
         nn::RunDriverConfig zero;
         zero.epochs = 0;
         zero.max_steps = 0;
-        auto z = nn::RunDriver::create(*fx.session, src,
-                                       std::make_unique<nn::TextTrainState>(), zero);
+        auto z =
+            nn::RunDriver::create(*fx.session, src, std::make_unique<nn::TextTrainState>(), zero);
         CHECK(z.has_value(), "epochs=0 + max_steps=0 → 0 步运行合法");
         if (z)
         {
@@ -448,8 +442,7 @@ void test_validation()
         nn::RunDriverConfig bad;
         bad.epochs = 2;
         bad.stop_after_epoch = 5;
-        CHECK(!nn::RunDriver::create(*fx.session, src,
-                                     std::make_unique<nn::TextTrainState>(), bad)
+        CHECK(!nn::RunDriver::create(*fx.session, src, std::make_unique<nn::TextTrainState>(), bad)
                    .has_value(),
               "stop_after_epoch > epochs → 报错");
     }
@@ -457,10 +450,9 @@ void test_validation()
     {
         nn::RunDriverConfig cfg;
         cfg.epochs = 1;
-        auto drv = nn::RunDriver::create(*fx.session, src,
-                                         std::make_unique<nn::TextTrainState>(), cfg);
-        if (drv)
-            CHECK(!drv->fit().has_value(), "缺 do_update → fit 报错");
+        auto drv =
+            nn::RunDriver::create(*fx.session, src, std::make_unique<nn::TextTrainState>(), cfg);
+        if (drv) CHECK(!drv->fit().has_value(), "缺 do_update → fit 报错");
     }
 }
 

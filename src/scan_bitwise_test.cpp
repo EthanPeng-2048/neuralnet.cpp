@@ -58,13 +58,13 @@ std::uint32_t float_as_bits(float f)
 
 // 逐位比较（同 u32 位型才算相等；-0.0 与 0.0 视为**不同**——它们位型不同，
 // 而本测试的语义正是"位型不动"）
-void compare_bits(const char* label, const nn::Matrix& a, const nn::Matrix& b,
-                  int& mismatches, float& max_abs)
+void compare_bits(const char* label, const nn::Matrix& a, const nn::Matrix& b, int& mismatches,
+                  float& max_abs)
 {
     if (a.rows() != b.rows() || a.cols() != b.cols())
     {
-        std::printf("  [FAIL] %s: 形状不同 (%zu,%zu) vs (%zu,%zu)\n", label, a.rows(),
-                    a.cols(), b.rows(), b.cols());
+        std::printf("  [FAIL] %s: 形状不同 (%zu,%zu) vs (%zu,%zu)\n", label, a.rows(), a.cols(),
+                    b.rows(), b.cols());
         ++mismatches;
         return;
     }
@@ -80,9 +80,8 @@ void compare_bits(const char* label, const nn::Matrix& a, const nn::Matrix& b,
         if (ba != bb)
         {
             if (mismatches < 3)
-                std::printf("    [bit] %s idx=%zu cpu=%.9g(0x%08x) gpu=%.9g(0x%08x)\n",
-                            label, i, static_cast<double>(sa[i]), ba,
-                            static_cast<double>(sb[i]), bb);
+                std::printf("    [bit] %s idx=%zu cpu=%.9g(0x%08x) gpu=%.9g(0x%08x)\n", label, i,
+                            static_cast<double>(sa[i]), ba, static_cast<double>(sb[i]), bb);
             ++mismatches;
         }
     }
@@ -92,7 +91,8 @@ nn::Matrix make_matrix(std::mt19937& rng, std::size_t rows, std::size_t cols)
 {
     nn::Matrix m(rows, cols);
     std::normal_distribution<nn::Scalar> d(0.0f, 0.6f);
-    for (auto& v : m.span()) v = d(rng);
+    for (auto& v : m.span())
+        v = d(rng);
     return m;
 }
 
@@ -107,16 +107,15 @@ nn::Matrix make_boundary(std::mt19937& rng, std::size_t cols)
 }
 
 // 一次 prefix 比对（两个引擎跑同一份输入）
-void run_prefix_case(nn::ComputeEngine& cpu, nn::ComputeEngine& gpu, std::size_t dk,
-                     bool causal, bool has_state, bool has_bnd, bool f16)
+void run_prefix_case(nn::ComputeEngine& cpu, nn::ComputeEngine& gpu, std::size_t dk, bool causal,
+                     bool has_state, bool has_bnd, bool f16)
 {
     const std::size_t B = 2, H = 2, seq = 7;
     const std::size_t rows = B * H * dk;
     const nn::Precision prec = f16 ? nn::Precision::F16 : nn::Precision::F32;
 
-    std::mt19937 rng(20261015u + dk * 17u + (causal ? 1u : 0u) * 3u +
-                     (has_state ? 1u : 0u) * 5u + (has_bnd ? 1u : 0u) * 7u +
-                     (f16 ? 1u : 0u) * 11u);
+    std::mt19937 rng(20261015u + dk * 17u + (causal ? 1u : 0u) * 3u + (has_state ? 1u : 0u) * 5u +
+                     (has_bnd ? 1u : 0u) * 7u + (f16 ? 1u : 0u) * 11u);
     const nn::Matrix Km = make_matrix(rng, rows, seq);
     const nn::Matrix Vm = make_matrix(rng, rows, seq);
     const nn::Matrix Pm = make_matrix(rng, rows, seq);
@@ -125,7 +124,8 @@ void run_prefix_case(nn::ComputeEngine& cpu, nn::ComputeEngine& gpu, std::size_t
     const nn::Matrix B0m = make_matrix(rng, H * dk, dk);
     const nn::Matrix bnd = make_boundary(rng, B * seq);
 
-    auto run = [&](nn::ComputeEngine& e) -> nn::Result<nn::Matrix> {
+    auto run = [&](nn::ComputeEngine& e) -> nn::Result<nn::Matrix>
+    {
         NN_TRY(k, e.from_matrix(Km, prec));
         NN_TRY(v, e.from_matrix(Vm, prec));
         NN_TRY(p, e.from_matrix(Pm, prec));
@@ -133,23 +133,21 @@ void run_prefix_case(nn::ComputeEngine& cpu, nn::ComputeEngine& gpu, std::size_t
         NN_TRY(a0, e.from_matrix(A0m, prec));
         NN_TRY(b0, e.from_matrix(B0m, prec));
         NN_TRY(bd, e.from_matrix(bnd, prec));
-        auto out = e.scan_prefix_outer(*k, *v, *p, *r, *a0, *b0, has_state, dk, H, causal,
-                                       *bd, has_bnd, prec);
+        auto out = e.scan_prefix_outer(*k, *v, *p, *r, *a0, *b0, has_state, dk, H, causal, *bd,
+                                       has_bnd, prec);
         NN_TRY_CHECK(out);
         return e.to_matrix(*out);
     };
 
     ++g_cases;
     char label[160];
-    std::snprintf(label, sizeof(label), "prefix dk=%zu causal=%d state=%d bnd=%d %s",
-                  dk, causal ? 1 : 0, has_state ? 1 : 0, has_bnd ? 1 : 0,
-                  f16 ? "f16" : "f32");
+    std::snprintf(label, sizeof(label), "prefix dk=%zu causal=%d state=%d bnd=%d %s", dk,
+                  causal ? 1 : 0, has_state ? 1 : 0, has_bnd ? 1 : 0, f16 ? "f16" : "f32");
     auto cm = run(cpu);
     auto gm = run(gpu);
     if (!cm || !gm)
     {
-        std::printf("  [FAIL] %s: 运行失败 (%s%s)\n", label,
-                    cm ? "" : cm.error().message.c_str(),
+        std::printf("  [FAIL] %s: 运行失败 (%s%s)\n", label, cm ? "" : cm.error().message.c_str(),
                     gm ? "" : gm.error().message.c_str());
         ++g_failures;
         return;
@@ -169,21 +167,22 @@ void run_prefix_case(nn::ComputeEngine& cpu, nn::ComputeEngine& gpu, std::size_t
     }
 }
 
-void run_suffix_case(nn::ComputeEngine& cpu, nn::ComputeEngine& gpu, std::size_t dk,
-                     bool causal, bool has_bnd, bool f16)
+void run_suffix_case(nn::ComputeEngine& cpu, nn::ComputeEngine& gpu, std::size_t dk, bool causal,
+                     bool has_bnd, bool f16)
 {
     const std::size_t B = 2, H = 2, seq = 7;
     const std::size_t rows = B * H * dk;
     const nn::Precision prec = f16 ? nn::Precision::F16 : nn::Precision::F32;
 
-    std::mt19937 rng(777000u + dk * 13u + (causal ? 1u : 0u) * 3u +
-                     (has_bnd ? 1u : 0u) * 7u + (f16 ? 1u : 0u) * 11u);
+    std::mt19937 rng(777000u + dk * 13u + (causal ? 1u : 0u) * 3u + (has_bnd ? 1u : 0u) * 7u +
+                     (f16 ? 1u : 0u) * 11u);
     const nn::Matrix Dm = make_matrix(rng, rows * dk, seq);
     const nn::Matrix Xm = make_matrix(rng, rows, seq);
     const nn::Matrix Ym = make_matrix(rng, rows, seq);
     const nn::Matrix bnd = make_boundary(rng, B * seq);
 
-    auto run = [&](nn::ComputeEngine& e) -> nn::Result<nn::Matrix> {
+    auto run = [&](nn::ComputeEngine& e) -> nn::Result<nn::Matrix>
+    {
         NN_TRY(d, e.from_matrix(Dm, prec));
         NN_TRY(x, e.from_matrix(Xm, prec));
         NN_TRY(y, e.from_matrix(Ym, prec));
@@ -195,8 +194,8 @@ void run_suffix_case(nn::ComputeEngine& cpu, nn::ComputeEngine& gpu, std::size_t
 
     ++g_cases;
     char label[160];
-    std::snprintf(label, sizeof(label), "suffix dk=%zu causal=%d bnd=%d %s", dk,
-                  causal ? 1 : 0, has_bnd ? 1 : 0, f16 ? "f16" : "f32");
+    std::snprintf(label, sizeof(label), "suffix dk=%zu causal=%d bnd=%d %s", dk, causal ? 1 : 0,
+                  has_bnd ? 1 : 0, f16 ? "f16" : "f32");
     auto cm = run(cpu);
     auto gm = run(gpu);
     if (!cm || !gm)

@@ -40,8 +40,8 @@ struct CnnConvSpec
 struct CnnConfig
 {
     std::size_t in_channels = 1;          // 输入通道数（MNIST=1）
-    std::size_t in_size     = 28;         // 输入空间尺寸（方形）
-    std::size_t pool        = 2;          // 每个卷积后的 MaxPool 窗口（0=无池化）
+    std::size_t in_size = 28;         // 输入空间尺寸（方形）
+    std::size_t pool = 2;          // 每个卷积后的 MaxPool 窗口（0=无池化）
     std::vector<CnnConvSpec> convs;       // 卷积层列表
     // 展平后的全连接头（首元素 = 展平后第一隐藏层宽度，末位 = 类别数）。
     // 例如 {120, 10} → Linear(flatten→120) + ReLU + Linear(120→10)。
@@ -52,7 +52,7 @@ struct CnnConfig
     // （BatchNorm 下即“逐特征跨 batch”的经典 Conv→BN 语义）；Head = 全连接头
     // 隐藏层 Linear→Norm→ReLU（MLP 同款）。默认值由 4 epoch A/B 实测选定。
     // 旧模型文件缺 norm_place 键 → spec 读回 None → 不加（旧布局逐位一致）。
-    NormType  norm_type  = NormType::BatchNorm;
+    NormType norm_type = NormType::BatchNorm;
     NormPlace norm_place = NormPlace::Conv;
     // 模型级精度配置（P2-3）：默认全 F32（与历史逐位一致）。`--f16` 下由调用方
     // 置 profile_f16() → Conv2D 权重/梯度按 param、融合算子按 compute 走 f16。
@@ -70,20 +70,15 @@ inline const std::vector<CnnConvSpec> MNIST_CNN_CONVS = {
 inline const std::vector<std::size_t> MNIST_CNN_FC = {120, 10};
 
 // ── 卷积输出尺寸（不含池化） ─────────────────────────────────────────────
-[[nodiscard]] inline std::size_t conv_out_size(
-    std::size_t in, std::size_t k, std::size_t s, std::size_t p)
-{
-    return (in + 2 * p - k) / s + 1;
-}
+[[nodiscard]] inline std::size_t conv_out_size(std::size_t in, std::size_t k, std::size_t s,
+                                               std::size_t p)
+{ return (in + 2 * p - k) / s + 1; }
 
 // ── 构建 CNN 模型（CnnConfig 版本，推荐使用） ────────────────────────────
-[[nodiscard]] inline Result<Model> build_cnn_model(
-    ComputeEngine& engine, const CnnConfig& cfg)
+[[nodiscard]] inline Result<Model> build_cnn_model(ComputeEngine& engine, const CnnConfig& cfg)
 {
-    if (cfg.convs.empty())
-        NN_FAIL("CNN: convs must not be empty");
-    if (cfg.fc_dims.size() < 2)
-        NN_FAIL("CNN: fc_dims must have at least 2 elements");
+    if (cfg.convs.empty()) NN_FAIL("CNN: convs must not be empty");
+    if (cfg.fc_dims.size() < 2) NN_FAIL("CNN: fc_dims must have at least 2 elements");
     if (cfg.in_channels == 0 || cfg.in_size == 0)
         NN_FAIL("CNN: in_channels/in_size must be positive");
     if (cfg.norm_place != NormPlace::None && cfg.norm_place != NormPlace::Conv &&
@@ -105,8 +100,7 @@ inline const std::vector<std::size_t> MNIST_CNN_FC = {120, 10};
         if (cv.kernel > h + 2 * cv.padding || cv.kernel > w + 2 * cv.padding)
             NN_FAIL("CNN: kernel larger than input spatial size");
         {
-            auto r = model.add<Conv2D>(c, cv.out_channels, cv.kernel,
-                                       cv.stride, cv.padding, h, w);
+            auto r = model.add<Conv2D>(c, cv.out_channels, cv.kernel, cv.stride, cv.padding, h, w);
             NN_TRY_CHECK(r);
         }
         h = conv_out_size(h, cv.kernel, cv.stride, cv.padding);
@@ -131,12 +125,10 @@ inline const std::vector<std::size_t> MNIST_CNN_FC = {120, 10};
     }
 
     const std::size_t flattened = c * h * w;
-    if (flattened == 0)
-        NN_FAIL("CNN: flattened size is zero");
+    if (flattened == 0) NN_FAIL("CNN: flattened size is zero");
     // 全连接头：Linear(flatten → fc_dims[0]) → [Norm] → ReLU → ...
     // → Linear(→ num_classes)；Norm 只挂隐藏层，最后一层保持原始 logits。
-    const bool norm_head = (cfg.norm_place == NormPlace::Head ||
-                            cfg.norm_place == NormPlace::Both);
+    const bool norm_head = (cfg.norm_place == NormPlace::Head || cfg.norm_place == NormPlace::Both);
     {
         auto r = model.add<Linear>(flattened, cfg.fc_dims[0]);
         NN_TRY_CHECK(r);
@@ -168,23 +160,19 @@ inline const std::vector<std::size_t> MNIST_CNN_FC = {120, 10};
 
 // ── 构造 CNN ModelSpec ────────────────────────────────────────────────────
 // fc_dims 复用 layer_dims 字段（type 区分，与 MLP 互斥）。
-[[nodiscard]] inline ModelSpec make_cnn_spec(
-    std::size_t in_channels,
-    std::size_t in_size,
-    std::size_t pool,
-    const std::vector<CnnConvSpec>& convs,
-    const std::vector<std::size_t>& fc_dims,
-    NormType norm_type = NormType::BatchNorm,
-    NormPlace norm_place = NormPlace::Conv)
+[[nodiscard]] inline ModelSpec
+make_cnn_spec(std::size_t in_channels, std::size_t in_size, std::size_t pool,
+              const std::vector<CnnConvSpec>& convs, const std::vector<std::size_t>& fc_dims,
+              NormType norm_type = NormType::BatchNorm, NormPlace norm_place = NormPlace::Conv)
 {
     ModelSpec spec;
-    auto &c = spec.emplace<CnnSpec>();
-    c.norm_type       = norm_type;
-    c.norm_place      = norm_place;
+    auto& c = spec.emplace<CnnSpec>();
+    c.norm_type = norm_type;
+    c.norm_place = norm_place;
     c.cnn_in_channels = in_channels;
-    c.cnn_in_size     = in_size;
-    c.cnn_pool        = pool;
-    c.layer_dims      = fc_dims;  // 复用为 CNN 全连接头
+    c.cnn_in_size = in_size;
+    c.cnn_pool = pool;
+    c.layer_dims = fc_dims;  // 复用为 CNN 全连接头
     for (const auto& cv : convs)
     {
         c.cnn_channels.push_back(cv.out_channels);
@@ -198,22 +186,20 @@ inline const std::vector<std::size_t> MNIST_CNN_FC = {120, 10};
 // ── 从 ModelSpec 还原 CnnConfig ──────────────────────────────────────────
 [[nodiscard]] inline Result<CnnConfig> cnn_config_from_spec(const ModelSpec& spec)
 {
-    const auto *c = spec.as<CnnSpec>();
-    if (c == nullptr)
-        NN_FAIL("cnn_config_from_spec: not a CNN spec");
+    const auto* c = spec.as<CnnSpec>();
+    if (c == nullptr) NN_FAIL("cnn_config_from_spec: not a CNN spec");
     if (c->cnn_channels.size() != c->cnn_kernels.size() ||
         c->cnn_channels.size() != c->cnn_strides.size() ||
         c->cnn_channels.size() != c->cnn_paddings.size())
         NN_FAIL("CNN spec: conv vectors length mismatch");
-    if (c->cnn_channels.empty())
-        NN_FAIL("CNN spec: no conv layers");
+    if (c->cnn_channels.empty()) NN_FAIL("CNN spec: no conv layers");
     CnnConfig cfg;
     cfg.in_channels = c->cnn_in_channels;
-    cfg.in_size     = c->cnn_in_size;
-    cfg.pool        = c->cnn_pool;
-    cfg.fc_dims     = c->layer_dims;
-    cfg.norm_type   = c->norm_type;
-    cfg.norm_place  = c->norm_place;
+    cfg.in_size = c->cnn_in_size;
+    cfg.pool = c->cnn_pool;
+    cfg.fc_dims = c->layer_dims;
+    cfg.norm_type = c->norm_type;
+    cfg.norm_place = c->norm_place;
     if (cfg.norm_place != NormPlace::None && cfg.norm_place != NormPlace::Conv &&
         cfg.norm_place != NormPlace::Head && cfg.norm_place != NormPlace::Both)
         NN_FAIL("CNN spec: norm_place must be none/conv/head/both (final is ViT-only)");
@@ -232,18 +218,16 @@ inline const std::vector<std::size_t> MNIST_CNN_FC = {120, 10};
 // ── 从 ModelSpec 构建 CNN 模型（用于从二进制文件加载时自动还原） ─────────
 // precision：模型级精度配置（P2-3）。**精度是运行期配置、不进 ModelSpec**
 //（与 GPT 一致：GptConfig::precision 同样只在构建期传）——由调用方显式给。
-[[nodiscard]] inline Result<Model> build_cnn_model_from_spec(
-    ComputeEngine& engine, const ModelSpec& spec,
-    const PrecisionProfile& precision = PrecisionProfile{})
+[[nodiscard]] inline Result<Model>
+build_cnn_model_from_spec(ComputeEngine& engine, const ModelSpec& spec,
+                          const PrecisionProfile& precision = PrecisionProfile{})
 {
     auto cfg_r = cnn_config_from_spec(spec);
     NN_TRY_CHECK(cfg_r);
     cfg_r->precision = precision;
     auto model = build_cnn_model(engine, *cfg_r);
-    if (model)
-        model->set_spec(spec);  // 记录架构规格，供 load_model 校验
+    if (model) model->set_spec(spec);  // 记录架构规格，供 load_model 校验
     return model;
 }
 
 } // namespace nn
-

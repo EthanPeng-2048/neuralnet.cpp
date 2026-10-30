@@ -33,24 +33,22 @@ namespace detail
 {
     if (res != VK_SUCCESS)
     {
-        NN_FAIL("Vulkan error " + std::to_string(static_cast<int>(res)) +             " at " + std::string(file) + ":" + std::to_string(line));
+        NN_FAIL("Vulkan error " + std::to_string(static_cast<int>(res)) + " at " +
+                std::string(file) + ":" + std::to_string(line));
     }
     return {};
 }
 
 // ── CPU Scalar ↔ GPU float 转换 ─────────────────────────────────────────
-inline void convert_scalar_to_float(
-    std::span<const Scalar> src, float* __restrict dst) noexcept
+inline void convert_scalar_to_float(std::span<const Scalar> src, float* __restrict dst) noexcept
 {
     if constexpr (std::is_same_v<Scalar, float>)
         std::memcpy(dst, src.data(), src.size() * sizeof(float));
     else
-        std::transform(src.begin(), src.end(), dst,
-                       [](Scalar v) { return static_cast<float>(v); });
+        std::transform(src.begin(), src.end(), dst, [](Scalar v) { return static_cast<float>(v); });
 }
 
-inline void convert_float_to_scalar(
-    const float* __restrict src, std::span<Scalar> dst) noexcept
+inline void convert_float_to_scalar(const float* __restrict src, std::span<Scalar> dst) noexcept
 {
     if constexpr (std::is_same_v<Scalar, float>)
         std::memcpy(dst.data(), src, dst.size() * sizeof(float));
@@ -117,10 +115,8 @@ public:
 
     ~VulkanDevice()
     {
-        if (device_ != VK_NULL_HANDLE)
-            vkDestroyDevice(device_, nullptr);
-        if (instance_ != VK_NULL_HANDLE)
-            vkDestroyInstance(instance_, nullptr);
+        if (device_ != VK_NULL_HANDLE) vkDestroyDevice(device_, nullptr);
+        if (instance_ != VK_NULL_HANDLE) vkDestroyInstance(instance_, nullptr);
     }
 
     // 禁止拷贝和移动
@@ -131,24 +127,18 @@ public:
 
     // 读取环境变量（RV-09：实现收敛到 core_env.hpp；本包装保留供后端调用）
     [[nodiscard]] static std::string get_env(const char* name)
-    {
-        return ::nn::detail::env_string_raw(name);
-    }
+    { return ::nn::detail::env_string_raw(name); }
 
     // ── 手动指定计算设备（必须在 initialize() 之前调用）────────────────────
     // selector = 枚举索引（"2"）或设备名子串（"40HX" / "NVIDIA"）；
     // 空字符串 = 自动选择（设备类型 + apiVersion 打分）。
     // 优先级高于环境变量 NN_VULKAN_DEVICE；未命中时 initialize() 返回
     // 列出全部候选设备的错误。
-    void set_device_selector(std::string selector)
-    {
-        device_selector_ = std::move(selector);
-    }
+    void set_device_selector(std::string selector) { device_selector_ = std::move(selector); }
 
     [[nodiscard]] Result<void> initialize()
     {
-        if (initialized_)
-            return {};
+        if (initialized_) return {};
 
         // 1. 创建 VkInstance
         // 实例版本请求到 1.2：时间线信号量（跨 submit 依赖的正确原语）是
@@ -159,8 +149,7 @@ public:
                 vkGetInstanceProcAddr(nullptr, "vkEnumerateInstanceVersion")))
         {
             uint32_t supported = VK_API_VERSION_1_0;
-            if (enum_version(&supported) == VK_SUCCESS)
-                loader_version = supported;
+            if (enum_version(&supported) == VK_SUCCESS) loader_version = supported;
         }
 
         VkApplicationInfo app_info{};
@@ -176,13 +165,11 @@ public:
         instance_info.pApplicationInfo = &app_info;
 
         VkResult res = vkCreateInstance(&instance_info, nullptr, &instance_);
-        if (res != VK_SUCCESS)
-            NN_FAIL("vkCreateInstance failed: " + std::to_string(res));
+        if (res != VK_SUCCESS) NN_FAIL("vkCreateInstance failed: " + std::to_string(res));
         // 2. 选择物理设备
         uint32_t device_count = 0;
         vkEnumeratePhysicalDevices(instance_, &device_count, nullptr);
-        if (device_count == 0)
-            NN_FAIL("No Vulkan devices found");
+        if (device_count == 0) NN_FAIL("No Vulkan devices found");
         std::vector<VkPhysicalDevice> devices(device_count);
         vkEnumeratePhysicalDevices(instance_, &device_count, devices.data());
 
@@ -202,8 +189,7 @@ public:
         //   显式 API（set_device_selector / GpuBackend::initialize(sel)）
         //   > 环境变量 NN_VULKAN_DEVICE > 自动打分（见下）
         std::string selector = device_selector_;
-        if (selector.empty())
-            selector = get_env("NN_VULKAN_DEVICE");
+        if (selector.empty()) selector = get_env("NN_VULKAN_DEVICE");
 
         // selector = 枚举索引（"2"）或设备名称子串（"40HX"/"NVIDIA"）
         if (!selector.empty())
@@ -211,16 +197,14 @@ public:
             const std::string_view want(selector);
             // 纯数字只按索引匹配：否则 "2" 会命中 "R5 240" 这类名称子串
             const bool want_is_index =
-                !want.empty() &&
-                want.find_first_not_of("0123456789") == std::string_view::npos;
+                !want.empty() && want.find_first_not_of("0123456789") == std::string_view::npos;
             for (std::size_t i = 0; i < devices.size(); ++i)
             {
                 VkPhysicalDeviceProperties props;
                 vkGetPhysicalDeviceProperties(devices[i], &props);
                 const std::string_view name(props.deviceName);
-                const bool matched = want_is_index
-                    ? (want == std::string_view(std::to_string(i)))
-                    : (name.find(want) != std::string_view::npos);
+                const bool matched = want_is_index ? (want == std::string_view(std::to_string(i)))
+                                                   : (name.find(want) != std::string_view::npos);
                 if (matched)
                 {
                     physical_device_ = devices[i];
@@ -252,16 +236,13 @@ public:
                 const std::string_view name(props.deviceName);
 
                 int rank = 1;
-                if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU)
-                    rank = 3;
-                else if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU)
-                    rank = 2;
+                if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) rank = 3;
+                else if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) rank = 2;
                 if (name.rfind("Microsoft Direct3D12", 0) == 0 ||
                     name == "Microsoft Basic Render Driver")
                     rank = 0;
 
-                if (rank > best_rank ||
-                    (rank == best_rank && props.apiVersion > best_api))
+                if (rank > best_rank || (rank == best_rank && props.apiVersion > best_api))
                 {
                     best_rank = rank;
                     best_api = props.apiVersion;
@@ -270,8 +251,7 @@ public:
             }
         }
         // 兜底：无可打分设备时使用第一个设备
-        if (physical_device_ == VK_NULL_HANDLE)
-            physical_device_ = devices[0];
+        if (physical_device_ == VK_NULL_HANDLE) physical_device_ = devices[0];
 
         // 记录所选设备名（诊断"到底跑在哪块卡上"用）
         {
@@ -286,7 +266,8 @@ public:
         vkGetPhysicalDeviceQueueFamilyProperties(physical_device_, &queue_family_count, nullptr);
 
         std::vector<VkQueueFamilyProperties> queue_families(queue_family_count);
-        vkGetPhysicalDeviceQueueFamilyProperties(physical_device_, &queue_family_count, queue_families.data());
+        vkGetPhysicalDeviceQueueFamilyProperties(physical_device_, &queue_family_count,
+                                                 queue_families.data());
 
         bool found_queue = false;
         for (uint32_t i = 0; i < queue_family_count; ++i)
@@ -299,8 +280,7 @@ public:
                 break;
             }
         }
-        if (!found_queue)
-            NN_FAIL("No compute queue family found");
+        if (!found_queue) NN_FAIL("No compute queue family found");
         // 4. 创建逻辑设备
         // 先探测时间线信号量能力（Vulkan 1.2 核心特性）：跨 submit 数据依赖
         // 需要"同一信号量可被多个 submit 等待"的语义，二进制信号量做不到
@@ -312,8 +292,7 @@ public:
         {
             VkPhysicalDeviceProperties props{};
             vkGetPhysicalDeviceProperties(physical_device_, &props);
-            if (app_info.apiVersion >= VK_API_VERSION_1_2 &&
-                props.apiVersion >= VK_API_VERSION_1_2)
+            if (app_info.apiVersion >= VK_API_VERSION_1_2 && props.apiVersion >= VK_API_VERSION_1_2)
             {
                 timeline_features.sType =
                     VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES;
@@ -326,8 +305,7 @@ public:
             // 逃生阀：某些驱动的 timeline 实现有问题时，用
             // NN_VULKAN_NO_TIMELINE=1 强制走"host 等在飞上传"回退路径
             // （正确性优先，牺牲非阻塞流水线）。
-            if (!get_env("NN_VULKAN_NO_TIMELINE").empty())
-                timeline_semaphores_ = false;
+            if (!get_env("NN_VULKAN_NO_TIMELINE").empty()) timeline_semaphores_ = false;
         }
 
         // 计算 subgroup 尺寸（VK1.1 核心，查询链式同上方 features2 模式）：
@@ -360,8 +338,7 @@ public:
             has_16bit_storage_ = (storage16.storageBuffer16BitAccess == VK_TRUE);
         }
         // 逃生阀：某些驱动/校验层对 16 位存储支持不佳时强制走边界 cast 路径
-        if (!get_env("NN_VULKAN_NO_16BIT_STORAGE").empty())
-            has_16bit_storage_ = false;
+        if (!get_env("NN_VULKAN_NO_16BIT_STORAGE").empty()) has_16bit_storage_ = false;
 
         // f16 ALU（Phase 3 原生 f16 算术）：查询 + 启用 shaderFloat16
         // （Vulkan 1.2 核心特性 / VK_KHR_shader_float16_int8 扩展）。
@@ -378,10 +355,8 @@ public:
             has_shader_float16_ = (f16alu.shaderFloat16 == VK_TRUE);
         }
         // 逃生阀：强制回退 f32 算术变体（对照实验 / 驱动问题）
-        if (!get_env("NN_VULKAN_NO_16BIT_ALU").empty())
-            has_shader_float16_ = false;
-        if (!has_shader_float16_)
-            f16alu.shaderFloat16 = VK_FALSE;
+        if (!get_env("NN_VULKAN_NO_16BIT_ALU").empty()) has_shader_float16_ = false;
+        if (!has_shader_float16_) f16alu.shaderFloat16 = VK_FALSE;
 
         // ── int8 点积（P3，W2A8）：查询 + 启用 shaderIntegerDotProduct ──────
         // VK_KHR_shader_integer_dot_product（Vulkan 1.3 核心）。Turing+ 的 DP4A
@@ -398,19 +373,16 @@ public:
             has_int8_dot_ = (int8dot.shaderIntegerDotProduct == VK_TRUE);
 
             VkPhysicalDeviceShaderIntegerDotProductProperties props{};
-            props.sType =
-                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_PROPERTIES;
+            props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_PROPERTIES;
             VkPhysicalDeviceProperties2 p2{};
             p2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
             p2.pNext = &props;
             vkGetPhysicalDeviceProperties2(physical_device_, &p2);
-            int8_dot_accelerated_ = (props.integerDotProduct4x8BitPackedSignedAccelerated ==
-                                     VK_TRUE);
+            int8_dot_accelerated_ =
+                (props.integerDotProduct4x8BitPackedSignedAccelerated == VK_TRUE);
         }
-        if (!get_env("NN_VULKAN_NO_INT8_DOT").empty())
-            has_int8_dot_ = false;
-        if (!has_int8_dot_)
-            int8dot.shaderIntegerDotProduct = VK_FALSE;
+        if (!get_env("NN_VULKAN_NO_INT8_DOT").empty()) has_int8_dot_ = false;
+        if (!has_int8_dot_) int8dot.shaderIntegerDotProduct = VK_FALSE;
         // 查询阶段把整个结构体清零后可能置 VK_TRUE；非启用分支必须显式关掉，
         // 避免把未启用的特性声明进 pNext（校验层 VUID-VkDeviceCreateInfo 系列）。
         f16alu.shaderInt8 = VK_FALSE;   // 本库不用 int8 ALU，恒不启用
@@ -431,8 +403,7 @@ public:
                 has_buffer_device_address_ = (bda.bufferDeviceAddress == VK_TRUE);
             }
         }
-        if (!has_buffer_device_address_)
-            bda.bufferDeviceAddress = VK_FALSE;
+        if (!has_buffer_device_address_) bda.bufferDeviceAddress = VK_FALSE;
 
         float queue_priority = 1.0f;
         VkDeviceQueueCreateInfo queue_info{};
@@ -446,28 +417,23 @@ public:
         // pNext 链：按需串起"已启用的特性"（链上顺序无语义，这里统一用前插，
         // 免得每加一个特性都要重排多层三元表达式 —— 之前那种写法已经很难读了）
         VkBaseInStructure* chain = nullptr;
-        const auto link = [&chain](VkBaseInStructure* node) {
+        const auto link = [&chain](VkBaseInStructure* node)
+        {
             node->pNext = chain;
             chain = node;
         };
-        if (timeline_semaphores_)
-            link(reinterpret_cast<VkBaseInStructure*>(&timeline_features));
-        if (has_16bit_storage_)
-            link(reinterpret_cast<VkBaseInStructure*>(&storage16));
-        if (has_shader_float16_)
-            link(reinterpret_cast<VkBaseInStructure*>(&f16alu));
-        if (has_int8_dot_)
-            link(reinterpret_cast<VkBaseInStructure*>(&int8dot));
+        if (timeline_semaphores_) link(reinterpret_cast<VkBaseInStructure*>(&timeline_features));
+        if (has_16bit_storage_) link(reinterpret_cast<VkBaseInStructure*>(&storage16));
+        if (has_shader_float16_) link(reinterpret_cast<VkBaseInStructure*>(&f16alu));
+        if (has_int8_dot_) link(reinterpret_cast<VkBaseInStructure*>(&int8dot));
         // P3 BDA（`#b` 批量变体）：支持即启用，作为 pNext 链头（其余链不变）
-        if (has_buffer_device_address_)
-            link(reinterpret_cast<VkBaseInStructure*>(&bda));
+        if (has_buffer_device_address_) link(reinterpret_cast<VkBaseInStructure*>(&bda));
         device_info.pNext = chain;
         device_info.queueCreateInfoCount = 1;
         device_info.pQueueCreateInfos = &queue_info;
 
         res = vkCreateDevice(physical_device_, &device_info, nullptr, &device_);
-        if (res != VK_SUCCESS)
-            NN_FAIL("vkCreateDevice failed: " + std::to_string(res));
+        if (res != VK_SUCCESS) NN_FAIL("vkCreateDevice failed: " + std::to_string(res));
         // 5. 获取计算队列
         vkGetDeviceQueue(device_, queue_family_index_, 0, &compute_queue_);
 
@@ -490,8 +456,7 @@ public:
     [[nodiscard]] bool int8_dot_accelerated() const noexcept { return int8_dot_accelerated_; }
     // buffer device address 是否已启用：P3 批量派发（`key#b`）前提。未启用
     // → 后端不登记 `#b` pipeline，运行期逐 kernel 降级（可观测、非错误）。
-    [[nodiscard]] bool bda_available() const noexcept
-    { return has_buffer_device_address_; }
+    [[nodiscard]] bool bda_available() const noexcept { return has_buffer_device_address_; }
     // 所选物理设备名（"NVIDIA CMP 40HX" 等；初始化前为空）
     [[nodiscard]] const std::string& device_name() const noexcept { return device_name_; }
     // 计算队列 subgroup 尺寸（初始化前 = 兜底值 4；GEMV 分派门禁用）
@@ -499,15 +464,10 @@ public:
     // timestamp query 能力（NN_PROFILE 设备侧计时）：
     // validBits=0 → 所选队列不支持时间戳；period = 1 tick 的纳秒数
     [[nodiscard]] uint32_t queue_timestamp_valid_bits() const noexcept
-    {
-        return queue_timestamp_valid_bits_;
-    }
+    { return queue_timestamp_valid_bits_; }
     [[nodiscard]] float timestamp_period_ns() const noexcept { return timestamp_period_ns_; }
     // 已启用时间线信号量（决定跨 submit 依赖走信号量还是 host 等 fence）
-    [[nodiscard]] bool has_timeline_semaphores() const noexcept
-    {
-        return timeline_semaphores_;
-    }
+    [[nodiscard]] bool has_timeline_semaphores() const noexcept { return timeline_semaphores_; }
 };
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -528,8 +488,7 @@ public:
 
     ~VulkanPipeline()
     {
-        if (pipeline_ != VK_NULL_HANDLE)
-            vkDestroyPipeline(device_, pipeline_, nullptr);
+        if (pipeline_ != VK_NULL_HANDLE) vkDestroyPipeline(device_, pipeline_, nullptr);
         if (pipeline_layout_ != VK_NULL_HANDLE)
             vkDestroyPipelineLayout(device_, pipeline_layout_, nullptr);
         if (descriptor_layout_ != VK_NULL_HANDLE)
@@ -541,8 +500,8 @@ public:
     // 移动语义
     VulkanPipeline(VulkanPipeline&& o) noexcept
         : device_(o.device_), shader_module_(o.shader_module_),
-          descriptor_layout_(o.descriptor_layout_),
-          pipeline_layout_(o.pipeline_layout_), pipeline_(o.pipeline_)
+          descriptor_layout_(o.descriptor_layout_), pipeline_layout_(o.pipeline_layout_),
+          pipeline_(o.pipeline_)
     {
         o.device_ = VK_NULL_HANDLE;
         o.shader_module_ = VK_NULL_HANDLE;
@@ -569,8 +528,8 @@ public:
     VulkanPipeline& operator=(const VulkanPipeline&) = delete;
 
     // 创建 matmul pipeline
-    [[nodiscard]] static Result<VulkanPipeline> create_matmul(
-        VkDevice device, std::span<const uint32_t> spirv_code)
+    [[nodiscard]] static Result<VulkanPipeline> create_matmul(VkDevice device,
+                                                              std::span<const uint32_t> spirv_code)
     {
         VulkanPipeline pl;
         pl.device_ = device;
@@ -582,8 +541,8 @@ public:
         module_info.pCode = spirv_code.data();
 
         auto r = detail::vk_check(
-            vkCreateShaderModule(device, &module_info, nullptr, &pl.shader_module_),
-            __FILE__, __LINE__);
+            vkCreateShaderModule(device, &module_info, nullptr, &pl.shader_module_), __FILE__,
+            __LINE__);
         NN_TRY_CHECK(r);
         // 创建 descriptor set layout（3 个 storage buffer）
         VkDescriptorSetLayoutBinding bindings[3]{};
@@ -630,18 +589,19 @@ public:
         pipeline_info.stage.pName = "main";
         pipeline_info.layout = pl.pipeline_layout_;
 
-        r = detail::vk_check(
-            vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &pl.pipeline_),
-            __FILE__, __LINE__);
+        r = detail::vk_check(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeline_info,
+                                                      nullptr, &pl.pipeline_),
+                             __FILE__, __LINE__);
         NN_TRY_CHECK(r);
         return pl;
     }
 
     // 创建通用 pipeline（可变 binding 数和 push constant 大小）
     // 用于 elementwise_v2 / reduce / broadcast 等纯原语着色器
-    [[nodiscard]] static Result<VulkanPipeline> create_generic(
-        VkDevice device, std::span<const uint32_t> spirv_code,
-        uint32_t num_bindings, uint32_t push_constant_size)
+    [[nodiscard]] static Result<VulkanPipeline> create_generic(VkDevice device,
+                                                               std::span<const uint32_t> spirv_code,
+                                                               uint32_t num_bindings,
+                                                               uint32_t push_constant_size)
     {
         VulkanPipeline pl;
         pl.device_ = device;
@@ -653,8 +613,8 @@ public:
         module_info.pCode = spirv_code.data();
 
         auto r = detail::vk_check(
-            vkCreateShaderModule(device, &module_info, nullptr, &pl.shader_module_),
-            __FILE__, __LINE__);
+            vkCreateShaderModule(device, &module_info, nullptr, &pl.shader_module_), __FILE__,
+            __LINE__);
         NN_TRY_CHECK(r);
         // 创建 descriptor set layout（num_bindings 个 storage buffer）
         std::vector<VkDescriptorSetLayoutBinding> bindings(num_bindings);
@@ -701,16 +661,16 @@ public:
         pipeline_info.stage.pName = "main";
         pipeline_info.layout = pl.pipeline_layout_;
 
-        r = detail::vk_check(
-            vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &pl.pipeline_),
-            __FILE__, __LINE__);
+        r = detail::vk_check(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeline_info,
+                                                      nullptr, &pl.pipeline_),
+                             __FILE__, __LINE__);
         NN_TRY_CHECK(r);
         return pl;
     }
 
     [[nodiscard]] VkPipeline handle() const noexcept { return pipeline_; }
     [[nodiscard]] VkPipelineLayout pipeline_layout() const noexcept { return pipeline_layout_; }
-    [[nodiscard]] VkDescriptorSetLayout descriptor_layout() const noexcept { return descriptor_layout_; }
+    [[nodiscard]] VkDescriptorSetLayout descriptor_layout() const noexcept
+    { return descriptor_layout_; }
 };
 } // namespace nn
-

@@ -47,13 +47,13 @@ struct ExprRegistry
 {
     struct VariantRef
     {
-        std::string  key;   // 结构 key（canonical 形态）
-        ExprPrecSig  sig;   // 观察到的精度签名（≠0、≠ EXPR_PREC_SIG_DISPATCH）
+        std::string key;   // 结构 key（canonical 形态）
+        ExprPrecSig sig;   // 观察到的精度签名（≠0、≠ EXPR_PREC_SIG_DISPATCH）
     };
 
-    std::vector<ExprSpec>           specs;
+    std::vector<ExprSpec> specs;
     std::unordered_set<std::string> keys;
-    std::vector<VariantRef>         variants;
+    std::vector<VariantRef> variants;
     std::unordered_set<std::string> variant_keys;
 
     void add(const ExprSpec& s)
@@ -63,8 +63,7 @@ struct ExprRegistry
         // 同一规则见 expr_opt.hpp 的 expr_spec_lookup_key）。
         const ExprSpec canon = canonicalize_expr_spec(s);
         const std::string k = expr_spec_key(canon);
-        if (keys.insert(k).second)
-            specs.push_back(canon);
+        if (keys.insert(k).second) specs.push_back(canon);
     }
 
     // 记录"某结构在某签名下真的被调用过"（扫描期 = dry-run / 模型 pass /
@@ -72,13 +71,11 @@ struct ExprRegistry
     // 不记：前者与 V0 共用条目，后者不是签名。
     void add_variant(const ExprSpec& s, ExprPrecSig sig)
     {
-        if (sig == 0u || expr_prec_sig_is_dispatch(sig))
-            return;
+        if (sig == 0u || expr_prec_sig_is_dispatch(sig)) return;
         const ExprSpec canon = canonicalize_expr_spec(s);
         const std::string k = expr_spec_key(canon);
         const std::string vk = expr_prec_sig_key(k, sig);
-        if (variant_keys.insert(vk).second)
-            variants.push_back(VariantRef{k, sig});
+        if (variant_keys.insert(vk).second) variants.push_back(VariantRef{k, sig});
     }
 };
 
@@ -90,4 +87,3 @@ struct ExprRegistry
 }
 
 } // namespace nn::fused
-

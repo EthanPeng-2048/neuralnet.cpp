@@ -41,125 +41,158 @@
 
 namespace nn::cli
 {
-    // ── 通用训练参数 ───────────────────────────────────────────────────────
-    // 默认值仅作为结构体占位；调用方应根据程序语义在解析前覆盖。
-    struct TrainCommonArgs
-    {
-        int epochs = 10;
-        nn::Scalar lr = 0.001f;
-        std::size_t batch_size = 32;
-        std::string optimizer = "adam";
-        nn::Scalar weight_decay = 0.0f;
-        nn::Scalar min_lr = 0.0f;
-        int warmup_epochs = 0;
-        std::string lr_schedule = "constant";  // "fixed"/"constant" 等价，"cosine" 退火
-        std::vector<nn::Scalar> lr_per_epoch;
-        bool use_gpu = false;
-        // --gpu 的可选设备选择子（索引或名称子串）；空 = 自动选卡
-        std::string gpu_device;
-    };
+// ── 通用训练参数 ───────────────────────────────────────────────────────
+// 默认值仅作为结构体占位；调用方应根据程序语义在解析前覆盖。
+struct TrainCommonArgs
+{
+    int epochs = 10;
+    nn::Scalar lr = 0.001f;
+    std::size_t batch_size = 32;
+    std::string optimizer = "adam";
+    nn::Scalar weight_decay = 0.0f;
+    nn::Scalar min_lr = 0.0f;
+    int warmup_epochs = 0;
+    std::string lr_schedule = "constant";  // "fixed"/"constant" 等价，"cosine" 退火
+    std::vector<nn::Scalar> lr_per_epoch;
+    bool use_gpu = false;
+    // --gpu 的可选设备选择子（索引或名称子串）；空 = 自动选卡
+    std::string gpu_device;
+};
 
-    // ── 解析通用训练参数 ───────────────────────────────────────────────────
-    // 在 argv[i] 处尝试解析一个通用 flag。
-    // 成功消费时返回 true 并将 i 递增到本次消费的最后一个 argv 索引；
-    // 不是通用 flag 时返回 false（i 不变），由调用方继续判断。
-    // 解析失败时打印错误并 std::exit(1)（与现有 parse_args 行为一致）。
-    inline bool parse_train_common_args(
-        int argc, char *argv[], int &i, TrainCommonArgs &cfg)
-    {
-        std::string arg = argv[i];
+// ── 解析通用训练参数 ───────────────────────────────────────────────────
+// 在 argv[i] 处尝试解析一个通用 flag。
+// 成功消费时返回 true 并将 i 递增到本次消费的最后一个 argv 索引；
+// 不是通用 flag 时返回 false（i 不变），由调用方继续判断。
+// 解析失败时打印错误并 std::exit(1)（与现有 parse_args 行为一致）。
+inline bool parse_train_common_args(int argc, char* argv[], int& i, TrainCommonArgs& cfg)
+{
+    std::string arg = argv[i];
 
-        if (arg == "--epochs" && i + 1 < argc)
+    if (arg == "--epochs" && i + 1 < argc)
+    {
+        auto v = nn::parse_number<int>(argv[++i]);
+        if (!v)
         {
-            auto v = nn::parse_number<int>(argv[++i]);
-            if (!v) { std::cerr << "无效 --epochs: " << v.error().message << "\n"; std::exit(1); }
-            if (*v <= 0) { std::cerr << "--epochs 必须为正整数\n"; std::exit(1); }
-            cfg.epochs = *v;
-            return true;
+            std::cerr << "无效 --epochs: " << v.error().message << "\n";
+            std::exit(1);
         }
-        if (arg == "--lr" && i + 1 < argc)
+        if (*v <= 0)
         {
-            auto v = nn::parse_number<nn::Scalar>(argv[++i]);
-            if (!v) { std::cerr << "无效 --lr: " << v.error().message << "\n"; std::exit(1); }
-            cfg.lr = *v;
-            return true;
+            std::cerr << "--epochs 必须为正整数\n";
+            std::exit(1);
         }
-        if (arg == "--batch-size" && i + 1 < argc)
-        {
-            auto v = nn::parse_number<std::size_t>(argv[++i]);
-            if (!v) { std::cerr << "无效 --batch-size: " << v.error().message << "\n"; std::exit(1); }
-            if (*v == 0) { std::cerr << "--batch-size 必须为正整数\n"; std::exit(1); }
-            cfg.batch_size = *v;
-            return true;
-        }
-        if (arg == "--optimizer" && i + 1 < argc)
-        {
-            cfg.optimizer = argv[++i];
-            if (cfg.optimizer != "sgd" && cfg.optimizer != "sgd_momentum" &&
-                cfg.optimizer != "adam" && cfg.optimizer != "adamw" &&
-                cfg.optimizer != "muon")
-            {
-                std::cerr << "未知优化器: " << cfg.optimizer
-                          << "，可选: sgd, sgd_momentum, adam, adamw, muon\n";
-                std::exit(1);
-            }
-            return true;
-        }
-        if (arg == "--weight-decay" && i + 1 < argc)
-        {
-            auto v = nn::parse_number<nn::Scalar>(argv[++i]);
-            if (!v) { std::cerr << "无效 --weight-decay: " << v.error().message << "\n"; std::exit(1); }
-            cfg.weight_decay = *v;
-            return true;
-        }
-        if (arg == "--min-lr" && i + 1 < argc)
-        {
-            auto v = nn::parse_number<nn::Scalar>(argv[++i]);
-            if (!v) { std::cerr << "无效 --min-lr: " << v.error().message << "\n"; std::exit(1); }
-            cfg.min_lr = *v;
-            return true;
-        }
-        if (arg == "--warmup-epochs" && i + 1 < argc)
-        {
-            auto v = nn::parse_number<int>(argv[++i]);
-            if (!v) { std::cerr << "无效 --warmup-epochs: " << v.error().message << "\n"; std::exit(1); }
-            cfg.warmup_epochs = *v;
-            return true;
-        }
-        if (arg == "--lr-per-epoch" && i + 1 < argc)
-        {
-            std::string dims_str = argv[++i];
-            std::stringstream ss(dims_str);
-            std::string token;
-            cfg.lr_per_epoch.clear();
-            while (std::getline(ss, token, ','))
-            {
-                auto v = nn::parse_number<nn::Scalar>(token);
-                if (!v) { std::cerr << "无效 --lr-per-epoch 值: " << v.error().message << "\n"; std::exit(1); }
-                cfg.lr_per_epoch.push_back(*v);
-            }
-            return true;
-        }
-        if (arg == "--lr-schedule" && i + 1 < argc)
-        {
-            cfg.lr_schedule = argv[++i];
-            // "fixed" 与 "constant" 等价（同一调度分支）；"cosine" 为余弦退火
-            if (cfg.lr_schedule != "fixed" && cfg.lr_schedule != "constant" &&
-                cfg.lr_schedule != "cosine")
-            {
-                std::cerr << "未知 --lr-schedule: " << cfg.lr_schedule
-                          << "，可选: fixed, constant, cosine\n";
-                std::exit(1);
-            }
-            return true;
-        }
-        if (auto dev = parse_gpu_option(argc, argv, i))
-        {
-            cfg.use_gpu = true;
-            if (!dev->empty())
-                cfg.gpu_device = *dev;
-            return true;
-        }
-        return false;  // 不是通用 flag
+        cfg.epochs = *v;
+        return true;
     }
+    if (arg == "--lr" && i + 1 < argc)
+    {
+        auto v = nn::parse_number<nn::Scalar>(argv[++i]);
+        if (!v)
+        {
+            std::cerr << "无效 --lr: " << v.error().message << "\n";
+            std::exit(1);
+        }
+        cfg.lr = *v;
+        return true;
+    }
+    if (arg == "--batch-size" && i + 1 < argc)
+    {
+        auto v = nn::parse_number<std::size_t>(argv[++i]);
+        if (!v)
+        {
+            std::cerr << "无效 --batch-size: " << v.error().message << "\n";
+            std::exit(1);
+        }
+        if (*v == 0)
+        {
+            std::cerr << "--batch-size 必须为正整数\n";
+            std::exit(1);
+        }
+        cfg.batch_size = *v;
+        return true;
+    }
+    if (arg == "--optimizer" && i + 1 < argc)
+    {
+        cfg.optimizer = argv[++i];
+        if (cfg.optimizer != "sgd" && cfg.optimizer != "sgd_momentum" && cfg.optimizer != "adam" &&
+            cfg.optimizer != "adamw" && cfg.optimizer != "muon")
+        {
+            std::cerr << "未知优化器: " << cfg.optimizer
+                      << "，可选: sgd, sgd_momentum, adam, adamw, muon\n";
+            std::exit(1);
+        }
+        return true;
+    }
+    if (arg == "--weight-decay" && i + 1 < argc)
+    {
+        auto v = nn::parse_number<nn::Scalar>(argv[++i]);
+        if (!v)
+        {
+            std::cerr << "无效 --weight-decay: " << v.error().message << "\n";
+            std::exit(1);
+        }
+        cfg.weight_decay = *v;
+        return true;
+    }
+    if (arg == "--min-lr" && i + 1 < argc)
+    {
+        auto v = nn::parse_number<nn::Scalar>(argv[++i]);
+        if (!v)
+        {
+            std::cerr << "无效 --min-lr: " << v.error().message << "\n";
+            std::exit(1);
+        }
+        cfg.min_lr = *v;
+        return true;
+    }
+    if (arg == "--warmup-epochs" && i + 1 < argc)
+    {
+        auto v = nn::parse_number<int>(argv[++i]);
+        if (!v)
+        {
+            std::cerr << "无效 --warmup-epochs: " << v.error().message << "\n";
+            std::exit(1);
+        }
+        cfg.warmup_epochs = *v;
+        return true;
+    }
+    if (arg == "--lr-per-epoch" && i + 1 < argc)
+    {
+        std::string dims_str = argv[++i];
+        std::stringstream ss(dims_str);
+        std::string token;
+        cfg.lr_per_epoch.clear();
+        while (std::getline(ss, token, ','))
+        {
+            auto v = nn::parse_number<nn::Scalar>(token);
+            if (!v)
+            {
+                std::cerr << "无效 --lr-per-epoch 值: " << v.error().message << "\n";
+                std::exit(1);
+            }
+            cfg.lr_per_epoch.push_back(*v);
+        }
+        return true;
+    }
+    if (arg == "--lr-schedule" && i + 1 < argc)
+    {
+        cfg.lr_schedule = argv[++i];
+        // "fixed" 与 "constant" 等价（同一调度分支）；"cosine" 为余弦退火
+        if (cfg.lr_schedule != "fixed" && cfg.lr_schedule != "constant" &&
+            cfg.lr_schedule != "cosine")
+        {
+            std::cerr << "未知 --lr-schedule: " << cfg.lr_schedule
+                      << "，可选: fixed, constant, cosine\n";
+            std::exit(1);
+        }
+        return true;
+    }
+    if (auto dev = parse_gpu_option(argc, argv, i))
+    {
+        cfg.use_gpu = true;
+        if (!dev->empty()) cfg.gpu_device = *dev;
+        return true;
+    }
+    return false;  // 不是通用 flag
+}
 } // namespace nn::cli

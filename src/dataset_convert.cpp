@@ -20,11 +20,12 @@
 #include <string>
 
 // ==================== 帮助信息 ====================
-void print_usage(const char *prog)
+void print_usage(const char* prog)
 {
     nn::cli::Help help(std::cout, prog, "旧格式转换器（词表/数据集迁移）");
 
-    help.usage("vocab <in.json> -o <out.nnvocab> | csv <train.csv> [<test.csv>] -o <out.nndataset>");
+    help.usage(
+        "vocab <in.json> -o <out.nnvocab> | csv <train.csv> [<test.csv>] -o <out.nndataset>");
 
     help.section("子命令");
     help.item("vocab", "旧 JSON 词表 → .nnvocab（kvrec v2）");
@@ -44,7 +45,7 @@ struct Config
     std::string output_path;
 };
 
-Config parse_args(int argc, char *argv[])
+Config parse_args(int argc, char* argv[])
 {
     Config cfg;
     for (int i = 1; i < argc; ++i)
@@ -55,16 +56,12 @@ Config parse_args(int argc, char *argv[])
             print_usage(argv[0]);
             std::exit(0);
         }
-        else if ((arg == "-o" || arg == "--output") && i + 1 < argc)
-            cfg.output_path = argv[++i];
+        else if ((arg == "-o" || arg == "--output") && i + 1 < argc) cfg.output_path = argv[++i];
         else if (!arg.starts_with("--"))
         {
-            if (arg == "vocab" || arg == "csv")
-                cfg.subcommand = arg;
-            else if (cfg.input1.empty())
-                cfg.input1 = arg;
-            else if (cfg.input2.empty())
-                cfg.input2 = arg;
+            if (arg == "vocab" || arg == "csv") cfg.subcommand = arg;
+            else if (cfg.input1.empty()) cfg.input1 = arg;
+            else if (cfg.input2.empty()) cfg.input2 = arg;
             else
             {
                 std::cerr << "多余的位置参数: " << arg << "\n使用 --help 查看用法\n";
@@ -96,7 +93,7 @@ Config parse_args(int argc, char *argv[])
 }
 
 // ==================== vocab：旧 JSON 词表 → .nnvocab ====================
-int convert_vocab(const Config &cfg)
+int convert_vocab(const Config& cfg)
 {
     std::ifstream ifs(cfg.input1, std::ios::binary);
     if (!ifs)
@@ -104,8 +101,7 @@ int convert_vocab(const Config &cfg)
         std::cerr << "无法打开输入文件: " << cfg.input1 << "\n";
         return 1;
     }
-    const std::string json((std::istreambuf_iterator<char>(ifs)),
-                            std::istreambuf_iterator<char>());
+    const std::string json((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
     if (json.empty() || json[0] != '{')
     {
         std::cerr << "输入不是 JSON 词表（应以 '{' 开头）: " << cfg.input1 << "\n";
@@ -116,20 +112,19 @@ int convert_vocab(const Config &cfg)
     auto tok = nn::load_tokenizer_from_string(json);
     if (!tok)
     {
-        std::cerr << "无法解析 JSON 词表（缺少有效 \"type\" 字段）: "
-                  << cfg.input1 << "\n";
+        std::cerr << "无法解析 JSON 词表（缺少有效 \"type\" 字段）: " << cfg.input1 << "\n";
         return 1;
     }
 
     auto save_r = tok->save(cfg.output_path);
     NN_EXIT(save_r, 1, "写入 .nnvocab 失败: ");
-    std::cout << "词表已转换: " << cfg.input1 << " -> " << cfg.output_path
-              << "（" << tok->vocab_size() << " 词）" << std::endl;
+    std::cout << "词表已转换: " << cfg.input1 << " -> " << cfg.output_path << "（"
+              << tok->vocab_size() << " 词）" << std::endl;
     return 0;
 }
 
 // ==================== csv：预留（阶段四） ====================
-int convert_csv(const Config &)
+int convert_csv(const Config&)
 {
     std::cerr << "dataset_convert csv 尚未实现（tabular 形态为阶段四预留，"
                  "见 docs/internal/19-unified-dataset.md §4.4）\n";
@@ -137,10 +132,9 @@ int convert_csv(const Config &)
 }
 
 // ==================== 主函数 ====================
-int main(int argc, char *argv[])
+int main(int argc, char* argv[])
 {
     Config cfg = parse_args(argc, argv);
-    if (cfg.subcommand == "vocab")
-        return convert_vocab(cfg);
+    if (cfg.subcommand == "vocab") return convert_vocab(cfg);
     return convert_csv(cfg);
 }

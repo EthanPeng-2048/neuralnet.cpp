@@ -32,11 +32,11 @@
 #include <neuralnet.cpp/cli/cli_engine_factory.hpp>
 #include <neuralnet.cpp/cli/cli_help.hpp>
 
-using nn::Scalar;
-using nn::Matrix;
-using nn::Tensor;
 using nn::ComputeEngine;
+using nn::Matrix;
 using nn::Model;
+using nn::Scalar;
+using nn::Tensor;
 
 namespace
 {
@@ -80,9 +80,7 @@ struct BenchConfig
 //  工具
 // ═══════════════════════════════════════════════════════════════════════════
 double ms_since(std::chrono::steady_clock::time_point t0)
-{
-    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-}
+{ return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); }
 
 // 随机填充 Matrix 并上传到引擎设备
 Tensor make_input(ComputeEngine& e, std::size_t rows, std::size_t cols)
@@ -94,8 +92,7 @@ Tensor make_input(ComputeEngine& e, std::size_t rows, std::size_t cols)
     for (std::size_t i = 0; i < s.size(); ++i)
         s[i] = d(g);
     auto t = e.from_matrix(std::move(m));
-    if (!t)
-        std::abort();
+    if (!t) std::abort();
     return std::move(*t);
 }
 
@@ -123,18 +120,24 @@ bool build_linear(Model& m, const BenchConfig& c)
     auto r = m.template add<nn::Linear>(c.in, c.out);
     return r.has_value();
 }
-std::pair<std::size_t, std::size_t> shape_linear(const BenchConfig& c) { return {c.in, c.batch}; }
-double flops_linear(const BenchConfig& c) { return 2.0 * c.in * c.out * c.batch; }
-std::size_t tok_linear(const BenchConfig& c) { return c.batch; }
+std::pair<std::size_t, std::size_t> shape_linear(const BenchConfig& c)
+{ return {c.in, c.batch}; }
+double flops_linear(const BenchConfig& c)
+{ return 2.0 * c.in * c.out * c.batch; }
+std::size_t tok_linear(const BenchConfig& c)
+{ return c.batch; }
 
 bool build_swiglu(Model& m, const BenchConfig& c)
 {
     auto r = m.template add<nn::SwiGLU>(c.dff);
     return r.has_value();
 }
-std::pair<std::size_t, std::size_t> shape_swiglu(const BenchConfig& c) { return {2 * c.dff, c.batch}; }
-double flops_swiglu(const BenchConfig& c) { return 8.0 * 2 * c.dff * c.batch; }
-std::size_t tok_swiglu(const BenchConfig& c) { return c.batch; }
+std::pair<std::size_t, std::size_t> shape_swiglu(const BenchConfig& c)
+{ return {2 * c.dff, c.batch}; }
+double flops_swiglu(const BenchConfig& c)
+{ return 8.0 * 2 * c.dff * c.batch; }
+std::size_t tok_swiglu(const BenchConfig& c)
+{ return c.batch; }
 
 bool build_layernorm(Model& m, const BenchConfig& c)
 {
@@ -146,18 +149,24 @@ bool build_rmsnorm(Model& m, const BenchConfig& c)
     auto r = m.template add<nn::RMSNorm>(c.dmodel);
     return r.has_value();
 }
-std::pair<std::size_t, std::size_t> shape_norm(const BenchConfig& c) { return {c.dmodel, c.batch * c.seq}; }
-double flops_norm(const BenchConfig& c) { return 6.0 * c.dmodel * c.batch * c.seq; }
-std::size_t tok_norm(const BenchConfig& c) { return c.batch * c.seq; }
+std::pair<std::size_t, std::size_t> shape_norm(const BenchConfig& c)
+{ return {c.dmodel, c.batch * c.seq}; }
+double flops_norm(const BenchConfig& c)
+{ return 6.0 * c.dmodel * c.batch * c.seq; }
+std::size_t tok_norm(const BenchConfig& c)
+{ return c.batch * c.seq; }
 
 bool build_softmax(Model& m, [[maybe_unused]] const BenchConfig& c)
 {
     auto r = m.template add<nn::Softmax>();
     return r.has_value();
 }
-std::pair<std::size_t, std::size_t> shape_softmax(const BenchConfig& c) { return {c.rows, c.cols}; }
-double flops_softmax(const BenchConfig& c) { return 6.0 * c.rows * c.cols; }
-std::size_t tok_softmax(const BenchConfig& c) { return c.rows > 0 ? 1u : 0u; }
+std::pair<std::size_t, std::size_t> shape_softmax(const BenchConfig& c)
+{ return {c.rows, c.cols}; }
+double flops_softmax(const BenchConfig& c)
+{ return 6.0 * c.rows * c.cols; }
+std::size_t tok_softmax(const BenchConfig& c)
+{ return c.rows > 0 ? 1u : 0u; }
 
 bool build_mha(Model& m, const BenchConfig& c)
 {
@@ -169,13 +178,15 @@ bool build_causal(Model& m, const BenchConfig& c)
     auto r = m.template add<nn::CausalSelfAttention>(c.dmodel, c.heads, c.seq, c.seq);
     return r.has_value();
 }
-std::pair<std::size_t, std::size_t> shape_attn(const BenchConfig& c) { return {c.dmodel, c.batch * c.seq}; }
+std::pair<std::size_t, std::size_t> shape_attn(const BenchConfig& c)
+{ return {c.dmodel, c.batch * c.seq}; }
 double flops_attn(const BenchConfig& c)
 {
     const double T = static_cast<double>(c.batch) * c.seq;
     return 6.0 * c.dmodel * c.dmodel * T + 4.0 * T * T * c.dmodel;
 }
-std::size_t tok_attn(const BenchConfig& c) { return c.batch * c.seq; }
+std::size_t tok_attn(const BenchConfig& c)
+{ return c.batch * c.seq; }
 
 bool build_feedforward(Model& m, const BenchConfig& c)
 {
@@ -183,9 +194,7 @@ bool build_feedforward(Model& m, const BenchConfig& c)
     return r.has_value();
 }
 double flops_feedforward(const BenchConfig& c)
-{
-    return 4.0 * c.dmodel * c.dff * c.batch * c.seq;
-}
+{ return 4.0 * c.dmodel * c.dff * c.batch * c.seq; }
 
 bool build_transformer(Model& m, const BenchConfig& c)
 {
@@ -193,9 +202,7 @@ bool build_transformer(Model& m, const BenchConfig& c)
     return r.has_value();
 }
 double flops_transformer(const BenchConfig& c)
-{
-    return flops_attn(c) + flops_feedforward(c) + flops_norm(c) * 2.0;
-}
+{ return flops_attn(c) + flops_feedforward(c) + flops_norm(c) * 2.0; }
 
 bool build_gpt_block(Model& m, const BenchConfig& c)
 {
@@ -205,29 +212,32 @@ bool build_gpt_block(Model& m, const BenchConfig& c)
 
 bool build_conv(Model& m, const BenchConfig& c)
 {
-    auto r = m.template add<nn::Conv2D>(c.cin, c.cout, c.kernel, /*stride=*/1, /*pad=*/c.kernel / 2, c.hw, c.hw);
+    auto r = m.template add<nn::Conv2D>(c.cin, c.cout, c.kernel, /*stride=*/1, /*pad=*/c.kernel / 2,
+                                        c.hw, c.hw);
     return r.has_value();
 }
-std::pair<std::size_t, std::size_t> shape_conv(const BenchConfig& c) { return {c.cin * c.hw * c.hw, c.batch}; }
+std::pair<std::size_t, std::size_t> shape_conv(const BenchConfig& c)
+{ return {c.cin * c.hw * c.hw, c.batch}; }
 double flops_conv(const BenchConfig& c)
-{
-    return 2.0 * c.cout * c.cin * c.kernel * c.kernel * c.hw * c.hw * c.batch;
-}
-std::size_t tok_conv(const BenchConfig& c) { return c.batch; }
+{ return 2.0 * c.cout * c.cin * c.kernel * c.kernel * c.hw * c.hw * c.batch; }
+std::size_t tok_conv(const BenchConfig& c)
+{ return c.batch; }
 
 bool build_maxpool(Model& m, const BenchConfig& c)
 {
     auto r = m.template add<nn::MaxPool2D>(c.cin, c.hw, c.hw, /*pool=*/2, /*stride=*/2);
     return r.has_value();
 }
-std::pair<std::size_t, std::size_t> shape_maxpool(const BenchConfig& c) { return {c.cin * c.hw * c.hw, c.batch}; }
+std::pair<std::size_t, std::size_t> shape_maxpool(const BenchConfig& c)
+{ return {c.cin * c.hw * c.hw, c.batch}; }
 double flops_maxpool(const BenchConfig& c)
 {
     const std::size_t oh = (c.hw - 2) / 2 + 1;
     const std::size_t ow = (c.hw - 2) / 2 + 1;
     return 1.0 * c.cin * oh * ow * c.batch;
 }
-std::size_t tok_maxpool(const BenchConfig& c) { return c.batch; }
+std::size_t tok_maxpool(const BenchConfig& c)
+{ return c.batch; }
 
 // ── 层注册表 ──────────────────────────────────────────────────────────────
 const std::vector<LayerSpec>& layer_registry()
@@ -297,25 +307,38 @@ void setup_matmul_at(ComputeEngine& e, const BenchConfig& c, OpCtx& ctx)
 void run_matmul(ComputeEngine& e, const BenchConfig&, OpCtx& ctx)
 {
     // 输出精度跟随标记：--f16 时不额外付一次边界 cast（同 BitLinear 的 f16 路径）
-    auto r = e.matmul(ctx.a, ctx.b, false, false,
-                      ctx.a.precision() == nn::Precision::F16 ? nn::Precision::F16
-                                                             : nn::Precision::F32);
-    if (!r) { std::printf("matmul error: %s\n", r.error().message.c_str()); std::abort(); }
+    auto r =
+        e.matmul(ctx.a, ctx.b, false, false,
+                 ctx.a.precision() == nn::Precision::F16 ? nn::Precision::F16 : nn::Precision::F32);
+    if (!r)
+    {
+        std::printf("matmul error: %s\n", r.error().message.c_str());
+        std::abort();
+    }
     ctx.c = std::move(*r);
 }
 void run_matmul_bt(ComputeEngine& e, const BenchConfig&, OpCtx& ctx)
 {
     auto r = e.matmul(ctx.a, ctx.b, false, true);
-    if (!r) { std::printf("matmul_bt error: %s\n", r.error().message.c_str()); std::abort(); }
+    if (!r)
+    {
+        std::printf("matmul_bt error: %s\n", r.error().message.c_str());
+        std::abort();
+    }
     ctx.c = std::move(*r);
 }
 void run_matmul_at(ComputeEngine& e, const BenchConfig&, OpCtx& ctx)
 {
     auto r = e.matmul(ctx.a, ctx.b, true, false);
-    if (!r) { std::printf("matmul_at error: %s\n", r.error().message.c_str()); std::abort(); }
+    if (!r)
+    {
+        std::printf("matmul_at error: %s\n", r.error().message.c_str());
+        std::abort();
+    }
     ctx.c = std::move(*r);
 }
-double work_matmul(const BenchConfig& c) { return 2.0 * c.m * c.n * c.k; }
+double work_matmul(const BenchConfig& c)
+{ return 2.0 * c.m * c.n * c.k; }
 
 void setup_batched(ComputeEngine& e, const BenchConfig& c, OpCtx& ctx)
 {
@@ -325,10 +348,15 @@ void setup_batched(ComputeEngine& e, const BenchConfig& c, OpCtx& ctx)
 void run_batched(ComputeEngine& e, const BenchConfig& c, OpCtx& ctx)
 {
     auto r = e.batched_matmul(ctx.a, ctx.b, c.batch);
-    if (!r) { std::printf("batched_matmul error: %s\n", r.error().message.c_str()); std::abort(); }
+    if (!r)
+    {
+        std::printf("batched_matmul error: %s\n", r.error().message.c_str());
+        std::abort();
+    }
     ctx.c = std::move(*r);
 }
-double work_batched(const BenchConfig& c) { return 2.0 * c.batch * c.m * c.n * c.k; }
+double work_batched(const BenchConfig& c)
+{ return 2.0 * c.batch * c.m * c.n * c.k; }
 
 void setup_add(ComputeEngine& e, const BenchConfig& c, OpCtx& ctx)
 {
@@ -336,41 +364,34 @@ void setup_add(ComputeEngine& e, const BenchConfig& c, OpCtx& ctx)
     ctx.b = make_input(e, c.m, c.n);
 }
 void run_add(ComputeEngine& e, const BenchConfig&, OpCtx& ctx)
-{
-    (void)e.add_inplace(ctx.a, ctx.b);
-}
-double bytes_add(const BenchConfig& c) { return 3.0 * c.m * c.n * sizeof(Scalar); }
+{ (void)e.add_inplace(ctx.a, ctx.b); }
+double bytes_add(const BenchConfig& c)
+{ return 3.0 * c.m * c.n * sizeof(Scalar); }
 
 void setup_exp(ComputeEngine& e, const BenchConfig& c, OpCtx& ctx)
-{
-    ctx.a = make_input(e, c.m, c.n);
-}
-double bytes_binary(const BenchConfig& c) { return 2.0 * c.m * c.n * sizeof(Scalar); }
+{ ctx.a = make_input(e, c.m, c.n); }
+double bytes_binary(const BenchConfig& c)
+{ return 2.0 * c.m * c.n * sizeof(Scalar); }
 
 void run_row_reduce(ComputeEngine& e, const BenchConfig&, OpCtx& ctx)
-{
-    ctx.c = *e.row_reduce_sum(ctx.a);
-}
+{ ctx.c = *e.row_reduce_sum(ctx.a); }
 void run_col_reduce(ComputeEngine& e, const BenchConfig&, OpCtx& ctx)
-{
-    ctx.c = *e.col_reduce_sum(ctx.a);
-}
+{ ctx.c = *e.col_reduce_sum(ctx.a); }
 // 归约实际搬运 = 读全矩阵 (m*n) + 写输出（row_reduce 输出 (m,1) → m 个；
 // col_reduce 输出 (1,n) → n 个）。**不能记 2*m*n**——输出只有向量级，按全量
 // 记会把 GB/s 虚高 ~2×（5244² 下虚报 440 GB/s，超过 448 理论峰值，物理不可能）。
-double bytes_row_reduce(const BenchConfig& c) { return (c.m * c.n + c.m) * sizeof(Scalar); }
-double bytes_col_reduce(const BenchConfig& c) { return (c.m * c.n + c.n) * sizeof(Scalar); }
+double bytes_row_reduce(const BenchConfig& c)
+{ return (c.m * c.n + c.m) * sizeof(Scalar); }
+double bytes_col_reduce(const BenchConfig& c)
+{ return (c.m * c.n + c.n) * sizeof(Scalar); }
 
 void run_transpose(ComputeEngine& e, const BenchConfig&, OpCtx& ctx)
-{
-    ctx.c = *e.transpose(ctx.a);
-}
-double bytes_transpose(const BenchConfig& c) { return 2.0 * c.m * c.n * sizeof(Scalar); }
+{ ctx.c = *e.transpose(ctx.a); }
+double bytes_transpose(const BenchConfig& c)
+{ return 2.0 * c.m * c.n * sizeof(Scalar); }
 
 void run_scale(ComputeEngine& e, const BenchConfig&, OpCtx& ctx)
-{
-    (void)e.scale_inplace(ctx.a, Scalar{0.5f});
-}
+{ (void)e.scale_inplace(ctx.a, Scalar{0.5f}); }
 
 // ── RLA / RAPT 扫描原语（P4-2b）：状态扫描的顺序依赖是靠 barrier 串起来的，
 //    kernel 天生是**延迟敏感**而非吞吐敏感型 —— 所以口径记 ms（附 GFLOPS 仅作
@@ -387,15 +408,16 @@ Tensor make_zeros(ComputeEngine& e, std::size_t rows, std::size_t cols)
     return std::move(*t);
 }
 
-Tensor make_scan_input(ComputeEngine& e, const BenchConfig& c,
-                       std::size_t rows, std::size_t cols)
-{
-    return c.f16 ? make_input_f16(e, rows, cols) : make_input(e, rows, cols);
-}
+Tensor make_scan_input(ComputeEngine& e, const BenchConfig& c, std::size_t rows, std::size_t cols)
+{ return c.f16 ? make_input_f16(e, rows, cols) : make_input(e, rows, cols); }
 
 void setup_scan_prefix(ComputeEngine& e, const BenchConfig& c, OpCtx& ctx)
 {
-    if (c.heads == 0 || c.dk == 0) { std::printf("scan_prefix: heads/dk 不能为 0\n"); std::abort(); }
+    if (c.heads == 0 || c.dk == 0)
+    {
+        std::printf("scan_prefix: heads/dk 不能为 0\n");
+        std::abort();
+    }
     const std::size_t rows = c.batch * c.heads * c.dk;
     ctx.a = make_scan_input(e, c, rows, c.seq);            // K
     ctx.b = make_scan_input(e, c, rows, c.seq);            // V
@@ -407,11 +429,15 @@ void setup_scan_prefix(ComputeEngine& e, const BenchConfig& c, OpCtx& ctx)
 }
 void run_scan_prefix(ComputeEngine& e, const BenchConfig& c, OpCtx& ctx)
 {
-    auto r = e.scan_prefix_outer(ctx.a, ctx.b, ctx.extra[0], ctx.extra[1],
-                                 ctx.extra[2], ctx.extra[3], /*has_state=*/true,
-                                 c.dk, c.heads, /*causal=*/true, ctx.aux, /*has_bnd=*/true,
-                                 c.f16 ? nn::Precision::F16 : nn::Precision::F32);
-    if (!r) { std::printf("scan_prefix error: %s\n", r.error().message.c_str()); std::abort(); }
+    auto r =
+        e.scan_prefix_outer(ctx.a, ctx.b, ctx.extra[0], ctx.extra[1], ctx.extra[2], ctx.extra[3],
+                            /*has_state=*/true, c.dk, c.heads, /*causal=*/true, ctx.aux,
+                            /*has_bnd=*/true, c.f16 ? nn::Precision::F16 : nn::Precision::F32);
+    if (!r)
+    {
+        std::printf("scan_prefix error: %s\n", r.error().message.c_str());
+        std::abort();
+    }
     ctx.c = std::move(*r);
 }
 // 每 (t, 头) 的浮点工作量：[0)/[1)/[2) 三个 dk×dk 的 matvec = 3·2dk²，[3)/[4)
@@ -419,13 +445,16 @@ void run_scan_prefix(ComputeEngine& e, const BenchConfig& c, OpCtx& ctx)
 double flops_scan_prefix(const BenchConfig& c)
 {
     return 6.0 * static_cast<double>(c.dk) * static_cast<double>(c.dk) *
-           static_cast<double>(c.heads) * static_cast<double>(c.batch) *
-           static_cast<double>(c.seq);
+           static_cast<double>(c.heads) * static_cast<double>(c.batch) * static_cast<double>(c.seq);
 }
 
 void setup_scan_suffix(ComputeEngine& e, const BenchConfig& c, OpCtx& ctx)
 {
-    if (c.heads == 0 || c.dk == 0) { std::printf("scan_suffix: heads/dk 不能为 0\n"); std::abort(); }
+    if (c.heads == 0 || c.dk == 0)
+    {
+        std::printf("scan_suffix: heads/dk 不能为 0\n");
+        std::abort();
+    }
     const std::size_t rows = c.batch * c.heads * c.dk;
     ctx.extra.push_back(make_scan_input(e, c, rows * c.dk, c.seq));   // D (B*H*dk², seq)
     ctx.a = make_scan_input(e, c, rows, c.seq);            // X
@@ -434,13 +463,18 @@ void setup_scan_suffix(ComputeEngine& e, const BenchConfig& c, OpCtx& ctx)
 }
 void run_scan_suffix(ComputeEngine& e, const BenchConfig& c, OpCtx& ctx)
 {
-    auto r = e.scan_suffix_outer(ctx.extra[0], ctx.a, ctx.b,
-                                 c.dk, c.heads, /*causal=*/true, ctx.aux, /*has_bnd=*/true,
-                                 c.f16 ? nn::Precision::F16 : nn::Precision::F32);
-    if (!r) { std::printf("scan_suffix error: %s\n", r.error().message.c_str()); std::abort(); }
+    auto r =
+        e.scan_suffix_outer(ctx.extra[0], ctx.a, ctx.b, c.dk, c.heads, /*causal=*/true, ctx.aux,
+                            /*has_bnd=*/true, c.f16 ? nn::Precision::F16 : nn::Precision::F32);
+    if (!r)
+    {
+        std::printf("scan_suffix error: %s\n", r.error().message.c_str());
+        std::abort();
+    }
     ctx.c = std::move(*r);
 }
-double flops_scan_suffix(const BenchConfig& c) { return flops_scan_prefix(c); }
+double flops_scan_suffix(const BenchConfig& c)
+{ return flops_scan_prefix(c); }
 
 // ── 三值打包权重 GEMM（P2 / F3）与稠密 GEMM 的配对 A/B ───────────────────
 // 口径（docs 21 §5 的 P2 准入门槛）：同一 (m,k)·(k,n) 形状、同一份随机数造的
@@ -454,8 +488,7 @@ double flops_scan_suffix(const BenchConfig& c) { return flops_scan_prefix(c); }
 // --f16 时打包侧跑 f16 存储变体（B/C 均 half）= BitLinear 的 compute=f16 路径。
 
 // 造 latent (rows,len) → τ 逐行 absmean → 引擎 trit_pack（即被测路径本身）
-void make_packed(ComputeEngine& e, std::size_t rows, std::size_t len,
-                 Tensor& packed, Tensor& tau)
+void make_packed(ComputeEngine& e, std::size_t rows, std::size_t len, Tensor& packed, Tensor& tau)
 {
     if (!e.describe().ternary_gemm)
     {
@@ -466,7 +499,8 @@ void make_packed(ComputeEngine& e, std::size_t rows, std::size_t len,
     std::mt19937 g(4321u);
     std::uniform_real_distribution<Scalar> d(-1.0f, 1.0f);
     auto s = w.span();
-    for (std::size_t i = 0; i < s.size(); ++i) s[i] = d(g);
+    for (std::size_t i = 0; i < s.size(); ++i)
+        s[i] = d(g);
     Matrix tm(rows, 1);
     for (std::size_t r = 0; r < rows; ++r)
     {
@@ -477,7 +511,11 @@ void make_packed(ComputeEngine& e, std::size_t rows, std::size_t len,
     }
     auto wt = e.from_matrix(std::move(w));
     auto tt = e.from_matrix(std::move(tm));
-    if (!wt || !tt) { std::printf("matmul_q setup: 上传失败\n"); std::abort(); }
+    if (!wt || !tt)
+    {
+        std::printf("matmul_q setup: 上传失败\n");
+        std::abort();
+    }
     auto pk = e.trit_pack(*wt, *tt);
     if (!pk)
     {
@@ -495,7 +533,8 @@ Tensor make_input_f16(ComputeEngine& e, std::size_t rows, std::size_t cols)
     std::mt19937 g(1234u);
     std::uniform_real_distribution<Scalar> d(-1.0f, 1.0f);
     auto s = m.span();
-    for (std::size_t i = 0; i < s.size(); ++i) s[i] = d(g);
+    for (std::size_t i = 0; i < s.size(); ++i)
+        s[i] = d(g);
     auto t = e.from_matrix(std::move(m), nn::Precision::F16);
     if (!t) std::abort();
     return std::move(*t);
@@ -509,7 +548,11 @@ void setup_matmul_q(ComputeEngine& e, const BenchConfig& c, OpCtx& ctx)
 void run_matmul_q(ComputeEngine& e, const BenchConfig& c, OpCtx& ctx)
 {
     auto r = e.matmul_q(ctx.a, ctx.aux, ctx.b, c.f16 ? nn::Precision::F16 : nn::Precision::F32);
-    if (!r) { std::printf("matmul_q error: %s\n", r.error().message.c_str()); std::abort(); }
+    if (!r)
+    {
+        std::printf("matmul_q error: %s\n", r.error().message.c_str());
+        std::abort();
+    }
     ctx.c = std::move(*r);
 }
 // A 存 (K,M)：τ 按**存储行** k 取（转发形态，反向 dX 走这条）
@@ -520,14 +563,20 @@ void setup_matmul_q_t(ComputeEngine& e, const BenchConfig& c, OpCtx& ctx)
 }
 void run_matmul_q_t(ComputeEngine& e, const BenchConfig& c, OpCtx& ctx)
 {
-    auto r = e.matmul_q_t(ctx.a, ctx.aux, ctx.b, c.m,
-                          c.f16 ? nn::Precision::F16 : nn::Precision::F32);
-    if (!r) { std::printf("matmul_q_t error: %s\n", r.error().message.c_str()); std::abort(); }
+    auto r =
+        e.matmul_q_t(ctx.a, ctx.aux, ctx.b, c.m, c.f16 ? nn::Precision::F16 : nn::Precision::F32);
+    if (!r)
+    {
+        std::printf("matmul_q_t error: %s\n", r.error().message.c_str());
+        std::abort();
+    }
     ctx.c = std::move(*r);
 }
 // 权重带宽口径：打包 A 的实际字节（m*k/4 B）+ τ（4 B/存储行）
-double bytes_packed(const BenchConfig& c) { return c.m * c.k / 4.0 + 4.0 * c.m; }
-double bytes_packed_t(const BenchConfig& c) { return c.m * c.k / 4.0 + 4.0 * c.k; }
+double bytes_packed(const BenchConfig& c)
+{ return c.m * c.k / 4.0 + 4.0 * c.m; }
+double bytes_packed_t(const BenchConfig& c)
+{ return c.m * c.k / 4.0 + 4.0 * c.k; }
 
 const std::vector<OpSpec>& op_registry()
 {
@@ -581,7 +630,11 @@ void bench_op(ComputeEngine& engine, const BenchConfig& cfg, const OpSpec& spec)
     if (cfg.hash)
     {
         auto out_m = engine.to_matrix(ctx.c);
-        if (!out_m) { std::printf("  哈希：to_matrix 失败\n"); std::abort(); }
+        if (!out_m)
+        {
+            std::printf("  哈希：to_matrix 失败\n");
+            std::abort();
+        }
         std::uint64_t h = 1469598103934665603ull;
         for (const auto& v : out_m->span())
         {
@@ -630,8 +683,7 @@ void bench_layer(ComputeEngine& engine, const BenchConfig& cfg, const LayerSpec&
     for (int i = 0; i < cfg.warmup; ++i)
     {
         (void)model.forward(x);
-        if (!cfg.forward_only)
-            (void)model.backward(grad);
+        if (!cfg.forward_only) (void)model.backward(grad);
     }
 
     // 计时
@@ -683,7 +735,8 @@ void print_help(const char* prog)
     help.opt("--f16", "打包算子 (matmul_q*) 跑 f16 存储变体 (B/C 均 half)");
     help.opt("--iter <n>", "迭代次数 (默认: 10)");
     help.opt("--warmup <n>", "预热次数 (默认: 2)");
-    help.opt("--inner <n>", "每次计时内重复执行次数 (默认: 1；小 n 的 GEMM 用它摊薄\nsubmit/wait 固定开销 —— 否则测到的是启动开销不是内核)");
+    help.opt("--inner <n>", "每次计时内重复执行次数 (默认: 1；小 n 的 GEMM 用它摊薄\nsubmit/wait "
+                            "固定开销 —— 否则测到的是启动开销不是内核)");
     help.opt("--in/--out <n>", "Linear 输入/输出维度");
     help.opt("--dmodel/--heads/--dff <n>", "序列层维度");
     help.opt("--batch/--seq <n>", "batch / 序列长度");
@@ -730,14 +783,27 @@ int main(int argc, char* argv[])
             std::string cur;
             for (char ch : val)
             {
-                if (ch == ',') { if (!cur.empty()) cfg.layers.push_back(cur); cur.clear(); }
+                if (ch == ',')
+                {
+                    if (!cur.empty()) cfg.layers.push_back(cur);
+                    cur.clear();
+                }
                 else cur.push_back(ch);
             }
             if (!cur.empty()) cfg.layers.push_back(cur);
         }
-        else if (a == "--iter" && i + 1 < argc) { cfg.iter = static_cast<int>(parse_size(argv[++i])); }
-        else if (a == "--warmup" && i + 1 < argc) { cfg.warmup = static_cast<int>(parse_size(argv[++i])); }
-        else if (a == "--inner" && i + 1 < argc) { cfg.inner = static_cast<int>(parse_size(argv[++i])); }
+        else if (a == "--iter" && i + 1 < argc)
+        {
+            cfg.iter = static_cast<int>(parse_size(argv[++i]));
+        }
+        else if (a == "--warmup" && i + 1 < argc)
+        {
+            cfg.warmup = static_cast<int>(parse_size(argv[++i]));
+        }
+        else if (a == "--inner" && i + 1 < argc)
+        {
+            cfg.inner = static_cast<int>(parse_size(argv[++i]));
+        }
         else if (a == "--in") { cfg.in = parse_size(argv[++i]); }
         else if (a == "--out") { cfg.out = parse_size(argv[++i]); }
         else if (a == "--dmodel") { cfg.dmodel = parse_size(argv[++i]); }
@@ -757,7 +823,11 @@ int main(int argc, char* argv[])
             std::string cur;
             for (char ch : val)
             {
-                if (ch == ',') { if (!cur.empty()) cfg.ops.push_back(cur); cur.clear(); }
+                if (ch == ',')
+                {
+                    if (!cur.empty()) cfg.ops.push_back(cur);
+                    cur.clear();
+                }
                 else cur.push_back(ch);
             }
             if (!cur.empty()) cfg.ops.push_back(cur);
@@ -767,8 +837,16 @@ int main(int argc, char* argv[])
         else if (a == "--k") { cfg.k = parse_size(argv[++i]); }
         else if (a == "--dk") { cfg.dk = parse_size(argv[++i]); }
         else if (a == "--hash") { cfg.hash = true; }
-        else if (a == "--help" || a == "-h") { print_help(argv[0]); return 0; }
-        else { std::printf("未知参数: %s（--help 查看用法）\n", a.c_str()); return 2; }
+        else if (a == "--help" || a == "-h")
+        {
+            print_help(argv[0]);
+            return 0;
+        }
+        else
+        {
+            std::printf("未知参数: %s（--help 查看用法）\n", a.c_str());
+            return 2;
+        }
     }
 
     // 选择引擎（CPU/GPU），失败硬报错不回退
@@ -777,8 +855,7 @@ int main(int argc, char* argv[])
     NN_EXIT(engine_r, 2, "引擎创建失败: %s\n");
     ComputeEngine& engine = **engine_r;
     const bool op_mode = !cfg.ops.empty();
-    std::printf("=== layer_bench (%s%s) ===\n",
-                cfg.gpu ? "GPU" : "CPU",
+    std::printf("=== layer_bench (%s%s) ===\n", cfg.gpu ? "GPU" : "CPU",
                 op_mode ? ", ops" : (cfg.forward_only ? ", forward-only" : ", fwd+bwd"));
 
     // 算子模式：--op <name|all>
@@ -790,13 +867,19 @@ int main(int argc, char* argv[])
         {
             if (want == "all")
             {
-                for (const auto& s : oreg) to_run.push_back(&s);
+                for (const auto& s : oreg)
+                    to_run.push_back(&s);
                 continue;
             }
             bool found = false;
             for (const auto& s : oreg)
             {
-                if (want == s.name) { to_run.push_back(&s); found = true; break; }
+                if (want == s.name)
+                {
+                    to_run.push_back(&s);
+                    found = true;
+                    break;
+                }
             }
             if (!found) std::printf("未知算子: %s\n", want.c_str());
         }
@@ -815,7 +898,8 @@ int main(int argc, char* argv[])
     const auto& reg = layer_registry();
     if (cfg.all)
     {
-        for (const auto& s : reg) to_run.push_back(&s);
+        for (const auto& s : reg)
+            to_run.push_back(&s);
     }
     else if (!cfg.layers.empty())
     {
@@ -824,7 +908,12 @@ int main(int argc, char* argv[])
             bool found = false;
             for (const auto& s : reg)
             {
-                if (want == s.name) { to_run.push_back(&s); found = true; break; }
+                if (want == s.name)
+                {
+                    to_run.push_back(&s);
+                    found = true;
+                    break;
+                }
             }
             if (!found) std::printf("未知层: %s\n", want.c_str());
         }

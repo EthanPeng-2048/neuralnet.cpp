@@ -63,4 +63,3 @@
 // 注：训练驱动 `text_trainer.hpp`（L5：数据集 + 样本 + 循环）**不**进聚合头，
 // 需要时 include 薄转发头 `train.hpp` 或直接 include `text_trainer.hpp`。
 // 训练配方 `text_train_config.hpp` 随 train.hpp / text_trainer.hpp 一起提供。
-

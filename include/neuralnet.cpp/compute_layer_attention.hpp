@@ -70,35 +70,34 @@ enum class AttnMaskKind
 // fold 构造：掩码 × 位置偏置两个正交维度；生成的 IR 指令顺序固定为
 //   掩码（causal → doc）→ ALiBi 斜率项，与拆分前的 5 个融合变体逐指令一致。
 [[nodiscard]] inline ExprSpec make_fold_attn_o(std::uint32_t seq, std::uint32_t dk,
-                                               std::uint32_t bh, AttnMaskKind mask,
-                                               bool score_bias,
+                                               std::uint32_t bh, AttnMaskKind mask, bool score_bias,
                                                std::uint32_t kv_ratio = 1)
 {
     ExprSpec s;
     FoldSpec f;
-    f.k             = seq;
-    f.num_state     = 2;                       // 0 = m, 1 = l
-    f.inits         = { -std::numeric_limits<Scalar>::infinity(), Scalar{0} };
+    f.k = seq;
+    f.num_state = 2;                       // 0 = m, 1 = l
+    f.inits = {-std::numeric_limits<Scalar>::infinity(), Scalar{0}};
     f.vec_state_len = dk;
-    f.matmul        = MatmulSpec{ 0, 1, 1, 0, dk, bh };  // A=Q(trans), B=K, k=dk, batch=bh
+    f.matmul = MatmulSpec{0, 1, 1, 0, dk, bh};  // A=Q(trans), B=K, k=dk, batch=bh
     // 常量：c0 = 0（拷贝/中性元）、c1 = -inf（掩码屏蔽）
-    s.consts = { Scalar{0}, -std::numeric_limits<Scalar>::infinity() };
+    s.consts = {Scalar{0}, -std::numeric_limits<Scalar>::infinity()};
     // 输入/视图槽位（与掩码策略 append_fold_inputs 的追加顺序约定一致）：
     //   0=Q 1=K 2=V_t；[slopes (1,bh)→BatchMod]；[doc_col (BH*seq,1)→RowBroadcast]；
     //   [doc_ids (1,bh*seq)→BatchCol(seq)]
     const bool has_slope = score_bias;
-    const bool has_doc   = (mask == AttnMaskKind::CausalDoc);
+    const bool has_doc = (mask == AttnMaskKind::CausalDoc);
     const bool has_causal = (mask != AttnMaskKind::Plain);
     f.tri_skip = has_causal;   // 生成器据此钳 valid（整块/边界跳过 -inf 区）
-    s.views = { linear(), linear(), linear() };
+    s.views = {linear(), linear(), linear()};
     // GQA（docs 22 §3.2 P2）：K/V_t 只存 bh/kv_ratio 份行块（块映射）
     //   —— 挂成 HeadGroup 视图，比率走运行期 vp 槽（不进 key → 任意 n_rep
     //   共用一份 shader）。kv_ratio==1 时保持 linear()，既有结构逐字节不变。
     if (kv_ratio > 1)
     {
-        s.views[1].kind  = static_cast<std::uint8_t>(ExprViewKind::HeadGroup);
+        s.views[1].kind = static_cast<std::uint8_t>(ExprViewKind::HeadGroup);
         s.views[1].param = kv_ratio;
-        s.views[2].kind  = static_cast<std::uint8_t>(ExprViewKind::HeadGroup);
+        s.views[2].kind = static_cast<std::uint8_t>(ExprViewKind::HeadGroup);
         s.views[2].param = kv_ratio;
     }
     std::uint8_t slot_slope = 0, slot_dc = 0, slot_ids = 0;
@@ -115,13 +114,13 @@ enum class AttnMaskKind
         s.views.push_back(batch_col(seq));           // doc_ids：b[batch*seq + col]
     }
 
-    const auto ins = [](ExprOp op, std::uint8_t dst, ExprOperand a,
-                        ExprOperand b = {}) {
+    const auto ins = [](ExprOp op, std::uint8_t dst, ExprOperand a, ExprOperand b = {})
+    {
         ExprInstr i;
-        i.op  = static_cast<uint8_t>(op);
+        i.op = static_cast<uint8_t>(op);
         i.dst = dst;
-        i.a   = a;
-        i.b   = b;
+        i.a = a;
+        i.b = b;
         return i;
     };
     std::uint8_t nreg = 2;                     // 状态占 0..1，临时从 2 递增
@@ -138,11 +137,11 @@ enum class AttnMaskKind
         const uint8_t sel = nreg++;            // Select(gt, c1=-inf, c0=0)
         {
             ExprInstr isel;                     // 三操作数指令：手填 c 字段
-            isel.op  = static_cast<uint8_t>(ExprOp::Select);
+            isel.op = static_cast<uint8_t>(ExprOp::Select);
             isel.dst = sel;
-            isel.a   = reg(gt);
-            isel.b   = cst(1);
-            isel.c   = cst(0);
+            isel.a = reg(gt);
+            isel.b = cst(1);
+            isel.c = cst(0);
             body.push_back(isel);
         }
         const uint8_t sm = nreg++;             // S + 屏蔽项
@@ -158,11 +157,11 @@ enum class AttnMaskKind
         const uint8_t ds = nreg++;
         {
             ExprInstr isel;
-            isel.op  = static_cast<uint8_t>(ExprOp::Select);
+            isel.op = static_cast<uint8_t>(ExprOp::Select);
             isel.dst = ds;
-            isel.a   = reg(ne);
-            isel.b   = cst(1);
-            isel.c   = cst(0);
+            isel.a = reg(ne);
+            isel.b = cst(1);
+            isel.c = cst(0);
             body.push_back(isel);
         }
         const uint8_t sm = nreg++;
@@ -201,17 +200,17 @@ enum class AttnMaskKind
     body.push_back(ins(ExprOp::Add, 1, reg(la), reduce(blk_l)));      // l ← 状态更新
 
     // ── vecacc：O *= α；O += Σ_块 e·V_t ──
-    f.vecacc  = VecAccSpec{ 0, weight, 2, alpha, 1 };
-    f.body    = std::move(body);
+    f.vecacc = VecAccSpec{0, weight, 2, alpha, 1};
+    f.body = std::move(body);
     // ── 向量域 finalize：out[d] = O[d] / l ──
     // dst 必须用**临时寄存器**（新号）：向量域逐列循环执行，若 dst 复用被读
     // 状态（如 l），第 1 列的输出会覆盖除数 → 第 2 列起读到被污染的值
     // （实测 0.4 = 10/25：l=4 被首列输出 25 覆盖）。
     {
         const uint8_t fout = nreg++;
-        f.finalize = { ins(ExprOp::Div, fout, nn::expr::vec_state(0), reg(1)) };
+        f.finalize = {ins(ExprOp::Div, fout, nn::expr::vec_state(0), reg(1))};
     }
-    s.fold     = std::move(f);
+    s.fold = std::move(f);
     s.num_regs = nreg;
     return s;
 }
@@ -246,13 +245,12 @@ inline constexpr AttnMaskKind kMaskKinds[] = {
     constexpr std::uint32_t seq = 64, dk = 2, bh = 2;
     for (const AttnMaskKind mask : kMaskKinds)
     {
-        for (const bool score_bias : { false, true })
+        for (const bool score_bias : {false, true})
         {
             if (mask == AttnMaskKind::Plain && score_bias)
                 continue;   // 无掩码 + 位置偏置：本仓不构造该组合
-            for (const std::uint32_t kv_ratio : { 1u, 2u })
-                (void)dsl::FoldAnchor{
-                    make_fold_attn_o(seq, dk, bh, mask, score_bias, kv_ratio) };
+            for (const std::uint32_t kv_ratio : {1u, 2u})
+                (void)dsl::FoldAnchor{make_fold_attn_o(seq, dk, bh, mask, score_bias, kv_ratio)};
         }
     }
     return true;
@@ -305,8 +303,8 @@ public:
     [[nodiscard]] virtual expr::AttnMaskKind mask_kind() const noexcept = 0;
 
     // 每步准备掩码输入张量（无掩码分量 = no-op）
-    [[nodiscard]] virtual Result<void> prepare(
-        ComputeEngine& /*engine*/, std::size_t /*batch*/, std::size_t /*seq*/)
+    [[nodiscard]] virtual Result<void> prepare(ComputeEngine& /*engine*/, std::size_t /*batch*/,
+                                               std::size_t /*seq*/)
     { return {}; }
 
     // fold 输入追加：顺序必须与 make_fold_attn_o 的 views 顺序一致
@@ -315,10 +313,10 @@ public:
 
     // 反向：S = mask(Q·Kᵀ)（DSL 文本 —— 与 forward fold 掩码语义同构；
     //   位置偏置由位置编码策略另行叠加，见 PositionEncoder::apply_score_bias）
-    [[nodiscard]] virtual Result<Tensor> masked_scores(
-        ComputeEngine& engine, const Tensor& Q, const Tensor& K,
-        std::size_t BH, std::size_t seq, const PrecisionProfile& p,
-        std::uint32_t kv_ratio) const = 0;
+    [[nodiscard]] virtual Result<Tensor> masked_scores(ComputeEngine& engine, const Tensor& Q,
+                                                       const Tensor& K, std::size_t BH,
+                                                       std::size_t seq, const PrecisionProfile& p,
+                                                       std::uint32_t kv_ratio) const = 0;
 
     // 文档 id 注入（仅文档感知策略覆写；其余 no-op = 无文档掩码）
     virtual void set_doc_ids(std::span<const std::size_t> /*ids*/) {}
@@ -331,10 +329,10 @@ public:
     [[nodiscard]] expr::AttnMaskKind mask_kind() const noexcept override
     { return expr::AttnMaskKind::Plain; }
 
-    [[nodiscard]] Result<Tensor> masked_scores(
-        ComputeEngine& engine, const Tensor& Q, const Tensor& K,
-        std::size_t BH, std::size_t /*seq*/, const PrecisionProfile& p,
-        std::uint32_t kv_ratio) const override
+    [[nodiscard]] Result<Tensor> masked_scores(ComputeEngine& engine, const Tensor& Q,
+                                               const Tensor& K, std::size_t BH, std::size_t /*seq*/,
+                                               const PrecisionProfile& p,
+                                               std::uint32_t kv_ratio) const override
     {
         return dsl::compute(engine, dsl::matmul_kv(Q, K, true, false, BH, 1, kv_ratio),
                             p.compute);   // 输出 (BH·seq, seq) 由 matmul 段推导
@@ -351,17 +349,15 @@ public:
     [[nodiscard]] expr::AttnMaskKind mask_kind() const noexcept override
     { return expr::AttnMaskKind::Causal; }
 
-    [[nodiscard]] Result<Tensor> masked_scores(
-        ComputeEngine& engine, const Tensor& Q, const Tensor& K,
-        std::size_t BH, std::size_t seq, const PrecisionProfile& p,
-        std::uint32_t kv_ratio) const override
+    [[nodiscard]] Result<Tensor> masked_scores(ComputeEngine& engine, const Tensor& Q,
+                                               const Tensor& K, std::size_t BH, std::size_t seq,
+                                               const PrecisionProfile& p,
+                                               std::uint32_t kv_ratio) const override
     {
         const auto scores = dsl::matmul_kv(Q, K, true, false, BH, 1, kv_ratio);
-        const auto causal = dsl::select(dsl::col() > dsl::row(),
-                                        Scalar{1}, Scalar{0});
-        return dsl::compute(engine,
-            scores + dsl::select(causal != Scalar{0}, kNegInf, Scalar{0}),
-            BH * seq, seq, p.compute);
+        const auto causal = dsl::select(dsl::col() > dsl::row(), Scalar{1}, Scalar{0});
+        return dsl::compute(engine, scores + dsl::select(causal != Scalar{0}, kNegInf, Scalar{0}),
+                            BH * seq, seq, p.compute);
     }
 };
 
@@ -380,7 +376,12 @@ public:
 
     void set_doc_ids(std::span<const std::size_t> ids) override
     {
-        if (ids.empty()) { doc_ids_.clear(); has_doc_ids_ = false; return; }
+        if (ids.empty())
+        {
+            doc_ids_.clear();
+            has_doc_ids_ = false;
+            return;
+        }
         doc_ids_.assign(ids.begin(), ids.end());
         has_doc_ids_ = true;
     }
@@ -390,8 +391,8 @@ public:
     [[nodiscard]] expr::AttnMaskKind mask_kind() const noexcept override
     { return expr::AttnMaskKind::CausalDoc; }
 
-    [[nodiscard]] Result<void> prepare(
-        ComputeEngine& engine, std::size_t batch, std::size_t seq) override
+    [[nodiscard]] Result<void> prepare(ComputeEngine& engine, std::size_t batch,
+                                       std::size_t seq) override
     {
         // 文档感知：doc_ids_ 每 step 变化，每步重建（小张量 O(BH*seq)）。
         // doc_ids_cache_ 为 (1, BH*seq) 布局——每 (b,h) 块重复 doc_ids[b*seq..]
@@ -403,8 +404,7 @@ public:
         for (std::size_t b = 0; b < batch; ++b)
             for (std::size_t h = 0; h < num_heads_; ++h)
                 for (std::size_t i = 0; i < seq; ++i)
-                    d[(b * num_heads_ + h) * seq + i] =
-                        static_cast<Scalar>(doc_ids_[b * seq + i]);
+                    d[(b * num_heads_ + h) * seq + i] = static_cast<Scalar>(doc_ids_[b * seq + i]);
         auto t = detail::upload_span(engine, 1, BH * seq, Precision::F32, std::span(d));
         NN_TRY_CHECK(t);
         doc_ids_cache_ = std::move(*t);
@@ -419,8 +419,7 @@ public:
         else
         {
             // CPU：直接构造目标形状，避免为一个小表引入额外转置遍历。
-            auto tc = detail::upload_span(engine, BH * seq, 1, Precision::F32,
-                                          std::span(d));
+            auto tc = detail::upload_span(engine, BH * seq, 1, Precision::F32, std::span(d));
             NN_TRY_CHECK(tc);
             doc_col_ = std::move(*tc);
         }
@@ -433,20 +432,18 @@ public:
         io.push_back(doc_ids_cache_);
     }
 
-    [[nodiscard]] Result<Tensor> masked_scores(
-        ComputeEngine& engine, const Tensor& Q, const Tensor& K,
-        std::size_t BH, std::size_t seq, const PrecisionProfile& p,
-        std::uint32_t kv_ratio) const override
+    [[nodiscard]] Result<Tensor> masked_scores(ComputeEngine& engine, const Tensor& Q,
+                                               const Tensor& K, std::size_t BH, std::size_t seq,
+                                               const PrecisionProfile& p,
+                                               std::uint32_t kv_ratio) const override
     {
         const auto scores = dsl::matmul_kv(Q, K, true, false, BH, 1, kv_ratio);
-        const auto causal = dsl::select(dsl::col() > dsl::row(),
-                                        Scalar{1}, Scalar{0});
-        const auto blocked = causal + dsl::select(
-            dsl::row_broadcast(doc_col_) != dsl::batch_col(doc_ids_cache_, seq),
-            Scalar{1}, Scalar{0});
-        return dsl::compute(engine,
-            scores + dsl::select(blocked != Scalar{0}, kNegInf, Scalar{0}),
-            BH * seq, seq, p.compute);
+        const auto causal = dsl::select(dsl::col() > dsl::row(), Scalar{1}, Scalar{0});
+        const auto blocked = causal + dsl::select(dsl::row_broadcast(doc_col_) !=
+                                                      dsl::batch_col(doc_ids_cache_, seq),
+                                                  Scalar{1}, Scalar{0});
+        return dsl::compute(engine, scores + dsl::select(blocked != Scalar{0}, kNegInf, Scalar{0}),
+                            BH * seq, seq, p.compute);
     }
 };
 
@@ -571,37 +568,31 @@ protected:
     }
 
 public:
-    AttentionBase(std::size_t d_model, std::size_t num_heads,
-                  std::size_t seq_len = 0,
-                  bool subln = false,
-                  NormType subln_norm_type = NormType::LayerNorm,
-                  std::size_t n_head_kv = 0,
-                  WeightQuant weight_quant = WeightQuant::None)
+    AttentionBase(std::size_t d_model, std::size_t num_heads, std::size_t seq_len = 0,
+                  bool subln = false, NormType subln_norm_type = NormType::LayerNorm,
+                  std::size_t n_head_kv = 0, WeightQuant weight_quant = WeightQuant::None)
         : d_model_(d_model), num_heads_(num_heads),
           n_head_kv_(n_head_kv == 0 ? num_heads : n_head_kv),
           kv_ratio_(num_heads / (n_head_kv == 0 ? num_heads : n_head_kv)),
-          d_k_(d_model / num_heads),
-          seq_len_(seq_len),
+          d_k_(d_model / num_heads), seq_len_(seq_len),
           scale_(Scalar{1} / std::sqrt(static_cast<Scalar>(d_model / num_heads))),
           w_q_(make_linear_layer(d_model, d_model, weight_quant)),
           // Linear(in_features, out_features)：GQA 只收窄**输出**宽度
           // （K/V 的 out = n_head_kv·d_k），输入侧仍是 d_model。
-          w_k_(make_linear_layer(
-              d_model, (n_head_kv == 0 ? num_heads : n_head_kv) * (d_model / num_heads),
-              weight_quant)),
-          w_v_(make_linear_layer(
-              d_model, (n_head_kv == 0 ? num_heads : n_head_kv) * (d_model / num_heads),
-              weight_quant)),
-          w_o_(make_linear_layer(d_model, d_model, weight_quant)),
-          weight_quant_(weight_quant)
+          w_k_(make_linear_layer(d_model,
+                                 (n_head_kv == 0 ? num_heads : n_head_kv) * (d_model / num_heads),
+                                 weight_quant)),
+          w_v_(make_linear_layer(d_model,
+                                 (n_head_kv == 0 ? num_heads : n_head_kv) * (d_model / num_heads),
+                                 weight_quant)),
+          w_o_(make_linear_layer(d_model, d_model, weight_quant)), weight_quant_(weight_quant)
     {
         NN_ASSERT_ALWAYS(d_model % num_heads == 0,
                          "AttentionBase: d_model must be divisible by num_heads");
         NN_ASSERT_ALWAYS(n_head_kv_ != 0 && num_heads % n_head_kv_ == 0,
                          "AttentionBase: num_heads must be divisible by n_head_kv");
         mask_ = std::make_unique<PlainScoreMask>();
-        if (subln)
-            attn_sub_norm_ = make_norm_layer(d_model, subln_norm_type);
+        if (subln) attn_sub_norm_ = make_norm_layer(d_model, subln_norm_type);
     }
 
     [[nodiscard]] PositionEncoder& position_encoder() noexcept { return *pos_; }
@@ -618,8 +609,8 @@ public:
     // 的那一份。非三值模式 split 退化为恒等 → 逐位不变。
     void set_precision_profile(const PrecisionProfile& profile) override
     {
-        const TernaryProfileSplit sp = split_ternary_profile(
-            layer_name(), profile, weight_quant_ == WeightQuant::T1_58);
+        const TernaryProfileSplit sp =
+            split_ternary_profile(layer_name(), profile, weight_quant_ == WeightQuant::T1_58);
         Layer::set_precision_profile(sp.self);
         w_q_->set_precision_profile(sp.linear);
         w_k_->set_precision_profile(sp.linear);
@@ -648,12 +639,13 @@ public:
                 for (std::size_t r = 0; r < d_k_; ++r)
                     idx[h * d_k_ + r] = static_cast<Scalar>(src + r);
             }
-            NN_TRY(gi, detail::upload_span(engine, num_heads_ * d_k_, 1,
-                                           Precision::F32, idx));
+            NN_TRY(gi, detail::upload_span(engine, num_heads_ * d_k_, 1, Precision::F32, idx));
             gqa_expand_idx_ = std::move(*gi);
         }
         // M6 段 C：softmax_ 是子 Layer（engine 由 init 绑定），否则 forward 内 fail-fast
-        { NN_TRY(r6, softmax_.init(engine)); }
+        {
+            NN_TRY(r6, softmax_.init(engine));
+        }
         // 注意力侧位置编码（RoPE/ALiBi 的 init 是 no-op；恒等策略同样 no-op）——
         // 按 M6 段 C 的不变量"复合层 init_impl 必须 init 全部子对象"统一调用。
         if (attn_sub_norm_) { NN_TRY(r7, attn_sub_norm_->init(engine)); }
@@ -662,8 +654,8 @@ public:
 
     std::vector<TensorRef> parameters() override
     {
-        auto r = collect_refs(w_q_->parameters(), w_k_->parameters(),
-                              w_v_->parameters(), w_o_->parameters());
+        auto r = collect_refs(w_q_->parameters(), w_k_->parameters(), w_v_->parameters(),
+                              w_o_->parameters());
         if (attn_sub_norm_)
         {
             auto s = attn_sub_norm_->parameters();
@@ -705,10 +697,7 @@ public:
     }
 
     // 文档感知：转发给掩码策略（非文档策略 = no-op，与旧"无 doc 钩子"一致）
-    void set_doc_ids(std::span<const std::size_t> ids) override
-    {
-        score_mask().set_doc_ids(ids);
-    }
+    void set_doc_ids(std::span<const std::size_t> ids) override { score_mask().set_doc_ids(ids); }
 
     void clear_cache() override
     {
@@ -731,11 +720,16 @@ public:
         if (Q_cache_.valid()) r.emplace_back(Q_cache_);
         if (K_cache_.valid()) r.emplace_back(K_cache_);
         if (V_cache_.valid()) r.emplace_back(V_cache_);
-        auto wq = w_q_->activation_cache(); r.insert(r.end(), wq.begin(), wq.end());
-        auto wk = w_k_->activation_cache(); r.insert(r.end(), wk.begin(), wk.end());
-        auto wv = w_v_->activation_cache(); r.insert(r.end(), wv.begin(), wv.end());
-        auto wo = w_o_->activation_cache(); r.insert(r.end(), wo.begin(), wo.end());
-        auto sm = softmax_.activation_cache(); r.insert(r.end(), sm.begin(), sm.end());
+        auto wq = w_q_->activation_cache();
+        r.insert(r.end(), wq.begin(), wq.end());
+        auto wk = w_k_->activation_cache();
+        r.insert(r.end(), wk.begin(), wk.end());
+        auto wv = w_v_->activation_cache();
+        r.insert(r.end(), wv.begin(), wv.end());
+        auto wo = w_o_->activation_cache();
+        r.insert(r.end(), wo.begin(), wo.end());
+        auto sm = softmax_.activation_cache();
+        r.insert(r.end(), sm.begin(), sm.end());
         if (attn_sub_norm_)
         {
             auto sn = attn_sub_norm_->activation_cache();
@@ -744,15 +738,13 @@ public:
         return r;
     }
 
-    [[nodiscard]] Result<Tensor> forward(
-        const Tensor& input) override
+    [[nodiscard]] Result<Tensor> forward(const Tensor& input) override
     {
         ComputeEngine& engine = engine_ref();
-        if (input.rows() != d_model_)
-            NN_FAIL("AttentionBase forward: input shape mismatch");
+        if (input.rows() != d_model_) NN_FAIL("AttentionBase forward: input shape mismatch");
         const std::size_t total_seq = input.cols();
-        const std::size_t seq      = (seq_len_ > 0) ? seq_len_ : total_seq;
-        const std::size_t batch    = (seq_len_ > 0) ? (total_seq / seq_len_) : 1;
+        const std::size_t seq = (seq_len_ > 0) ? seq_len_ : total_seq;
+        const std::size_t batch = (seq_len_ > 0) ? (total_seq / seq_len_) : 1;
         if (total_seq != batch * seq)
             NN_FAIL("AttentionBase forward: cols not divisible by seq_len");
         // 1. 线性投影 → Q/K/V: (H*d_k, batch*seq)
@@ -810,8 +802,7 @@ public:
         // （另分配一整块缓冲），此处不适用。
         // scale_ 用 rparam 承载 → 值不进 expr_spec_key（融合二期教训 1）。
         {
-            auto qs = dsl::compute_into(engine,
-                dsl::leaf(Q) * dsl::rparam(scale_), Q);
+            auto qs = dsl::compute_into(engine, dsl::leaf(Q) * dsl::rparam(scale_), Q);
             NN_TRY_CHECK(qs);
         }
 
@@ -835,9 +826,9 @@ public:
         std::vector<Tensor> fold_in{Q, K, *V_t};
         pos_->append_score_bias_inputs(fold_in);
         mask_->append_fold_inputs(fold_in);
-        const nn::ExprSpec fold_spec = nn::expr::make_fold_attn_o(
-            seq, d_k_, BH, mask_->mask_kind(), pos_->has_score_bias(),
-            static_cast<std::uint32_t>(kv_ratio_));
+        const nn::ExprSpec fold_spec =
+            nn::expr::make_fold_attn_o(seq, d_k_, BH, mask_->mask_kind(), pos_->has_score_bias(),
+                                       static_cast<std::uint32_t>(kv_ratio_));
         NN_TRY(fv, nn::validate_expr_spec(fold_spec, fold_in.size()));
         // scale 已折进 Q（见上 2.6；运行时值不进 expr_spec_key）——fold 的 mm 段直接消费
         NN_TRY(O_t_r, engine.eval_expr(fold_spec, fold_in, BH * seq, d_k_, p_.compute));
@@ -879,14 +870,13 @@ public:
         return w_o_->forward(attn_out);
     }
 
-    [[nodiscard]] Result<Tensor> backward(
-        const Tensor& grad_output) override
+    [[nodiscard]] Result<Tensor> backward(const Tensor& grad_output) override
     {
         ComputeEngine& engine = engine_ref();
         // 推断 batch/seq（与 forward 一致）
         const std::size_t total_seq = grad_output.cols();
-        const std::size_t seq      = (seq_len_ > 0) ? seq_len_ : total_seq;
-        const std::size_t batch    = (seq_len_ > 0) ? (total_seq / seq_len_) : 1;
+        const std::size_t seq = (seq_len_ > 0) ? seq_len_ : total_seq;
+        const std::size_t batch = (seq_len_ > 0) ? (total_seq / seq_len_) : 1;
         const std::size_t H_dk = num_heads_ * d_k_;
         const std::size_t BH = batch * num_heads_;
 
@@ -923,8 +913,8 @@ public:
             // 输出形状：transA=true → rows=BH*A.cols()；transB=false → cols=B.cols()
             // GQA：V_cache_ 存的是 n_head_kv 个头 → B 侧按头分组比取行块
             const std::uint32_t kvr = static_cast<std::uint32_t>(kv_ratio_);
-            auto grad_A = dsl::compute(engine,
-                dsl::matmul_kv(grad_concat_re, V_cache_, true, false, BH, 1, kvr),
+            auto grad_A = dsl::compute(
+                engine, dsl::matmul_kv(grad_concat_re, V_cache_, true, false, BH, 1, kvr),
                 BH * grad_concat_re.cols(), V_cache_.cols(), p_.compute);
             NN_TRY_CHECK(grad_A);
             nn_dbg_scan("attn.grad_A", engine, *grad_A);
@@ -941,44 +931,38 @@ public:
             //   R  = row_sum(W·P)                     → (BH*seq, 1)
             //   X  = scale·W·(P − R)                  → (BH*seq, seq)（物化）
             //   grad_Q = K × X^T；grad_K = Q × X；grad_V = W^T × G
-            auto R = dsl::compute_reduce(engine,
-                dsl::row_reduce_sum(dsl::leaf(*W_re) * dsl::leaf(*grad_A)),
-                BH * seq, seq);
+            auto R = dsl::compute_reduce(
+                engine, dsl::row_reduce_sum(dsl::leaf(*W_re) * dsl::leaf(*grad_A)), BH * seq, seq);
             NN_TRY_CHECK(R);
             nn_dbg_scan("attn.R", engine, *R);
             auto X = dsl::compute(engine,
-                dsl::leaf(*W_re)
-                    * (dsl::leaf(*grad_A) - dsl::row_broadcast(*R)),
-                BH * seq, seq, p_.compute);
+                                  dsl::leaf(*W_re) * (dsl::leaf(*grad_A) - dsl::row_broadcast(*R)),
+                                  BH * seq, seq, p_.compute);
             NN_TRY_CHECK(X);
             nn_dbg_scan("attn.X", engine, *X);
             // grad_Q = K × X^T（K_b (d_k,seq)，X_b (seq,seq) 按 X^T 使用）
             // dsl::matmul(batch)（transA=F,transB=T → rows=K.rows(), cols=X.rows()/BH）
             // GQA：A 侧 K 只存 n_head_kv 个头 → 按头分组比取行块；输出仍是
             //   **全 H 头**（rows = BH·d_k），即"紧输入 → 满输出"的映射。
-            auto gq = dsl::compute(engine,
-                dsl::matmul_kv(K_cache_, *X, false, true, BH, kvr, 1),
-                BH * d_k_, X->rows() / BH, p_.compute);
+            auto gq = dsl::compute(engine, dsl::matmul_kv(K_cache_, *X, false, true, BH, kvr, 1),
+                                   BH * d_k_, X->rows() / BH, p_.compute);
             NN_TRY_CHECK(gq);
             nn_dbg_scan("attn.gq(pre-scale)", engine, *gq);
             // grad_Q 补乘 scale（forward 把 scale 折进了 Q）：compute_into 原地
             // （同 forward 2.6 的写法；rparam 承载 scale 值不进 key）
             {
-                auto gqs = dsl::compute_into(engine,
-                    dsl::leaf(*gq) * dsl::rparam(scale_), *gq);
+                auto gqs = dsl::compute_into(engine, dsl::leaf(*gq) * dsl::rparam(scale_), *gq);
                 NN_TRY_CHECK(gqs);
             }
             // grad_K = Q × X（dsl::matmul(batch)：false,false → rows=Q.rows(), cols=X.cols()）
-            auto gk = dsl::compute(engine,
-                dsl::matmul(Q_cache_, *X, false, false, BH),
-                Q_cache_.rows(), X->cols(), p_.compute);
+            auto gk = dsl::compute(engine, dsl::matmul(Q_cache_, *X, false, false, BH),
+                                   Q_cache_.rows(), X->cols(), p_.compute);
             NN_TRY_CHECK(gk);
             nn_dbg_scan("attn.gk", engine, *gk);
             // grad_V = W^T × G（W_b (seq,seq) 按 W^T 使用，G_b (seq,d_k)）→ (BH*seq, d_k)
             // dsl::matmul(batch)：transA=T,transB=F → rows=BH*W.cols(), cols=G.cols()
-            auto gv_t = dsl::compute(engine,
-                dsl::matmul(*W_re, *G, true, false, BH),
-                BH * W_re->cols(), G->cols(), p_.compute);
+            auto gv_t = dsl::compute(engine, dsl::matmul(*W_re, *G, true, false, BH),
+                                     BH * W_re->cols(), G->cols(), p_.compute);
             NN_TRY_CHECK(gv_t);
             // grad_V 转置回 (BH*d_k, seq)（与 forward 的 V_t→V 逆变换一致）
             NN_TRY(gv_T, engine.transpose(*gv_t));
@@ -1040,8 +1024,8 @@ public:
         // grad_input = grad_Q + grad_K + grad_V：三路累加**原地**融合为单趟
         // （dsl::compute_into 目标传递，不额外分配）。结合顺序固定为
         // (giq + gik) + giv —— 求和顺序确定，结果可复现。
-        auto acc = dsl::compute_into(engine,
-            dsl::leaf(*giq) + dsl::leaf(*gik) + dsl::leaf(*giv), *giq);
+        auto acc =
+            dsl::compute_into(engine, dsl::leaf(*giq) + dsl::leaf(*gik) + dsl::leaf(*giv), *giq);
         NN_TRY_CHECK(acc);
         return giq;
     }
@@ -1059,12 +1043,8 @@ public:
     //
     // 输入: x_new (d_model, 1) 单个新 token 的嵌入
     // 输出: (d_model, 1) attention 输出
-    [[nodiscard]] Result<Tensor> forward_step(
-        ComputeEngine& engine,
-        const Tensor& x_new,
-        Tensor& k_cache,
-        Tensor& v_cache,
-        std::size_t cur_len)
+    [[nodiscard]] Result<Tensor> forward_step(ComputeEngine& engine, const Tensor& x_new,
+                                              Tensor& k_cache, Tensor& v_cache, std::size_t cur_len)
     {
         if (x_new.rows() != d_model_ || x_new.cols() != 1)
             NN_FAIL("AttentionBase forward_step: x_new must be (d_model, 1)");
@@ -1122,8 +1102,8 @@ public:
         //    每头: (1, d_k) × (d_k, new_len) = (1, new_len)
         //    堆叠: (H, new_len)
         //    scale (1/sqrt(d_k)) 经 rparam 尾链乘在 matmul 结果上（不进 expr_spec_key）
-        auto scores = dsl::compute(engine,
-            dsl::matmul(*q_res, *K_T, true, false, num_heads_) * dsl::rparam(scale_),
+        auto scores = dsl::compute(
+            engine, dsl::matmul(*q_res, *K_T, true, false, num_heads_) * dsl::rparam(scale_),
             num_heads_ * q_res->cols(), K_T->cols(), p_.compute);
         NN_TRY_CHECK(scores);
 
@@ -1140,9 +1120,8 @@ public:
         //    每头: (d_k, new_len) × (new_len, 1) = (d_k, 1)
         //    堆叠: (H*d_k, 1)
         // dsl::matmul(batch)：纯 {0,1} 结构（attention backward 已登记同 key）
-        auto attn_out = dsl::compute(engine,
-            dsl::matmul(*V_T, *attn, false, true, num_heads_),
-            V_T->rows(), attn->rows() / num_heads_, p_.compute);
+        auto attn_out = dsl::compute(engine, dsl::matmul(*V_T, *attn, false, true, num_heads_),
+                                     V_T->rows(), attn->rows() / num_heads_, p_.compute);
         NN_TRY_CHECK(attn_out);
 
         // 9. SubLN（子层内部归一化；关 = 直通）→ 输出投影 → (d_model, 1)
@@ -1164,10 +1143,9 @@ protected:
     //     3) W = softmax(S)（归约快路径）
     // 返回 (BH*seq, seq) 的 softmax 归一化权重；attention FLOPs ×1.5–2
     // （QK^T 在 backward 重算），训练可接受。
-    [[nodiscard]] Result<Tensor> recompute_W_(
-        ComputeEngine& engine,
-        const Tensor& Q, const Tensor& K,
-        std::size_t BH, std::size_t seq) const
+    [[nodiscard]] Result<Tensor> recompute_W_(ComputeEngine& engine, const Tensor& Q,
+                                              const Tensor& K, std::size_t BH,
+                                              std::size_t seq) const
     {
         NN_TRY(sres, mask_->masked_scores(engine, Q, K, BH, seq, p_, kv_ratio_));
         Tensor S = std::move(*sres);
@@ -1176,10 +1154,10 @@ protected:
         // W = softmax(S)：单表达式归约快路径——与 Softmax::forward
         // 同构：ReduceRef 直接参与算术按行广播；m/l 在 kernel 内部归一化，
         // 不作为输入/缓存存在。
-        return dsl::compute(engine,
-            dsl::exp(dsl::leaf(S) - dsl::row_reduce_max(S))
-            / dsl::row_reduce_sum(
-                dsl::exp(dsl::leaf(S) - dsl::row_reduce_max(S))),
+        return dsl::compute(
+            engine,
+            dsl::exp(dsl::leaf(S) - dsl::row_reduce_max(S)) /
+                dsl::row_reduce_sum(dsl::exp(dsl::leaf(S) - dsl::row_reduce_max(S))),
             BH * seq, seq, p_.compute);
     }
 };
@@ -1195,11 +1173,11 @@ class MultiHeadAttention final : public AttentionBase
 public:
     [[nodiscard]] const char* layer_name() const noexcept override { return "MultiHeadAttention"; }
 
-    MultiHeadAttention(std::size_t d_model, std::size_t num_heads,
-                       std::size_t seq_len = 0,
+    MultiHeadAttention(std::size_t d_model, std::size_t num_heads, std::size_t seq_len = 0,
                        WeightQuant weight_quant = WeightQuant::None)
-        : AttentionBase(d_model, num_heads, seq_len, false, NormType::LayerNorm, 0,
-                        weight_quant) {}
+        : AttentionBase(d_model, num_heads, seq_len, false, NormType::LayerNorm, 0, weight_quant)
+    {
+    }
 };
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -1237,27 +1215,21 @@ private:
     {
         // 配置期工厂：这是**唯一**决定掩码种类的地方（只依赖文档掩码的开关，
         // 与位置编码无关）。forward/backward 里没有任何变体判断。
-        if (doc_enabled_)
-            return std::make_unique<CausalDocScoreMask>(num_heads_);
+        if (doc_enabled_) return std::make_unique<CausalDocScoreMask>(num_heads_);
         return std::make_unique<CausalScoreMask>();
     }
 
 public:
-    CausalSelfAttention(std::size_t d_model, std::size_t num_heads,
-                        std::size_t /*max_len*/ = 1024,
-                        std::size_t seq_len = 0,
-                        PosEncodingType pos_enc = PosEncodingType::Learned,
-                        bool subln = false,
-                        NormType subln_norm_type = NormType::LayerNorm,
-                        std::size_t n_head_kv = 0,
-                        WeightQuant weight_quant = WeightQuant::None)
+    CausalSelfAttention(std::size_t d_model, std::size_t num_heads, std::size_t /*max_len*/ = 1024,
+                        std::size_t seq_len = 0, PosEncodingType pos_enc = PosEncodingType::Learned,
+                        bool subln = false, NormType subln_norm_type = NormType::LayerNorm,
+                        std::size_t n_head_kv = 0, WeightQuant weight_quant = WeightQuant::None)
         : AttentionBase(d_model, num_heads, seq_len, subln, subln_norm_type, n_head_kv,
                         weight_quant)
     {
         // ① 位置编码：注意力侧**由本层自持**（RoPE 的 cos/sin 表随层构建；
         //    Learned/Sinusoidal 在注意力侧是恒等 → 交回模型侧施加）。
-        install_position_encoder(
-            make_attention_position_encoder(pos_enc, d_k_, num_heads_));
+        install_position_encoder(make_attention_position_encoder(pos_enc, d_k_, num_heads_));
         // ② 掩码：本类的因果语义（与位置编码正交，故独立安装）
         install_score_mask_();
     }
@@ -1321,19 +1293,18 @@ private:
     std::size_t seq_kv_len_;   // memory 每样本序列长（0 = 单样本，cols 即 seq）
 
 public:
-    [[nodiscard]] const char* layer_name() const noexcept override
-    { return "CrossAttention"; }
+    [[nodiscard]] const char* layer_name() const noexcept override { return "CrossAttention"; }
 
     // seq_len   = query 每样本序列长（0 = 单样本，cols 即 seq）
     // seq_kv_len = memory 每样本序列长（0 = 单样本；一般 ≠ seq_len）
-    CrossAttention(std::size_t d_model, std::size_t num_heads,
-                   std::size_t seq_len = 0, std::size_t seq_kv_len = 0,
-                   std::size_t n_head_kv = 0,
+    CrossAttention(std::size_t d_model, std::size_t num_heads, std::size_t seq_len = 0,
+                   std::size_t seq_kv_len = 0, std::size_t n_head_kv = 0,
                    WeightQuant weight_quant = WeightQuant::None)
-        : AttentionBase(d_model, num_heads, seq_len, false, NormType::LayerNorm,
-                        n_head_kv, weight_quant),
+        : AttentionBase(d_model, num_heads, seq_len, false, NormType::LayerNorm, n_head_kv,
+                        weight_quant),
           seq_kv_len_(seq_kv_len)
-    {}
+    {
+    }
     // 注意：掩码基类默认 PlainScoreMask、位置编码默认恒等 —— 正是本层语义
     // （见类注释），无需 install。
 
@@ -1353,22 +1324,21 @@ public:
     // query  (d_model, batch*seq_q)   —— 输出侧序列（decoder 位置）
     // memory (d_model, batch*seq_kv)  —— 被注意序列（encoder 输出等）
     // 输出 (d_model, batch*seq_q)（列布局与自注意力一致）。
-    [[nodiscard]] Result<Tensor> forward_pair(const Tensor& query,
-                                              const Tensor& memory)
+    [[nodiscard]] Result<Tensor> forward_pair(const Tensor& query, const Tensor& memory)
     {
         ComputeEngine& engine = engine_ref();
         if (query.rows() != d_model_ || memory.rows() != d_model_)
             NN_FAIL("CrossAttention forward_pair: 输入形状不匹配（rows != d_model）");
         // batch 一致性：两侧按各自 seq 长推 batch，必须相等
-        const std::size_t seq_q  = (seq_len_ > 0) ? seq_len_ : query.cols();
+        const std::size_t seq_q = (seq_len_ > 0) ? seq_len_ : query.cols();
         const std::size_t seq_kv = (seq_kv_len_ > 0) ? seq_kv_len_ : memory.cols();
         if (query.cols() % seq_q != 0 || memory.cols() % seq_kv != 0)
             NN_FAIL("CrossAttention forward_pair: cols 不能被各自的 seq 长整除");
-        const std::size_t batch_q  = query.cols() / seq_q;
+        const std::size_t batch_q = query.cols() / seq_q;
         const std::size_t batch_kv = memory.cols() / seq_kv;
         if (batch_q != batch_kv)
-            NN_FAIL("CrossAttention forward_pair: query 与 memory 的 batch 不一致（"
-                    + std::to_string(batch_q) + " vs " + std::to_string(batch_kv) + "）");
+            NN_FAIL("CrossAttention forward_pair: query 与 memory 的 batch 不一致（" +
+                    std::to_string(batch_q) + " vs " + std::to_string(batch_kv) + "）");
 
         // 1. 投影：Q 吃 query，K/V 吃 memory
         NN_TRY(q_res, w_q_->forward(query));
@@ -1376,7 +1346,7 @@ public:
         NN_TRY(v_proj, w_v_->forward(memory));
 
         // 2. rearrange：Q → (batch*H*d_k, seq_q)；K/V → (batch*KV_dk, seq_kv)
-        const std::size_t H_dk  = num_heads_ * d_k_;
+        const std::size_t H_dk = num_heads_ * d_k_;
         const std::size_t KV_dk = n_head_kv_ * d_k_;
         Tensor Q, K, V;
         if (batch_q > 1)
@@ -1397,8 +1367,7 @@ public:
 
         // 3. scale 折进 Q（与自注意力 2.6 同口径；rparam 承载不进 key）
         {
-            auto qs = dsl::compute_into(engine,
-                dsl::leaf(Q) * dsl::rparam(scale_), Q);
+            auto qs = dsl::compute_into(engine, dsl::leaf(Q) * dsl::rparam(scale_), Q);
             NN_TRY_CHECK(qs);
         }
 
@@ -1411,12 +1380,11 @@ public:
         std::vector<Tensor> fold_in{Q, K, *V_t};
         mask_->append_fold_inputs(fold_in);
         // Plain/no-bias 构造：f.k = seq_kv；eval 输出行 = BH·seq_q（矩形）
-        const nn::ExprSpec fold_spec = nn::expr::make_fold_attn_o(
-            seq_kv, d_k_, BH, mask_->mask_kind(), /*score_bias=*/false,
-            static_cast<std::uint32_t>(kv_ratio_));
+        const nn::ExprSpec fold_spec =
+            nn::expr::make_fold_attn_o(seq_kv, d_k_, BH, mask_->mask_kind(), /*score_bias=*/false,
+                                       static_cast<std::uint32_t>(kv_ratio_));
         NN_TRY(fv, nn::validate_expr_spec(fold_spec, fold_in.size()));
-        NN_TRY(O_t_r, engine.eval_expr(fold_spec, fold_in, BH * seq_q, d_k_,
-                                       p_.compute));
+        NN_TRY(O_t_r, engine.eval_expr(fold_spec, fold_in, BH * seq_q, d_k_, p_.compute));
         // O_t (BH*seq_q, dk) → (BH*dk, seq_q) → (H*dk, batch*seq_q)
         NN_TRY(O_T_full, engine.transpose(*O_t_r));
         NN_TRY(co, engine.rearrange_3d(*O_T_full, d_k_, BH, seq_q, false));
@@ -1442,15 +1410,14 @@ public:
 
     // ── backward_pair：双路梯度 ────────────────────────────────────────
     // grad_output (d_model, batch*seq_q) → {grad_query, grad_memory}
-    [[nodiscard]] Result<CrossAttentionGrads> backward_pair(
-        const Tensor& grad_output)
+    [[nodiscard]] Result<CrossAttentionGrads> backward_pair(const Tensor& grad_output)
     {
         ComputeEngine& engine = engine_ref();
         if (!Q_cache_.valid() || !K_cache_.valid() || !V_cache_.valid())
             NN_FAIL("CrossAttention backward_pair: 无缓存（backward_pair 前必须"
                     "先 forward_pair；checkpoint 模式下缓存不保留）");
         // batch/seq 从缓存推（Q: (BH*dk, seq_q)，K: (BH_kv*dk, seq_kv)）
-        const std::size_t seq_q  = Q_cache_.cols();
+        const std::size_t seq_q = Q_cache_.cols();
         const std::size_t seq_kv = K_cache_.cols();
         if (grad_output.cols() % seq_q != 0)
             NN_FAIL("CrossAttention backward_pair: grad_output.cols() 不能被 seq_q 整除");
@@ -1477,8 +1444,8 @@ public:
         {
             const std::uint32_t kvr = static_cast<std::uint32_t>(kv_ratio_);
             // P = grad_A = grad_O^T × V → (BH*seq_q, seq_kv)
-            auto grad_A = dsl::compute(engine,
-                dsl::matmul_kv(grad_concat_re, V_cache_, true, false, BH, 1, kvr),
+            auto grad_A = dsl::compute(
+                engine, dsl::matmul_kv(grad_concat_re, V_cache_, true, false, BH, 1, kvr),
                 BH * grad_concat_re.cols(), V_cache_.cols(), p_.compute);
             NN_TRY_CHECK(grad_A);
             nn_dbg_scan("xattn.grad_A", engine, *grad_A);
@@ -1486,40 +1453,34 @@ public:
             NN_TRY(G_T_full, engine.transpose(grad_concat_re));
             NN_TRY(G, engine.rearrange_3d(*G_T_full, seq_q, BH, d_k_, false));
             // W = softmax(mask(Q·Kᵀ))（矩形；Plain 掩码 = 无屏蔽）
-            NN_TRY(W_re, recompute_W_pair_(engine, Q_cache_, K_cache_, BH,
-                                           seq_q, seq_kv));
+            NN_TRY(W_re, recompute_W_pair_(engine, Q_cache_, K_cache_, BH, seq_q, seq_kv));
             nn_dbg_scan("xattn.W_re", engine, *W_re);
             // R = row_sum(W·P) → (BH*seq_q, 1)
             auto R = dsl::compute_reduce(engine,
-                dsl::row_reduce_sum(dsl::leaf(*W_re) * dsl::leaf(*grad_A)),
-                BH * seq_q, seq_kv);
+                                         dsl::row_reduce_sum(dsl::leaf(*W_re) * dsl::leaf(*grad_A)),
+                                         BH * seq_q, seq_kv);
             NN_TRY_CHECK(R);
             // X = W·(P − R) → (BH*seq_q, seq_kv)
             auto X = dsl::compute(engine,
-                dsl::leaf(*W_re)
-                    * (dsl::leaf(*grad_A) - dsl::row_broadcast(*R)),
-                BH * seq_q, seq_kv, p_.compute);
+                                  dsl::leaf(*W_re) * (dsl::leaf(*grad_A) - dsl::row_broadcast(*R)),
+                                  BH * seq_q, seq_kv, p_.compute);
             NN_TRY_CHECK(X);
             nn_dbg_scan("xattn.X", engine, *X);
             // grad_Q = K × X^T → (BH*d_k, seq_q)（scale 补乘同自反向）
-            auto gq = dsl::compute(engine,
-                dsl::matmul_kv(K_cache_, *X, false, true, BH, kvr, 1),
-                BH * d_k_, X->rows() / BH, p_.compute);
+            auto gq = dsl::compute(engine, dsl::matmul_kv(K_cache_, *X, false, true, BH, kvr, 1),
+                                   BH * d_k_, X->rows() / BH, p_.compute);
             NN_TRY_CHECK(gq);
             {
-                auto gqs = dsl::compute_into(engine,
-                    dsl::leaf(*gq) * dsl::rparam(scale_), *gq);
+                auto gqs = dsl::compute_into(engine, dsl::leaf(*gq) * dsl::rparam(scale_), *gq);
                 NN_TRY_CHECK(gqs);
             }
             // grad_K = Q × X → (BH*d_k, seq_kv)
-            auto gk = dsl::compute(engine,
-                dsl::matmul(Q_cache_, *X, false, false, BH),
-                Q_cache_.rows(), X->cols(), p_.compute);
+            auto gk = dsl::compute(engine, dsl::matmul(Q_cache_, *X, false, false, BH),
+                                   Q_cache_.rows(), X->cols(), p_.compute);
             NN_TRY_CHECK(gk);
             // grad_V = W^T × G → (BH*seq_kv, d_k) → 转置回 (BH*d_k, seq_kv)
-            auto gv_t = dsl::compute(engine,
-                dsl::matmul(*W_re, *G, true, false, BH),
-                BH * W_re->cols(), G->cols(), p_.compute);
+            auto gv_t = dsl::compute(engine, dsl::matmul(*W_re, *G, true, false, BH),
+                                     BH * W_re->cols(), G->cols(), p_.compute);
             NN_TRY_CHECK(gv_t);
             NN_TRY(gv_T, engine.transpose(*gv_t));
             NN_TRY(gv_re, engine.rearrange_3d(*gv_T, d_k_, BH, seq_kv, false));
@@ -1551,10 +1512,8 @@ public:
         auto fold_kv = [&](Tensor&& grad_full) -> Result<Tensor>
         {
             if (!gqa_expand_idx_.valid()) return std::move(grad_full);
-            Tensor collapsed = engine.create_tensor(n_head_kv_ * d_k_,
-                                                    grad_full.cols(),
-                                                    grad_full.precision(),
-                                                    InitSpec::zero());
+            Tensor collapsed = engine.create_tensor(n_head_kv_ * d_k_, grad_full.cols(),
+                                                    grad_full.precision(), InitSpec::zero());
             if (!collapsed.valid()) NN_FAIL("CrossAttention: GQA 折叠缓冲分配失败");
             NN_TRY(sr, engine.scatter_add_rows(collapsed, gqa_expand_idx_, grad_full));
             return collapsed;
@@ -1567,9 +1526,8 @@ public:
         CrossAttentionGrads out;
         out.grad_query = std::move(*giq);
         // memory 侧两路累加（结合顺序固定 = 可复现）
-        auto acc = dsl::compute(engine,
-            dsl::leaf(*gik) + dsl::leaf(*giv),
-            gik->rows(), gik->cols(), p_.compute);
+        auto acc = dsl::compute(engine, dsl::leaf(*gik) + dsl::leaf(*giv), gik->rows(), gik->cols(),
+                                p_.compute);
         NN_TRY_CHECK(acc);
         out.grad_memory = std::move(*acc);
         return out;
@@ -1578,15 +1536,15 @@ public:
 protected:
     // W 重算（矩形版；与自反向 recompute_W_ 同构，仅形状参数分离为
     // seq_q/seq_kv）。掩码恒 Plain → 屏蔽链为空；位置编码恒等 → 无偏置叠加。
-    [[nodiscard]] Result<Tensor> recompute_W_pair_(
-        ComputeEngine& engine, const Tensor& Q, const Tensor& K,
-        std::size_t BH, std::size_t seq_q, std::size_t seq_kv) const
+    [[nodiscard]] Result<Tensor> recompute_W_pair_(ComputeEngine& engine, const Tensor& Q,
+                                                   const Tensor& K, std::size_t BH,
+                                                   std::size_t seq_q, std::size_t seq_kv) const
     {
         NN_TRY(sres, mask_->masked_scores(engine, Q, K, BH, seq_kv, p_, kv_ratio_));
-        return dsl::compute(engine,
-            dsl::exp(dsl::leaf(*sres) - dsl::row_reduce_max(*sres))
-            / dsl::row_reduce_sum(
-                dsl::exp(dsl::leaf(*sres) - dsl::row_reduce_max(*sres))),
+        return dsl::compute(
+            engine,
+            dsl::exp(dsl::leaf(*sres) - dsl::row_reduce_max(*sres)) /
+                dsl::row_reduce_sum(dsl::exp(dsl::leaf(*sres) - dsl::row_reduce_max(*sres))),
             BH * seq_q, seq_kv, p_.compute);
     }
 };

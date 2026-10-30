@@ -27,8 +27,7 @@
 namespace nn
 {
 
-template <typename T>
-class observer_ptr
+template <typename T> class observer_ptr
 {
     T* ptr_ = nullptr;
 
@@ -42,7 +41,9 @@ public:
     // 从另一个 observer_ptr<U> 转换（允许隐式向上转型）
     template <typename U>
         requires std::is_convertible_v<U*, T*>
-    constexpr observer_ptr(const observer_ptr<U>& other) noexcept : ptr_(other.get()) {}
+    constexpr observer_ptr(const observer_ptr<U>& other) noexcept : ptr_(other.get())
+    {
+    }
 
     // ── 访问 ─────────────────────────────────────────────────────────────
     [[nodiscard]] constexpr T& operator*() const noexcept { return *ptr_; }
@@ -60,22 +61,14 @@ public:
     friend constexpr bool operator==(const observer_ptr&, const observer_ptr&) = default;
     friend constexpr bool operator==(const observer_ptr& p, std::nullptr_t) noexcept { return !p; }
     friend constexpr auto operator<=>(const observer_ptr& a, const observer_ptr& b) noexcept
-    {
-        return a.ptr_ <=> b.ptr_;
-    }
+    { return a.ptr_ <=> b.ptr_; }
 };
 
 // ── 便捷工厂函数 ───────────────────────────────────────────────────────
-template <typename T>
-[[nodiscard]] constexpr observer_ptr<T> make_observer(T& obj) noexcept
-{
-    return observer_ptr<T>(obj);
-}
+template <typename T> [[nodiscard]] constexpr observer_ptr<T> make_observer(T& obj) noexcept
+{ return observer_ptr<T>(obj); }
 
-template <typename T>
-[[nodiscard]] constexpr observer_ptr<T> make_observer(T* ptr) noexcept
-{
-    return observer_ptr<T>(ptr);
-}
+template <typename T> [[nodiscard]] constexpr observer_ptr<T> make_observer(T* ptr) noexcept
+{ return observer_ptr<T>(ptr); }
 
 } // namespace nn

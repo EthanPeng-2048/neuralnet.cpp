@@ -51,8 +51,8 @@
 
 #include <csignal>
 #if __has_include(<stacktrace>)
-  #include <stacktrace>
-  #define NN_SCAN_HAS_STACKTRACE 1
+#include <stacktrace>
+#define NN_SCAN_HAS_STACKTRACE 1
 #endif
 
 // abort（NN_ASSERT）时打印调用栈：NN_ASSERT 只有断言点行号，缺"谁调的"——
@@ -61,7 +61,8 @@
 // 老编译器无 <stacktrace> 时降级为无栈消息（__has_include 守卫）。注：
 // handler 内 to_string(stacktrace) 会分配、严格说非异步信号安全——abort
 // 路径本已终止进程，这里只求尽力打印，不保证死锁免疫。
-namespace {
+namespace
+{
 void on_abort(int)
 {
 #ifdef NN_SCAN_HAS_STACKTRACE
@@ -105,8 +106,8 @@ int main(int argc, char* argv[])
                      "  精度分派 shader（键 key#x），运行时按真实精度填 PC `prec`。\n");
         return 2;
     }
-    const std::string out_dir  = argv[1];
-    const std::string glslc    = argv[2];
+    const std::string out_dir = argv[1];
+    const std::string glslc = argv[2];
     std::signal(SIGABRT, &on_abort);   // NN_ASSERT → abort 带栈（见文件头）
 
     auto raw_engine = nn::CpuEngine::create();
@@ -116,584 +117,552 @@ int main(int argc, char* argv[])
     // ── dry-run 主体：跑一遍 Layer 的 forward/backward（只收集**结构**）──
     // engine 是**形参**（遮蔽外层 raw_engine）：f16 边界 cast 由基类 NVI 入口
     // 统一处理（原 PrecisionEngine 适配层已删除，见 docs/history/history.md「15 号归档」 §4.1）。
-    [[maybe_unused]] const auto dry_run = [&](nn::ComputeEngine& engine, const nn::PrecisionProfile& prof)
+    [[maybe_unused]] const auto dry_run =
+        [&](nn::ComputeEngine& engine, const nn::PrecisionProfile& prof)
     {
         scan_prof = prof;
         // M1（docs/internal/17 §4.1）：库外不再直构 Tensor——scan 输入经
         // 引擎创建（出生绑定与本段 dry-run 使用的 engine 一致）。
         const auto scan_tensor = [&](std::size_t rows, std::size_t cols)
+        { return engine.create_tensor(rows, cols, scan_prof.compute); };
+        // ── RoPE：forward + backward ─────────────────────────────────────────
+        // （apply 与 apply_step 折叠出的结构相同，会自动去重）
+        //
+        // 形状无关融合：RowMod/RotateHalf 的周期/块大小是**运行时视图参数**
+        // （不进 expr_spec_key），故 RoPE 结构不依赖 d_k——这里任意 d_k 收集到的
+        // 结构完全相同（去重成一个），**任何 d_k（含非 2 的幂）都能命中该融合
+        // shader**。下面保留多个 d_k 仅作覆盖验证；若未来表达式重新引入形状
+        // 常量，需再补对应 dry-run。
+        for (const std::size_t dk :
+             {std::size_t{16}, std::size_t{32}, std::size_t{64}, std::size_t{128}})
         {
-            return engine.create_tensor(rows, cols, scan_prof.compute);
-        };
-    // ── RoPE：forward + backward ─────────────────────────────────────────
-    // （apply 与 apply_step 折叠出的结构相同，会自动去重）
-    //
-    // 形状无关融合：RowMod/RotateHalf 的周期/块大小是**运行时视图参数**
-    // （不进 expr_spec_key），故 RoPE 结构不依赖 d_k——这里任意 d_k 收集到的
-    // 结构完全相同（去重成一个），**任何 d_k（含非 2 的幂）都能命中该融合
-    // shader**。下面保留多个 d_k 仅作覆盖验证；若未来表达式重新引入形状
-    // 常量，需再补对应 dry-run。
-    for (const std::size_t dk : {std::size_t{16}, std::size_t{32},
-                                 std::size_t{64}, std::size_t{128}})
-    {
-        nn::RotaryEmbedding rope(dk);
-        rope.set_precision_profile(scan_prof);   // 扫描期精度（f16 pass 收集变体）
-        (void)rope.init(engine);   // M6 段 C：层由 init 绑定引擎
-        nn::Tensor q = scan_tensor(2 * dk, 8);   // rows 为 dk 的整数倍
-        (void)rope.apply(engine, q, /*seq=*/8, /*backward=*/false);
-        (void)rope.apply(engine, q, /*seq=*/8, /*backward=*/true);
-        nn::Tensor q1 = scan_tensor(dk, 1);      // 增量推理（单位置）
-        (void)rope.apply_step(engine, q1, /*pos=*/3, /*backward=*/false);
-        (void)rope.apply_step(engine, q1, /*pos=*/3, /*backward=*/true);
-    }
+            nn::RotaryEmbedding rope(dk);
+            rope.set_precision_profile(scan_prof);   // 扫描期精度（f16 pass 收集变体）
+            (void)rope.init(engine);   // M6 段 C：层由 init 绑定引擎
+            nn::Tensor q = scan_tensor(2 * dk, 8);   // rows 为 dk 的整数倍
+            (void)rope.apply(engine, q, /*seq=*/8, /*backward=*/false);
+            (void)rope.apply(engine, q, /*seq=*/8, /*backward=*/true);
+            nn::Tensor q1 = scan_tensor(dk, 1);      // 增量推理（单位置）
+            (void)rope.apply_step(engine, q1, /*pos=*/3, /*backward=*/false);
+            (void)rope.apply_step(engine, q1, /*pos=*/3, /*backward=*/true);
+        }
 
-    // ── MSELoss forward（diff = pred-target；diff_sq = diff*diff）────────
-    {
-        const std::size_t R = 8, C = 5;
-        nn::MSELoss mse;
-        mse.set_precision_profile(scan_prof);   // 扫描期精度（f16 pass 收集变体）
-        nn::Tensor pred = scan_tensor(R, C);
-        nn::Tensor target = scan_tensor(R, C);
-        (void)mse.forward(engine, pred, target);
-    }
-
-    // ── CrossEntropyLoss 稠密 forward（grad=softmax-target；target*log_sm；
-    //    log_col_sum = log(col_sum)）─────────────────────────────────────
-    {
-        const std::size_t C = 8, B = 5;
-        nn::CrossEntropyLoss ce;
-        ce.set_precision_profile(scan_prof);   // 扫描期精度（f16 pass 收集变体）
-        nn::Tensor logits = scan_tensor(C, B);
-        nn::Tensor target = scan_tensor(C, B);
-        (void)ce.forward(engine, logits, target);
-    }
-
-    // ── 优化器 step + 梯度裁剪（全部变体）────────────────────────────────
-    // 各优化器均为 DSL 融合表达式 / 目标传递（dsl::compute_into）：
-    //   sgd          : p += -lr*g
-    //   sgd_momentum : v = β*v + (1-β)*g ; p += -lr*v
-    //   adam         : m/v 更新 + p += delta
-    //   adamw        : p *= (1-lr*wd) + adam
-    //   muon         : v = μ*v + g；Nesterov；Newton–Schulz（含 A=bA+cA² 等）
-    //   clip_grad_norm: g *= scale
-    // 必须逐个 dry-run：GPU 运行时同一结构才能命中 AOT 融合 shader（闭合世界）。
-    // 结构不依赖形状，任取小 R×C 即可（Muon 的 NS 只对 ≥2D 参数生效）。
-    {
-        const std::size_t R = 8, C = 5;
-        // RV-04：名单来自 nn::optimizer_table()（唯一真源）——新增优化器自动覆盖
-        for (const auto &meta : nn::optimizer_table())
+        // ── MSELoss forward（diff = pred-target；diff_sq = diff*diff）────────
         {
-            nn::Tensor p = scan_tensor(R, C);
-            nn::Tensor g = scan_tensor(R, C);
-            // 精度配置与运行期同源（`text_train` 把 `cfg.precision` 透传给
-            // create_optimizer）：优化器的状态/参数槽精度决定 K3 更新量
-            // （`upd_prec = p_.param`）与写目标的存储精度 → 直接决定该结构的
-            // 运行期精度签名。漏传 = scan 只按默认 f32 profile 登记优化器，
-            // `--f16` 下 K3 的 `#10000`（F32 输入 + F16 输出）签名不被观察
-            // ⇒ 无 `key#10000` 特化变体 ⇒ 逐成员派发回退 `#x` 且拿不到
-            // `key#10000#b` 批量变体（P2-12 残差的结构性根因之一）。
-            const nn::PrecisionProfile opt_prof = scan_prof;
-            auto opt = nn::create_optimizer(meta.name, engine,
-                                            std::vector<nn::TensorRef>{p},
-                                            std::vector<nn::TensorRef>{g},
-                                            nn::Scalar{1e-3f},
-                                            /*weight_decay=*/nn::Scalar{0},
-                                            /*precision=*/opt_prof);
-            if (opt)
+            const std::size_t R = 8, C = 5;
+            nn::MSELoss mse;
+            mse.set_precision_profile(scan_prof);   // 扫描期精度（f16 pass 收集变体）
+            nn::Tensor pred = scan_tensor(R, C);
+            nn::Tensor target = scan_tensor(R, C);
+            (void)mse.forward(engine, pred, target);
+        }
+
+        // ── CrossEntropyLoss 稠密 forward（grad=softmax-target；target*log_sm；
+        //    log_col_sum = log(col_sum)）─────────────────────────────────────
+        {
+            const std::size_t C = 8, B = 5;
+            nn::CrossEntropyLoss ce;
+            ce.set_precision_profile(scan_prof);   // 扫描期精度（f16 pass 收集变体）
+            nn::Tensor logits = scan_tensor(C, B);
+            nn::Tensor target = scan_tensor(C, B);
+            (void)ce.forward(engine, logits, target);
+        }
+
+        // ── 优化器 step + 梯度裁剪（全部变体）────────────────────────────────
+        // 各优化器均为 DSL 融合表达式 / 目标传递（dsl::compute_into）：
+        //   sgd          : p += -lr*g
+        //   sgd_momentum : v = β*v + (1-β)*g ; p += -lr*v
+        //   adam         : m/v 更新 + p += delta
+        //   adamw        : p *= (1-lr*wd) + adam
+        //   muon         : v = μ*v + g；Nesterov；Newton–Schulz（含 A=bA+cA² 等）
+        //   clip_grad_norm: g *= scale
+        // 必须逐个 dry-run：GPU 运行时同一结构才能命中 AOT 融合 shader（闭合世界）。
+        // 结构不依赖形状，任取小 R×C 即可（Muon 的 NS 只对 ≥2D 参数生效）。
+        {
+            const std::size_t R = 8, C = 5;
+            // RV-04：名单来自 nn::optimizer_table()（唯一真源）——新增优化器自动覆盖
+            for (const auto& meta : nn::optimizer_table())
             {
-                (void)opt->step();
-                (void)opt->clip_grad_norm(nn::Scalar{1e3f});
+                nn::Tensor p = scan_tensor(R, C);
+                nn::Tensor g = scan_tensor(R, C);
+                // 精度配置与运行期同源（`text_train` 把 `cfg.precision` 透传给
+                // create_optimizer）：优化器的状态/参数槽精度决定 K3 更新量
+                // （`upd_prec = p_.param`）与写目标的存储精度 → 直接决定该结构的
+                // 运行期精度签名。漏传 = scan 只按默认 f32 profile 登记优化器，
+                // `--f16` 下 K3 的 `#10000`（F32 输入 + F16 输出）签名不被观察
+                // ⇒ 无 `key#10000` 特化变体 ⇒ 逐成员派发回退 `#x` 且拿不到
+                // `key#10000#b` 批量变体（P2-12 残差的结构性根因之一）。
+                const nn::PrecisionProfile opt_prof = scan_prof;
+                auto opt = nn::create_optimizer(meta.name, engine, std::vector<nn::TensorRef>{p},
+                                                std::vector<nn::TensorRef>{g}, nn::Scalar{1e-3f},
+                                                /*weight_decay=*/nn::Scalar{0},
+                                                /*precision=*/opt_prof);
+                if (opt)
+                {
+                    (void)opt->step();
+                    (void)opt->clip_grad_norm(nn::Scalar{1e3f});
+                }
             }
         }
-    }
 
-    // ── 算子融合二期（docs/internal/02-operator-fusion.md）：matmul 参与 IR 融合 ──
-    // 结构 = Layer 内 dsl::matmul(A,B)+bias+relu 折叠后的派生物：
-    //   前置 matmul 段（MatmulSpec）+ 尾逐元素链（Add + Max）。
-    // 这里直接构造折叠后的结构并登记（与 dsl::compute 登记 spec 是同一机制），
-    // 保证 GPU 运行时同一结构命中 AOT 融合 shader（闭合世界）。
-    //   - transA/transB 是**运行期 operand layout**（PC `mm_trans`）→ **不进 key**：
-    //     4 种转置组合折叠成同一个 key，登记一次即可（历史上此处登记 4 份，
-    //     key 去掉转置后它们全被去重合并）。
-    //   - k（求和维度）是形状参数 → 不进 key：任取一个 K 登记，运行时任何 K
-    //     都命中同一融合 shader（同 RowMod/RotateHalf 的视图参数处理：不进 key，
-    //     运行时填充）。
-    {
-        nn::ExprSpec s;
-        s.views    = {nn::expr::linear(), nn::expr::linear(), nn::expr::linear()};
-        s.num_regs = 2;
-        // transA/transB 取 (0,0) 作代表值：它们不进 key
-        s.matmul   = nn::MatmulSpec{0, 1, /*transA=*/0, /*transB=*/0, /*k=*/8};
-        // Add r0 = matmul(A,B) + bias（Input 2）
-        s.instrs.push_back({static_cast<std::uint8_t>(nn::ExprOp::Add), 0,
-                            nn::expr::matmul_op(), nn::expr::input(2), {}});
-        // Max r1 = max(r0, 0)（relu）
-        s.consts.push_back(nn::Scalar{0});
-        s.instrs.push_back({static_cast<std::uint8_t>(nn::ExprOp::Max), 1,
-                            nn::expr::reg(0), nn::expr::cst(0), {}});
-        nn::fused::global_registry().add(s);
-        // 纯 matmul（无逐元素链）：输出 = matmul 结果
+        // ── 算子融合二期（docs/internal/02-operator-fusion.md）：matmul 参与 IR 融合 ──
+        // 结构 = Layer 内 dsl::matmul(A,B)+bias+relu 折叠后的派生物：
+        //   前置 matmul 段（MatmulSpec）+ 尾逐元素链（Add + Max）。
+        // 这里直接构造折叠后的结构并登记（与 dsl::compute 登记 spec 是同一机制），
+        // 保证 GPU 运行时同一结构命中 AOT 融合 shader（闭合世界）。
+        //   - transA/transB 是**运行期 operand layout**（PC `mm_trans`）→ **不进 key**：
+        //     4 种转置组合折叠成同一个 key，登记一次即可（历史上此处登记 4 份，
+        //     key 去掉转置后它们全被去重合并）。
+        //   - k（求和维度）是形状参数 → 不进 key：任取一个 K 登记，运行时任何 K
+        //     都命中同一融合 shader（同 RowMod/RotateHalf 的视图参数处理：不进 key，
+        //     运行时填充）。
         {
-            nn::ExprSpec pure;
-            pure.views    = {nn::expr::linear(), nn::expr::linear()};
-            pure.num_regs = 0;
-            pure.matmul   = nn::MatmulSpec{0, 1, 0, 0, /*k=*/8};
-            nn::fused::global_registry().add(pure);
+            nn::ExprSpec s;
+            s.views = {nn::expr::linear(), nn::expr::linear(), nn::expr::linear()};
+            s.num_regs = 2;
+            // transA/transB 取 (0,0) 作代表值：它们不进 key
+            s.matmul = nn::MatmulSpec{0, 1, /*transA=*/0, /*transB=*/0, /*k=*/8};
+            // Add r0 = matmul(A,B) + bias（Input 2）
+            s.instrs.push_back({static_cast<std::uint8_t>(nn::ExprOp::Add),
+                                0,
+                                nn::expr::matmul_op(),
+                                nn::expr::input(2),
+                                {}});
+            // Max r1 = max(r0, 0)（relu）
+            s.consts.push_back(nn::Scalar{0});
+            s.instrs.push_back({static_cast<std::uint8_t>(nn::ExprOp::Max),
+                                1,
+                                nn::expr::reg(0),
+                                nn::expr::cst(0),
+                                {}});
+            nn::fused::global_registry().add(s);
+            // 纯 matmul（无逐元素链）：输出 = matmul 结果
+            {
+                nn::ExprSpec pure;
+                pure.views = {nn::expr::linear(), nn::expr::linear()};
+                pure.num_regs = 0;
+                pure.matmul = nn::MatmulSpec{0, 1, 0, 0, /*k=*/8};
+                nn::fused::global_registry().add(pure);
+            }
         }
-    }
 
-    // ── 算子融合二期（docs/internal/02-operator-fusion.md S5）：matmul+归约组合（注意力结构）
-    // bmm_reduce / bmm_denom 的 IR 等价物：matmul 段被归约指令消费，
-    // 不物化 (M,N) 得分矩阵（kernel 内联点积重算）。结构不依赖形状。
-    //   Q (M,K)，K 存储 (N,K)（transB=1）：QK^T = matmul(Q, K, transB)
-    {
-        // row_max(QK^T)：行归约 max（bmm_reduce ReduceOp::Max 等价）
-        nn::ExprSpec s;
-        s.views    = {nn::expr::linear(), nn::expr::linear()};
-        s.num_regs = 1;
-        s.matmul   = nn::MatmulSpec{0, 1, 0, 1, /*k=*/8};
-        s.instrs.push_back({static_cast<std::uint8_t>(nn::ExprOp::RowMax), 0,
-                            nn::expr::matmul_op(), {}, {}});
-        nn::fused::global_registry().add(s);
-        // row_sum(matmul)：行归约 sum（bmm_reduce ReduceOp::Sum 等价）
-        nn::ExprSpec s2;
-        s2.views    = {nn::expr::linear(), nn::expr::linear()};
-        s2.num_regs = 1;
-        s2.matmul   = nn::MatmulSpec{0, 1, 0, 1, /*k=*/8};
-        s2.instrs.push_back({static_cast<std::uint8_t>(nn::ExprOp::RowSum), 0,
-                             nn::expr::matmul_op(), {}, {}});
-        nn::fused::global_registry().add(s2);
-        // 列方向：col_max(matmul)（bmm_reduce reduce_cols=false 等价）
-        nn::ExprSpec s3;
-        s3.views    = {nn::expr::linear(), nn::expr::linear()};
-        s3.num_regs = 1;
-        s3.matmul   = nn::MatmulSpec{0, 1, 0, 1, /*k=*/8};
-        s3.instrs.push_back({static_cast<std::uint8_t>(nn::ExprOp::ColMax), 0,
-                             nn::expr::matmul_op(), {}, {}});
-        nn::fused::global_registry().add(s3);
-        // denom：row_sum(exp(QK^T - rb(row_max)))（bmm_denom 等价；row_max
-        // 经 RowBroadcast 视图 (M,1)，不物化得分矩阵）
-        nn::ExprSpec sd;
-        sd.views    = {nn::expr::linear(), nn::expr::linear(), nn::expr::row_broadcast()};
-        sd.num_regs = 3;
-        sd.matmul   = nn::MatmulSpec{0, 1, 0, 1, /*k=*/8};
-        sd.instrs.push_back({static_cast<std::uint8_t>(nn::ExprOp::Sub), 0,
-                             nn::expr::matmul_op(), nn::expr::input(2), {}});
-        sd.instrs.push_back({static_cast<std::uint8_t>(nn::ExprOp::Exp), 1,
-                             nn::expr::reg(0), {}, {}});
-        sd.instrs.push_back({static_cast<std::uint8_t>(nn::ExprOp::RowSum), 2,
-                             nn::expr::reg(1), {}, {}});
-        nn::fused::global_registry().add(sd);
-    }
+        // ── 算子融合二期（docs/internal/02-operator-fusion.md S5）：matmul+归约组合（注意力结构）
+        // bmm_reduce / bmm_denom 的 IR 等价物：matmul 段被归约指令消费，
+        // 不物化 (M,N) 得分矩阵（kernel 内联点积重算）。结构不依赖形状。
+        //   Q (M,K)，K 存储 (N,K)（transB=1）：QK^T = matmul(Q, K, transB)
+        {
+            // row_max(QK^T)：行归约 max（bmm_reduce ReduceOp::Max 等价）
+            nn::ExprSpec s;
+            s.views = {nn::expr::linear(), nn::expr::linear()};
+            s.num_regs = 1;
+            s.matmul = nn::MatmulSpec{0, 1, 0, 1, /*k=*/8};
+            s.instrs.push_back(
+                {static_cast<std::uint8_t>(nn::ExprOp::RowMax), 0, nn::expr::matmul_op(), {}, {}});
+            nn::fused::global_registry().add(s);
+            // row_sum(matmul)：行归约 sum（bmm_reduce ReduceOp::Sum 等价）
+            nn::ExprSpec s2;
+            s2.views = {nn::expr::linear(), nn::expr::linear()};
+            s2.num_regs = 1;
+            s2.matmul = nn::MatmulSpec{0, 1, 0, 1, /*k=*/8};
+            s2.instrs.push_back(
+                {static_cast<std::uint8_t>(nn::ExprOp::RowSum), 0, nn::expr::matmul_op(), {}, {}});
+            nn::fused::global_registry().add(s2);
+            // 列方向：col_max(matmul)（bmm_reduce reduce_cols=false 等价）
+            nn::ExprSpec s3;
+            s3.views = {nn::expr::linear(), nn::expr::linear()};
+            s3.num_regs = 1;
+            s3.matmul = nn::MatmulSpec{0, 1, 0, 1, /*k=*/8};
+            s3.instrs.push_back(
+                {static_cast<std::uint8_t>(nn::ExprOp::ColMax), 0, nn::expr::matmul_op(), {}, {}});
+            nn::fused::global_registry().add(s3);
+            // denom：row_sum(exp(QK^T - rb(row_max)))（bmm_denom 等价；row_max
+            // 经 RowBroadcast 视图 (M,1)，不物化得分矩阵）
+            nn::ExprSpec sd;
+            sd.views = {nn::expr::linear(), nn::expr::linear(), nn::expr::row_broadcast()};
+            sd.num_regs = 3;
+            sd.matmul = nn::MatmulSpec{0, 1, 0, 1, /*k=*/8};
+            sd.instrs.push_back({static_cast<std::uint8_t>(nn::ExprOp::Sub),
+                                 0,
+                                 nn::expr::matmul_op(),
+                                 nn::expr::input(2),
+                                 {}});
+            sd.instrs.push_back(
+                {static_cast<std::uint8_t>(nn::ExprOp::Exp), 1, nn::expr::reg(0), {}, {}});
+            sd.instrs.push_back(
+                {static_cast<std::uint8_t>(nn::ExprOp::RowSum), 2, nn::expr::reg(1), {}, {}});
+            nn::fused::global_registry().add(sd);
+        }
 
-    // ── CausalSelfAttention（IR 掩码组合 forward/backward）──────────
-    // 掩码表达式 4 配置（causal / causal+alibi / causal+doc / causal+alibi+doc）
-    // 各产生确定结构：m/l/W（matmul 段 + Row/Col/Batch 操作数 + 视图）与
-    // backward 的 R/X（纯逐元素）。必须全部 dry-run 覆盖（闭合世界）。
-    {
-        const std::size_t d_model = 16, heads = 2, seq = 4, batch = 2;
-        const auto run_csa = [&](nn::CausalSelfAttention& attn) {
+        // ── CausalSelfAttention（IR 掩码组合 forward/backward）──────────
+        // 掩码表达式 4 配置（causal / causal+alibi / causal+doc / causal+alibi+doc）
+        // 各产生确定结构：m/l/W（matmul 段 + Row/Col/Batch 操作数 + 视图）与
+        // backward 的 R/X（纯逐元素）。必须全部 dry-run 覆盖（闭合世界）。
+        {
+            const std::size_t d_model = 16, heads = 2, seq = 4, batch = 2;
+            const auto run_csa = [&](nn::CausalSelfAttention& attn)
+            {
+                (void)attn.init(engine);
+                nn::Tensor x = scan_tensor(d_model, batch * seq);
+                // 禁止 (void) 吞错：forward 失败会让缓存为空，backward 直接
+                //   在 batched_matmul 读空张量上 NN_ASSERT（栈无上下文难定位）
+                auto fr = attn.forward(x);
+                if (!fr)
+                {
+                    std::fprintf(stderr, "[scan] CSA forward FAILED: %s\n",
+                                 fr.error().message.c_str());
+                    std::fflush(stderr);
+                    std::abort();   // 带栈停在真凶处
+                }
+                nn::Tensor grad = scan_tensor(d_model, batch * seq);
+                auto br = attn.backward(grad);
+                if (!br)
+                {
+                    std::fprintf(stderr, "[scan] CSA backward FAILED: %s\n",
+                                 br.error().message.c_str());
+                    std::fflush(stderr);
+                    std::abort();
+                }
+            };
+            for (const auto enc : {nn::PosEncodingType::Learned, nn::PosEncodingType::ALiBi})
+            {
+                nn::CausalSelfAttention attn(d_model, heads, /*max_len=*/1024,
+                                             /*seq_len=*/seq, enc);
+                attn.set_precision_profile(scan_prof);   // 扫描期精度（f16 pass 收集变体）
+                (void)attn.init(engine);   // M6 段 C：层由 init 绑定引擎
+                run_csa(attn);
+            }
+            // doc 变体（doc_ids 每位置文档 id，长度 = batch*seq）
+            {
+                const std::size_t doc_ids[8] = {0, 0, 1, 1, 0, 0, 1, 1};
+                nn::CausalSelfAttention attn_d(d_model, heads, 1024, seq,
+                                               nn::PosEncodingType::Learned);
+                attn_d.set_precision_profile(scan_prof);   // 扫描期精度（f16 pass 收集变体）
+                (void)attn_d.init(engine);   // M6 段 C：层由 init 绑定引擎
+                attn_d.set_doc_ids(doc_ids);
+                run_csa(attn_d);
+            }
+            {
+                const std::size_t doc_ids[8] = {0, 0, 1, 1, 0, 0, 1, 1};
+                nn::CausalSelfAttention attn_ad(d_model, heads, 1024, seq,
+                                                nn::PosEncodingType::ALiBi);
+                attn_ad.set_precision_profile(scan_prof);   // 扫描期精度（f16 pass 收集变体）
+                (void)attn_ad.init(engine);   // M6 段 C：层由 init 绑定引擎
+                attn_ad.set_doc_ids(doc_ids);
+                run_csa(attn_ad);
+            }
+            // GQA（docs/internal/22 §3.2 的 P2）：K/V_t 走 **HeadGroup 视图**
+            //   （头分组比是运行期 vp 参数、**不进 key** → 登记一次覆盖任意 n_rep，
+            //   但"视图种类"本身是结构 → 必须是独立一条，否则 GPU 闭合世界对
+            //   GQA 的 fold 直接硬报错）。heads=2 / n_head_kv=1 → ratio 2。
+            {
+                nn::CausalSelfAttention attn_gqa(d_model, heads, 1024, seq,
+                                                 nn::PosEncodingType::RoPE,
+                                                 /*subln=*/false, nn::NormType::LayerNorm,
+                                                 /*n_head_kv=*/1);
+                attn_gqa.set_precision_profile(scan_prof);
+                (void)attn_gqa.init(engine);
+                run_csa(attn_gqa);
+            }
+        }
+
+        // ── MultiHeadAttention（MHA=Plain 双向无掩码）───────────────
+        //   forward fold 的 Plain 变体 + **backward recompute 的裸 S 表达式**
+        //   （无掩码 dsl::compute(matmul)，MHA dry-run 是该结构唯一的
+        //   闭合世界注册来源）；R/X 与 grad 累加与
+        //   CSA 同构同 key。
+        {
+            const std::size_t d_model = 16, heads = 2, seq = 4, batch = 2;
+            nn::MultiHeadAttention attn(d_model, heads, /*seq_len=*/seq);
+            attn.set_precision_profile(scan_prof);   // 扫描期精度（f16 pass 收集变体）
             (void)attn.init(engine);
             nn::Tensor x = scan_tensor(d_model, batch * seq);
-            // 禁止 (void) 吞错：forward 失败会让缓存为空，backward 直接
-            //   在 batched_matmul 读空张量上 NN_ASSERT（栈无上下文难定位）
             auto fr = attn.forward(x);
             if (!fr)
             {
-                std::fprintf(stderr, "[scan] CSA forward FAILED: %s\n",
-                             fr.error().message.c_str());
+                std::fprintf(stderr, "[scan] MHA forward FAILED: %s\n", fr.error().message.c_str());
                 std::fflush(stderr);
-                std::abort();   // 带栈停在真凶处
+                std::abort();
             }
             nn::Tensor grad = scan_tensor(d_model, batch * seq);
             auto br = attn.backward(grad);
             if (!br)
             {
-                std::fprintf(stderr, "[scan] CSA backward FAILED: %s\n",
+                std::fprintf(stderr, "[scan] MHA backward FAILED: %s\n",
                              br.error().message.c_str());
                 std::fflush(stderr);
                 std::abort();
             }
-        };
-        for (const auto enc : {nn::PosEncodingType::Learned,
-                               nn::PosEncodingType::ALiBi})
+        }
+
+        // ── CrossAttention（issue #33：矩形 cross 注意力）──────────────
+        //   表达式结构与 MHA 同 key（Plain fold / 裸 S / R / X 均同构；seq_q/
+        //   seq_kv 是形状参数不进 key）——本 dry-run 的职责是**显式登记**
+        //   seq_q ≠ seq_kv 的矩形路径（闭合世界按"注册过才存在"口径），并在
+        //   构建期验证 forward_pair/backward_pair 在矩形形状下可跑通。
         {
-            nn::CausalSelfAttention attn(d_model, heads, /*max_len=*/1024,
-                                         /*seq_len=*/seq, enc);
+            const std::size_t d_model = 16, heads = 2, seq_q = 4, seq_kv = 6, batch = 2;
+            nn::CrossAttention attn(d_model, heads, /*seq_len=*/seq_q,
+                                    /*seq_kv_len=*/seq_kv);
             attn.set_precision_profile(scan_prof);   // 扫描期精度（f16 pass 收集变体）
-            (void)attn.init(engine);   // M6 段 C：层由 init 绑定引擎
-            run_csa(attn);
+            (void)attn.init(engine);
+            nn::Tensor q = scan_tensor(d_model, batch * seq_q);
+            nn::Tensor mem = scan_tensor(d_model, batch * seq_kv);
+            auto fr = attn.forward_pair(q, mem);
+            if (!fr)
+            {
+                std::fprintf(stderr, "[scan] CrossAttention forward FAILED: %s\n",
+                             fr.error().message.c_str());
+                std::fflush(stderr);
+                std::abort();
+            }
+            nn::Tensor grad = scan_tensor(d_model, batch * seq_q);
+            auto br = attn.backward_pair(grad);
+            if (!br)
+            {
+                std::fprintf(stderr, "[scan] CrossAttention backward FAILED: %s\n",
+                             br.error().message.c_str());
+                std::fflush(stderr);
+                std::abort();
+            }
         }
-        // doc 变体（doc_ids 每位置文档 id，长度 = batch*seq）
+
+        // ── CrossEntropyLoss 稀疏 forward（IR 组合 denom/loss_vec/grad）──
+        // 结构不依赖形状；含 mask 与 label 越界修正的统一 mask 构造。
         {
-            const std::size_t doc_ids[8] = {0, 0, 1, 1, 0, 0, 1, 1};
-            nn::CausalSelfAttention attn_d(d_model, heads, 1024, seq,
-                                           nn::PosEncodingType::Learned);
-            attn_d.set_precision_profile(scan_prof);   // 扫描期精度（f16 pass 收集变体）
-            (void)attn_d.init(engine);   // M6 段 C：层由 init 绑定引擎
-            attn_d.set_doc_ids(doc_ids);
-            run_csa(attn_d);
+            const std::size_t C = 8, B = 5;
+            nn::CrossEntropyLoss ce;
+            ce.set_precision_profile(scan_prof);   // 扫描期精度（f16 pass 收集变体）
+            nn::Tensor logits = scan_tensor(C, B);
+            std::vector<std::size_t> labels(B, 1);
+            std::vector<nn::Scalar> mask(B, 1.0f);
+            (void)ce.forward_sparse(engine, logits, labels, mask, C);
+            // 无 mask（全 1 修正）与带越界 label 的变体
+            std::vector<std::size_t> labels2(B, 0);
+            labels2[0] = 99;  // 越界 → mask 修正为 0
+            (void)ce.forward_sparse(engine, logits, labels2, {}, C);
         }
+
+        // ── Softmax forward/backward（独立层；各模型主干走 fold 不经过它）──
+        // 输入槽去重（SpecBuilder::add_input）后 leaf(S)/row_reduce_max(S) 各由
+        // 4 槽并为 2 槽 → 结构 key 变化；锚点符号实例（占位张量）**不参与去重**
+        // 只登记旧结构，故此类"锚点覆盖但 dry-run 未覆盖"的表达式必须在此以
+        // 真实张量 dry-run 登记（否则运行期去重后 key 未命中 → 闭合世界硬报错）。
         {
-            const std::size_t doc_ids[8] = {0, 0, 1, 1, 0, 0, 1, 1};
-            nn::CausalSelfAttention attn_ad(d_model, heads, 1024, seq,
-                                            nn::PosEncodingType::ALiBi);
-            attn_ad.set_precision_profile(scan_prof);   // 扫描期精度（f16 pass 收集变体）
-            (void)attn_ad.init(engine);   // M6 段 C：层由 init 绑定引擎
-            attn_ad.set_doc_ids(doc_ids);
-            run_csa(attn_ad);
+            const std::size_t R = 6, C = 9;   // 与 fused_gpu_test run_softmax 同形
+            nn::Softmax sm;
+            sm.set_precision_profile(scan_prof);
+            (void)sm.init(engine);
+            nn::Tensor x = scan_tensor(R, C);
+            (void)sm.forward(x);
+            nn::Tensor g = scan_tensor(R, C);
+            (void)sm.backward(g);
         }
-        // GQA（docs/internal/22 §3.2 的 P2）：K/V_t 走 **HeadGroup 视图**
-        //   （头分组比是运行期 vp 参数、**不进 key** → 登记一次覆盖任意 n_rep，
-        //   但"视图种类"本身是结构 → 必须是独立一条，否则 GPU 闭合世界对
-        //   GQA 的 fold 直接硬报错）。heads=2 / n_head_kv=1 → ratio 2。
+
+        // ── 归约表达式内联常量（push-constant 头长度回归）────────────────────
+        // `col_reduce_sum(select(cond, 1, 0))` 是**带常量池的归约**结构：GPU 侧
+        // push-constant 固定头长度必须按形态算（归约且无 matmul = 4 个 uint）。
+        // ⚠ 固定头长度必须与生成器 PC 声明**逐形态一致**：错一个 uint 即常量池
+        // 整体后移 → GPU 静默错值而 CPU 正常。fused_gpu_test 的 run_reduce_consts
+        // 做 CPU/GPU 对比覆盖。
         {
-            nn::CausalSelfAttention attn_gqa(d_model, heads, 1024, seq,
-                                             nn::PosEncodingType::RoPE,
-                                             /*subln=*/false, nn::NormType::LayerNorm,
-                                             /*n_head_kv=*/1);
-            attn_gqa.set_precision_profile(scan_prof);
-            (void)attn_gqa.init(engine);
-            run_csa(attn_gqa);
+            const std::size_t kk = 4, cols = 3;
+            nn::Tensor x = scan_tensor(kk, cols);
+            nn::Tensor mx = scan_tensor(1, cols);
+            (void)nn::dsl::compute_reduce(
+                engine,
+                nn::dsl::col_reduce_sum(nn::dsl::select(
+                    nn::dsl::leaf(x) == nn::dsl::col_broadcast(mx), nn::Scalar{1}, nn::Scalar{0})),
+                kk, cols);
         }
-    }
 
-    // ── MultiHeadAttention（MHA=Plain 双向无掩码）───────────────
-    //   forward fold 的 Plain 变体 + **backward recompute 的裸 S 表达式**
-    //   （无掩码 dsl::compute(matmul)，MHA dry-run 是该结构唯一的
-    //   闭合世界注册来源）；R/X 与 grad 累加与
-    //   CSA 同构同 key。
-    {
-        const std::size_t d_model = 16, heads = 2, seq = 4, batch = 2;
-        nn::MultiHeadAttention attn(d_model, heads, /*seq_len=*/seq);
-        attn.set_precision_profile(scan_prof);   // 扫描期精度（f16 pass 收集变体）
-        (void)attn.init(engine);
-        nn::Tensor x = scan_tensor(d_model, batch * seq);
-        auto fr = attn.forward(x);
-        if (!fr)
+        // ── BitLinear 的**两条量化缓冲路径**（F3 / P2）────────────────────────
+        // 模型 pass 只产出"该引擎默认走的那条"（CPU 引擎 supports_ternary_gemm()
+        // = true → 打包路径），于是稠密路径的 `select → wq_` 与 matmul 尾链**不再
+        // 被任何用例登记**；而未接打包的后端（GPU 未接时）运行期走稠密路径 →
+        // 闭合世界硬报错（t1_58_test_gpu 就是这么暴露的）。两条路径的结构都必须
+        // 登记，故这里各 dry-run 一份（结构不依赖精度）。
+        for (const bool packed : {true, false})
         {
-            std::fprintf(stderr, "[scan] MHA forward FAILED: %s\n",
-                         fr.error().message.c_str());
-            std::fflush(stderr);
-            std::abort();
+            nn::BitLinear bl(4, 3);
+            nn::PrecisionProfile t1 = scan_prof;
+            t1.param = nn::Precision::T1_58;
+            bl.set_precision_profile(t1);
+            (void)bl.init(engine);
+            bl.set_ternary_pack_enabled(packed);
+            nn::Tensor x = scan_tensor(4, 2);
+            auto fr = bl.forward(x);
+            if (!fr)
+            {
+                std::fprintf(stderr, "[scan] BitLinear(%s) forward FAILED: %s\n",
+                             packed ? "packed" : "dense", fr.error().message.c_str());
+                std::fflush(stderr);
+                std::abort();
+            }
+            nn::Tensor g = scan_tensor(3, 2);
+            auto br = bl.backward(g);
+            if (!br)
+            {
+                std::fprintf(stderr, "[scan] BitLinear(%s) backward FAILED: %s\n",
+                             packed ? "packed" : "dense", br.error().message.c_str());
+                std::fflush(stderr);
+                std::abort();
+            }
         }
-        nn::Tensor grad = scan_tensor(d_model, batch * seq);
-        auto br = attn.backward(grad);
-        if (!br)
+
+        // ── RL：experience transforms / categorical policy / objectives ────────
+        // RL 头不经过 Layer 模型 pass；这里显式触达每个 public evaluate 路径，
+        // 让 dsl::compute* 的 FusedAnchor 在构建期登记结构。scan 模式的算子是
+        // 占位返回，具体数值分支不重要；所有表达式调用点都会被实例化。
         {
-            std::fprintf(stderr, "[scan] MHA backward FAILED: %s\n",
-                         br.error().message.c_str());
-            std::fflush(stderr);
-            std::abort();
+            constexpr std::size_t R = 3, C = 2;
+            nn::Tensor logits = scan_tensor(R, C);
+            nn::Tensor action = scan_tensor(1, C);
+            nn::Tensor one = scan_tensor(1, C);
+            nn::Tensor value = scan_tensor(1, C);
+            nn::Tensor reward = scan_tensor(R, C);
+            nn::Tensor done = scan_tensor(R, C);
+            nn::Tensor mask_rc = scan_tensor(R, C);
+            nn::Tensor old_log_prob = scan_tensor(1, C);
+
+            nn::CategoricalDistribution dist(scan_prof.stable);
+            (void)dist.log_prob(engine, logits, action);
+            (void)dist.entropy(engine, logits);
+            (void)dist.log_prob_with_gradient(engine, logits, action, one);
+            (void)dist.entropy_with_gradient(engine, logits, one);
+
+            // PPO/value clip 的 select 结构：目标方法在 dry-run 中可能因全零
+            // mask 提前返回；这里直接触达同一表达式类型，避免闭合世界漏项。
+            nn::Tensor ratio = scan_tensor(1, C);
+            nn::Tensor old_value_scan = scan_tensor(1, C);
+            nn::Tensor value_scan = scan_tensor(1, C);
+            nn::Tensor returns_scan = scan_tensor(1, C);
+            const nn::Scalar lower = 0.8f;
+            const nn::Scalar upper = 1.2f;
+            auto clipped_ratio_expr = nn::dsl::select(
+                nn::dsl::leaf(ratio) < nn::dsl::rparam(lower), nn::dsl::rparam(lower),
+                nn::dsl::select(nn::dsl::leaf(ratio) > nn::dsl::rparam(upper),
+                                nn::dsl::rparam(upper), nn::dsl::leaf(ratio)));
+            nn::Tensor clipped_ratio =
+                NN_UNWRAP(nn::dsl::compute(engine, clipped_ratio_expr, 1, C, scan_prof.stable));
+            nn::Tensor clip_low = NN_UNWRAP(
+                nn::dsl::compute(engine, nn::dsl::leaf(old_value_scan) - nn::dsl::rparam(0.2f), 1,
+                                 C, scan_prof.stable));
+            nn::Tensor clip_high = NN_UNWRAP(
+                nn::dsl::compute(engine, nn::dsl::leaf(old_value_scan) + nn::dsl::rparam(0.2f), 1,
+                                 C, scan_prof.stable));
+            auto clipped_value_expr = nn::dsl::select(
+                nn::dsl::leaf(value_scan) < nn::dsl::leaf(clip_low), nn::dsl::leaf(clip_low),
+                nn::dsl::select(nn::dsl::leaf(value_scan) > nn::dsl::leaf(clip_high),
+                                nn::dsl::leaf(clip_high), nn::dsl::leaf(value_scan)));
+            nn::Tensor clipped_value =
+                NN_UNWRAP(nn::dsl::compute(engine, clipped_value_expr, 1, C, scan_prof.stable));
+            nn::Tensor clipped_diff = NN_UNWRAP(
+                nn::dsl::compute(engine, nn::dsl::leaf(clipped_value) - nn::dsl::leaf(returns_scan),
+                                 1, C, scan_prof.stable));
+            nn::Tensor value_diff = NN_UNWRAP(
+                nn::dsl::compute(engine, nn::dsl::leaf(value_scan) - nn::dsl::leaf(returns_scan), 1,
+                                 C, scan_prof.stable));
+            nn::Tensor value_diff_sq = NN_UNWRAP(
+                nn::dsl::compute(engine, nn::dsl::leaf(value_diff) * nn::dsl::leaf(value_diff), 1,
+                                 C, scan_prof.stable));
+            nn::Tensor value_clipped_sq = NN_UNWRAP(
+                nn::dsl::compute(engine, nn::dsl::leaf(clipped_diff) * nn::dsl::leaf(clipped_diff),
+                                 1, C, scan_prof.stable));
+            auto value_max_expr =
+                nn::dsl::max(nn::dsl::leaf(value_diff_sq), nn::dsl::leaf(value_clipped_sq));
+            (void)nn::dsl::compute(engine, value_max_expr, 1, C, scan_prof.stable);
+
+            nn::Tensor ppo_objective = NN_UNWRAP(nn::dsl::compute(
+                engine, nn::dsl::leaf(ratio) * nn::dsl::leaf(one), 1, C, scan_prof.stable));
+            nn::Tensor ppo_clipped_objective = NN_UNWRAP(nn::dsl::compute(
+                engine, nn::dsl::leaf(clipped_ratio) * nn::dsl::leaf(one), 1, C, scan_prof.stable));
+            auto ppo_min_expr =
+                nn::dsl::min(nn::dsl::leaf(ppo_objective), nn::dsl::leaf(ppo_clipped_objective));
+            (void)nn::dsl::compute(engine, ppo_min_expr, 1, C, scan_prof.stable);
+            const auto ratio_leaf = nn::dsl::leaf(ratio);
+            const auto adv_leaf = nn::dsl::leaf(one);
+            const auto positive_factor = nn::dsl::select(ratio_leaf > nn::dsl::rparam(upper),
+                                                         nn::Scalar{0}, ratio_leaf * adv_leaf);
+            const auto negative_factor = nn::dsl::select(ratio_leaf < nn::dsl::rparam(lower),
+                                                         nn::Scalar{0}, ratio_leaf * adv_leaf);
+            auto ppo_factor_expr =
+                nn::dsl::select(adv_leaf > nn::Scalar{0}, positive_factor, negative_factor);
+            nn::Tensor ppo_factor_scan =
+                NN_UNWRAP(nn::dsl::compute(engine, ppo_factor_expr, 1, C, scan_prof.stable));
+            (void)nn::dsl::compute(engine,
+                                   nn::dsl::leaf(ppo_factor_scan) * nn::dsl::leaf(one) *
+                                       nn::dsl::rparam(-1.0f),
+                                   1, C, scan_prof.stable);
+            auto ppo_outside_expr =
+                nn::dsl::select(ratio_leaf < nn::dsl::rparam(lower), nn::Scalar{1},
+                                nn::dsl::select(ratio_leaf > nn::dsl::rparam(upper), nn::Scalar{1},
+                                                nn::Scalar{0})) *
+                nn::dsl::leaf(one);
+            (void)nn::dsl::compute(engine, ppo_outside_expr, 1, C, scan_prof.stable);
+            const auto value_outside = nn::dsl::select(
+                nn::dsl::leaf(value_scan) < nn::dsl::leaf(clip_low), nn::Scalar{1},
+                nn::dsl::select(nn::dsl::leaf(value_scan) > nn::dsl::leaf(clip_high), nn::Scalar{1},
+                                nn::Scalar{0}));
+            auto value_outside_mask_expr = value_outside * nn::dsl::leaf(one);
+            (void)nn::dsl::compute(engine, value_outside_mask_expr, 1, C, scan_prof.stable);
+            nn::Tensor value_outside_tensor =
+                NN_UNWRAP(nn::dsl::compute(engine, value_outside, 1, C, scan_prof.stable));
+            nn::Tensor value_clipped_grad = NN_UNWRAP(nn::dsl::compute(
+                engine,
+                nn::dsl::select(nn::dsl::leaf(value_outside_tensor) > nn::Scalar{0}, nn::Scalar{0},
+                                nn::dsl::leaf(value_diff) * nn::dsl::rparam(2.0f)),
+                1, C, scan_prof.stable));
+            nn::Tensor value_unclipped_grad = NN_UNWRAP(nn::dsl::compute(
+                engine, nn::dsl::leaf(value_diff) * nn::dsl::rparam(2.0f), 1, C, scan_prof.stable));
+            auto value_choose_clipped =
+                nn::dsl::leaf(value_clipped_sq) > nn::dsl::leaf(value_diff_sq);
+            auto value_grad_expr =
+                nn::dsl::select(value_choose_clipped, nn::dsl::leaf(value_clipped_grad),
+                                nn::dsl::leaf(value_unclipped_grad)) *
+                nn::dsl::leaf(one) * nn::dsl::rparam(1.0f);
+            (void)nn::dsl::compute(engine, value_grad_expr, 1, C, scan_prof.stable);
+
+            nn::GaeAdvantage gae;
+            (void)gae.apply(engine, reward, reward, &done, &mask_rc, &one);
+            nn::MonteCarloReturn returns;
+            (void)returns.apply(engine, reward, &done, &mask_rc);
+            nn::MaskedNormalizer normalizer;
+            (void)normalizer.apply(engine, reward, mask_rc);
+            const nn::GroupSpan groups[1]{{0, R}};
+            nn::GroupAdvantage group;
+            (void)group.apply(engine, reward, groups);
+
+            nn::ExperienceSchema exp = NN_UNWRAP(nn::ExperienceSchema::create(
+                {"action", "action_mask", "advantage", "return", "old_value", "old_log_prob"}));
+            nn::TensorRecord record = NN_UNWRAP(nn::TensorRecord::create(
+                exp.schema(), {nn::NamedTensor{.name = "action", .value = action},
+                               nn::NamedTensor{.name = "action_mask", .value = one},
+                               nn::NamedTensor{.name = "value_mask", .value = one},
+                               nn::NamedTensor{.name = "advantage", .value = one},
+                               nn::NamedTensor{.name = "return", .value = one},
+                               nn::NamedTensor{.name = "old_value", .value = one},
+                               nn::NamedTensor{.name = "old_log_prob", .value = old_log_prob}}));
+            nn::PolicyBatchView view = NN_UNWRAP(nn::PolicyBatchView::create(record));
+
+            nn::ReinforceObjective reinforce;
+            (void)reinforce.evaluate_context(engine, logits, view);
+            nn::ValueRegressionObjective value_reg;
+            (void)value_reg.evaluate_context(engine, value, view);
+            nn::EntropyBonusObjective entropy;
+            (void)entropy.evaluate_context(engine, logits, view);
+            nn::SampledKlObjective kl;
+            (void)kl.evaluate_context(engine, logits, view);
+            nn::ClippedPolicyObjective ppo_policy;
+            (void)ppo_policy.evaluate_context(engine, logits, view);
+            nn::ClippedValueObjective ppo_value;
+            (void)ppo_value.evaluate_context(engine, value, view);
+
+            nn::TensorSchema output = NN_UNWRAP(nn::TensorSchema::create(
+                "rl_output", {nn::tensor_field("policy", nn::TensorShapeSpec::exact(R, C)),
+                              nn::tensor_field("value", nn::TensorShapeSpec::exact(1, C))}));
+            nn::PpoObjective ppo;
+            (void)ppo.evaluate(engine, output, logits, value, view);
         }
-    }
-
-    // ── CrossAttention（issue #33：矩形 cross 注意力）──────────────
-    //   表达式结构与 MHA 同 key（Plain fold / 裸 S / R / X 均同构；seq_q/
-    //   seq_kv 是形状参数不进 key）——本 dry-run 的职责是**显式登记**
-    //   seq_q ≠ seq_kv 的矩形路径（闭合世界按"注册过才存在"口径），并在
-    //   构建期验证 forward_pair/backward_pair 在矩形形状下可跑通。
-    {
-        const std::size_t d_model = 16, heads = 2, seq_q = 4, seq_kv = 6,
-                          batch = 2;
-        nn::CrossAttention attn(d_model, heads, /*seq_len=*/seq_q,
-                                /*seq_kv_len=*/seq_kv);
-        attn.set_precision_profile(scan_prof);   // 扫描期精度（f16 pass 收集变体）
-        (void)attn.init(engine);
-        nn::Tensor q = scan_tensor(d_model, batch * seq_q);
-        nn::Tensor mem = scan_tensor(d_model, batch * seq_kv);
-        auto fr = attn.forward_pair(q, mem);
-        if (!fr)
-        {
-            std::fprintf(stderr, "[scan] CrossAttention forward FAILED: %s\n",
-                         fr.error().message.c_str());
-            std::fflush(stderr);
-            std::abort();
-        }
-        nn::Tensor grad = scan_tensor(d_model, batch * seq_q);
-        auto br = attn.backward_pair(grad);
-        if (!br)
-        {
-            std::fprintf(stderr, "[scan] CrossAttention backward FAILED: %s\n",
-                         br.error().message.c_str());
-            std::fflush(stderr);
-            std::abort();
-        }
-    }
-
-    // ── CrossEntropyLoss 稀疏 forward（IR 组合 denom/loss_vec/grad）──
-    // 结构不依赖形状；含 mask 与 label 越界修正的统一 mask 构造。
-    {
-        const std::size_t C = 8, B = 5;
-        nn::CrossEntropyLoss ce;
-        ce.set_precision_profile(scan_prof);   // 扫描期精度（f16 pass 收集变体）
-        nn::Tensor logits = scan_tensor(C, B);
-        std::vector<std::size_t> labels(B, 1);
-        std::vector<nn::Scalar> mask(B, 1.0f);
-        (void)ce.forward_sparse(engine, logits, labels, mask, C);
-        // 无 mask（全 1 修正）与带越界 label 的变体
-        std::vector<std::size_t> labels2(B, 0);
-        labels2[0] = 99;  // 越界 → mask 修正为 0
-        (void)ce.forward_sparse(engine, logits, labels2, {}, C);
-    }
-
-    // ── Softmax forward/backward（独立层；各模型主干走 fold 不经过它）──
-    // 输入槽去重（SpecBuilder::add_input）后 leaf(S)/row_reduce_max(S) 各由
-    // 4 槽并为 2 槽 → 结构 key 变化；锚点符号实例（占位张量）**不参与去重**
-    // 只登记旧结构，故此类"锚点覆盖但 dry-run 未覆盖"的表达式必须在此以
-    // 真实张量 dry-run 登记（否则运行期去重后 key 未命中 → 闭合世界硬报错）。
-    {
-        const std::size_t R = 6, C = 9;   // 与 fused_gpu_test run_softmax 同形
-        nn::Softmax sm;
-        sm.set_precision_profile(scan_prof);
-        (void)sm.init(engine);
-        nn::Tensor x = scan_tensor(R, C);
-        (void)sm.forward(x);
-        nn::Tensor g = scan_tensor(R, C);
-        (void)sm.backward(g);
-    }
-
-    // ── 归约表达式内联常量（push-constant 头长度回归）────────────────────
-    // `col_reduce_sum(select(cond, 1, 0))` 是**带常量池的归约**结构：GPU 侧
-    // push-constant 固定头长度必须按形态算（归约且无 matmul = 4 个 uint）。
-    // ⚠ 固定头长度必须与生成器 PC 声明**逐形态一致**：错一个 uint 即常量池
-    // 整体后移 → GPU 静默错值而 CPU 正常。fused_gpu_test 的 run_reduce_consts
-    // 做 CPU/GPU 对比覆盖。
-    {
-        const std::size_t kk = 4, cols = 3;
-        nn::Tensor x = scan_tensor(kk, cols);
-        nn::Tensor mx = scan_tensor(1, cols);
-        (void)nn::dsl::compute_reduce(engine,
-            nn::dsl::col_reduce_sum(nn::dsl::select(
-                nn::dsl::leaf(x) == nn::dsl::col_broadcast(mx),
-                nn::Scalar{1}, nn::Scalar{0})),
-            kk, cols);
-    }
-
-    // ── BitLinear 的**两条量化缓冲路径**（F3 / P2）────────────────────────
-    // 模型 pass 只产出"该引擎默认走的那条"（CPU 引擎 supports_ternary_gemm()
-    // = true → 打包路径），于是稠密路径的 `select → wq_` 与 matmul 尾链**不再
-    // 被任何用例登记**；而未接打包的后端（GPU 未接时）运行期走稠密路径 →
-    // 闭合世界硬报错（t1_58_test_gpu 就是这么暴露的）。两条路径的结构都必须
-    // 登记，故这里各 dry-run 一份（结构不依赖精度）。
-    for (const bool packed : {true, false})
-    {
-        nn::BitLinear bl(4, 3);
-        nn::PrecisionProfile t1 = scan_prof;
-        t1.param = nn::Precision::T1_58;
-        bl.set_precision_profile(t1);
-        (void)bl.init(engine);
-        bl.set_ternary_pack_enabled(packed);
-        nn::Tensor x = scan_tensor(4, 2);
-        auto fr = bl.forward(x);
-        if (!fr)
-        {
-            std::fprintf(stderr, "[scan] BitLinear(%s) forward FAILED: %s\n",
-                         packed ? "packed" : "dense", fr.error().message.c_str());
-            std::fflush(stderr);
-            std::abort();
-        }
-        nn::Tensor g = scan_tensor(3, 2);
-        auto br = bl.backward(g);
-        if (!br)
-        {
-            std::fprintf(stderr, "[scan] BitLinear(%s) backward FAILED: %s\n",
-                         packed ? "packed" : "dense", br.error().message.c_str());
-            std::fflush(stderr);
-            std::abort();
-        }
-    }
-
-    // ── RL：experience transforms / categorical policy / objectives ────────
-    // RL 头不经过 Layer 模型 pass；这里显式触达每个 public evaluate 路径，
-    // 让 dsl::compute* 的 FusedAnchor 在构建期登记结构。scan 模式的算子是
-    // 占位返回，具体数值分支不重要；所有表达式调用点都会被实例化。
-    {
-        constexpr std::size_t R = 3, C = 2;
-        nn::Tensor logits = scan_tensor(R, C);
-        nn::Tensor action = scan_tensor(1, C);
-        nn::Tensor one = scan_tensor(1, C);
-        nn::Tensor value = scan_tensor(1, C);
-        nn::Tensor reward = scan_tensor(R, C);
-        nn::Tensor done = scan_tensor(R, C);
-        nn::Tensor mask_rc = scan_tensor(R, C);
-        nn::Tensor old_log_prob = scan_tensor(1, C);
-
-        nn::CategoricalDistribution dist(scan_prof.stable);
-        (void)dist.log_prob(engine, logits, action);
-        (void)dist.entropy(engine, logits);
-        (void)dist.log_prob_with_gradient(engine, logits, action, one);
-        (void)dist.entropy_with_gradient(engine, logits, one);
-
-        // PPO/value clip 的 select 结构：目标方法在 dry-run 中可能因全零
-        // mask 提前返回；这里直接触达同一表达式类型，避免闭合世界漏项。
-        nn::Tensor ratio = scan_tensor(1, C);
-        nn::Tensor old_value_scan = scan_tensor(1, C);
-        nn::Tensor value_scan = scan_tensor(1, C);
-        nn::Tensor returns_scan = scan_tensor(1, C);
-        const nn::Scalar lower = 0.8f;
-        const nn::Scalar upper = 1.2f;
-        auto clipped_ratio_expr = nn::dsl::select(
-            nn::dsl::leaf(ratio) < nn::dsl::rparam(lower),
-            nn::dsl::rparam(lower),
-            nn::dsl::select(
-                nn::dsl::leaf(ratio) > nn::dsl::rparam(upper),
-                nn::dsl::rparam(upper), nn::dsl::leaf(ratio)));
-        nn::Tensor clipped_ratio = NN_UNWRAP(nn::dsl::compute(
-            engine, clipped_ratio_expr, 1, C, scan_prof.stable));
-        nn::Tensor clip_low = NN_UNWRAP(nn::dsl::compute(
-            engine,
-            nn::dsl::leaf(old_value_scan) - nn::dsl::rparam(0.2f),
-            1, C, scan_prof.stable));
-        nn::Tensor clip_high = NN_UNWRAP(nn::dsl::compute(
-            engine,
-            nn::dsl::leaf(old_value_scan) + nn::dsl::rparam(0.2f),
-            1, C, scan_prof.stable));
-        auto clipped_value_expr = nn::dsl::select(
-            nn::dsl::leaf(value_scan) < nn::dsl::leaf(clip_low),
-            nn::dsl::leaf(clip_low),
-            nn::dsl::select(
-                nn::dsl::leaf(value_scan) > nn::dsl::leaf(clip_high),
-                nn::dsl::leaf(clip_high), nn::dsl::leaf(value_scan)));
-        nn::Tensor clipped_value = NN_UNWRAP(nn::dsl::compute(
-            engine, clipped_value_expr, 1, C, scan_prof.stable));
-        nn::Tensor clipped_diff = NN_UNWRAP(nn::dsl::compute(
-            engine,
-            nn::dsl::leaf(clipped_value) - nn::dsl::leaf(returns_scan),
-            1, C, scan_prof.stable));
-        nn::Tensor value_diff = NN_UNWRAP(nn::dsl::compute(
-            engine,
-            nn::dsl::leaf(value_scan) - nn::dsl::leaf(returns_scan),
-            1, C, scan_prof.stable));
-        nn::Tensor value_diff_sq = NN_UNWRAP(nn::dsl::compute(
-            engine, nn::dsl::leaf(value_diff) * nn::dsl::leaf(value_diff),
-            1, C, scan_prof.stable));
-        nn::Tensor value_clipped_sq = NN_UNWRAP(nn::dsl::compute(
-            engine,
-            nn::dsl::leaf(clipped_diff) * nn::dsl::leaf(clipped_diff),
-            1, C, scan_prof.stable));
-        auto value_max_expr = nn::dsl::max(
-            nn::dsl::leaf(value_diff_sq),
-            nn::dsl::leaf(value_clipped_sq));
-        (void)nn::dsl::compute(engine, value_max_expr, 1, C,
-                               scan_prof.stable);
-
-        nn::Tensor ppo_objective = NN_UNWRAP(nn::dsl::compute(
-            engine,
-            nn::dsl::leaf(ratio) * nn::dsl::leaf(one),
-            1, C, scan_prof.stable));
-        nn::Tensor ppo_clipped_objective = NN_UNWRAP(nn::dsl::compute(
-            engine,
-            nn::dsl::leaf(clipped_ratio) * nn::dsl::leaf(one),
-            1, C, scan_prof.stable));
-        auto ppo_min_expr = nn::dsl::min(
-            nn::dsl::leaf(ppo_objective),
-            nn::dsl::leaf(ppo_clipped_objective));
-        (void)nn::dsl::compute(engine, ppo_min_expr, 1, C,
-                               scan_prof.stable);
-        const auto ratio_leaf = nn::dsl::leaf(ratio);
-        const auto adv_leaf = nn::dsl::leaf(one);
-        const auto positive_factor = nn::dsl::select(ratio_leaf > nn::dsl::rparam(upper),
-                                                     nn::Scalar{0}, ratio_leaf * adv_leaf);
-        const auto negative_factor = nn::dsl::select(ratio_leaf < nn::dsl::rparam(lower),
-                                                     nn::Scalar{0}, ratio_leaf * adv_leaf);
-        auto ppo_factor_expr = nn::dsl::select(
-            adv_leaf > nn::Scalar{0}, positive_factor, negative_factor);
-        nn::Tensor ppo_factor_scan = NN_UNWRAP(nn::dsl::compute(
-            engine, ppo_factor_expr, 1, C, scan_prof.stable));
-        (void)nn::dsl::compute(engine,
-                               nn::dsl::leaf(ppo_factor_scan) *
-                                   nn::dsl::leaf(one) *
-                                   nn::dsl::rparam(-1.0f),
-                               1, C, scan_prof.stable);
-        auto ppo_outside_expr = nn::dsl::select(
-            ratio_leaf < nn::dsl::rparam(lower), nn::Scalar{1},
-            nn::dsl::select(ratio_leaf > nn::dsl::rparam(upper),
-                            nn::Scalar{1}, nn::Scalar{0})) *
-            nn::dsl::leaf(one);
-        (void)nn::dsl::compute(engine, ppo_outside_expr, 1, C,
-                               scan_prof.stable);
-        const auto value_outside = nn::dsl::select(
-            nn::dsl::leaf(value_scan) < nn::dsl::leaf(clip_low),
-            nn::Scalar{1},
-            nn::dsl::select(
-                nn::dsl::leaf(value_scan) > nn::dsl::leaf(clip_high),
-                nn::Scalar{1}, nn::Scalar{0}));
-        auto value_outside_mask_expr =
-            value_outside * nn::dsl::leaf(one);
-        (void)nn::dsl::compute(engine, value_outside_mask_expr, 1, C,
-                               scan_prof.stable);
-        nn::Tensor value_outside_tensor = NN_UNWRAP(nn::dsl::compute(
-            engine, value_outside, 1, C, scan_prof.stable));
-        nn::Tensor value_clipped_grad = NN_UNWRAP(nn::dsl::compute(
-            engine,
-            nn::dsl::select(
-                nn::dsl::leaf(value_outside_tensor) > nn::Scalar{0},
-                nn::Scalar{0},
-                nn::dsl::leaf(value_diff) * nn::dsl::rparam(2.0f)),
-            1, C, scan_prof.stable));
-        nn::Tensor value_unclipped_grad = NN_UNWRAP(nn::dsl::compute(
-            engine, nn::dsl::leaf(value_diff) * nn::dsl::rparam(2.0f),
-            1, C, scan_prof.stable));
-        auto value_choose_clipped =
-            nn::dsl::leaf(value_clipped_sq) >
-            nn::dsl::leaf(value_diff_sq);
-        auto value_grad_expr = nn::dsl::select(
-            value_choose_clipped, nn::dsl::leaf(value_clipped_grad),
-            nn::dsl::leaf(value_unclipped_grad)) *
-            nn::dsl::leaf(one) * nn::dsl::rparam(1.0f);
-        (void)nn::dsl::compute(engine, value_grad_expr, 1, C,
-                               scan_prof.stable);
-
-        nn::GaeAdvantage gae;
-        (void)gae.apply(engine, reward, reward, &done, &mask_rc, &one);
-        nn::MonteCarloReturn returns;
-        (void)returns.apply(engine, reward, &done, &mask_rc);
-        nn::MaskedNormalizer normalizer;
-        (void)normalizer.apply(engine, reward, mask_rc);
-        const nn::GroupSpan groups[1]{{0, R}};
-        nn::GroupAdvantage group;
-        (void)group.apply(engine, reward, groups);
-
-        nn::ExperienceSchema exp = NN_UNWRAP(nn::ExperienceSchema::create(
-            {"action", "action_mask", "advantage", "return", "old_value",
-             "old_log_prob"}));
-        nn::TensorRecord record = NN_UNWRAP(nn::TensorRecord::create(
-            exp.schema(),
-            {nn::NamedTensor{.name = "action", .value = action},
-             nn::NamedTensor{.name = "action_mask", .value = one},
-             nn::NamedTensor{.name = "value_mask", .value = one},
-             nn::NamedTensor{.name = "advantage", .value = one},
-             nn::NamedTensor{.name = "return", .value = one},
-             nn::NamedTensor{.name = "old_value", .value = one},
-             nn::NamedTensor{.name = "old_log_prob",
-                             .value = old_log_prob}}));
-        nn::PolicyBatchView view = NN_UNWRAP(
-            nn::PolicyBatchView::create(record));
-
-        nn::ReinforceObjective reinforce;
-        (void)reinforce.evaluate_context(engine, logits, view);
-        nn::ValueRegressionObjective value_reg;
-        (void)value_reg.evaluate_context(engine, value, view);
-        nn::EntropyBonusObjective entropy;
-        (void)entropy.evaluate_context(engine, logits, view);
-        nn::SampledKlObjective kl;
-        (void)kl.evaluate_context(engine, logits, view);
-        nn::ClippedPolicyObjective ppo_policy;
-        (void)ppo_policy.evaluate_context(engine, logits, view);
-        nn::ClippedValueObjective ppo_value;
-        (void)ppo_value.evaluate_context(engine, value, view);
-
-        nn::TensorSchema output = NN_UNWRAP(nn::TensorSchema::create(
-            "rl_output",
-            {nn::tensor_field("policy",
-                              nn::TensorShapeSpec::exact(R, C)),
-             nn::tensor_field("value",
-                              nn::TensorShapeSpec::exact(1, C))}));
-        nn::PpoObjective ppo;
-        (void)ppo.evaluate(engine, output, logits, value, view);
-    }
-
     };   // dry_run 结束
 #if !defined(NN_SCAN_NO_DRYRUN)
     // 跑两遍：f32 定**结构**，f16 定**精度签名**。
@@ -717,8 +686,7 @@ int main(int argc, char* argv[])
     // 本 pass 产出，故**失败即构建失败**：静默降级会产出不完整的注册表，只在
     // GPU 运行期以闭合世界硬报错暴露（离根因很远）。与 dry-run 的 fail-fast
     // （见 run_csa 的 abort）一致。
-    const auto model_pass = [&](nn::ComputeEngine& engine,
-                                const nn::PrecisionProfile& prof) -> bool
+    const auto model_pass = [&](nn::ComputeEngine& engine, const nn::PrecisionProfile& prof) -> bool
     {
         scan_prof = prof;
         std::size_t n_fail = 0;
@@ -756,8 +724,8 @@ int main(int argc, char* argv[])
             auto eout = model.forward(input);
             if (!eout)
             {
-                std::fprintf(stderr, "[scan][FAIL] %s 推理态 forward 失败：%s\n",
-                             name, eout.error().message.c_str());
+                std::fprintf(stderr, "[scan][FAIL] %s 推理态 forward 失败：%s\n", name,
+                             eout.error().message.c_str());
                 ++n_fail;
             }
             else
@@ -766,8 +734,8 @@ int main(int argc, char* argv[])
                 auto ebr = model.backward(egrad);
                 if (!ebr)
                 {
-                    std::fprintf(stderr, "[scan][FAIL] %s 推理态 backward 失败：%s\n",
-                                 name, ebr.error().message.c_str());
+                    std::fprintf(stderr, "[scan][FAIL] %s 推理态 backward 失败：%s\n", name,
+                                 ebr.error().message.c_str());
                     ++n_fail;
                 }
             }
@@ -803,16 +771,16 @@ int main(int argc, char* argv[])
 
         // ── 1) MNIST MLP：归一化维（LayerNorm/RMSNorm/BatchNorm 是三条不同
         //        融合表达式：归约链形状与原地更新都不同）──
-        for (const auto nrm : {nn::NormType::LayerNorm, nn::NormType::RMSNorm,
-                               nn::NormType::BatchNorm})
+        for (const auto nrm :
+             {nn::NormType::LayerNorm, nn::NormType::RMSNorm, nn::NormType::BatchNorm})
         {
             const char* nm = (nrm == nn::NormType::LayerNorm) ? "mnist_mlp_ln"
-                           : (nrm == nn::NormType::RMSNorm)   ? "mnist_mlp_rms"
+                             : (nrm == nn::NormType::RMSNorm) ? "mnist_mlp_rms"
                                                               : "mnist_mlp_bn";
-            try_build(nm,
-                      [&] { return nn::build_mnist_mlp_model(
-                                engine, nn::MNIST_LAYER_DIMS, nrm, prof); },
-                      scan_tensor(nn::MNIST_LAYER_DIMS.front(), B));
+            try_build(
+                nm,
+                [&] { return nn::build_mnist_mlp_model(engine, nn::MNIST_LAYER_DIMS, nrm, prof); },
+                scan_tensor(nn::MNIST_LAYER_DIMS.front(), B));
         }
         // ── 1b) 三值（T1_58）MLP：BitLinear 的量化 / 去量化 / STE 三段结构 ──
         //   BitLinear 的表达式（τ 的 absmean 归约、wq 的阈值 select、
@@ -824,42 +792,57 @@ int main(int argc, char* argv[])
         {
             nn::PrecisionProfile t1 = prof;
             t1.param = nn::Precision::T1_58;
-            try_build("mnist_mlp_t1_58",
-                      [&] { return nn::build_mnist_mlp_model(
-                                engine, nn::MNIST_LAYER_DIMS,
-                                nn::NormType::LayerNorm, t1); },
-                      scan_tensor(nn::MNIST_LAYER_DIMS.front(), B));
+            try_build(
+                "mnist_mlp_t1_58",
+                [&]
+                {
+                    return nn::build_mnist_mlp_model(engine, nn::MNIST_LAYER_DIMS,
+                                                     nn::NormType::LayerNorm, t1);
+                },
+                scan_tensor(nn::MNIST_LAYER_DIMS.front(), B));
         }
         // ── 2) MNIST Transformer（ViT 风格；输入 img²）──
-        try_build("mnist_transformer",
-                  [&] { return nn::build_mnist_transformer_model(
-                            engine, nn::MNIST_IMG_SIZE, nn::MNIST_PATCH_SIZE,
-                            nn::MNIST_TF_D_MODEL, nn::MNIST_TF_NUM_HEADS,
-                            nn::MNIST_TF_D_FF, nn::MNIST_TF_NUM_LAYERS, prof); },
-                  scan_tensor(nn::MNIST_IMG_SIZE * nn::MNIST_IMG_SIZE, B));
+        try_build(
+            "mnist_transformer",
+            [&]
+            {
+                return nn::build_mnist_transformer_model(
+                    engine, nn::MNIST_IMG_SIZE, nn::MNIST_PATCH_SIZE, nn::MNIST_TF_D_MODEL,
+                    nn::MNIST_TF_NUM_HEADS, nn::MNIST_TF_D_FF, nn::MNIST_TF_NUM_LAYERS, prof);
+            },
+            scan_tensor(nn::MNIST_IMG_SIZE * nn::MNIST_IMG_SIZE, B));
         // ── 2b) 归一化维（NormType / NormPlace 是运行期配置决定的结构，类型
         //        层面推不出 → 与 GPT 的 pe/act/norm 同理，必须在这里补 dry-run）──
-        try_build("mnist_transformer_final_ln",
-                  [&] { return nn::build_mnist_transformer_model(
-                            engine, nn::MNIST_IMG_SIZE, nn::MNIST_PATCH_SIZE,
-                            nn::MNIST_TF_D_MODEL, nn::MNIST_TF_NUM_HEADS,
-                            nn::MNIST_TF_D_FF, nn::MNIST_TF_NUM_LAYERS, prof,
-                            nn::NormType::LayerNorm, nn::NormPlace::Final); },
-                  scan_tensor(nn::MNIST_IMG_SIZE * nn::MNIST_IMG_SIZE, B));
-        try_build("mnist_transformer_final_rms",
-                  [&] { return nn::build_mnist_transformer_model(
-                            engine, nn::MNIST_IMG_SIZE, nn::MNIST_PATCH_SIZE,
-                            nn::MNIST_TF_D_MODEL, nn::MNIST_TF_NUM_HEADS,
-                            nn::MNIST_TF_D_FF, nn::MNIST_TF_NUM_LAYERS, prof,
-                            nn::NormType::RMSNorm, nn::NormPlace::Final); },
-                  scan_tensor(nn::MNIST_IMG_SIZE * nn::MNIST_IMG_SIZE, B));
-        try_build("mnist_transformer_prenorm_bn",
-                  [&] { return nn::build_mnist_transformer_model(
-                            engine, nn::MNIST_IMG_SIZE, nn::MNIST_PATCH_SIZE,
-                            nn::MNIST_TF_D_MODEL, nn::MNIST_TF_NUM_HEADS,
-                            nn::MNIST_TF_D_FF, nn::MNIST_TF_NUM_LAYERS, prof,
-                            nn::NormType::BatchNorm, nn::NormPlace::None); },
-                  scan_tensor(nn::MNIST_IMG_SIZE * nn::MNIST_IMG_SIZE, B));
+        try_build(
+            "mnist_transformer_final_ln",
+            [&]
+            {
+                return nn::build_mnist_transformer_model(
+                    engine, nn::MNIST_IMG_SIZE, nn::MNIST_PATCH_SIZE, nn::MNIST_TF_D_MODEL,
+                    nn::MNIST_TF_NUM_HEADS, nn::MNIST_TF_D_FF, nn::MNIST_TF_NUM_LAYERS, prof,
+                    nn::NormType::LayerNorm, nn::NormPlace::Final);
+            },
+            scan_tensor(nn::MNIST_IMG_SIZE * nn::MNIST_IMG_SIZE, B));
+        try_build(
+            "mnist_transformer_final_rms",
+            [&]
+            {
+                return nn::build_mnist_transformer_model(
+                    engine, nn::MNIST_IMG_SIZE, nn::MNIST_PATCH_SIZE, nn::MNIST_TF_D_MODEL,
+                    nn::MNIST_TF_NUM_HEADS, nn::MNIST_TF_D_FF, nn::MNIST_TF_NUM_LAYERS, prof,
+                    nn::NormType::RMSNorm, nn::NormPlace::Final);
+            },
+            scan_tensor(nn::MNIST_IMG_SIZE * nn::MNIST_IMG_SIZE, B));
+        try_build(
+            "mnist_transformer_prenorm_bn",
+            [&]
+            {
+                return nn::build_mnist_transformer_model(
+                    engine, nn::MNIST_IMG_SIZE, nn::MNIST_PATCH_SIZE, nn::MNIST_TF_D_MODEL,
+                    nn::MNIST_TF_NUM_HEADS, nn::MNIST_TF_D_FF, nn::MNIST_TF_NUM_LAYERS, prof,
+                    nn::NormType::BatchNorm, nn::NormPlace::None);
+            },
+            scan_tensor(nn::MNIST_IMG_SIZE * nn::MNIST_IMG_SIZE, B));
         // ── 3) CNN：池化窗口维（R 是运行期视图参数，pool=3 → R=9）──
         for (const std::size_t pool : {std::size_t{2}, std::size_t{3}})
         {
@@ -868,20 +851,22 @@ int main(int argc, char* argv[])
             cfg.fc_dims = nn::MNIST_CNN_FC;
             cfg.pool = pool;
             // 注：CnnConfig 无精制度字段（CNN 走默认 f32 profile）
-            try_build(pool == 2 ? "cnn_pool2" : "cnn_pool3",
-                      [&] { return nn::build_cnn_model(engine, cfg); },
-                      scan_tensor(1 * 28 * 28, B));
+            try_build(
+                pool == 2 ? "cnn_pool2" : "cnn_pool3",
+                [&] { return nn::build_cnn_model(engine, cfg); }, scan_tensor(1 * 28 * 28, B));
         }
         // ── 3b) CNN 归一化维（NormPlace × NormType 同上：运行期配置决定）──
         {
-            struct CnnNormCase { const char* name; nn::NormType nt; nn::NormPlace np; };
+            struct CnnNormCase
+            {
+                const char* name;
+                nn::NormType nt;
+                nn::NormPlace np;
+            };
             for (const CnnNormCase c : {
-                     CnnNormCase{"cnn_norm_both_ln", nn::NormType::LayerNorm,
-                                 nn::NormPlace::Both},
-                     CnnNormCase{"cnn_norm_conv_rms", nn::NormType::RMSNorm,
-                                 nn::NormPlace::Conv},
-                     CnnNormCase{"cnn_norm_head_bn",  nn::NormType::BatchNorm,
-                                 nn::NormPlace::Head},
+                     CnnNormCase{"cnn_norm_both_ln", nn::NormType::LayerNorm, nn::NormPlace::Both},
+                     CnnNormCase{"cnn_norm_conv_rms", nn::NormType::RMSNorm, nn::NormPlace::Conv},
+                     CnnNormCase{"cnn_norm_head_bn", nn::NormType::BatchNorm, nn::NormPlace::Head},
                  })
             {
                 nn::CnnConfig cfg;
@@ -890,9 +875,9 @@ int main(int argc, char* argv[])
                 cfg.pool = 2;
                 cfg.norm_type = c.nt;
                 cfg.norm_place = c.np;
-                try_build(c.name,
-                          [&] { return nn::build_cnn_model(engine, cfg); },
-                          scan_tensor(1 * 28 * 28, B));
+                try_build(
+                    c.name, [&] { return nn::build_cnn_model(engine, cfg); },
+                    scan_tensor(1 * 28 * 28, B));
             }
         }
         // ── 4) GPT：位置编码 × 激活 × 归一化（每一维都换一组融合表达式：
@@ -900,57 +885,62 @@ int main(int argc, char* argv[])
         //        SwiGLU ≠ GeLU、RMSNorm ≠ LayerNorm）──
         struct GptCase
         {
-            const char*          name;
-            nn::PosEncodingType  pe;
-            nn::ActivationType   act;
-            nn::NormType         norm;
-            std::size_t          n_head_kv = 0;   // 0 = MHA；>0 = GQA（头映射结构）
-            bool                 subln     = false;
-            bool                 tie       = false;
-            bool                 ternary   = false;  // P1.5：param=T1_58 → BitLinear
+            const char* name;
+            nn::PosEncodingType pe;
+            nn::ActivationType act;
+            nn::NormType norm;
+            std::size_t n_head_kv = 0;   // 0 = MHA；>0 = GQA（头映射结构）
+            bool subln = false;
+            bool tie = false;
+            bool ternary = false;  // P1.5：param=T1_58 → BitLinear
         };
-        for (const GptCase& c : {
-                 GptCase{"gpt_learned_gelu_ln", nn::PosEncodingType::Learned,
-                         nn::ActivationType::GeLU, nn::NormType::LayerNorm},
-                 GptCase{"gpt_alibi_gelu_ln", nn::PosEncodingType::ALiBi,
-                         nn::ActivationType::GeLU, nn::NormType::LayerNorm},
-                 GptCase{"gpt_sinusoidal_gelu_ln", nn::PosEncodingType::Sinusoidal,
-                         nn::ActivationType::GeLU, nn::NormType::LayerNorm},
-                 GptCase{"gpt_rope_gelu_ln", nn::PosEncodingType::RoPE,
-                         nn::ActivationType::GeLU, nn::NormType::LayerNorm},
-                 GptCase{"gpt_learned_swiglu_rms", nn::PosEncodingType::Learned,
-                         nn::ActivationType::SwiGLU, nn::NormType::RMSNorm},
-                 // BitNet 2B4T 形态：门控平方 ReLU（relu2 ≠ swiglu ≠ gelu）
-                 GptCase{"gpt_rope_relu2_rms", nn::PosEncodingType::RoPE,
-                         nn::ActivationType::ReLU2, nn::NormType::RMSNorm},
-                 // 2B4T 完整组合：GQA（HeadGroup 视图）+ SubLN + tied head。
-                 // GQA 的 fold / masked_scores / grad_A / grad_Q 是**新结构**
-                 //   （K/V 走 HeadGroup 视图）→ 必须在此登记（闭合世界）。
-                 GptCase{"gpt_rope_relu2_rms_gqa_subln_tied", nn::PosEncodingType::RoPE,
-                         nn::ActivationType::ReLU2, nn::NormType::RMSNorm,
-                         // 模型 pass 的小配置 H=2 → n_head_kv=1 才得到 ratio>1
-                         // （比率是**视图参数**、不进 key → 任意 n_rep 共用一份 shader）
-                         /*n_head_kv=*/1, /*subln=*/true, /*tie=*/true},
-                 // ── 三值 GPT（P1.5-W2）：权重侧接线后，注意力 4 个投影、
-                 //    fc1/fc2、LM head 全部是 BitLinear。BitLinear 的三段结构
-                 //    （τ 的 absmean 归约 / wq 的阈值 select / 去量化点积与 STE
-                 //    累加）已由 1b) 的 MLP 用例登记；这里再按 GPT 组合登记一遍，
-                 //    把"三值 + GQA/SubLN/tied + ReLU²/RoPE"这一整条链路钉进
-                 //    闭合世界（漏登记 = GPU 硬报错，见 AGENTS §7）。
-                 GptCase{"gpt_learned_gelu_ln_t1_58", nn::PosEncodingType::Learned,
-                         nn::ActivationType::GeLU, nn::NormType::LayerNorm,
-                         /*n_head_kv=*/0, /*subln=*/false, /*tie=*/false,
-                         /*ternary=*/true},
-                 GptCase{"gpt_rope_relu2_rms_gqa_subln_tied_t1_58",
-                         nn::PosEncodingType::RoPE, nn::ActivationType::ReLU2,
-                         nn::NormType::RMSNorm,
-                         /*n_head_kv=*/1, /*subln=*/true, /*tie=*/true,
-                         /*ternary=*/true}})
+        for (const GptCase& c :
+             {GptCase{"gpt_learned_gelu_ln", nn::PosEncodingType::Learned, nn::ActivationType::GeLU,
+                      nn::NormType::LayerNorm},
+              GptCase{"gpt_alibi_gelu_ln", nn::PosEncodingType::ALiBi, nn::ActivationType::GeLU,
+                      nn::NormType::LayerNorm},
+              GptCase{"gpt_sinusoidal_gelu_ln", nn::PosEncodingType::Sinusoidal,
+                      nn::ActivationType::GeLU, nn::NormType::LayerNorm},
+              GptCase{"gpt_rope_gelu_ln", nn::PosEncodingType::RoPE, nn::ActivationType::GeLU,
+                      nn::NormType::LayerNorm},
+              GptCase{"gpt_learned_swiglu_rms", nn::PosEncodingType::Learned,
+                      nn::ActivationType::SwiGLU, nn::NormType::RMSNorm},
+              // BitNet 2B4T 形态：门控平方 ReLU（relu2 ≠ swiglu ≠ gelu）
+              GptCase{"gpt_rope_relu2_rms", nn::PosEncodingType::RoPE, nn::ActivationType::ReLU2,
+                      nn::NormType::RMSNorm},
+              // 2B4T 完整组合：GQA（HeadGroup 视图）+ SubLN + tied head。
+              // GQA 的 fold / masked_scores / grad_A / grad_Q 是**新结构**
+              //   （K/V 走 HeadGroup 视图）→ 必须在此登记（闭合世界）。
+              GptCase{"gpt_rope_relu2_rms_gqa_subln_tied", nn::PosEncodingType::RoPE,
+                      nn::ActivationType::ReLU2, nn::NormType::RMSNorm,
+                      // 模型 pass 的小配置 H=2 → n_head_kv=1 才得到 ratio>1
+                      // （比率是**视图参数**、不进 key → 任意 n_rep 共用一份 shader）
+                      /*n_head_kv=*/1, /*subln=*/true, /*tie=*/true},
+              // ── 三值 GPT（P1.5-W2）：权重侧接线后，注意力 4 个投影、
+              //    fc1/fc2、LM head 全部是 BitLinear。BitLinear 的三段结构
+              //    （τ 的 absmean 归约 / wq 的阈值 select / 去量化点积与 STE
+              //    累加）已由 1b) 的 MLP 用例登记；这里再按 GPT 组合登记一遍，
+              //    把"三值 + GQA/SubLN/tied + ReLU²/RoPE"这一整条链路钉进
+              //    闭合世界（漏登记 = GPU 硬报错，见 AGENTS §7）。
+              GptCase{"gpt_learned_gelu_ln_t1_58", nn::PosEncodingType::Learned,
+                      nn::ActivationType::GeLU, nn::NormType::LayerNorm,
+                      /*n_head_kv=*/0, /*subln=*/false, /*tie=*/false,
+                      /*ternary=*/true},
+              GptCase{"gpt_rope_relu2_rms_gqa_subln_tied_t1_58", nn::PosEncodingType::RoPE,
+                      nn::ActivationType::ReLU2, nn::NormType::RMSNorm,
+                      /*n_head_kv=*/1, /*subln=*/true, /*tie=*/true,
+                      /*ternary=*/true}})
         {
             nn::GptConfig cfg;
-            cfg.vocab_size = V; cfg.d_model = D; cfg.seq_len = S;
-            cfg.num_heads = H; cfg.d_ff = F; cfg.num_layers = L;
-            cfg.pos_enc = c.pe; cfg.activation = c.act; cfg.norm_type = c.norm;
+            cfg.vocab_size = V;
+            cfg.d_model = D;
+            cfg.seq_len = S;
+            cfg.num_heads = H;
+            cfg.d_ff = F;
+            cfg.num_layers = L;
+            cfg.pos_enc = c.pe;
+            cfg.activation = c.act;
+            cfg.norm_type = c.norm;
             cfg.n_head_kv = c.n_head_kv;
             cfg.subln = c.subln;
             cfg.tie_embeddings = c.tie;
@@ -962,13 +952,18 @@ int main(int argc, char* argv[])
         for (const bool causal : {true, false})
         {
             nn::RAPTConfig cfg;
-            cfg.vocab_size = V; cfg.d_model = D; cfg.seq_len = S;
-            cfg.num_heads = H; cfg.d_ff = F; cfg.num_layers = L;
+            cfg.vocab_size = V;
+            cfg.d_model = D;
+            cfg.seq_len = S;
+            cfg.num_heads = H;
+            cfg.d_ff = F;
+            cfg.num_layers = L;
             cfg.pos_enc = nn::PosEncodingType::RoPE;   // RAPT v1 仅支持 RoPE
             cfg.causal = causal;
             cfg.precision = prof;
-            try_build(causal ? "rapt_causal" : "rapt_bidir",
-                      [&] { return nn::build_rapt_model(engine, cfg); }, ids);
+            try_build(
+                causal ? "rapt_causal" : "rapt_bidir",
+                [&] { return nn::build_rapt_model(engine, cfg); }, ids);
         }
         return n_fail == 0;
     };
@@ -978,9 +973,8 @@ int main(int argc, char* argv[])
 #if !defined(NN_SCAN_NO_DRYRUN)
     if (!model_pass(*raw_engine, nn::profile_f32()))
     {
-        std::fprintf(stderr,
-                     "[scan][FAIL] 模型 pass 失败 → 注册表不完整，中止构建"
-                     "（闭合世界：缺结构只在 GPU 运行期报错）\n");
+        std::fprintf(stderr, "[scan][FAIL] 模型 pass 失败 → 注册表不完整，中止构建"
+                             "（闭合世界：缺结构只在 GPU 运行期报错）\n");
         return 1;
     }
     // f16 模型 pass：同为**签名**来源（整模型路径的精度组合与 per-layer
@@ -988,8 +982,7 @@ int main(int argc, char* argv[])
     // 结构对结构是第一遍的重复（注册表按 key 去重），只有签名是新信息。
     if (!model_pass(*raw_engine, nn::profile_f16()))
     {
-        std::fprintf(stderr,
-                     "[scan][FAIL] f16 模型 pass 失败 → 特化签名不完整，中止构建\n");
+        std::fprintf(stderr, "[scan][FAIL] f16 模型 pass 失败 → 特化签名不完整，中止构建\n");
         return 1;
     }
 #endif
@@ -1029,39 +1022,33 @@ int main(int argc, char* argv[])
             for (const auto& i : s.instrs)
             {
                 if (!ins.empty()) ins += ";";
-                ins += std::to_string(static_cast<int>(i.op)) + "("
-                     + std::to_string(static_cast<int>(i.a.kind)) + "/"
-                     + std::to_string(static_cast<int>(i.a.idx)) + ","
-                     + std::to_string(static_cast<int>(i.b.kind)) + "/"
-                     + std::to_string(static_cast<int>(i.b.idx)) + ","
-                     + std::to_string(static_cast<int>(i.c.kind)) + "/"
-                     + std::to_string(static_cast<int>(i.c.idx)) + ")";
+                ins += std::to_string(static_cast<int>(i.op)) + "(" +
+                       std::to_string(static_cast<int>(i.a.kind)) + "/" +
+                       std::to_string(static_cast<int>(i.a.idx)) + "," +
+                       std::to_string(static_cast<int>(i.b.kind)) + "/" +
+                       std::to_string(static_cast<int>(i.b.idx)) + "," +
+                       std::to_string(static_cast<int>(i.c.kind)) + "/" +
+                       std::to_string(static_cast<int>(i.c.idx)) + ")";
             }
-            return "raxis=" + std::to_string(raxis)
-                 + " mm=" + (s.matmul ? "1" : "0")
-                 + " fold=" + (s.fold ? "1" : "0")
-                 + " nreg=" + std::to_string(s.num_regs)
-                 + " nconst=" + std::to_string(s.consts.size())
-                 + " nrparam=" + std::to_string(s.rparams.size())
-                 + " nview=" + std::to_string(s.views.size())
-                 + " viewkinds=[" + v + "]"
-                 + " instrs=[" + ins + "]";
+            return "raxis=" + std::to_string(raxis) + " mm=" + (s.matmul ? "1" : "0") +
+                   " fold=" + (s.fold ? "1" : "0") + " nreg=" + std::to_string(s.num_regs) +
+                   " nconst=" + std::to_string(s.consts.size()) +
+                   " nrparam=" + std::to_string(s.rparams.size()) +
+                   " nview=" + std::to_string(s.views.size()) + " viewkinds=[" + v + "]" +
+                   " instrs=[" + ins + "]";
         };
         std::size_t n_dry_only = 0;
         for (const auto& s : reg.specs)
         {
             const std::string k = nn::expr_spec_key(s);
-            if (anchor_keys.count(k))
-                continue;
+            if (anchor_keys.count(k)) continue;
             ++n_dry_only;
-            if (dump_src)
-                std::printf("[scan][dry-only] %s  %s\n", k.c_str(), summarize(s).c_str());
+            if (dump_src) std::printf("[scan][dry-only] %s  %s\n", k.c_str(), summarize(s).c_str());
         }
         for (const auto& s : anchor.specs)
         {
             const std::string k = nn::expr_spec_key(s);
-            if (dry_keys.count(k))
-                continue;
+            if (dry_keys.count(k)) continue;
             if (dump_src)
                 std::printf("[scan][anchor-only] %s  %s\n", k.c_str(), summarize(s).c_str());
         }
@@ -1071,8 +1058,8 @@ int main(int argc, char* argv[])
         if (dump_src)
             for (const auto& s : reg.specs)
                 if (anchor_keys.count(nn::expr_spec_key(s)))
-                    std::printf("[scan][both] %s  %s\n",
-                                nn::expr_spec_key(s).c_str(), summarize(s).c_str());
+                    std::printf("[scan][both] %s  %s\n", nn::expr_spec_key(s).c_str(),
+                                summarize(s).c_str());
         for (const auto& s : anchor.specs)
             reg.add(s);
         // 分段口径（**互不重叠**）：dry-run 侧 = ①per-layer dry-run + matmul/bmm
@@ -1081,19 +1068,15 @@ int main(int argc, char* argv[])
         std::printf("[scan] 结构来源：dry-run 侧 %zu（per-layer+显式 %zu、模型 pass +%zu）"
                     " + 锚点 %zu（新增 %zu）= 合计 %zu"
                     "（锚点独有 %zu、dry-run 独有 %zu）\n",
-                    n_before_anchor,
-                    n_after_dry,
-                    n_after_model - n_after_dry,
-                    anchor.specs.size(),
-                    reg.specs.size() - n_before_anchor,
-                    reg.specs.size(),
+                    n_before_anchor, n_after_dry, n_after_model - n_after_dry, anchor.specs.size(),
+                    reg.specs.size() - n_before_anchor, reg.specs.size(),
                     reg.specs.size() - n_before_anchor, n_dry_only);
         // 锚点独有 = 手写 dry-run 覆盖不到的调用点（该数突然变大 → 有新层路径
         // 没纳入 dry-run）。
         if (anchor.specs.empty() || n_before_anchor == reg.specs.size())
             std::fprintf(stderr,
-                "[scan][warn] 锚点未贡献任何结构：可能被 -DNN_SCAN_NO_ANCHOR 关闭，"
-                "或所有调用点都已被 dry-run 覆盖\n");
+                         "[scan][warn] 锚点未贡献任何结构：可能被 -DNN_SCAN_NO_ANCHOR 关闭，"
+                         "或所有调用点都已被 dry-run 覆盖\n");
     }
     std::printf("[scan] 收集到 %zu 条融合表达式\n", reg.specs.size());
     // ── 签名覆盖：**构建期不再需要任何背书** ──────────────────────────────
@@ -1108,7 +1091,6 @@ int main(int argc, char* argv[])
     //   NN_SCAN_NO_DISPATCH=1、或设备无 16bit 存储时不注册 → 落到边界 cast。
     // ── 生成阶段（原 gen_fused）：同一进程内直接消费注册表 → fused_registry.hpp
     //    构建期因此只有一步；不再经 expr_specs.bin 中间序列化。
-    if (!nn::tool::generate_fused_registry(out_dir, glslc, reg))
-        return 1;
+    if (!nn::tool::generate_fused_registry(out_dir, glslc, reg)) return 1;
     return 0;
 }

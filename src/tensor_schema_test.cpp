@@ -52,8 +52,7 @@ nn::TensorSchema output_schema(bool value_optional = false)
     return std::move(*r);
 }
 
-nn::Tensor make_f16_tensor(nn::ComputeEngine& engine,
-                           std::size_t rows, std::size_t cols)
+nn::Tensor make_f16_tensor(nn::ComputeEngine& engine, std::size_t rows, std::size_t cols)
 {
     nn::Matrix host(rows, cols);
     auto r = engine.from_matrix(host, nn::Precision::F16);
@@ -74,12 +73,10 @@ void test_schema_and_handles()
     CHECK(p && v, "field name resolves");
     if (!p || !v) return;
     CHECK(p->index == 0 && v->index == 1, "field handle indexes");
-    CHECK(p->schema_fingerprint == schema.fingerprint(),
-          "field handle carries schema fingerprint");
+    CHECK(p->schema_fingerprint == schema.fingerprint(), "field handle carries schema fingerprint");
     CHECK(schema.field(*p).has_value(), "handle lookup succeeds");
     CHECK(!schema.field("missing").has_value(), "unknown field rejected");
-    CHECK(!schema.optional_field("missing")->valid(),
-          "optional lookup reports missing");
+    CHECK(!schema.optional_field("missing")->valid(), "optional lookup reports missing");
 
     const nn::TensorSchema same = output_schema();
     CHECK(same.fingerprint() == schema.fingerprint(),
@@ -92,32 +89,22 @@ void test_schema_and_handles()
     auto other_r = nn::TensorSchema::create("policy_value", std::move(changed));
     CHECK(other_r.has_value(), "reordered schema builds");
     if (!other_r) return;
-    CHECK(other_r->fingerprint() != schema.fingerprint(),
-          "field order changes fingerprint");
+    CHECK(other_r->fingerprint() != schema.fingerprint(), "field order changes fingerprint");
     auto foreign = other_r->field("policy");
     CHECK(foreign.has_value(), "foreign field resolves there");
-    if (foreign)
-        CHECK(!schema.field(*foreign).has_value(),
-              "cross-schema handle rejected");
+    if (foreign) CHECK(!schema.field(*foreign).has_value(), "cross-schema handle rejected");
 
     nn::FieldHandle bad{schema.fingerprint(), 99};
     CHECK(!schema.field(bad).has_value(), "out-of-range handle rejected");
-    CHECK(!schema.field(nn::FieldHandle{}).has_value(),
-          "uninitialized handle rejected");
+    CHECK(!schema.field(nn::FieldHandle{}).has_value(), "uninitialized handle rejected");
 }
 
 void test_schema_construction_errors()
 {
-    CHECK(!nn::TensorSchema::create(
-               "", {simple_field("x")}),
-          "empty schema name rejected");
-    CHECK(!nn::TensorSchema::create("empty", {}),
-          "empty schema rejected");
-    CHECK(!nn::TensorSchema::create(
-               "blank", {simple_field("")}),
-          "empty field name rejected");
-    CHECK(!nn::TensorSchema::create(
-               "dup", {simple_field("x"), simple_field("x")}),
+    CHECK(!nn::TensorSchema::create("", {simple_field("x")}), "empty schema name rejected");
+    CHECK(!nn::TensorSchema::create("empty", {}), "empty schema rejected");
+    CHECK(!nn::TensorSchema::create("blank", {simple_field("")}), "empty field name rejected");
+    CHECK(!nn::TensorSchema::create("dup", {simple_field("x"), simple_field("x")}),
           "duplicate field name rejected");
 }
 
@@ -142,10 +129,9 @@ void test_named_tensor_set()
     nn::Tensor policy = make_tensor(*owner, 4, 3, 0.1f, 0.01f);
     nn::Tensor value = make_tensor(*owner, 1, 3, 0.2f, 0.01f);
 
-    auto set_r = nn::NamedTensorSet::create(
-        schema,
-        {nn::NamedTensor{.name = "value", .value = value},
-         nn::NamedTensor{.name = "policy", .value = policy}});
+    auto set_r =
+        nn::NamedTensorSet::create(schema, {nn::NamedTensor{.name = "value", .value = value},
+                                            nn::NamedTensor{.name = "policy", .value = policy}});
     CHECK(set_r.has_value(), "named set accepts out-of-order input");
     if (!set_r) return;
     CHECK(set_r->size() == 2, "named set size");
@@ -156,42 +142,30 @@ void test_named_tensor_set()
     if (!p_h || !v_h) return;
     auto p = set_r->require(*p_h);
     auto v = set_r->require(*v_h);
-    CHECK(p && (*p)->rows() == policy.rows() &&
-              (*p)->cols() == policy.cols(),
+    CHECK(p && (*p)->rows() == policy.rows() && (*p)->cols() == policy.cols(),
           "policy handle returns original tensor");
-    CHECK(v && (*v)->rows() == value.rows() &&
-              (*v)->cols() == value.cols(),
+    CHECK(v && (*v)->rows() == value.rows() && (*v)->cols() == value.cols(),
           "value handle returns original tensor");
     CHECK(set_r->find("policy") == *p, "find by name");
     CHECK(set_r->find(*v_h) == *v, "find by handle");
 
-    CHECK(!nn::NamedTensorSet::create(
-               schema,
-               {nn::NamedTensor{.name = "policy", .value = policy}}),
+    CHECK(!nn::NamedTensorSet::create(schema, {nn::NamedTensor{.name = "policy", .value = policy}}),
           "missing required field rejected");
-    CHECK(!nn::NamedTensorSet::create(
-               schema,
-               {nn::NamedTensor{.name = "policy", .value = policy},
-                nn::NamedTensor{.name = "policy", .value = policy},
-                nn::NamedTensor{.name = "value", .value = value}}),
+    CHECK(!nn::NamedTensorSet::create(schema, {nn::NamedTensor{.name = "policy", .value = policy},
+                                               nn::NamedTensor{.name = "policy", .value = policy},
+                                               nn::NamedTensor{.name = "value", .value = value}}),
           "duplicate named tensor rejected");
-    CHECK(!nn::NamedTensorSet::create(
-               schema,
-               {nn::NamedTensor{.name = "policy", .value = policy},
-                nn::NamedTensor{.name = "value", .value = value},
-                nn::NamedTensor{.name = "extra", .value = value}}),
+    CHECK(!nn::NamedTensorSet::create(schema, {nn::NamedTensor{.name = "policy", .value = policy},
+                                               nn::NamedTensor{.name = "value", .value = value},
+                                               nn::NamedTensor{.name = "extra", .value = value}}),
           "unknown named tensor rejected");
     CHECK(!nn::NamedTensorSet::create(
-               schema,
-               {nn::NamedTensor{.name = "policy", .value = policy},
-                nn::NamedTensor{.name = "value",
-                                .value = make_tensor(*owner, 2, 3)}}),
+              schema, {nn::NamedTensor{.name = "policy", .value = policy},
+                       nn::NamedTensor{.name = "value", .value = make_tensor(*owner, 2, 3)}}),
           "shape constraint enforced");
     CHECK(!nn::NamedTensorSet::create(
-               schema,
-               {nn::NamedTensor{.name = "policy",
-                                .value = make_f16_tensor(*owner, 4, 3)},
-                nn::NamedTensor{.name = "value", .value = value}}),
+              schema, {nn::NamedTensor{.name = "policy", .value = make_f16_tensor(*owner, 4, 3)},
+                       nn::NamedTensor{.name = "value", .value = value}}),
           "precision constraint enforced");
 }
 
@@ -201,15 +175,14 @@ void test_optional_and_gradients()
     const nn::TensorSchema schema = output_schema(/*value_optional=*/true);
     nn::Tensor policy = make_tensor(*owner, 5, 2, 0.3f, 0.01f);
 
-    auto only_policy = nn::NamedTensorSet::create(
-        schema, {nn::NamedTensor{.name = "policy", .value = policy}});
+    auto only_policy =
+        nn::NamedTensorSet::create(schema, {nn::NamedTensor{.name = "policy", .value = policy}});
     CHECK(only_policy.has_value(), "optional field may be absent");
     if (only_policy)
-        CHECK(only_policy->find("value") == nullptr,
-              "absent optional field has no tensor");
+        CHECK(only_policy->find("value") == nullptr, "absent optional field has no tensor");
 
-    auto grads = nn::GradientBundle::create(
-        schema, {nn::NamedTensor{.name = "policy", .value = policy}});
+    auto grads =
+        nn::GradientBundle::create(schema, {nn::NamedTensor{.name = "policy", .value = policy}});
     CHECK(grads.has_value(), "gradient bundle uses output schema");
     if (!grads) return;
     auto gh = grads->field("policy");
@@ -217,8 +190,7 @@ void test_optional_and_gradients()
     if (gh)
     {
         auto g = grads->require(*gh);
-        CHECK(g && (*g)->rows() == policy.rows(),
-              "gradient bundle exposes tensor by handle");
+        CHECK(g && (*g)->rows() == policy.rows(), "gradient bundle exposes tensor by handle");
     }
 }
 

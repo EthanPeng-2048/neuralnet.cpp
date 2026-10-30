@@ -57,25 +57,21 @@ std::filesystem::path scratch_dir()
 }
 
 [[nodiscard]] nn::ModelSpec tiny_spec()
-{
-    return nn::make_gpt_spec(VOCAB, D_MODEL, SEQ_LEN, HEADS, D_FF, LAYERS);
-}
+{ return nn::make_gpt_spec(VOCAB, D_MODEL, SEQ_LEN, HEADS, D_FF, LAYERS); }
 
-[[nodiscard]] nn::Result<nn::Model> make_model(nn::ComputeEngine &engine)
-{
-    return nn::build_gpt_model_from_spec(engine, tiny_spec(), nn::PrecisionProfile{});
-}
+[[nodiscard]] nn::Result<nn::Model> make_model(nn::ComputeEngine& engine)
+{ return nn::build_gpt_model_from_spec(engine, tiny_spec(), nn::PrecisionProfile{}); }
 
 // ── 参数快照 / 逐位比较（[6] 用；顺序 = parameters()，逐元素 ==）─────────
-[[nodiscard]] std::vector<nn::Matrix> snapshot_params(nn::ComputeEngine &engine, nn::Model &m)
+[[nodiscard]] std::vector<nn::Matrix> snapshot_params(nn::ComputeEngine& engine, nn::Model& m)
 {
     std::vector<nn::Matrix> out;
-    for (auto &t : m.parameters()) out.push_back(download(engine, t.get()));
+    for (auto& t : m.parameters())
+        out.push_back(download(engine, t.get()));
     return out;
 }
 
-[[nodiscard]] bool same_matrices(const std::vector<nn::Matrix> &a,
-                                 const std::vector<nn::Matrix> &b)
+[[nodiscard]] bool same_matrices(const std::vector<nn::Matrix>& a, const std::vector<nn::Matrix>& b)
 {
     if (a.size() != b.size()) return false;
     for (std::size_t i = 0; i < a.size(); ++i)
@@ -130,13 +126,12 @@ std::filesystem::path scratch_dir()
     return s;
 }
 
-[[nodiscard]] bool same_state(const nn::TrainState &a, const nn::TrainState &b)
+[[nodiscard]] bool same_state(const nn::TrainState& a, const nn::TrainState& b)
 {
     if (std::string(a.state_kind()) != std::string(b.state_kind())) return false;
     return a.counters.global_step == b.counters.global_step &&
            a.counters.epoch == b.counters.epoch &&
-           a.counters.step_in_epoch == b.counters.step_in_epoch &&
-           a.counters.lr == b.counters.lr &&
+           a.counters.step_in_epoch == b.counters.step_in_epoch && a.counters.lr == b.counters.lr &&
            a.optimizer_step == b.optimizer_step &&
            a.optimizer_blob_count == b.optimizer_blob_count &&
            a.recipe.precision.param == b.recipe.precision.param &&
@@ -144,12 +139,10 @@ std::filesystem::path scratch_dir()
            a.recipe.precision.stable == b.recipe.precision.stable &&
            a.recipe.precision.optimizer == b.recipe.precision.optimizer &&
            a.recipe.optimizer == b.recipe.optimizer &&
-           a.recipe.lr_schedule == b.recipe.lr_schedule &&
-           a.recipe.lr == b.recipe.lr && a.recipe.min_lr == b.recipe.min_lr &&
-           a.recipe.weight_decay == b.recipe.weight_decay &&
+           a.recipe.lr_schedule == b.recipe.lr_schedule && a.recipe.lr == b.recipe.lr &&
+           a.recipe.min_lr == b.recipe.min_lr && a.recipe.weight_decay == b.recipe.weight_decay &&
            a.recipe.beta1 == b.recipe.beta1 && a.recipe.beta2 == b.recipe.beta2 &&
-           a.recipe.max_norm == b.recipe.max_norm &&
-           a.recipe.epochs == b.recipe.epochs &&
+           a.recipe.max_norm == b.recipe.max_norm && a.recipe.epochs == b.recipe.epochs &&
            a.recipe.total_steps == b.recipe.total_steps &&
            a.recipe.warmup_epochs == b.recipe.warmup_epochs &&
            a.recipe.warmup_steps == b.recipe.warmup_steps &&
@@ -164,8 +157,7 @@ std::filesystem::path scratch_dir()
     const auto* tb = dynamic_cast<const nn::TextTrainState*>(&b);
     if ((ta == nullptr) != (tb == nullptr)) return false;
     if (ta == nullptr) return true;   // 两份都无文本扩展 ⇒ 基类字段一致即一致
-    return ta->stride == tb->stride &&
-           ta->dataset.path == tb->dataset.path &&
+    return ta->stride == tb->stride && ta->dataset.path == tb->dataset.path &&
            ta->dataset.sha256 == tb->dataset.sha256 &&
            ta->dataset.num_tokens == tb->dataset.num_tokens &&
            ta->dataset.num_docs == tb->dataset.num_docs &&
@@ -175,19 +167,19 @@ std::filesystem::path scratch_dir()
 }
 
 // ── 宿主文件辅助（测试自用；库内字节 cast 收敛在 core_file.hpp）─────────
-[[nodiscard]] std::string read_file(const std::filesystem::path &p)
+[[nodiscard]] std::string read_file(const std::filesystem::path& p)
 {
     std::ifstream ifs(p, std::ios::binary);
     return std::string{std::istreambuf_iterator<char>(ifs), std::istreambuf_iterator<char>()};
 }
 
-void write_file(const std::filesystem::path &p, const std::string &bytes)
+void write_file(const std::filesystem::path& p, const std::string& bytes)
 {
     std::ofstream ofs(p, std::ios::binary);
     ofs.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
 }
 
-[[nodiscard]] std::uint64_t rd_u64(const std::string &b, std::size_t off)
+[[nodiscard]] std::uint64_t rd_u64(const std::string& b, std::size_t off)
 {
     std::uint64_t v = 0;
     std::memcpy(&v, b.data() + off, sizeof(v));
@@ -206,7 +198,8 @@ void test_kvrec_roundtrip()
     auto back = nn::train_state_from_kv(*kv);
     CHECK(back.has_value(), "TrainState 读回成功");
     if (!back) return;
-    CHECK(back && same_state(s, **back), "全字段逐项一致（含精度四槽 / lr_per_epoch / 数据集身份）");
+    CHECK(back && same_state(s, **back),
+          "全字段逐项一致（含精度四槽 / lr_per_epoch / 数据集身份）");
 
     // 缺键 → 默认值（老文件兜底口径）
     nn::KeyValueRecord empty;
@@ -223,7 +216,7 @@ void test_kvrec_roundtrip()
 }
 
 // ── [2][3][4][6][8] 落盘往返与 role 门禁 ───────────────────────────────
-void test_checkpoint_roundtrip(const std::filesystem::path &dir)
+void test_checkpoint_roundtrip(const std::filesystem::path& dir)
 {
     std::cout << "\n── [2] Checkpoint 往返（状态段 + 优化器张量）──\n";
     auto engine_owner = nn::CpuEngine::create();
@@ -231,16 +224,23 @@ void test_checkpoint_roundtrip(const std::filesystem::path &dir)
     auto model_r = make_model(engine);
     CHECK(model_r.has_value(), "建模型");
     if (!model_r) return;
-    nn::Model &model = *model_r;
+    nn::Model& model = *model_r;
     const nn::ModelSpec spec = tiny_spec();
     const auto params_before = snapshot_params(engine, model);
 
     // 优化器状态张量：一个 f32（值可精确比较）+ 一个 f16（验证精度记录）
     nn::Matrix m32(3, 2);
-    m32.span()[0] = 0.5f;  m32.span()[1] = 1.5f;  m32.span()[2] = -2.0f;
-    m32.span()[3] = 0.25f; m32.span()[4] = 8.0f;  m32.span()[5] = -0.125f;
+    m32.span()[0] = 0.5f;
+    m32.span()[1] = 1.5f;
+    m32.span()[2] = -2.0f;
+    m32.span()[3] = 0.25f;
+    m32.span()[4] = 8.0f;
+    m32.span()[5] = -0.125f;
     nn::Matrix m16(2, 2);
-    m16.span()[0] = 0.5f; m16.span()[1] = 1.0f; m16.span()[2] = 2.0f; m16.span()[3] = -3.0f;
+    m16.span()[0] = 0.5f;
+    m16.span()[1] = 1.0f;
+    m16.span()[2] = 2.0f;
+    m16.span()[3] = -3.0f;
     std::vector<nn::Tensor> blobs{
         upload(engine, m32, nn::Precision::F32),
         upload(engine, m16, nn::Precision::F16),
@@ -251,10 +251,13 @@ void test_checkpoint_roundtrip(const std::filesystem::path &dir)
     s.optimizer_blob_count = blobs.size();   // 写侧按实参回填，读回应等于它
     nn::CheckpointState ckpt{&s, blobs};
     const auto ckpt_path = dir / "state.nnckpt";
-    auto sr = nn::save_model(ckpt_path.string(), model, spec, tok,
-                             nn::ModelRole::Checkpoint, ckpt);
+    auto sr = nn::save_model(ckpt_path.string(), model, spec, tok, nn::ModelRole::Checkpoint, ckpt);
     CHECK(sr.has_value(), "写 Checkpoint（含状态段）");
-    if (!sr) { std::cout << "     " << sr.error().message << "\n"; return; }
+    if (!sr)
+    {
+        std::cout << "     " << sr.error().message << "\n";
+        return;
+    }
 
     auto pr = nn::peek_train_state(ckpt_path.string());
     CHECK(pr.has_value(), "peek_train_state 成功");
@@ -379,13 +382,17 @@ void test_checkpoint_roundtrip(const std::filesystem::path &dir)
 }
 
 // ── [5] 尾部校验和（P2-1）──────────────────────────────────────────────
-void test_integrity(const std::filesystem::path &dir)
+void test_integrity(const std::filesystem::path& dir)
 {
     std::cout << "\n── [5] 整文件校验和 / 尾部完整性标记 ──\n";
     auto engine_owner = nn::CpuEngine::create();
     nn::CpuEngine& engine = *engine_owner;
     auto model_r = make_model(engine);
-    if (!model_r) { CHECK(false, "建模型"); return; }
+    if (!model_r)
+    {
+        CHECK(false, "建模型");
+        return;
+    }
     const auto path = dir / "integrity.nnmodel";
     auto sr = nn::save_model(path.string(), *model_r, tiny_spec(), "tok", nn::ModelRole::Model);
     CHECK(sr.has_value(), "写文件");
@@ -420,12 +427,12 @@ void test_integrity(const std::filesystem::path &dir)
     auto tv = nn::verify_model_integrity(trunc_path.string());
     CHECK(!tv.has_value(), "截断 → 明确报错");
     if (!tv)
-        CHECK(tv.error().message.find("NNEND") != std::string::npos,
-              "文案点明缺少尾部完整性标记");
+        CHECK(tv.error().message.find("NNEND") != std::string::npos, "文案点明缺少尾部完整性标记");
     {
         auto back = make_model(engine);
         if (back)
-            CHECK(!nn::load_model(trunc_path.string(), *back).has_value(), "截断文件 load_model 失败");
+            CHECK(!nn::load_model(trunc_path.string(), *back).has_value(),
+                  "截断文件 load_model 失败");
     }
 }
 
@@ -434,7 +441,7 @@ void test_integrity(const std::filesystem::path &dir)
 // kvrec 字段顺序固定、摘要覆盖确定、参数载荷同精度回写。
 // （f16 状态张量经 load 物化为 f32 ⇒ 再 save 会被提升为 f32：值逐位不变、
 //  编码变化；生产路径不存在这种再写——save 一律从活状态导出，见 23 §2.1.1。）
-void test_resave_byte_identity(const std::filesystem::path &dir)
+void test_resave_byte_identity(const std::filesystem::path& dir)
 {
     std::cout << "\n── [9] save → load → save 逐字节一致（f32 状态）──\n";
     auto engine_owner = nn::CpuEngine::create();
@@ -442,11 +449,15 @@ void test_resave_byte_identity(const std::filesystem::path &dir)
     auto model_r = make_model(engine);
     CHECK(model_r.has_value(), "建模型");
     if (!model_r) return;
-    nn::Model &model = *model_r;
+    nn::Model& model = *model_r;
 
     nn::Matrix m(2, 3);
-    m.span()[0] = 0.125f; m.span()[1] = -1.5f; m.span()[2] = 3.0f;
-    m.span()[3] = -0.25f; m.span()[4] = 7.5f;  m.span()[5] = 0.5f;
+    m.span()[0] = 0.125f;
+    m.span()[1] = -1.5f;
+    m.span()[2] = 3.0f;
+    m.span()[3] = -0.25f;
+    m.span()[4] = 7.5f;
+    m.span()[5] = 0.5f;
     std::vector<nn::Tensor> blobs{upload(engine, m, nn::Precision::F32)};
 
     nn::TextTrainState st = sample_state();
@@ -455,22 +466,21 @@ void test_resave_byte_identity(const std::filesystem::path &dir)
     const auto path1 = dir / "resave1.nnckpt";
     const auto path2 = dir / "resave2.nnckpt";
     CHECK(nn::save_model(path1.string(), model, tiny_spec(), tok, nn::ModelRole::Checkpoint,
-                         nn::CheckpointState{&st, blobs}).has_value(),
+                         nn::CheckpointState{&st, blobs})
+              .has_value(),
           "写第一份断点");
 
     auto loaded = nn::load_train_state(engine, path1.string());
     CHECK(loaded.has_value(), "读回状态 + 状态张量");
     if (loaded)
     {
-        CHECK(nn::save_model(path2.string(), model, tiny_spec(), tok,
-                             nn::ModelRole::Checkpoint,
-                             nn::CheckpointState{loaded->state.get(),
-                                                 loaded->optimizer_blobs}).has_value(),
+        CHECK(nn::save_model(path2.string(), model, tiny_spec(), tok, nn::ModelRole::Checkpoint,
+                             nn::CheckpointState{loaded->state.get(), loaded->optimizer_blobs})
+                  .has_value(),
               "用读回的内容重写第二份断点");
         const std::string b1 = read_file(path1);
         const std::string b2 = read_file(path2);
-        CHECK(b1.size() == b2.size() && b1 == b2,
-              "两份文件逐字节一致（save → load → save）");
+        CHECK(b1.size() == b2.size() && b1 == b2, "两份文件逐字节一致（save → load → save）");
         CHECK(b1.size() > nn::MODEL_TAIL_BYTES, "文件含尾部标记");
     }
 }

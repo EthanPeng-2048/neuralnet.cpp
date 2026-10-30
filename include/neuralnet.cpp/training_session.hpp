@@ -128,8 +128,7 @@ struct TrainingStepReport
 class TrainingSession
 {
 public:
-    [[nodiscard]] static Result<TrainingSession> create(Model model,
-                                                        TrainingConfig cfg = {})
+    [[nodiscard]] static Result<TrainingSession> create(Model model, TrainingConfig cfg = {})
     {
         if (!model.engine_bound())
             NN_FAIL("TrainingSession::create: Model 未绑定引擎"
@@ -137,8 +136,7 @@ public:
         if (cfg.grad_accum_steps == 0)
             NN_FAIL("TrainingSession::create: grad_accum_steps 必须 > 0");
 
-        if (cfg.checkpoint_every > 0)
-            model.set_checkpoint_every(cfg.checkpoint_every);
+        if (cfg.checkpoint_every > 0) model.set_checkpoint_every(cfg.checkpoint_every);
         if (cfg.activation_offload)
         {
             if (model.engine().device() != Device::GPU)
@@ -148,18 +146,17 @@ public:
         }
 
         ComputeEngine& engine = model.engine();
-        auto opt = create_optimizer(cfg.optimizer, engine, model.parameters(),
-                                    model.param_gradients(), cfg.lr,
-                                    cfg.weight_decay, cfg.precision, cfg.beta1,
-                                    cfg.beta2);
+        auto opt =
+            create_optimizer(cfg.optimizer, engine, model.parameters(), model.param_gradients(),
+                             cfg.lr, cfg.weight_decay, cfg.precision, cfg.beta1, cfg.beta2);
         if (!opt)
-            NN_FAIL("TrainingSession::create: 未知优化器 '" + cfg.optimizer + "'"
+            NN_FAIL("TrainingSession::create: 未知优化器 '" + cfg.optimizer +
+                    "'"
                     "（可用: sgd / sgd_momentum / adam / adamw / adamwquant / muon）");
 
         TrainingSessionState state;
         state.current_lr = cfg.lr;
-        return TrainingSession(std::move(model), std::move(opt), std::move(cfg),
-                               std::move(state));
+        return TrainingSession(std::move(model), std::move(opt), std::move(cfg), std::move(state));
     }
 
     TrainingSession(TrainingSession&&) noexcept = default;
@@ -176,8 +173,7 @@ public:
     [[nodiscard]] const TrainingConfig& config() const noexcept { return cfg_; }
     [[nodiscard]] const TrainingSessionState& state() const noexcept { return state_; }
     [[nodiscard]] Scalar current_lr() const noexcept { return state_.current_lr; }
-    [[nodiscard]] std::uint64_t step_count() const noexcept
-    { return state_.optimizer_step; }
+    [[nodiscard]] std::uint64_t step_count() const noexcept { return state_.optimizer_step; }
 
     // 核心单步入口。`step_fn` 只在本次调用期间使用，不进入 Session 状态。
     template <class Batch, class StepFn>
@@ -225,8 +221,7 @@ public:
             NN_FAIL("TrainingSession::train_step: Step 回调返回了空梯度");
         }
 
-        if (out.gradient_units > 0 &&
-            options.normalization_units != out.gradient_units)
+        if (out.gradient_units > 0 && options.normalization_units != out.gradient_units)
         {
             if (out.gradient_units > options.normalization_units)
             {
@@ -236,9 +231,8 @@ public:
                         std::to_string(out.gradient_units) + " > " +
                         std::to_string(options.normalization_units) + "）");
             }
-            const Scalar scale =
-                static_cast<Scalar>(out.gradient_units) /
-                static_cast<Scalar>(options.normalization_units);
+            const Scalar scale = static_cast<Scalar>(out.gradient_units) /
+                                 static_cast<Scalar>(options.normalization_units);
             auto sr = engine().scale_inplace(out.grad, scale);
             if (!sr)
             {
@@ -280,8 +274,7 @@ public:
         }
         ++state_.microsteps_in_update;
 
-        const bool update_ready =
-            state_.microsteps_in_update >= cfg_.grad_accum_steps;
+        const bool update_ready = state_.microsteps_in_update >= cfg_.grad_accum_steps;
         if (!update_ready && !options.force_update)
         {
             TrainingStepReport report;
@@ -326,8 +319,7 @@ public:
     // 是 step_fn 返回 GradientBundle 并走 Model::backward_named。
     template <class Batch, class StepFn>
     [[nodiscard]] Result<TrainingStepReport>
-    train_named_step(const Batch& batch, TrainingStepOptions options,
-                     StepFn&& step_fn)
+    train_named_step(const Batch& batch, TrainingStepOptions options, StepFn&& step_fn)
     {
         if (state_.accumulation_dirty)
             NN_FAIL("TrainingSession::train_named_step: 上一次失败留下了不完整"
@@ -351,8 +343,7 @@ public:
             if (options.normalization_units != state_.update_normalization_units)
                 NN_FAIL("TrainingSession::train_named_step: 同一 update 的 "
                         "normalization_units 发生变化（" +
-                        std::to_string(state_.update_normalization_units) +
-                        " vs " +
+                        std::to_string(state_.update_normalization_units) + " vs " +
                         std::to_string(options.normalization_units) + "）");
         }
 
@@ -373,8 +364,7 @@ public:
             NN_FAIL("TrainingSession::train_named_step: Step 回调返回了空梯度包");
         }
 
-        if (out.gradient_units > 0 &&
-            options.normalization_units != out.gradient_units)
+        if (out.gradient_units > 0 && options.normalization_units != out.gradient_units)
         {
             if (out.gradient_units > options.normalization_units)
             {
@@ -384,13 +374,11 @@ public:
                         std::to_string(out.gradient_units) + " > " +
                         std::to_string(options.normalization_units) + "）");
             }
-            const Scalar scale =
-                static_cast<Scalar>(out.gradient_units) /
-                static_cast<Scalar>(options.normalization_units);
+            const Scalar scale = static_cast<Scalar>(out.gradient_units) /
+                                 static_cast<Scalar>(options.normalization_units);
             for (std::size_t i = 0; i < out.gradients.schema().size(); ++i)
             {
-                const FieldHandle handle{
-                    out.gradients.schema().fingerprint(), i};
+                const FieldHandle handle{out.gradients.schema().fingerprint(), i};
                 auto grad_r = out.gradients.require(handle);
                 NN_TRY_CHECK(grad_r);
                 if (*grad_r == nullptr) continue;
@@ -418,8 +406,7 @@ public:
             }
             else
             {
-                auto ar = engine().accumulate(state_.pending_loss_sum,
-                                              out.loss_sum);
+                auto ar = engine().accumulate(state_.pending_loss_sum, out.loss_sum);
                 if (!ar)
                 {
                     state_.accumulation_dirty = true;
@@ -437,8 +424,7 @@ public:
         }
         ++state_.microsteps_in_update;
 
-        const bool update_ready =
-            state_.microsteps_in_update >= cfg_.grad_accum_steps;
+        const bool update_ready = state_.microsteps_in_update >= cfg_.grad_accum_steps;
         if (!update_ready && !options.force_update)
         {
             TrainingStepReport report;
@@ -543,8 +529,7 @@ public:
     // 状态 → 以 Checkpoint 角色落盘（blob 计数由 save_model 按实参回填，
     // 调用方不再需要手动同步）。`state` 的域字段（数据集身份等）由调用方
     // 预填；本入口不覆盖它们。
-    [[nodiscard]] Result<void> save_checkpoint(const std::string& path,
-                                               const ModelSpec& spec,
+    [[nodiscard]] Result<void> save_checkpoint(const std::string& path, const ModelSpec& spec,
                                                TrainState& state,
                                                const std::string& tokenizer_data = {})
     {
@@ -555,8 +540,7 @@ public:
         std::vector<Tensor> blobs;
         NN_TRY(er, opt_->save_state(blobs));
         const CheckpointState ckpt{&state, blobs};
-        return save_model(path, model_, spec, tokenizer_data,
-                          ModelRole::Checkpoint, ckpt);
+        return save_model(path, model_, spec, tokenizer_data, ModelRole::Checkpoint, ckpt);
     }
 
     // 一站式续训：载入权重（同一 .nnckpt 文件）→ 读训练状态段 → 可选交叉
@@ -564,22 +548,17 @@ public:
     // Relaxed 只查 kind）→ 恢复优化器状态（t 先于/后于张量无序依赖，本入口
     // 固定先 t 后张量）→ 恢复会话计数器。返回加载出的状态（域读取数据集身份
     // 等字段用）。
-    [[nodiscard]] Result<std::unique_ptr<TrainState>> resume(
-        const std::string& path, const TrainState* current = nullptr,
-        ResumePolicy policy = ResumePolicy::Strict)
+    [[nodiscard]] Result<std::unique_ptr<TrainState>>
+    resume(const std::string& path, const TrainState* current = nullptr,
+           ResumePolicy policy = ResumePolicy::Strict)
     {
-        NN_TRY(lm, load_model(path, model_, nullptr, nullptr,
-                              WeightLoadIntent::Trainable));
+        NN_TRY(lm, load_model(path, model_, nullptr, nullptr, WeightLoadIntent::Trainable));
         NN_TRY(loaded, load_train_state(engine(), path));
-        if (current != nullptr)
-        {
-            NN_TRY(vr, verify_resume(*loaded->state, *current, policy));
-        }
+        if (current != nullptr) { NN_TRY(vr, verify_resume(*loaded->state, *current, policy)); }
         opt_->set_state_step(loaded->state->optimizer_step);
         NN_TRY(ls, opt_->load_state(loaded->optimizer_blobs));
         state_.optimizer_step = loaded->state->counters.global_step;
-        if (loaded->state->counters.lr > 0)
-            set_lr(static_cast<Scalar>(loaded->state->counters.lr));
+        if (loaded->state->counters.lr > 0) set_lr(static_cast<Scalar>(loaded->state->counters.lr));
         clear_accumulation_state_();
         return std::move(loaded->state);
     }
@@ -590,8 +569,8 @@ private:
     {
     public:
         explicit RecordingGuard(ComputeEngine& engine) noexcept : engine_(&engine) {}
-        RecordingGuard(RecordingGuard&& other) noexcept
-            : engine_(other.engine_) { other.engine_ = nullptr; }
+        RecordingGuard(RecordingGuard&& other) noexcept : engine_(other.engine_)
+        { other.engine_ = nullptr; }
         RecordingGuard& operator=(RecordingGuard&&) = delete;
         RecordingGuard(const RecordingGuard&) = delete;
         ~RecordingGuard()

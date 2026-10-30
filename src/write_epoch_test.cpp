@@ -48,7 +48,8 @@ nn::Tensor zeros(nn::ComputeEngine& eng, std::size_t rows, std::size_t cols)
 nn::Tensor filled(nn::ComputeEngine& eng, std::size_t rows, std::size_t cols, float v)
 {
     nn::Matrix m(rows, cols);
-    for (auto& x : m.span()) x = v;
+    for (auto& x : m.span())
+        x = v;
     return upload(eng, m);
 }
 
@@ -58,8 +59,7 @@ void expect_bump(nn::ComputeEngine& eng, const char* what, nn::Tensor& t, Fn&& f
 {
     const std::uint64_t before = t.write_epoch();
     auto r = fn();
-    if (!r.has_value())
-        std::printf("[FAIL] %s: 调用失败 —— %s\n", what, r.error().message.c_str());
+    if (!r.has_value()) std::printf("[FAIL] %s: 调用失败 —— %s\n", what, r.error().message.c_str());
     CHECK(r.has_value(), what);
     const std::uint64_t after = t.write_epoch();
     if (!(after > before))
@@ -70,13 +70,11 @@ void expect_bump(nn::ComputeEngine& eng, const char* what, nn::Tensor& t, Fn&& f
     (void)eng;
 }
 
-template <class Fn>
-void expect_no_bump(const char* what, const nn::Tensor& t, Fn&& fn)
+template <class Fn> void expect_no_bump(const char* what, const nn::Tensor& t, Fn&& fn)
 {
     const std::uint64_t before = t.write_epoch();
     auto r = fn();
-    if (!r.has_value())
-        std::printf("[FAIL] %s: 调用失败 —— %s\n", what, r.error().message.c_str());
+    if (!r.has_value()) std::printf("[FAIL] %s: 调用失败 —— %s\n", what, r.error().message.c_str());
     CHECK(r.has_value(), what);
     if (t.write_epoch() != before)
         std::printf("[FAIL] %s: 只读路径推进了写版本（before=%llu after=%llu）\n", what,
@@ -96,102 +94,62 @@ void test_write_entries(nn::ComputeEngine& eng, const char* tag)
     nn::Tensor src = filled(eng, 3, 2, 1.0f);
     nn::Tensor idx = filled(eng, 1, 1, 0.0f);       // 行索引 0
     nn::Matrix m(3, 2);
-    for (auto& x : m.span()) x = 0.5f;
+    for (auto& x : m.span())
+        x = 0.5f;
 
     std::vector<nn::Scalar> flat(6, 0.25f);
-    expect_bump(eng, "write 推进写版本", t, [&]
-    {
-        return eng.write(t, std::span<nn::Scalar>(flat));
-    });
-    expect_bump(eng, "set_index 推进写版本", t, [&]
-    {
-        return eng.set_index(t, 0, 0, 1.0f);
-    });
-    expect_bump(eng, "copy_from 推进写版本", t, [&]
-    {
-        return eng.copy_from(t, m);
-    });
-    expect_bump(eng, "accumulate 推进写版本", t, [&]
-    {
-        return eng.accumulate(t, src);
-    });
-    expect_bump(eng, "add_inplace 推进写版本", t, [&]
-    {
-        return eng.add_inplace(t, src);
-    });
-    expect_bump(eng, "scale_inplace 推进写版本", t, [&]
-    {
-        return eng.scale_inplace(t, 2.0f);
-    });
+    expect_bump(eng, "write 推进写版本", t,
+                [&] { return eng.write(t, std::span<nn::Scalar>(flat)); });
+    expect_bump(eng, "set_index 推进写版本", t, [&] { return eng.set_index(t, 0, 0, 1.0f); });
+    expect_bump(eng, "copy_from 推进写版本", t, [&] { return eng.copy_from(t, m); });
+    expect_bump(eng, "accumulate 推进写版本", t, [&] { return eng.accumulate(t, src); });
+    expect_bump(eng, "add_inplace 推进写版本", t, [&] { return eng.add_inplace(t, src); });
+    expect_bump(eng, "scale_inplace 推进写版本", t, [&] { return eng.scale_inplace(t, 2.0f); });
     {
         // insert_rows 要求 dst 能容纳 src 的全部行
         nn::Tensor tall = zeros(eng, 4, 2);
-        expect_bump(eng, "insert_rows 推进写版本", tall, [&]
-        {
-            return eng.insert_rows(tall, 1, src);
-        });
+        expect_bump(eng, "insert_rows 推进写版本", tall,
+                    [&] { return eng.insert_rows(tall, 1, src); });
     }
-    expect_bump(eng, "scatter_add_rows 推进写版本", t, [&]
-    {
-        return eng.scatter_add_rows(t, idx, src);
-    });
-    expect_bump(eng, "eval_expr_into（DSL）推进写版本", t, [&]
-    {
-        // 优化器更新参数走的就是这条（dsl::compute_into → eval_expr_into）
-        return nn::dsl::compute_into(eng,
-            nn::dsl::leaf(t) + nn::dsl::leaf(src), t);
-    });
+    expect_bump(eng, "scatter_add_rows 推进写版本", t,
+                [&] { return eng.scatter_add_rows(t, idx, src); });
+    expect_bump(eng, "eval_expr_into（DSL）推进写版本", t,
+                [&]
+                {
+                    // 优化器更新参数走的就是这条（dsl::compute_into → eval_expr_into）
+                    return nn::dsl::compute_into(eng, nn::dsl::leaf(t) + nn::dsl::leaf(src), t);
+                });
     {
         // copy_into / cast_into：目标传递的其余两个出口
         nn::Tensor dst = zeros(eng, 3, 2);
-        expect_bump(eng, "copy_into 推进写版本", dst, [&]
-        {
-            return eng.copy_into(dst, src);
-        });
+        expect_bump(eng, "copy_into 推进写版本", dst, [&] { return eng.copy_into(dst, src); });
         nn::Tensor f16src = upload(eng, m, nn::Precision::F16);
         nn::Tensor f32dst = zeros(eng, 3, 2);
-        expect_bump(eng, "cast_into 推进写版本", f32dst, [&]
-        {
-            return eng.cast_into(f16src, f32dst);
-        });
+        expect_bump(eng, "cast_into 推进写版本", f32dst,
+                    [&] { return eng.cast_into(f16src, f32dst); });
     }
-    expect_bump(eng, "zero 推进写版本", t, [&]
-    {
-        return eng.zero(t);
-    });
+    expect_bump(eng, "zero 推进写版本", t, [&] { return eng.zero(t); });
 
     // ── [2] 只读路径不推进 ───────────────────────────────────────────────
     std::printf("[2] 只读路径不推进写版本（%s）\n", tag);
-    expect_no_bump("read 不推进写版本", t, [&]
-    {
-        std::vector<nn::Scalar> buf(6);
-        return eng.read(t, std::span<nn::Scalar>(buf));
-    });
-    expect_no_bump("to_matrix 不推进写版本", t, [&]
-    {
-        return eng.to_matrix(t, nn::Precision::F32);
-    });
-    expect_no_bump("clone 不推进源写版本", t, [&]
-    {
-        return eng.clone(t);
-    });
+    expect_no_bump("read 不推进写版本", t,
+                   [&]
+                   {
+                       std::vector<nn::Scalar> buf(6);
+                       return eng.read(t, std::span<nn::Scalar>(buf));
+                   });
+    expect_no_bump("to_matrix 不推进写版本", t,
+                   [&] { return eng.to_matrix(t, nn::Precision::F32); });
+    expect_no_bump("clone 不推进源写版本", t, [&] { return eng.clone(t); });
     {
         // 合法形状：A (2,3) × B (3,2)（t/src 是 (3,2)，不足以相乘）
         nn::Tensor a = filled(eng, 2, 3, 1.0f);
         nn::Tensor b = filled(eng, 3, 2, 1.0f);
-        expect_no_bump("matmul 不推进 A 操作数写版本", a, [&]
-        {
-            return eng.matmul(a, b);
-        });
-        expect_no_bump("matmul 不推进 B 操作数写版本", b, [&]
-        {
-            return eng.matmul(a, b);
-        });
+        expect_no_bump("matmul 不推进 A 操作数写版本", a, [&] { return eng.matmul(a, b); });
+        expect_no_bump("matmul 不推进 B 操作数写版本", b, [&] { return eng.matmul(a, b); });
     }
     expect_no_bump("dsl::compute 不推进输入写版本", t, [&]
-    {
-        return nn::dsl::compute(eng, nn::dsl::leaf(t) * nn::dsl::leaf(src), 3, 2);
-    });
+                   { return nn::dsl::compute(eng, nn::dsl::leaf(t) * nn::dsl::leaf(src), 3, 2); });
 
     // ── [3] 别名可见：拷贝共享存储 ───────────────────────────────────────
     std::printf("[3] 别名（Tensor 拷贝）上的写入对原句柄可见（%s）\n", tag);
@@ -227,13 +185,9 @@ nn::BitLinear make_bitlinear(nn::ComputeEngine& eng, std::size_t in, std::size_t
 
 // (τ, wq) 的宿主快照，用于逐位比较
 nn::Matrix wq_of(nn::ComputeEngine& eng, nn::BitLinear& bl)
-{
-    return download(eng, bl.quantized_weights());
-}
+{ return download(eng, bl.quantized_weights()); }
 nn::Matrix tau_of(nn::ComputeEngine& eng, nn::BitLinear& bl)
-{
-    return download(eng, bl.row_scales());
-}
+{ return download(eng, bl.row_scales()); }
 
 bool mat_same(const nn::Matrix& a, const nn::Matrix& b)
 {
@@ -273,8 +227,7 @@ void test_bitlinear_cache(nn::ComputeEngine& eng, const char* tag)
     // 同权重、同输入 → 命中缓存（且输出逐位不变）
     auto y2 = bl.forward(Xt);
     CHECK(y2.has_value(), "第二次 forward 成功");
-    if (y2.has_value())
-        CHECK(mat_same(y0, download(eng, *y2)), "缓存命中时输出逐位不变");
+    if (y2.has_value()) CHECK(mat_same(y0, download(eng, *y2)), "缓存命中时输出逐位不变");
     CHECK(bl.quantize_calls() == 1, "同权重下第二次 forward 不重算 τ/wq");
 
     // 换输入（权重没变）→ 仍不重算
@@ -309,8 +262,7 @@ void test_bitlinear_cache(nn::ComputeEngine& eng, const char* tag)
     CHECK(bl.quantize_calls() == 2, "优化器更新权重后重算一次");
     const nn::Matrix wq1 = wq_of(eng, bl);
     const nn::Matrix tau1 = tau_of(eng, bl);
-    CHECK(!mat_same(wq0, wq1) || !mat_same(tau0, tau1),
-          "权重变化后 τ/wq 至少之一变化");
+    CHECK(!mat_same(wq0, wq1) || !mat_same(tau0, tau1), "权重变化后 τ/wq 至少之一变化");
 
     // 另一条写入路径：engine.copy_from（序列化加载 / 宿主直写）
     {
@@ -373,8 +325,7 @@ void test_bitlinear_cache(nn::ComputeEngine& eng, const char* tag)
         CHECK(a.has_value() && b.has_value(), "打包路径 forward ×2 成功");
         CHECK(pk.quantize_calls() == 1, "打包路径：同权重两次 forward 只量化一次");
         if (a.has_value() && b.has_value())
-            CHECK(mat_same(download(eng, *a), download(eng, *b)),
-                  "打包路径缓存命中时输出逐位相同");
+            CHECK(mat_same(download(eng, *a), download(eng, *b)), "打包路径缓存命中时输出逐位相同");
     }
 }
 
@@ -447,7 +398,6 @@ int main(int argc, char* argv[])
         test_lazy_grads(eng, "CPU");
     }
 
-    if (g_failures == 0)
-        std::puts("write_epoch_test: 全部通过");
+    if (g_failures == 0) std::puts("write_epoch_test: 全部通过");
     return g_failures == 0 ? 0 : 1;
 }

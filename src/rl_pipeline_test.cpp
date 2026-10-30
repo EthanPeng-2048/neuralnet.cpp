@@ -25,11 +25,8 @@ namespace
 nn::TensorSchema rollout_schema()
 {
     auto r = nn::TensorSchema::create(
-        "rollout",
-        {nn::tensor_field("x",
-                          nn::TensorShapeSpec::exact(1, 1),
-                          true, nn::Precision::F32,
-                          nn::TensorPlacement::CPU)});
+        "rollout", {nn::tensor_field("x", nn::TensorShapeSpec::exact(1, 1), true,
+                                     nn::Precision::F32, nn::TensorPlacement::CPU)});
     NN_ASSERT_ALWAYS(r, "rollout schema");
     return std::move(*r);
 }
@@ -43,42 +40,31 @@ private:
 public:
     std::size_t calls = 0;
 
-    explicit CountingSource(nn::CpuEngine& engine)
-        : engine_(engine), schema_(rollout_schema())
-    {
-    }
+    explicit CountingSource(nn::CpuEngine& engine) : engine_(engine), schema_(rollout_schema()) {}
 
-    [[nodiscard]] nn::Result<nn::TensorRecord> rollout(
-        nn::DeterministicRng& rng) override
+    [[nodiscard]] nn::Result<nn::TensorRecord> rollout(nn::DeterministicRng& rng) override
     {
         ++calls;
-        const nn::Scalar value =
-            static_cast<nn::Scalar>(rng.next_u64() % 100000u);
-        NN_TRY(tensor, nn::detail::upload_span(
-                           engine_, 1, 1, nn::Precision::F32,
-                           std::span<const nn::Scalar>(&value, 1)));
-        return nn::TensorRecord::create(
-            schema_,
-            {nn::NamedTensor{.name = "x", .value = *tensor}});
+        const nn::Scalar value = static_cast<nn::Scalar>(rng.next_u64() % 100000u);
+        NN_TRY(tensor, nn::detail::upload_span(engine_, 1, 1, nn::Precision::F32,
+                                               std::span<const nn::Scalar>(&value, 1)));
+        return nn::TensorRecord::create(schema_, {nn::NamedTensor{.name = "x", .value = *tensor}});
     }
 };
 
 class BadSizeSampler final : public nn::BatchSampler
 {
 public:
-    [[nodiscard]] nn::Result<std::vector<std::size_t>> sample(
-        std::size_t, std::size_t, nn::DeterministicRng&) override
-    {
-        return std::vector<std::size_t>{};
-    }
+    [[nodiscard]] nn::Result<std::vector<std::size_t>> sample(std::size_t, std::size_t,
+                                                              nn::DeterministicRng&) override
+    { return std::vector<std::size_t>{}; }
 };
 
 class OutOfRangeSampler final : public nn::BatchSampler
 {
 public:
-    [[nodiscard]] nn::Result<std::vector<std::size_t>> sample(
-        std::size_t, std::size_t batch_size,
-        nn::DeterministicRng&) override
+    [[nodiscard]] nn::Result<std::vector<std::size_t>> sample(std::size_t, std::size_t batch_size,
+                                                              nn::DeterministicRng&) override
     {
         std::vector<std::size_t> indices(batch_size, 9999);
         return indices;
@@ -92,32 +78,26 @@ struct RunTrace
     std::size_t after_hooks = 0;
 };
 
-nn::Result<void> run_pipeline(
-    nn::RLTrainingPipeline& pipeline, std::size_t updates,
-    nn::ComputeEngine& engine, RunTrace& trace)
+nn::Result<void> run_pipeline(nn::RLTrainingPipeline& pipeline, std::size_t updates,
+                              nn::ComputeEngine& engine, RunTrace& trace)
 {
     nn::TrainerHooks hooks;
-    hooks.before_update =
-        [&](std::span<const nn::TensorRecord* const> batch)
-            -> nn::Result<void>
-        {
-            ++trace.before_hooks;
-            if (batch.empty()) NN_FAIL("empty hook batch");
-            return {};
-        };
-    hooks.after_update =
-        [&](std::span<const nn::TensorRecord* const> batch)
-            -> nn::Result<void>
-        {
-            ++trace.after_hooks;
-            if (batch.empty()) NN_FAIL("empty hook batch");
-            return {};
-        };
+    hooks.before_update = [&](std::span<const nn::TensorRecord* const> batch) -> nn::Result<void>
+    {
+        ++trace.before_hooks;
+        if (batch.empty()) NN_FAIL("empty hook batch");
+        return {};
+    };
+    hooks.after_update = [&](std::span<const nn::TensorRecord* const> batch) -> nn::Result<void>
+    {
+        ++trace.after_hooks;
+        if (batch.empty()) NN_FAIL("empty hook batch");
+        return {};
+    };
     return pipeline.run(
         updates,
-        [&](std::span<const nn::TensorRecord* const> batch,
-            nn::DeterministicRng&, nn::MetricSink& metrics)
-            -> nn::Result<void>
+        [&](std::span<const nn::TensorRecord* const> batch, nn::DeterministicRng&,
+            nn::MetricSink& metrics) -> nn::Result<void>
         {
             double sum = 0;
             for (const nn::TensorRecord* record : batch)
@@ -142,11 +122,10 @@ struct PipelineBundle
     nn::RLTrainingPipeline pipeline;
 };
 
-nn::Result<PipelineBundle> make_pipeline(
-    nn::CpuEngine& engine, std::shared_ptr<nn::MetricSink> metrics,
-    std::shared_ptr<nn::CheckpointProvider> checkpoints = {},
-    std::uint64_t seed = 177,
-    bool clear_buffer = false)
+nn::Result<PipelineBundle> make_pipeline(nn::CpuEngine& engine,
+                                         std::shared_ptr<nn::MetricSink> metrics,
+                                         std::shared_ptr<nn::CheckpointProvider> checkpoints = {},
+                                         std::uint64_t seed = 177, bool clear_buffer = false)
 {
     nn::RLPipelineConfig cfg;
     cfg.batch_size = 2;
@@ -158,10 +137,9 @@ nn::Result<PipelineBundle> make_pipeline(
     auto source = std::make_unique<CountingSource>(engine);
     CountingSource* source_ptr = source.get();
     NN_TRY(pipeline,
-           nn::RLTrainingPipeline::create(
-               std::move(cfg), std::move(source),
-               std::make_unique<nn::UniformBatchSampler>(),
-               std::move(metrics), std::move(checkpoints), seed));
+           nn::RLTrainingPipeline::create(std::move(cfg), std::move(source),
+                                          std::make_unique<nn::UniformBatchSampler>(),
+                                          std::move(metrics), std::move(checkpoints), seed));
     return PipelineBundle{
         .source = source_ptr,
         .pipeline = std::move(*pipeline),
@@ -176,20 +154,13 @@ void test_pipeline_and_metrics()
     CHECK(bundle.has_value(), "pipeline composition");
     if (!bundle) return;
     RunTrace trace;
-    CHECK(run_pipeline(bundle->pipeline, 4, *engine, trace).has_value(),
-          "pipeline run");
-    CHECK(bundle->source->calls == 8,
-          "collect_per_update drives source call count");
-    CHECK(trace.batches.size() == 8,
-          "four updates x batch_size records reach task update");
-    CHECK(trace.before_hooks == 4 && trace.after_hooks == 4,
-          "hooks run once around each update");
-    CHECK(metrics->records().size() == 4,
-          "metrics sink receives one record per update");
-    CHECK(bundle->pipeline.buffer().empty(),
-          "clear_buffer_after_update policy");
-    CHECK(bundle->pipeline.update_count() == 4 &&
-              bundle->pipeline.rollout_cursor() == 8,
+    CHECK(run_pipeline(bundle->pipeline, 4, *engine, trace).has_value(), "pipeline run");
+    CHECK(bundle->source->calls == 8, "collect_per_update drives source call count");
+    CHECK(trace.batches.size() == 8, "four updates x batch_size records reach task update");
+    CHECK(trace.before_hooks == 4 && trace.after_hooks == 4, "hooks run once around each update");
+    CHECK(metrics->records().size() == 4, "metrics sink receives one record per update");
+    CHECK(bundle->pipeline.buffer().empty(), "clear_buffer_after_update policy");
+    CHECK(bundle->pipeline.update_count() == 4 && bundle->pipeline.rollout_cursor() == 8,
           "pipeline counters");
 }
 
@@ -203,29 +174,24 @@ void test_checkpoint_reproducibility()
     RunTrace first;
     CHECK(run_pipeline(base->pipeline, 3, *engine, first).has_value(),
           "base pipeline first segment");
-    CHECK(base->pipeline.save_checkpoint().has_value(),
-          "pipeline checkpoint save");
+    CHECK(base->pipeline.save_checkpoint().has_value(), "pipeline checkpoint save");
 
     auto resumed = make_pipeline(*engine, {}, checkpoints, 4242, false);
     CHECK(resumed.has_value(), "resumed pipeline composition");
     if (!resumed) return;
     RunTrace resume_prefix;
-    CHECK(run_pipeline(resumed->pipeline, 3, *engine,
-                       resume_prefix).has_value(),
+    CHECK(run_pipeline(resumed->pipeline, 3, *engine, resume_prefix).has_value(),
           "resumed pipeline prefix");
-    CHECK(resumed->pipeline.restore_checkpoint().has_value(),
-          "pipeline checkpoint restore");
+    CHECK(resumed->pipeline.restore_checkpoint().has_value(), "pipeline checkpoint restore");
     RunTrace resumed_tail;
-    CHECK(run_pipeline(resumed->pipeline, 2, *engine,
-                       resumed_tail).has_value(),
+    CHECK(run_pipeline(resumed->pipeline, 2, *engine, resumed_tail).has_value(),
           "resumed pipeline continuation");
 
     auto uninterrupted = make_pipeline(*engine, {}, {}, 4242, false);
     CHECK(uninterrupted.has_value(), "uninterrupted pipeline");
     if (!uninterrupted) return;
     RunTrace reference;
-    CHECK(run_pipeline(uninterrupted->pipeline, 5, *engine,
-                       reference).has_value(),
+    CHECK(run_pipeline(uninterrupted->pipeline, 5, *engine, reference).has_value(),
           "uninterrupted pipeline run");
 
     const std::size_t offset = reference.batches.size() - 4;
@@ -233,14 +199,12 @@ void test_checkpoint_reproducibility()
     for (std::size_t i = 0; same && i < 4; ++i)
         same = resumed_tail.batches[i] == reference.batches[offset + i];
     CHECK(same, "checkpoint restores RNG/rollout/sampler sequence");
-    CHECK(resumed->pipeline.update_count() == 5 &&
-              resumed->pipeline.rollout_cursor() == 10,
+    CHECK(resumed->pipeline.update_count() == 5 && resumed->pipeline.rollout_cursor() == 10,
           "restored pipeline counters continue");
 
     NN_UNWRAP(checkpoints->save_section("custom", "opaque"));
     auto custom = checkpoints->load_section("custom");
-    CHECK(custom && *custom == "opaque",
-          "checkpoint provider supports custom sections");
+    CHECK(custom && *custom == "opaque", "checkpoint provider supports custom sections");
 }
 
 void test_after_update_failure_commits_state()
@@ -253,11 +217,11 @@ void test_after_update_failure_commits_state()
     nn::TrainerHooks hooks;
     hooks.after_update = [](std::span<const nn::TensorRecord* const>) -> nn::Result<void>
     { NN_FAIL("intentional after_update failure"); };
-    auto run = bundle->pipeline.run(1,
-                                    [](std::span<const nn::TensorRecord* const>,
-                                       nn::DeterministicRng&, nn::MetricSink&) -> nn::Result<void>
-                                    { return {}; },
-                                    std::move(hooks));
+    auto run = bundle->pipeline.run(
+        1,
+        [](std::span<const nn::TensorRecord* const>, nn::DeterministicRng&,
+           nn::MetricSink&) -> nn::Result<void> { return {}; },
+        std::move(hooks));
     CHECK(!run, "after_update failure propagates");
     CHECK(bundle->pipeline.update_count() == 1,
           "successful model update is committed before after hook");
@@ -273,12 +237,10 @@ void test_invalid_components()
     cfg.min_buffer_size = 2;
     cfg.collect_per_update = 2;
     auto source = std::make_unique<CountingSource>(*engine);
-    CHECK(!nn::RLTrainingPipeline::create(
-               cfg, nullptr,
-               std::make_unique<nn::UniformBatchSampler>()),
-          "null source rejected");
-    CHECK(!nn::RLTrainingPipeline::create(
-               cfg, std::move(source), nullptr),
+    CHECK(
+        !nn::RLTrainingPipeline::create(cfg, nullptr, std::make_unique<nn::UniformBatchSampler>()),
+        "null source rejected");
+    CHECK(!nn::RLTrainingPipeline::create(cfg, std::move(source), nullptr),
           "null sampler rejected");
 
     nn::RLPipelineConfig too_small = cfg;
@@ -293,9 +255,8 @@ void test_invalid_components()
                                           std::make_unique<nn::UniformBatchSampler>()),
           "empty checkpoint section rejected");
 
-    auto bad_size = nn::RLTrainingPipeline::create(
-        cfg, std::make_unique<CountingSource>(*engine),
-        std::make_unique<BadSizeSampler>());
+    auto bad_size = nn::RLTrainingPipeline::create(cfg, std::make_unique<CountingSource>(*engine),
+                                                   std::make_unique<BadSizeSampler>());
     CHECK(bad_size.has_value(), "bad-size sampler pipeline builds");
     if (bad_size)
     {
@@ -305,8 +266,7 @@ void test_invalid_components()
     }
 
     auto out_of_range = nn::RLTrainingPipeline::create(
-        cfg, std::make_unique<CountingSource>(*engine),
-        std::make_unique<OutOfRangeSampler>());
+        cfg, std::make_unique<CountingSource>(*engine), std::make_unique<OutOfRangeSampler>());
     CHECK(out_of_range.has_value(), "out-of-range sampler pipeline builds");
     if (out_of_range)
     {
