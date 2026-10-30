@@ -14,6 +14,7 @@
 // 拆分文件（按依赖顺序）：
 //   compute_layer_base.hpp          Layer 基类 + clone_tensor 辅助
 //   compute_layer_mlp.hpp           Linear/ReLU/GeLU/SwiGLU/LayerNorm/RMSNorm
+//   compute_layer_embedding.hpp     Embedding（可学习查表嵌入；issue #32）
 //   compute_layer_bitlinear.hpp     BitLinear（三值权重 1.58-bit：量化 forward + STE backward）
 //   compute_layer_conv.hpp          Conv2D / MaxPool2D
 //   compute_layer_softmax.hpp       Softmax
@@ -32,6 +33,7 @@
 // L2 计算层（引擎化）— 各子文件已自带依赖 include，这里按拓扑序聚合。
 #include "compute_layer_base.hpp"
 #include "compute_layer_mlp.hpp"
+#include "compute_layer_embedding.hpp"
 #include "compute_layer_bitlinear.hpp"
 #include "compute_layer_conv.hpp"
 #include "compute_layer_softmax.hpp"

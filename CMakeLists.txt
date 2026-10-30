@@ -553,6 +553,10 @@ if(NN_BUILD_APPS OR NN_ENABLE_TESTS)
     nn_add_executable(adam_quant_test src/adam_quant_test.cpp)
     list(APPEND NN_TEST_TARGETS adam_quant_test)
 
+    # ── Embedding 层（issue #32：查表 / 伴随散射 / padding / 整数入口）──
+    nn_add_executable(embedding_test src/embedding_test.cpp)
+    list(APPEND NN_TEST_TARGETS embedding_test)
+
     # ── Attention（梯度检查 + forward 一致性 + batch 行号回归）──────────
     nn_add_executable(attn_test src/attn_test.cpp)
     list(APPEND NN_TEST_TARGETS attn_test)
