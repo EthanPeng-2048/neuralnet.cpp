@@ -38,6 +38,8 @@
 #include "compute_optimizer.hpp"
 #include <neuralnet.cpp/core_errors.hpp>
 #include "model_container.hpp"
+#include "model_serialization.hpp"   // save_checkpoint/resume（issue #37）
+#include "train_state.hpp"           // TrainState / verify_resume（issue #37）
 #include <neuralnet.cpp/precision.hpp>
 
 namespace nn
@@ -511,6 +513,75 @@ public:
     {
         state_.current_lr = lr;
         opt_->set_lr(lr);
+    }
+
+    // ── 断点编排（issue #37）────────────────────────────────────────────
+    // 把"存一个断点 / 从断点续训"的零件收进库：save_state + 计数器同步 +
+    // 角色门控 + 载入序（load_model → load_train_state → set_state_step →
+    // load_state）。此前每个自定义训练器都要手拼这套七巧板，易错点 =
+    // optimizer_blob_count 忘同步、step 与 load_state 配对靠人记。
+    //
+    // TrainState.recipe 中与 TrainingConfig 一一对应的字段由 `fill_recipe`
+    // 自动派生（optimizer/lr/decay/beta/裁剪/累积步/精度四槽）；曲线形状
+    // （epochs/调度/warmup）属 Run Driver、数据集身份属域，仍由调用方补。
+
+    // 配方派生：只填 TrainingConfig 拥有的字段，不覆盖域已填的其余字段
+    // （epochs / lr_schedule / warmup / batch_size / lr_per_epoch 等）。
+    void fill_recipe(TrainRecipe& recipe) const
+    {
+        recipe.optimizer = cfg_.optimizer;
+        recipe.lr = static_cast<double>(cfg_.lr);
+        recipe.weight_decay = static_cast<double>(cfg_.weight_decay);
+        recipe.beta1 = static_cast<double>(cfg_.beta1);
+        recipe.beta2 = static_cast<double>(cfg_.beta2);
+        recipe.max_norm = static_cast<double>(cfg_.clip_grad_norm);
+        recipe.accum_steps = cfg_.grad_accum_steps;
+        recipe.precision = cfg_.precision;
+    }
+
+    // 一站式断点保存：内部同步计数器（global_step/lr/优化器 t）→ 导出优化器
+    // 状态 → 以 Checkpoint 角色落盘（blob 计数由 save_model 按实参回填，
+    // 调用方不再需要手动同步）。`state` 的域字段（数据集身份等）由调用方
+    // 预填；本入口不覆盖它们。
+    [[nodiscard]] Result<void> save_checkpoint(const std::string& path,
+                                               const ModelSpec& spec,
+                                               TrainState& state,
+                                               const std::string& tokenizer_data = {})
+    {
+        fill_recipe(state.recipe);
+        state.counters.global_step = state_.optimizer_step;
+        state.counters.lr = static_cast<double>(state_.current_lr);
+        state.optimizer_step = opt_->state_step();
+        std::vector<Tensor> blobs;
+        NN_TRY(er, opt_->save_state(blobs));
+        const CheckpointState ckpt{&state, blobs};
+        return save_model(path, model_, spec, tokenizer_data,
+                          ModelRole::Checkpoint, ckpt);
+    }
+
+    // 一站式续训：载入权重（同一 .nnckpt 文件）→ 读训练状态段 → 可选交叉
+    // 校验（`current` = 本次训练的状态快照；配方/数据集身份不一致硬报错，
+    // Relaxed 只查 kind）→ 恢复优化器状态（t 先于/后于张量无序依赖，本入口
+    // 固定先 t 后张量）→ 恢复会话计数器。返回加载出的状态（域读取数据集身份
+    // 等字段用）。
+    [[nodiscard]] Result<std::unique_ptr<TrainState>> resume(
+        const std::string& path, const TrainState* current = nullptr,
+        ResumePolicy policy = ResumePolicy::Strict)
+    {
+        NN_TRY(lm, load_model(path, model_, nullptr, nullptr,
+                              WeightLoadIntent::Trainable));
+        NN_TRY(loaded, load_train_state(engine(), path));
+        if (current != nullptr)
+        {
+            NN_TRY(vr, verify_resume(*loaded->state, *current, policy));
+        }
+        opt_->set_state_step(loaded->state->optimizer_step);
+        NN_TRY(ls, opt_->load_state(loaded->optimizer_blobs));
+        state_.optimizer_step = loaded->state->counters.global_step;
+        if (loaded->state->counters.lr > 0)
+            set_lr(static_cast<Scalar>(loaded->state->counters.lr));
+        clear_accumulation_state_();
+        return std::move(loaded->state);
     }
 
 private:

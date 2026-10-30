@@ -750,6 +750,10 @@ if(NN_BUILD_APPS OR NN_ENABLE_TESTS)
     nn_add_executable(train_state_test src/train_state_test.cpp)
     list(APPEND NN_TEST_TARGETS train_state_test)
 
+    # ── TrainingSession 断点编排（issue #37：save_checkpoint/resume）──
+    nn_add_executable(session_checkpoint_test src/session_checkpoint_test.cpp)
+    list(APPEND NN_TEST_TARGETS session_checkpoint_test)
+
     # ── issue #39 RFC 32 阶段 B：BatchSource 数据供给契约 ──────────────────
     nn_add_executable(batch_source_test src/batch_source_test.cpp)
     list(APPEND NN_TEST_TARGETS batch_source_test)
