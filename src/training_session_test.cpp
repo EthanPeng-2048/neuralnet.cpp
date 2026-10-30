@@ -1,6 +1,6 @@
 // ── training_session_test — TrainingSession 生命周期与训练原语 ──────────────
 //
-// docs/todo/29-session-architecture.md §8 P2a 验收：
+// docs/internal/29-session-architecture.md §8 P2a 验收：
 //   [1] 创建 → 8 步 step 参数确实移动（优化器与参数连通）
 //   [2] Session 移动后 step 正常（TensorRef 指向堆上 Layer 成员，地址稳定）
 //   [3] 作用域结束析构顺序正确（optimizer 先于 Model；ASan 下验证）
@@ -127,7 +127,7 @@ run_mse_step(nn::TrainingSession& session, const nn::Tensor& x,
 
 void test_accumulation_and_session_state()
 {
-    // docs/todo/30：Session 内部累积；未到边界不更新，移动后状态仍有效。
+    // docs/internal/30：Session 内部累积；未到边界不更新，移动后状态仍有效。
     auto engine = nn::CpuEngine::create();
     nn::Model model(*engine);
     CHECK(model.add<nn::Linear>(4, 3), "state: add");

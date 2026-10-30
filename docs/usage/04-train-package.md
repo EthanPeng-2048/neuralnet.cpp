@@ -1,5 +1,7 @@
 # 训练包：跨设备复现训练
 
+> **读者**：要用本库跑训练/推理的调用者。总索引见 [`../README.md`](../README.md)；历史归档在 [`../history/history.md`](../history/history.md)。
+> **状态**：现行。
 **用一个文件记录超参与训练集，用一条命令在任意设备上按超参训练，
 方便在多台设备上做训练/测试/对比。**
 
@@ -64,7 +66,7 @@ python train_pkg.py new --task mnist -o runs/mnist.json
 
 MNIST 的 `data.train` 是**数据集目录**（如 `datasets/mnist_data`），
 GPT 的 `data.train` 是**`.nndataset` 数据集文件**（token/词表/loss 掩码/test 子集
-都在生成期定好，见 `docs/todo/19-unified-dataset.md`；`.nnpkg` 只搬这一个文件）。
+都在生成期定好，见 `docs/internal/19-unified-dataset.md`；`.nnpkg` 只搬这一个文件）。
 
 ## 工作流
 

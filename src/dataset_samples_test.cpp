@@ -1,6 +1,6 @@
 // ── dataset_samples_test — 训练样本概念（TextSampleSet / TextSample / batch）──
 //
-// P2b 验收（docs/todo/29 §8）：数据集只存 doc；**训练单位 = 样本（窗口）**；
+// P2b 验收（docs/internal/29 §8）：数据集只存 doc；**训练单位 = 样本（窗口）**；
 // update step = ceil(样本数 / global_batch_size) 是派生量。本测试锁住：
 //   [1] 切窗：偏移序列、样本数、steps_per_epoch（派生）
 //   [2] sample(i) 的视图（tokens/doc_ids/loss_mask/valid_len）

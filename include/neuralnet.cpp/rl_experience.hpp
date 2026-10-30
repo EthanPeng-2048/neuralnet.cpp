@@ -1,6 +1,6 @@
 #pragma once
 
-// ── rl_experience.hpp — 可扩展经验记录与 advantage 变换（docs/todo/31 RL-1a）
+// ── rl_experience.hpp — 可扩展经验记录与 advantage 变换（docs/internal/31 RL-1a）
 //
 // 形状约定：转移字段使用 `(seq, batch)`，row = 时间、col = 独立轨迹。
 // `T = seq * batch` 仍可由调用方按 batch-major 展平；经验 schema 不把数据

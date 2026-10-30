@@ -1,6 +1,6 @@
 #pragma once
 
-// ── rl_pipeline.hpp — 可替换 RL 编排组件（docs/todo/31 RL-2b）─────────────
+// ── rl_pipeline.hpp — 可替换 RL 编排组件（docs/internal/31 RL-2b）─────────────
 //
 // 固定顺序：rollout source → experience buffer → batch sampler → task update。
 // 环境、自对局、规则、算法细节与 replay policy 均留给消费者。pipeline 只

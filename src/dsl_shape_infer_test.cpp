@@ -1,7 +1,7 @@
 // ───────────────────────────────────────────────────────────────────────────
 //  dsl_shape_infer_test.cpp — dsl::compute / compute_reduce 的**无形状重载**
 //
-//  背景：docs/todo/18-roadmap.md P4-4 把"`dsl::compute` 无 2 参重载"记为 API
+//  背景：docs/internal/18-roadmap.md P4-4 把"`dsl::compute` 无 2 参重载"记为 API
 //  摩擦点（调用方反复手写 `x.rows(), x.cols()`）。本测试锁定新重载的口径：
 //
 //   [1] 推导形状 == 显式形状（一族表达式：一元/二元/广播/select/matmul 段

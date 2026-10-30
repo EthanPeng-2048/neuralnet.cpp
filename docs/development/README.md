@@ -1,8 +1,12 @@
 # development/ —— 面向调用者的开发文档
 
-> **本分册写给调用者（库使用者 / 扩展者）**，不是项目开发者的工作区。
-> 内部设计稿、路线图、盘点、规范、踩坑、故障报告、审查整改一律在 [`../todo/`](../todo/)；
-> 历史叙事在 [`../history.md`](../history/history.md)。
+> **读者**：调用者（库使用者 / 扩展者），不是项目开发者。
+> **一句话结论**：从接入构建、全套 C++ API 到扩展（自定义层/引擎原语/融合算子）的开发文档，
+> 按 01→09 的阅读顺序编号。
+> **状态**：现行。
+> 内部设计稿、路线图、盘点、故障报告、审查整改在 [`../internal/`](../internal/)；
+> 贡献者规范在 [`../contributors/`](../contributors/README.md)；
+> 历史叙事在 [`../history/history.md`](../history/history.md)。
 
 ## 这里的文档解决什么问题
 
@@ -18,25 +22,23 @@
 
 ## 索引
 
-**入门路径建议**：先读 [`cpp-api-manual.md`](cpp-api-manual.md) §0 的「我要做什么 → 看哪节」表，
-按任务跳到对应章节；要改构建就再读 [`cmake-integration.md`](cmake-integration.md)。
+**入门路径建议**：先读 [`02-cpp-api-manual.md`](02-cpp-api-manual.md) §0 的「我要做什么 → 看哪节」表，
+按任务跳到对应章节；要改构建就再读 [`01-cmake-integration.md`](01-cmake-integration.md)。
 
 | 文档 | 何时读 |
 |------|--------|
-| [`cpp-api-manual.md`](cpp-api-manual.md) | **全功能 C++ API 手册**（首选）：错误处理宏、引擎、张量、精度、DSL、层与 Model、模型工厂、损失、优化器、训练循环、模型文件、数据集、分词器、生成、剖析——每节带代码片段 |
-| [`cmake-integration.md`](cmake-integration.md) | **接入与构建**：`add_subdirectory`/`FetchContent`、全部构建开关、GPU 语义、`nn_enable_gpu_fusion`、本仓构建/测试、跨平台、故障排查 |
-| [`write-a-custom-layer.md`](write-a-custom-layer.md) | **写自己的层**：完整示例（实测通过数值梯度检查）+ 七条接入契约 + 精度槽声明 + 可复制的梯度自检 + GPU 检查清单 + 常见编译错误 |
-| [`01-compute-engine-development.md`](01-compute-engine-development.md) | 想**扩展引擎**（加新原语）而不只是使用它：`ComputeEngine` 接口全解、CPU/GPU 实现模式、加原语的完整步骤 |
+| [`01-cmake-integration.md`](01-cmake-integration.md) | **接入与构建**：`add_subdirectory`/`FetchContent`、全部构建开关、GPU 语义、`nn_enable_gpu_fusion`、本仓构建/测试、跨平台、故障排查 |
+| [`02-cpp-api-manual.md`](02-cpp-api-manual.md) | **全功能 C++ API 手册**：错误处理宏、引擎、张量、精度、DSL、层与 Model、模型工厂、损失、优化器、训练循环、模型文件、数据集、分词器、生成、剖析——每节带代码片段 |
+| [`03-write-a-custom-layer.md`](03-write-a-custom-layer.md) | **写自己的层**：完整示例（实测通过数值梯度检查）+ 七条接入契约 + 精度槽声明 + 可复制的梯度自检 + GPU 检查清单 + 常见编译错误 |
+| [`04-compute-engine-development.md`](04-compute-engine-development.md) | 想**扩展引擎**（加新原语）而不只是使用它：`ComputeEngine` 接口全解、CPU/GPU 实现模式、加原语的完整步骤 |
 | [`05-mixed-precision.md`](05-mixed-precision.md) | 多精度**语义契约**（f16 的 P 精度算术、`PrecisionProfile{param/compute/stable/optimizer}`）+ 当前实测结论与已知数值限制（§12） |
-| [`06-rapt-algorithm.md`](06-rapt-algorithm.md) | 线性注意力家族（RLA / RAPT / RLA-2）：直观理解 + 数学定义 + 扫描原语工程落地 |
-| [`07-vulkan-backend-map.md`](07-vulkan-backend-map.md) | **维护者视角**：Vulkan 后端的调用链、所有权、依赖方向，以及"加一个算子/pipeline 要改哪几处" |
-| [`08-object-lifetimes.md`](08-object-lifetimes.md) | **维护者视角**：v3 转发页（唯一真源 = `09`：设备域从存储派生 / 入口域检查 / 跨域迁移清单） |
-| [`09-engine-ownership.md`](09-engine-ownership.md) | **生命周期 v3 唯一真源**：设备域从存储派生、入口域检查、backend weak 缓存、失败语义、迁移清单与性能口径 |
-| [`20-custom-layer-ergonomics.md`](20-custom-layer-ergonomics.md) | 自定义层的**实测报告**（库外使用者视角）：7 个摩擦点、逐条坐标。写层前读 [`write-a-custom-layer.md`](write-a-custom-layer.md)，本文是它的背景证据 |
+| [`06-vulkan-backend-map.md`](06-vulkan-backend-map.md) | **维护者视角**：Vulkan 后端的调用链、所有权、依赖方向，以及"加一个算子/pipeline 要改哪几处" |
+| [`07-engine-ownership.md`](07-engine-ownership.md) | **生命周期 v3 唯一真源**：设备域从存储派生、入口域检查、backend weak 缓存、失败语义、迁移清单与性能口径 |
+| [`08-rapt-algorithm.md`](08-rapt-algorithm.md) | 线性注意力家族（RLA / RAPT / RLA-2）：直观理解 + 数学定义 + 扫描原语工程落地；详细定义基线见 [`../../research/rla/`](../../research/rla/README.md) |
+| [`09-custom-layer-ergonomics.md`](09-custom-layer-ergonomics.md) | 自定义层的**实测报告**（库外使用者视角）：7 个摩擦点、逐条坐标。写层前读 [`03-write-a-custom-layer.md`](03-write-a-custom-layer.md)，本文是它的背景证据 |
 
-> **命名约定**：带数字前缀的文件沿用历史设计稿编号（`01` / `05` / `06` / `20`）；
-> 新增的**使用类文档**改用描述性文件名（`cpp-api-manual` / `cmake-integration` /
-> `write-a-custom-layer`），避免与已归档的编号混淆。
+> **编号制度**：本分册编号 = 建议阅读顺序，**连续不留洞**（文档规范见
+> [`../contributors/documentation-standard.md`](../contributors/documentation-standard.md) §1.2）。
 
 ## 相关（相邻分册）
 
@@ -47,7 +49,7 @@
 | 跑现成 CLI / GUI 训练推理 | [`../usage/02-quickstart-train-infer.md`](../usage/02-quickstart-train-infer.md) |
 | 写 RL / PPO / GRPO 或自定义 rollout | [`../usage/06-reinforcement-learning.md`](../usage/06-reinforcement-learning.md) |
 | 看**数据流/AOT 融合**的整体设计 | [`../introduction/01-architecture.md`](../introduction/01-architecture.md)、[`../introduction/04-innovative-designs.md`](../introduction/04-innovative-designs.md) |
-| 融合/IR 的**内部设计**（改库才需要） | [`../todo/02-operator-fusion.md`](../todo/02-operator-fusion.md)、[`../todo/03-ir-optimization.md`](../todo/03-ir-optimization.md) |
+| 融合/IR 的**内部设计**（改库才需要） | [`../internal/02-operator-fusion.md`](../internal/02-operator-fusion.md)、[`../internal/03-ir-optimization.md`](../internal/03-ir-optimization.md) |
 
 > ⚠ 本分册的文档同样受仓库写作纪律约束：**只描述当前状态**；演进过程、被否决方案、
 > 旧数字一律在 [`../history.md`](../history/history.md)。

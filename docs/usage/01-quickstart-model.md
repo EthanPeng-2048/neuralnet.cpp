@@ -1,5 +1,7 @@
 # 快速上手：构建自己的模型
 
+> **读者**：要用本库跑训练/推理的调用者。总索引见 [`../README.md`](../README.md)；历史归档在 [`../history/history.md`](../history/history.md)。
+> **状态**：现行。
 **本教程教你如何使用 `ComputeEngine` + `Layer` + `Model` 三件套从零构建神经网络模型。**
 
 ---
@@ -42,7 +44,7 @@ auto result = model.forward(input);   // engine 在 Model 内部自动传递
 
 > 两者取其一即可（都带 `#pragma once`，混用无副作用）。转发头是**整洁性**入口，
 > **不省编译时间** —— 各头的依赖闭包本就相互牵连，真正省 parse 是另一个专项
-> （`docs/todo/18-roadmap.md`）。模型工厂（`build_gpt_model` 等）与分词器
+> （`docs/internal/18-roadmap.md`）。模型工厂（`build_gpt_model` 等）与分词器
 > 仍在 `domain_*.hpp`，名字已足够清楚，不另起转发头。
 
 ---
@@ -130,7 +132,7 @@ NN_UNWRAP(model.add<nn::GPTBlock>(128, 4, 512, 1024));        // GPT 块
 `Tensor` 是所有数据的统一容器：
 
 ```cpp
-// M1（docs/todo/17 §4.1）起：创建/读写张量一律经 Engine——
+// M1（docs/internal/17 §4.1）起：创建/读写张量一律经 Engine——
 // Tensor 的静态工厂与存储访问器已私有化，绕过引擎 = 编译错误。
 
 // 通过 Engine 创建（统一入口：自动分配、出生绑定到引擎）
@@ -138,7 +140,7 @@ nn::Tensor t1 = engine.create_tensor(784, 32);  // 纯分配
 nn::Tensor t3 = engine.create_tensor(784, 32);
 (void)engine.zero(t3);  // 清零（分配后手动）
 
-// M2（docs/todo/17 §4.4）：声明式初始化——层算分布参数，引擎填数；
+// M2（docs/internal/17 §4.4）：声明式初始化——层算分布参数，引擎填数；
 // 分布类 seed 必填（同 seed 不同张量由引擎混流，不撞流）
 nn::Tensor t_w = engine.create_tensor(32, 10, nn::Precision::F32,
                                       nn::InitSpec::uniform(-0.1f, 0.1f, nn::kInitSeed));

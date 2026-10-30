@@ -3,7 +3,7 @@
 // 本头是 text_train 唯一允许**直接终止进程**的地方（`std::exit`）：参数错误属于
 // 用户输入错误，用退出码表达最直接（与 mnist_train 的 parse_args 同口径）。
 // 训练循环 / 恢复 / 断点保存三个模块一律返回 `Result`，不终止进程——见
-// docs/todo/18-roadmap.md §4.2 P1-1 的"std::exit 只在 CLI 参数解析层出现"。
+// docs/internal/18-roadmap.md §4.2 P1-1 的"std::exit 只在 CLI 参数解析层出现"。
 //
 // 内容：
 //   * `TrainConfig`（train_loop / recovery / checkpoint 三模块的输入）
@@ -86,7 +86,7 @@ void print_text_train_usage(const char *prog)
     // RV-04：名单文本由 nn::optimizer_table()（唯一真源）生成，不再手抄
     help.opt("--optimizer <name>",
              "优化器: " + nn::optimizer_names("/") +
-                 " (默认: adam)\nadamwquant: 量化状态的 AdamW（状态 4 B/权重 vs 8 B；见 docs/todo/21 §4.13）");
+                 " (默认: adam)\nadamwquant: 量化状态的 AdamW（状态 4 B/权重 vs 8 B；见 docs/internal/21 §4.13）");
     help.opt("--weight-decay <w>", "AdamW 权重衰减系数 (默认: 0.01)");
     help.opt("--beta1 <b>", "Adam/AdamW 一阶动量衰减 β1 (默认: 0.9，sgd/muon 忽略)");
     help.opt("--beta2 <b>", "Adam/AdamW 二阶动量衰减 β2 (默认: 0.999，sgd/muon 忽略)\nLLM 预训练惯例常取 0.95 (GPT-3/LLaMA 配方)");
@@ -126,12 +126,12 @@ void print_text_train_usage(const char *prog)
 
     help.section("混合精度 (docs/development/05-mixed-precision.md)");
     help.opt("--f16", "快捷方式: f16 存储 (param/compute=F16，stable/optimizer=F32)");
-    help.opt("--t1_58", "快捷方式: 精度预设 t1_58 = f16 存储 + 三值权重\n(param=T1_58，compute=F16，stable/optimizer=F32；等价于 --f16 再把 param 换成 t1_58)。\n范围与前置拒绝同 --precision-param t1_58（docs/todo/21-quantized-weights.md §4.10）");
+    help.opt("--t1_58", "快捷方式: 精度预设 t1_58 = f16 存储 + 三值权重\n(param=T1_58，compute=F16，stable/optimizer=F32；等价于 --f16 再把 param 换成 t1_58)。\n范围与前置拒绝同 --precision-param t1_58（docs/internal/21-quantized-weights.md §4.10）");
     help.opt("--precision-param <f16|f32|t1_58>",
              "权重/参数精度 (默认: f32)；t1_58 = 三值权重（1.58-bit）——\n"
              "GPT 已支持（注意力 4 投影 + fc1/fc2 + 未 tie 的 LM head 全部换成\n"
              "BitLinear；P1.5 落地）；--model rapt 选它会被前置拒绝\n"
-             "(docs/todo/21-quantized-weights.md §4.8.3)");
+             "(docs/internal/21-quantized-weights.md §4.8.3)");
     help.opt("--precision-compute <f16|f32>", "常规算子计算精度 (matmul/逐元素/gather，默认: f32)");
     help.opt("--precision-stable <f16|f32>", "数值敏感算子精度 (softmax/LayerNorm/loss，默认: f32)");
     help.opt("--precision-optimizer <f16|f32>", "优化器状态精度 (Adam m/v，默认: f32)");
@@ -170,12 +170,12 @@ struct TrainConfig : nn::TextTrainConfig
 
     // ── 本进程**显式给出**的 A/B 类旗标（P1-2；按旗标名登记，不含值）──────
     // 断点续训（role=Checkpoint 且带训练状态段）时，这些旗标一律禁止输入
-    // （docs/todo/23 §2.1.1），续训路径据此报错；`role=Model`（SFT warm start）
+    // （docs/internal/23 §2.1.1），续训路径据此报错；`role=Model`（SFT warm start）
     // 时它们才是合法的配方来源。
     std::vector<std::string> explicit_train_flags;
 };
 
-// ── 断点续训禁列（P1-2，docs/todo/18 §4.2 / docs/todo/23 §2.1.1）──────────
+// ── 断点续训禁列（P1-2，docs/internal/18 §4.2 / docs/internal/23 §2.1.1）──────────
 // A 类（计数器/状态）+ B 类（形状/配方）：断点是**训练的可续点**，这些值由
 // 断点自带的状态段提供，续训时再显式给 = 把轨迹掰弯（lr 曲线形状、step 网格、
 // 精度路径都会跟着变），故一律报错。

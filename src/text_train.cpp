@@ -1,6 +1,6 @@
 // ── GPT 文本生成训练程序（引擎化架构） ──────────────────────────────────────
 //
-// 输入：.nndataset 数据集（docs/todo/19-unified-dataset.md）——
+// 输入：.nndataset 数据集（docs/internal/19-unified-dataset.md）——
 //   tokenize、loss 掩码、词表都在生成期（dataset_gen）定好并嵌入数据集。
 //
 // 数据流（P2b：数据集 → **样本** → 训练工厂）：
@@ -141,7 +141,7 @@ namespace
     // ── 数据集身份（P1-2 断点门禁的"内容"侧）────────────────────────────
     // 路径是**位置**（机器相关、CLI 优先），sha256 + 网格是**身份**（断点权威）。
     // 身份不同 ⇒ 样本网格、step 号语义、lr 曲线形状全变 ⇒ 续训路径硬报错
-    // （出口 = 从 .nnmodel 开新一轮，docs/todo/23 §2.1.1）。
+    // （出口 = 从 .nnmodel 开新一轮，docs/internal/23 §2.1.1）。
     nn::DatasetIdentity dataset_identity;
     dataset_identity.path = cfg.text_path;
     NN_TRY_MSG(sha_r, "计算数据集身份失败", nn::sha256_file_hex(cfg.text_path));
@@ -154,7 +154,7 @@ namespace
     dataset_identity.steps_per_epoch =
         train_samples.steps_per_epoch(cfg.batch_size);
 
-    // ── 数据集身份门禁（硬错、无逃生阀；docs/todo/23 §2.1.1）────────────
+    // ── 数据集身份门禁（硬错、无逃生阀；docs/internal/23 §2.1.1）────────────
     // 数据集变 ⇒ 样本数变 ⇒ steps_per_epoch 变 ⇒ step 级调度的 total_steps、
     // global_step 语义、epoch 边界同时改变 ⇒ "同一断点 + 不同数据集"没有正确
     // 的续训语义。合法出口 = 从 .nnmodel 开新一轮（下面的 warm start 分支）。
@@ -246,7 +246,7 @@ namespace
         if (cfg.precision.param == nn::Precision::T1_58)
             NN_FAIL("RAPT 尚不支持三值权重（--precision-param t1_58）：RLA 注意力的"
                     " 4 个 Linear 还没接 make_linear_layer，\n"
-                    "见 docs/todo/21-quantized-weights.md §4.8.3。\n"
+                    "见 docs/internal/21-quantized-weights.md §4.8.3。\n"
                     "  · 三值 GPT：改用 --model gpt\n"
                     "  · 三值 MLP：mnist_train --arch mlp --precision-param t1_58");
         model_build = nn::build_rapt_model(*engine, nn::RAPTConfig{
@@ -277,7 +277,7 @@ namespace
             std::cout << "[精度] 三值权重已启用（T1_58 / BitLinear：量化 forward + "
                          "STE backward，latent 恒 f32）\n"
                          "  [范围] GPT（注意力 4 投影 + FFN fc1/fc2 + 未 tie 的 LM head）；"
-                         "RAPT/Transformer 见 docs/todo/21-quantized-weights.md §4.8.3\n";
+                         "RAPT/Transformer 见 docs/internal/21-quantized-weights.md §4.8.3\n";
         if (pp.param != nn::Precision::F32 || pp.compute != nn::Precision::F32 ||
             pp.stable != nn::Precision::F32 || pp.optimizer != nn::Precision::F32)
         {
@@ -352,7 +352,7 @@ namespace
     // 非致命失败（读不到规格、载参失败）打印提示后继续从头训练（旧行为）。
     if (cfg.load_existing)
     {
-        // 不加语境前缀：角色门禁的报错文案是用户可见契约（docs/todo/23 §2.1），
+        // 不加语境前缀：角色门禁的报错文案是用户可见契约（docs/internal/23 §2.1），
         // 原样透出；返回的 TextTrainResume（spec_restored / weights_loaded）
         // 只有测试消费，主流程按进度打印即可。
         NN_TRY_CHECK(nn::cli::resume_text_train(*engine, cfg, model, spec, std::cout, std::cerr));
@@ -434,7 +434,7 @@ int main(int argc, char *argv[])
 {
     nn::cli::TrainConfig cfg = nn::cli::parse_text_train_args(argc, argv);
 
-    // ── 危险精度组合启动期告警（仅警告，不拒绝；docs/todo/24 §2.3 F1）────
+    // ── 危险精度组合启动期告警（仅警告，不拒绝；docs/internal/24 §2.3 F1）────
     // optimizer=f16（含四字段全 f16）只打印一次到 stderr：不改变退出码、不阻断
     // 训练、不静默降级；`--f16` 与合法组合返回空串（静默）。
     if (const std::string warn = nn::cli::dangerous_precision_warning(cfg.precision);

@@ -283,7 +283,7 @@ private:
     // `effective_weight_quant`）
     WeightQuant weight_quant_ = WeightQuant::None;
 
-    // ── tied embedding（docs/todo/22 §3.3）────────────────────────
+    // ── tied embedding（docs/internal/22 §3.3）────────────────────────
     // true：head 复用 token_emb_（logits = W_embᵀ·x），lm_head_ 不建参数、
     //       不进 parameters()；head 侧 dW 累加进 grad_token_emb_（与嵌入侧
     //       的 scatter_add_rows 同一张缓冲，优化器每步只清一次）。

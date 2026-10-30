@@ -62,19 +62,19 @@ namespace nn
 //
 //  precision 字节: 0 = f32, 1 = f64（用于校验保存时与加载时的 Scalar 类型一致）
 //
-//  角色语义（v8 起冻结，docs/todo/23 §2.1.1）：checkpoint = model 的**超集** ——
+//  角色语义（v8 起冻结，docs/internal/23 §2.1.1）：checkpoint = model 的**超集** ——
 //  同一容器 + role 字节，训练状态段 role-gated（Model 写 0 长度）。`.nnckpt`
 //  仍需能被推理入口直接读（裁决第 3 条的"测试推理"用途），故不做独立格式。
 // ═══════════════════════════════════════════════════════════════════════════
 
 inline constexpr uint32_t MODEL_MAGIC    = 0x4E4E4E4E;  // "NNNN"
-// v7（docs/todo/23）：**文件角色**（role 字节：Model=推理 / Checkpoint=训练）
+// v7（docs/internal/23）：**文件角色**（role 字节：Model=推理 / Checkpoint=训练）
 //   + **参数级 kind**（[kind][precision][rows][cols][aux_len][payload_len][aux][payload]）。
 //   · 角色决定"写哪些参数"：`.nnmodel` 写推理所需全部参数（三值层写打包形态）；
 //     `.nnckpt` 写模型 + 训练参数（三值层写 f32 latent）。
 //   · v5/v6 的扁平矩阵序列仍**可读**（role 缺失按 Model 处理）；**写一律 v7**。
 // v6: 内嵌词表改为 .nnvocab kvrec（v5 及以下仍读其内嵌 JSON，见上）。
-// v8（docs/todo/18 §4.2 P1-2 + §4.3 P2-1 合批）：
+// v8（docs/internal/18 §4.2 P1-2 + §4.3 P2-1 合批）：
 //   · **训练状态段**（role 门控；spec 之后）：`TrainState` 的 kvrec（计数器 /
 //     训练配方含精度 profile 与 lr 曲线形状 / 数据集身份）+ 优化器状态张量条目。
 //     Model 角色写 0 长度；老文件（v7 及以下）缺段 ⇒ 冷启动语义（零破坏）。
@@ -988,7 +988,7 @@ struct ParamBlob
 
 // ── 训练状态段（v8；role 门控）──────────────────────────────────────────
 // 仅 Checkpoint 角色可携带；Model 角色必须为空（推理文件不带训练状态，
-// docs/todo/23 §2.1.1）。`optimizer_blobs` 的顺序由优化器定义
+// docs/internal/23 §2.1.1）。`optimizer_blobs` 的顺序由优化器定义
 // （`Optimizer::save_state` 的产出顺序即载入时的期望顺序）。
 struct CheckpointState
 {
@@ -1005,7 +1005,7 @@ struct CheckpointState
 {
     if (ckpt.state != nullptr && role != ModelRole::Checkpoint)
         NN_FAIL("训练状态段只能写入 Checkpoint 角色（.nnckpt）：推理模型（.nnmodel）"
-                "不得携带训练状态（docs/todo/23 §2.1.1）");
+                "不得携带训练状态（docs/internal/23 §2.1.1）");
     if (ckpt.state == nullptr && !ckpt.optimizer_blobs.empty())
         NN_FAIL("优化器状态张量必须与训练状态一同写入（CheckpointState::state 为空）");
 
@@ -1130,7 +1130,7 @@ struct CheckpointState
 // ── 只读训练状态段（v8）：计数器 / 训练配方 / 数据集身份（不读权重）──────
 // 供续训路径在建模型**之前**取精度 profile 与计数器、供 CLI/GUI 显示断点状态。
 // 没有该段（role=Model，或 v7 及以下 / 未接线的断点）→ 明确报错，调用方据此
-// 回落"冷启动语义"（docs/todo/18 §4.2 P1-2）。
+// 回落"冷启动语义"（docs/internal/18 §4.2 P1-2）。
 [[nodiscard]] inline Result<std::unique_ptr<TrainState>> peek_train_state(
     const std::string &filename)
 {

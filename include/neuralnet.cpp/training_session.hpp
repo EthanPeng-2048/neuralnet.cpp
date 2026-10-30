@@ -1,6 +1,6 @@
 #pragma once
 
-// ── training_session.hpp — TrainingSession：单次参数更新会话（docs/todo/30）──
+// ── training_session.hpp — TrainingSession：单次参数更新会话（docs/internal/30）──
 //
 // 定位：
 //   · 拥有 Model + Optimizer，结构性保证 optimizer 先于参数所有者析构；

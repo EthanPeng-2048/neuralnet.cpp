@@ -153,7 +153,7 @@ absmax 87.97 / 65.60 / 72.95 / 68.57 / 64.05。
 4. **llama.cpp 的 `TQ1_0` 选 absmax 有其语境**：它是"事后量化别人训好的 f32 权重"，
    此时没有任何训练去适应量化误差，逐块 absmax 至少能保证**相对**误差有界；而我们做 QAT / 从头训，
    权重会适应量化，此时唯一该关心的是"三值码位的信息容量"，absmean 完胜。
-5. **落地含义（对应 `docs/todo/21-quantized-weights.md`）**：
+5. **落地含义（对应 `docs/internal/21-quantized-weights.md`）**：
    `TQ1_0` 的**编码与解码照抄**（base-3 5-per-byte + 定点 `(s·3^n·3)>>8`），
    但**块内尺度换成 absmean**；又因为 llama.cpp 的 256 块要求行宽整除 256（我们 d_model=64/128、
    MNIST 784/10 都不满足），块粒度取**行**（per-row）：既满足 absmean、又没有整除约束、

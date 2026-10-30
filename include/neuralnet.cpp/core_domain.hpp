@@ -1,6 +1,6 @@
 #pragma once
 
-// ── core_domain.hpp — 设备域（对象生命周期 v3，docs/todo/28-lifecycle-v3.md）──
+// ── core_domain.hpp — 设备域（对象生命周期 v3，docs/internal/28-lifecycle-v3.md）──
 //
 // 域从**存储**派生，不保存身份：
 //   · CPU 存储    → `kHostDomain`（进程级常量；所有 CPU 引擎共享宿主内存，

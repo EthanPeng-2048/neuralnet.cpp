@@ -16,7 +16,7 @@
 //
 // ⚠ 引擎生命周期不要用 observer_ptr：Tensor 不保存引擎身份（设备域从存储派生）；Layer / Model /
 //   Optimizer / ExprGraph 持有 shared_ptr<ComputeEngine>。详见
-//   docs/development/09-engine-ownership.md。
+//   docs/development/07-engine-ownership.md。
 // ─────────────────────────────────────────────────────────────────────────
 
 #pragma once

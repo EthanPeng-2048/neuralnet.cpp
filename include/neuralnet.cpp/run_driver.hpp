@@ -2,7 +2,7 @@
 
 // ── run_driver.hpp — 领域无关训练骨架（RFC 32 §5；issue #39）─────────────
 //
-// 补上 `TrainingSession`（单步，docs/todo/30）与 `TextTrainer`（文本域驱动）
+// 补上 `TrainingSession`（单步，docs/internal/30）与 `TextTrainer`（文本域驱动）
 // 之间的**空洞层**：epoch/step 循环、lr 调度接线、断点节奏、报告聚合。
 //
 // 分层（不变 vs 可变）：

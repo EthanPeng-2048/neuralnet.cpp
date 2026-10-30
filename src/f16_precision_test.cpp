@@ -632,7 +632,7 @@ void test_f16_model_e2e(nn::ComputeEngine& raw, nn::ComputeEngine& eng)
 
 // ── 8. profile 组合矩阵：默认门禁廉价断言 + NN_F16_DEBUG 逐阶段诊断 ───────
 // 逐字段拆开跑同一个小 GPT（初值/数据/步数全固定 → 确定性）。cases 含此前缺失的
-// 「全 f16」= {F16,F16,F16,F16}（docs/todo/24 §2.4 覆盖缺口 / §5 F2）：
+// 「全 f16」= {F16,F16,F16,F16}（docs/internal/24 §2.4 覆盖缺口 / §5 F2）：
 //   · 健康组合（f32 / param / compute / stable / --f16）：loss 全程有限且末步不高于首步；
 //   · 危险组合（opt=f16 / 全 f16，24 §2 已定位机制）：只断言"能跑完"——数值形态由
 //     机制说明 + 下方轨迹打印披露，**不作健康断言**（否则 F5 修好它们时本测试反红）。
@@ -679,7 +679,7 @@ void run_profile_matrix(nn::ComputeEngine& eng, bool verbose)
     g_label = saved;
 }
 
-// ── 9. CE loss 标量归约在 stable=f16 下不得溢出（docs/todo/24 §2 / 14 号台账）──
+// ── 9. CE loss 标量归约在 stable=f16 下不得溢出（docs/internal/24 §2 / 14 号台账）──
 // ── 10. 四字段全 f16（含 optimizer=f16）可训练（F5）────────────────────────
 // 关键修复（2026-10-14）：Adam 的二阶矩 v ≈ (1-β2)·g² 在 f16 下**下溢为 0**
 // （g~1e-5 ⇒ v~1e-10），而一阶矩 m ~1e-8 仍在次正规区 ⇒ `m/(√v+eps)` 退化、

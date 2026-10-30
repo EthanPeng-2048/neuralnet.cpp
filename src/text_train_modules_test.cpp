@@ -1,6 +1,6 @@
 // ── text_train_modules_test — P1-1 拆出的模块（recovery / checkpoint）回归 ──
 //
-// 验收（docs/todo/18-roadmap.md §4.2 P1-1）："新增恢复路径单测"。
+// 验收（docs/internal/18-roadmap.md §4.2 P1-1）："新增恢复路径单测"。
 // 覆盖：
 //   [1] 断点路径派生：`--save` 的 .nnmodel → 同名 .nnckpt；非 .nnmodel 追加。
 //   [2] 恢复路径的角色语义：Checkpoint = 断点续训、Model = warm start（都放行）；
@@ -138,7 +138,7 @@ void test_role_gate_and_roundtrip(const std::filesystem::path& dir)
     log.save(ckpt_file, original, spec, kTokenizerBytes, ckpt_state, no_blobs, std::cerr);
     CHECK(log.failures() == 0, "断点写到可写路径不应记账失败");
 
-    // 角色语义（v8，2026-10-16 裁定；docs/todo/23 §2.1.1）：
+    // 角色语义（v8，2026-10-16 裁定；docs/internal/23 §2.1.1）：
     //   Model（.nnmodel）= warm start（SFT）⇒ **放行**（三值同样放行，见下面的
     //     P1-7 反量化块）；Checkpoint / 老文件 / 不存在 ⇒ 放行。
     //   **P1-7 已删除**"三值 .nnmodel 必须被拒"那条门禁（`check_resume_target`
@@ -205,7 +205,7 @@ void test_role_gate_and_roundtrip(const std::filesystem::path& dir)
                       ar3.error().message.find("禁止") != std::string::npos,
                   "报错文案应列出被禁旗标与规则");
 
-        // docs/todo/30：旧断点缺 batch 语义键 ⇒ micro-batch 解释，
+        // docs/internal/30：旧断点缺 batch 语义键 ⇒ micro-batch 解释，
         // 恢复时换成等效 global，并把 micro step 计数折成 update step。
         nn::TextTrainState legacy_state;
         legacy_state.counters.epoch = 1;

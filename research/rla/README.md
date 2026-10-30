@@ -38,7 +38,7 @@
 3. [`compute_engine.hpp`](../../include/neuralnet.cpp/compute_engine.hpp)：扫描原语语义。
 4. [`src/rapt_gradcheck.cpp`](../../src/rapt_gradcheck.cpp) 与
    [`src/rapt_smoke_test.cpp`](../../src/rapt_smoke_test.cpp)：正确性和接线证据。
-5. [`docs/development/06-rapt-algorithm.md`](../../docs/development/06-rapt-algorithm.md)：
+5. [`docs/development/08-rapt-algorithm.md`](../../docs/development/08-rapt-algorithm.md)：
    面向使用者的概览。历史设计叙述若与源码冲突，以源码和 `01` 为准。
 
 ## 4. 当前不回答的问题

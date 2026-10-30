@@ -1,6 +1,6 @@
 // ── lifetime_contract_test — P0 生命周期契约（CPU 可跑的负例）───────────────
 //
-// 覆盖 docs/todo/28-lifecycle-v3.md §5 P0 的三处安全修复（不破坏 API）：
+// 覆盖 docs/internal/28-lifecycle-v3.md §5 P0 的三处安全修复（不破坏 API）：
 //   [1] ExprSegment 持 shared_ptr<ComputeEngine>：录制段内丢掉外部最后一个
 //       引擎句柄，end() 仍然安全（原实现持裸引用 = 析构 UAF）
 //   [2] ActivationOffloader 状态机：未 import 的导出不能被下一次 export 静默

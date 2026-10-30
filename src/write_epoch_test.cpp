@@ -1,5 +1,5 @@
 // ── write_epoch_test — 写版本（write epoch）契约 + BitLinear 量化缓存 ──────
-// 设计依据：docs/todo/21-quantized-weights.md §4.11（F1/F4/F6 落地）
+// 设计依据：docs/internal/21-quantized-weights.md §4.11（F1/F4/F6 落地）
 //
 // 覆盖：
 //   [1] 逐写入口：每一个"经引擎媒介写入张量存储"的公共入口都推进写版本

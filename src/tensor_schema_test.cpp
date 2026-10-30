@@ -1,6 +1,6 @@
 // ── tensor_schema_test — 通用输出/experience 的公共契约 ────────────────────
 //
-// docs/todo/31 §6 公共基础 + RL-0 的 schema 前置：
+// docs/internal/31 §6 公共基础 + RL-0 的 schema 前置：
 //   [1] 有序字段、名称解析、稳定指纹；
 //   [2] 重复/空字段名、跨 schema handle、越界 handle；
 //   [3] 必需/可选字段、未知/重名字段；

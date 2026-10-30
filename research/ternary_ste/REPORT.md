@@ -9,7 +9,7 @@
 > | 三值（含 0） | `select(w>0.5γ, +1, select(w<-0.5γ, -1, 0))` | 14.207462 → **0.000000** | **1370 / 1370 = 100%** |
 > | 二值 | `select(w>0, +1, -1)` | 20.949087 → **0.000000** | **2048 / 2048 = 100%** |
 >
-> 本文是 `docs/todo/21-quantized-weights.md` 的**前置证据**：它证明 P1 的算法路径
+> 本文是 `docs/internal/21-quantized-weights.md` 的**前置证据**：它证明 P1 的算法路径
 > （Layer 级量化 + STE backward）没有障碍，剩下的是架构与工程（精度枚举、能力声明、打包内核）。
 > **它不证明性能**——本文全部是 CPU、f32 存储、单层玩具问题。
 
@@ -84,7 +84,7 @@ STE 用恒等映射 `dWq/dW ≈ 1` 替代，于是 `dW_latent = γ · dY · Xᵀ
 
 ---
 
-## 3. 实现要点（与 `docs/todo/21-quantized-weights.md` 的对应）
+## 3. 实现要点（与 `docs/internal/21-quantized-weights.md` 的对应）
 
 1. **量化只用现有 DSL**：`ExprOp` 里已有 `Gt` / `Lt` / `Select` / `Abs`，`rparam` 承载"值不进 key"的
    运行期标量（γ、阈值、lr）。所以本探针**没有新增引擎原语、没有新增 dtype**。

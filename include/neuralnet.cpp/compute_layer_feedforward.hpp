@@ -33,7 +33,7 @@ private:
     bool use_swiglu_ = false;
     bool use_relu2_ = false;
 
-    // ── SubLN（BitNet b1.58 的"子层归一化"，docs/todo/22 §3.1）──────
+    // ── SubLN（BitNet b1.58 的"子层归一化"，docs/internal/22 §3.1）──────
     // **子层内部**的额外归一化：挂在中间激活（宽 d_ff）与输出投影 fc2 之间。
     // 默认 nullptr = 关（既有路径逐位不变）。类型跟随模型的 norm_type
     // （2B4T = RMSNorm）——经 make_norm_layer 构造，与 GPTBlock 的 norm1_/norm2_

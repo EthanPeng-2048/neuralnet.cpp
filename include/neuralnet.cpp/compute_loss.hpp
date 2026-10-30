@@ -247,7 +247,7 @@ public:
         //      列归约融合为单次 dispatch（GPU 上 1 个融合 kernel）
         //      末步 (1,B)→(1,1) 的**输出恒 F32**（不用 p_.stable）：该标量是
         //      跨 batch×seq 的求和（≈ -log(vocab)·batch），大 batch 下可超 f16
-        //      上限 65504 → 按 stable=f16 落盘会溢出为 ±inf（docs/todo/24 §2.1
+        //      上限 65504 → 按 stable=f16 落盘会溢出为 ±inf（docs/internal/24 §2.1
         //      「loss 归约输出按 P 落盘」的真实后果；14 号台账的「4.0137 冻结」
         //      即该溢出的另一种硬件表现）。归约内部本就恒 f32 累加，输出改 F32
         //      即得正确值，且调用方随后本就 cast 到 F32 回读。
@@ -412,7 +412,7 @@ public:
         //    输出精度**恒 F32**（不用 p_.stable）：该 (1,1) 标量是跨
         //    batch×seq 的 log_prob 求和（≈ -log(vocab)·token 数），大 batch·seq
         //    （如 16384 token）下远超 f16 上限 65504 → 按 stable=f16 落盘会
-        //    溢出为 ±inf（docs/todo/24 §2.1；14 号台账的「4.0137 冻结」= 该
+        //    溢出为 ±inf（docs/internal/24 §2.1；14 号台账的「4.0137 冻结」= 该
         //    溢出在部分硬件上饱和为 f16 max 的表现）。归约内部恒 f32 累加，
         //    输出改 F32 即得正确值；调用方本就 cast 到 F32 回读。
         Tensor total_t;

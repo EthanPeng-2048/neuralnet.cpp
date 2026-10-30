@@ -24,8 +24,8 @@
 //     文件 sha256 + tokens/docs/**样本数**；旧 rc0 断点键 `dataset_windows`
 //     兼容读 / steps_per_epoch / loss_scope）。
 //
-// 为什么这些必须随断点走（而不是续训时由 CLI 再给一遍）：docs/todo/18 §4.2
-// P1-2、docs/todo/23 §2.1.1 —— ①精度 profile 今天完全不进文件，f16 断点忘带
+// 为什么这些必须随断点走（而不是续训时由 CLI 再给一遍）：docs/internal/18 §4.2
+// P1-2、docs/internal/23 §2.1.1 —— ①精度 profile 今天完全不进文件，f16 断点忘带
 // `--f16` 会被静默重建成 f32；②数据集 / `--epochs` / `--batch-size` 三者都能
 // 改变 lr 曲线形状（`total_epochs`、`total_steps`、`global_step` 都从这里派生）；
 // ③只存 m/v 而丢 `t` 会让偏置修正在重启后从 0 重算。
@@ -86,7 +86,7 @@ struct TrainRecipe
     std::uint64_t total_steps = 0;    // **曲线形状**（step 级调度的 total_steps）
     std::uint64_t warmup_epochs = 0;
     std::uint64_t warmup_steps = 0;
-    // docs/todo/30：新状态写 global batch；旧状态缺语义键时 batch 仍按
+    // docs/internal/30：新状态写 global batch；旧状态缺语义键时 batch 仍按
     // micro-batch 解释。步号在新语义下均指 optimizer update。
     std::uint64_t batch_size = 0;
     std::uint64_t micro_batch_size = 0;
@@ -110,7 +110,7 @@ struct DatasetIdentity
     std::string loss_scope;           // all / assistant（生成期定好，随数据集）
 };
 
-// ── 数据集身份校验（文本域续训门禁；docs/todo/18 §4.2 P1-2）──────────────
+// ── 数据集身份校验（文本域续训门禁；docs/internal/18 §4.2 P1-2）──────────────
 // 一致判据 = **sha256 相同且网格三元组相同**。数据集一变，样本数/网格变 ⇒
 // steps_per_epoch 变 ⇒ step 级调度的 total_steps、global_step 的语义、
 // epoch 边界**同时**改变 ⇒ "同一断点 + 不同数据集"不存在正确的续训语义。

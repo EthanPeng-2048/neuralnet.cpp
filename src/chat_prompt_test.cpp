@@ -1,6 +1,6 @@
 // ── chat_prompt_test — 多轮对话 prompt 构建 + CLI 接线（P0-5 尾项）──────────
 //
-// 背景（docs/todo/18 §3.3 X1 / §4.1 P0-5、docs/todo/27 §3 象限（二））：
+// 背景（docs/internal/18 §3.3 X1 / §4.1 P0-5、docs/internal/27 §3 象限（二））：
 // P0-5 的采样器 + CLI 半边早已交付，**"多轮对话闭环（连续 N 轮不丢上下文）"
 // 一直没落地** —— CLI 的 `--interactive` 每轮只把当轮输入拼进 prompt，GUI 也
 // 没有任何历史处理（每轮从零起算）。本用例锁这一项的验收：

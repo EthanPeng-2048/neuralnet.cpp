@@ -17,7 +17,7 @@
 | Layer（f32，fwd+bwd，large 组） | gpt_block 95.2 ms | 44.8 ms | torch 快 2.1× |
 | 训练稳定性（lr=1e-3 实测） | **f32 5 epoch 健康收敛（09-26 采集；09-25 采集为 NaN 发散）**；f16+`stable=f16` **loss 打印冻结**（见 §2.5 与 14 号报告） | fp16/fp32 全程稳定 | f32 打平；f16 存在缺陷 |
 
-三个反直觉发现（§2.4、§2.5、§3.3）：① torch 在 40HX 上该模型的 **fp16 路径比 fp32 慢 3.3×（病态）**；② nn 的 **f16 比 f32 慢 17%**（118.4 vs 101.0 ms；09-25 采集为 f16≈f32≈117 ms），且 `stable=f16` 下 **loss 打印冻结而权重照常更新**（2026-09-26 发现，`docs/todo/14-f16-stable-gpu-loss-frozen.md`）；③ nn f32 显存 **3069 MiB**（09-25 采集 5743，差 −47%）——峰值强相关于精度，见 §2.3。
+三个反直觉发现（§2.4、§2.5、§3.3）：① torch 在 40HX 上该模型的 **fp16 路径比 fp32 慢 3.3×（病态）**；② nn 的 **f16 比 f32 慢 17%**（118.4 vs 101.0 ms；09-25 采集为 f16≈f32≈117 ms），且 `stable=f16` 下 **loss 打印冻结而权重照常更新**（2026-09-26 发现，`docs/internal/14-f16-stable-gpu-loss-frozen.md`）；③ nn f32 显存 **3069 MiB**（09-25 采集 5743，差 −47%）——峰值强相关于精度，见 §2.3。
 
 ---
 
@@ -92,7 +92,7 @@
 ### 2.5 训练稳定性（按采集日期如实记录）
 
 - **nn f32（09-26 采集）**：短测 3 epoch 与长测 5 epoch **全程健康收敛**（短测 avg 7.38→5.93→5.28；长测 4.62→2.76），无 NaN。09-25 采集记录为「f16/f32 均 ~100–2000 步发散 NaN」；两者的差异归于 09-25 之后的提交窗口，未逐个二分。
-- **nn f16 + `stable=f16`（09-26 采集到的缺陷）**：loss **打印冻结**——step 5–45 恒 4.0137、跨 epoch/跨数据集/跨进程逐位相同；同时**权重照常更新**（同进程跨 epoch 模型快照 63% 参数字节不同）。定性矩阵：触发器 = `stable=f16`（GPU 特有，CPU 同配置健康）；`--f16` 推荐 profile（stable/optimizer=f32）实测健康；`optimizer=f16` 单独即爆炸（= 下条已知数值限制）。**测试全绿与该缺陷并存**（覆盖缺口：GPU+stable=f16 无自动化用例）。详见 `docs/todo/14-f16-stable-gpu-loss-frozen.md`。
+- **nn f16 + `stable=f16`（09-26 采集到的缺陷）**：loss **打印冻结**——step 5–45 恒 4.0137、跨 epoch/跨数据集/跨进程逐位相同；同时**权重照常更新**（同进程跨 epoch 模型快照 63% 参数字节不同）。定性矩阵：触发器 = `stable=f16`（GPU 特有，CPU 同配置健康）；`--f16` 推荐 profile（stable/optimizer=f32）实测健康；`optimizer=f16` 单独即爆炸（= 下条已知数值限制）。**测试全绿与该缺陷并存**（覆盖缺口：GPU+stable=f16 无自动化用例）。详见 `docs/internal/14-f16-stable-gpu-loss-frozen.md`。
 - **nn 四字段全 f16 的缺陷表现（按采集日期）**：09-25 采集为「epoch1 活 → epoch2 发散 -nan」（= 05 文档 §12.5「stable=F16 时 CE 链 ~200 步 NaN」）；09-26 采集为「epoch1 起即静默冻结」——冻结是静默出错（NaN 反而会暴露），风险等级更高。
 - **torch fp16**：默认 `eps=1e-8` 在 fp16 中表示为 0，稀疏 embedding 零梯度行 `0/0=NaN`，**必须 `eps=1e-4`** 后稳定（实测 3 epoch 平稳下降）。
 - **nn optimizer=f16 语义（本报告口径，以代码为准）**：`compute_optimizer.hpp:51-53` 注释明确状态张量按 `p_.optimizer` 创建（默认 F32；全 f16 profile 按字面取 F16，"用户显式选择全 f16 时不予阻拦，只如实报告数值表现"）。09-25 采集条目记的「`--precision-optimizer f16` 不改变 Adam 状态精度（m/v 恒 f32）」与当前代码不符，以本条为准。定性矩阵 case c（optimizer=f16, stable=f32）loss 爆炸至 1.8e7 即为该语义的实测表现（与 05 文档 §12.5「optimizer=F16 时 Adam 的 v≈g²~1e-10 下溢→更新爆炸」一致）。故 nn `--f16`（推荐 profile）实际语义 = 参数/激活 f16 + stable/optimizer **f32**；四字段全 f16 = 含爆炸/冻结双重风险的实验性组合。
@@ -232,7 +232,7 @@
   --epochs 3 --optimizer adam --lr 0.001 --gpu=40HX `
   --save-interval 0 --log-interval 100000
 
-# nn 训练 —— 全 f16（实验性；loss 打印冻结，仅计时/显存有效，见 docs/todo/14-*.md）
+# nn 训练 —— 全 f16（实验性；loss 打印冻结，仅计时/显存有效，见 docs/internal/14-*.md）
 #   追加: --precision-param f16 --precision-compute f16 --precision-stable f16 --precision-optimizer f16
 # nn 训练 —— 推荐 f16 profile（实测健康）: 追加 --f16
 

@@ -1,5 +1,5 @@
-// ── bitnet_struct_test — BitNet b1.58 2B4T 的结构开关（docs/todo/22）──
-// 设计依据：docs/todo/22-bitnet-2b4t-architecture.md（§3 设计、§5 验收）
+// ── bitnet_struct_test — BitNet b1.58 2B4T 的结构开关（docs/internal/22）──
+// 设计依据：docs/internal/22-bitnet-2b4t-architecture.md（§3 设计、§5 验收）
 //
 // 覆盖：
 //   [1] SubLN 参数条数：on − off = layers × (d_model + d_ff)（RMSNorm）；
@@ -837,7 +837,7 @@ struct BitnetData
 }
 
 // ── [14] 三值 GPT 接线：BitLinear 覆盖 4 个投影 + fc1/fc2 + LM head ───────-
-// P1.5（docs/todo/21-quantized-weights.md §4.8.3）：线性层走
+// P1.5（docs/internal/21-quantized-weights.md §4.8.3）：线性层走
 // make_linear_layer → 参数形状与 f32 基线**逐张量一致**（drop-in 语义），
 // 前向/反向跑通且权重梯度非零（STE 把梯度送回 f32 latent）。
 void test_gpt_ternary_wiring()

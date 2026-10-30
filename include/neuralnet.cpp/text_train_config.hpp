@@ -27,7 +27,7 @@ namespace nn
 // 本结构的同名字段只是"喂给循环/断点状态"的副本，必须与 Session 完全一致
 // （`TextTrainer::create` 逐项校验并报错）。起步用 `nn::make_text_train_config(session)`。
 //
-// **Batch 语义（docs/todo/30）**：`batch_size` 是一次 optimizer update 覆盖的
+// **Batch 语义（docs/internal/30）**：`batch_size` 是一次 optimizer update 覆盖的
 // 理论 global batch；每次 forward/backward 的 micro batch =
 // `batch_size / accum_steps`。`steps_per_epoch` 与计数器均以 update step 为单位。
 //

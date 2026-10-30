@@ -238,7 +238,7 @@ inline void log_text_train_gradient_stats(nn::ComputeEngine& engine,
     for (auto& grad_ref : grads)
     {
         const auto& grad = grad_ref.get();
-        // M1（docs/todo/17 §4.1）：张量读取一律经引擎下载到宿主
+        // M1（docs/internal/17 §4.1）：张量读取一律经引擎下载到宿主
         // （GPU 直接下载；CPU 同样走 to_matrix，f16 存储也安全）
         nn::Matrix mat;
         {

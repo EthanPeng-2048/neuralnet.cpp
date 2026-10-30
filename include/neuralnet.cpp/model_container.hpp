@@ -118,7 +118,7 @@ public:
     // 添加已构造的层并**显式**注入给定 profile（跳过 default_precision_）。
     // 用于"同一模型内按层类型分派精度"的场景：三值 MLP 里 BitLinear 要
     // param=T1_58，而非权重层/归一化层的 param 槽不适用（仍走模型默认）。
-    // 见 docs/todo/21-quantized-weights.md §4.8。
+    // 见 docs/internal/21-quantized-weights.md §4.8。
     Result<void> add_layer(std::unique_ptr<Layer> layer, const PrecisionProfile& profile)
     {
         layer->set_precision_profile(profile);
@@ -158,7 +158,7 @@ public:
     }
     [[nodiscard]] const std::optional<ModelSpec>& spec() const noexcept { return spec_; }
 
-    // ── 具名多输出（docs/todo/31 RL-0）────────────────────────────────
+    // ── 具名多输出（docs/internal/31 RL-0）────────────────────────────────
     void set_output_schema(TensorSchema schema)
     {
         output_schema_ = std::move(schema);

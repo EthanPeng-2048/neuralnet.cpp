@@ -97,7 +97,7 @@ enum class NormPlace : uint32_t
     }
 }
 
-// ── 权重三值量化（docs/todo/21-quantized-weights.md §4.7）──────────
+// ── 权重三值量化（docs/internal/21-quantized-weights.md §4.7）──────────
 // 描述"这个模型的线性层是不是 BitLinear（三值权重 1.58-bit + STE）"。
 //   None  = 普通 Linear（f32/f16 权重）
 //   T1_58 = BitLinear（param=T1_58；latent 仍 f32，量化缓冲是派生物、不落盘）
@@ -333,7 +333,7 @@ public:
 // ═══════════════════════════════════════════════════════════════════════
 struct ModelSpec
 {
-    // ── 域无关公共字段（通用多输出规范，docs/todo/31 RL-0）──────────────
+    // ── 域无关公共字段（通用多输出规范，docs/internal/31 RL-0）──────────────
     std::optional<TensorSchema> output_schema;   // nullopt = 旧单输出模型
     std::vector<std::string> output_packing;     // 空 = 不生成兼容打包表示
 

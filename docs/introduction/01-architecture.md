@@ -1,5 +1,7 @@
 # neuralnet.cpp 架构设计
 
+> **读者**：想了解本库架构/性能/算法的读者（调用者视角的总览）。总索引见 [`../README.md`](../README.md)；历史归档在 [`../history/history.md`](../history/history.md)。
+> **状态**：现行。
 从零实现的 C++26 神经网络库，支持 CPU/GPU 双后端、多层 Transformer、GPT 语言模型训练与推理。
 
 ---
@@ -275,7 +277,7 @@ class Tensor {
 
 > 引擎共 **52 个 virtual 方法**（复现 `bench/doc_inventory.ps1`）；逐元素/广播/条件选择不设 eager 原语，一律经表达式 DSL
 >（`dsl::compute` / `compute_into` / `compute_reduce`）执行。接口全量清单见
-> `../todo/12-compute-engine-inventory.md`。
+> `../internal/12-compute-engine-inventory.md`。
 
 **表达式统一入口：**
 

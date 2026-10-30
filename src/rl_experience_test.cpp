@@ -1,6 +1,6 @@
 // ── rl_experience_test — experience schema 与 advantage transforms ─────────
 //
-// docs/todo/31 RL-1a：
+// docs/internal/31 RL-1a：
 //   [1] 标准/自定义字段、必需字段、PolicyBatchView；
 //   [2] GAE 手算值、done 截断、bootstrap、mask；
 //   [3] MonteCarloReturn；

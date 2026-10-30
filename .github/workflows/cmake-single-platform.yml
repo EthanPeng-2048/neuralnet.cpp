@@ -233,7 +233,7 @@ jobs:
 
     # 注：v3 生命周期起删除"绑定调试开关"第二轮 ctest —— 设备域检查已从
     # "库外豁免 + 调试开关"升级为**默认入口检查**（每个操作数必须属于本引擎域），
-    # 不再需要补丁式第二轮门禁。见 docs/todo/28-lifecycle-v3.md §4.3。
+    # 不再需要补丁式第二轮门禁。见 docs/internal/28-lifecycle-v3.md §4.3。
 
     # 将编译产物打包为 7z
     - name: Package binaries (Linux)

@@ -1,5 +1,7 @@
 # 快速上手：训练与推理
 
+> **读者**：要用本库跑训练/推理的调用者。总索引见 [`../README.md`](../README.md)；历史归档在 [`../history/history.md`](../history/history.md)。
+> **状态**：现行。
 **本教程教你如何使用 neuralnet.cpp 训练和推理 MNIST 手写数字识别与 GPT 文本生成模型。**
 
 ---
@@ -83,7 +85,7 @@ GPT 训练需要一份文本语料（如 `datasets/llm_corpus.txt`，用 `script
 ### 准备数据集（dataset_gen）
 
 训练数据统一为 `.nndataset` 文件：token 流、词表、loss 掩码、test 子集都在**生成期**
-定好并嵌入数据集（设计见 `docs/todo/19-unified-dataset.md`）：
+定好并嵌入数据集（设计见 `docs/internal/19-unified-dataset.md`）：
 
 ```bash
 # 先训词表（tokenizer_train），再打包数据集（dataset_gen）
@@ -405,7 +407,7 @@ int main() {
 > （`TextSampleSet::steps_per_epoch(global_batch_size)`）——`steps_per_epoch` **不是** CLI 旗标，
 > 也不再由调用方手算。已切好样本集时用高性能入口
 > `TextTrainer::create(session, train_set, test_set, recipe)`；样本集 /
-> batch 装配接口见 [`../development/cpp-api-manual.md`](../development/cpp-api-manual.md) §13.3。
+> batch 装配接口见 [`../development/02-cpp-api-manual.md`](../development/02-cpp-api-manual.md) §13.3。
 
 ### GPT 推理（自回归生成）
 

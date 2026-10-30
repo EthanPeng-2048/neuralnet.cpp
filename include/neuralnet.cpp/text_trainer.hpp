@@ -1,6 +1,6 @@
 // ── text_trainer.hpp — 文本训练 Run Driver：数据集 → global batch → Session ─
 //
-// P2b（docs/todo/29 §8）的"训练工厂"：把原先散在 `text_train.cpp` / `cli/
+// P2b（docs/internal/29 §8）的"训练工厂"：把原先散在 `text_train.cpp` / `cli/
 // text_train_loop.hpp` 里的**数据装配 + epoch×step 循环 + 断点状态**收进库层，
 // 调用方只需要：
 //
@@ -10,7 +10,7 @@
 //                                                       nn::TextTrainConfig{}));
 //     auto report   = NN_UNWRAP(trainer.fit());
 //
-// 分工（docs/todo/30）：
+// 分工（docs/internal/30）：
 //   · `TrainingSession` 拥有 Model + Optimizer，执行 micro-step 并内置梯度累积；
 //   · Step 回调承载文本 sparse-CE，Session 不认识 token/loss mask；
 //   · `TextSampleSet` 拥有样本与最终 loss_mask，负责 batch 装配；

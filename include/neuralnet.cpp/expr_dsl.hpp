@@ -67,7 +67,7 @@ inline bool env_flag(const char* name)
 namespace nn::dsl
 {
 
-// M1（docs/todo/17 §4.1）：Tensor 存储访问已私有化，DSL 求值器经
+// M1（docs/internal/17 §4.1）：Tensor 存储访问已私有化，DSL 求值器经
 // 引擎域内通道 detail::TensorAccess 创建/读写张量（friend 关系，库外禁用）。
 using TensorAccess = ::nn::detail::TensorAccess;
 
@@ -564,7 +564,7 @@ struct MatmulRef
     bool transA = false;
     bool transB = false;
     std::uint32_t batch = 1;  // 批量数（形状参数，不进 key）
-    // GQA 头分组比（docs/todo/22 §3.2 P2）：>1 时该操作数只存
+    // GQA 头分组比（docs/internal/22 §3.2 P2）：>1 时该操作数只存
     // batch/ratio 份行块（多个 query 头共享一个 KV 头）。1 = 恒等。
     std::uint32_t a_kv_ratio = 1;
     std::uint32_t b_kv_ratio = 1;
@@ -956,7 +956,7 @@ inline constexpr bool has_reduction_v<Select<C, T, E>>
 { return MatmulRef{std::move(a), std::move(b), transA, transB, batch}; }
 
 // GQA 变体：a_kv_ratio / b_kv_ratio > 1 时该操作数只存 batch/ratio 份行块
-// （多个连续 query 头共享一个 KV 头；块映射见 docs/todo/22 §3.2）。
+// （多个连续 query 头共享一个 KV 头；块映射见 docs/internal/22 §3.2）。
 [[nodiscard]] inline MatmulRef matmul_kv(Tensor a, Tensor b,
                                          bool transA, bool transB,
                                          std::uint32_t batch,
@@ -1100,7 +1100,7 @@ template <typename E>
 // 输出网格形状推导（供 dsl::compute / compute_reduce 的**无形状重载**）
 //
 // 背景：`dsl::compute(engine, expr, rows, cols[, P])` 必带输出形状——调用方
-// 反复手写 `x.rows(), x.cols()`（docs/todo/18-roadmap.md P4-4 记为 API 摩擦点）。
+// 反复手写 `x.rows(), x.cols()`（docs/internal/18-roadmap.md P4-4 记为 API 摩擦点）。
 // `dsl::compute(engine, expr[, P])` 用**唯一口径**从表达式推导该形状：
 //
 //   输出网格 = 各"网格贡献者"的**广播合并**（逐维：相等，或其一为 1）。
