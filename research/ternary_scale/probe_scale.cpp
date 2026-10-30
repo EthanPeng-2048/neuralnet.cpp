@@ -1,6 +1,6 @@
 // ── probe_scale.cpp — 三值量化「尺度规则 × 粒度」对真实权重的影响 ──────────────
 // 配套报告：research/ternary_scale/REPORT.md
-// 设计文档：docs/todo/21-quantized-weights.md（这条对应待定项 D1）
+// 设计文档：docs/internal/21-quantized-weights.md（这条对应待定项 D1）
 //
 // 问题：三值化 w -> q*tau（q ∈ {-1,0,+1}）里，tau 取
 //   · 统计量：absmean（BitNet b1.58）还是 absmax（llama.cpp TQ1_0）

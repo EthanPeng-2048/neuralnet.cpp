@@ -3,7 +3,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 //  expr_opt.hpp — ExprSpec 规范化与优化 pass（IR-A + IR-B）
 //
-//  对应文档 `docs/todo/03-ir-optimization.md`：
+//  对应文档 `docs/internal/03-ir-optimization.md`：
 //    - IR-A：canonicalize_expr_spec（DCE / 常量折叠 / 代数化简 / 稳定重编号）
 //    - IR-B：CSE（公共子表达式消除）+ 寄存器分配（liveness 线性扫描）
 //
@@ -12,7 +12,7 @@
 //      expr_spec_key(spec) ≡ expr_spec_key(canonicalize_expr_spec(spec))
 //  （scan 构建期与 runtime 运行期都必须先 canonicalize 再算 key，两端一致。）
 //
-//  关键不变量（架构红线，详见 `docs/todo/03-ir-optimization.md`）：
+//  关键不变量（架构红线，详见 `docs/internal/03-ir-optimization.md`）：
 //    1. **不改变 views/inputs**（顺序、内容）——只优化 instrs/consts/num_regs。
 //       运行时 dispatch 的输入绑定顺序不变（融合 shader binding 布局不变），
 //       gpu_inputs 按原 inputs 传递即可。
@@ -213,7 +213,7 @@ namespace nn
             if (e == ins.dst) { is_output = true; break; }
 
         // 只重映射实际使用的操作数（未使用的 b/c 是默认哨兵 {0,0}，
-        // 不得当 Reg(0) 重编号——见 docs/todo/03-ir-optimization.md 关键坑 ②）
+        // 不得当 Reg(0) 重编号——见 docs/internal/03-ir-optimization.md 关键坑 ②）
         const std::size_t nops = expr_instr_num_operands(op);
         const ExprOperand a = remap_op(ins.a);
         const ExprOperand b = (nops >= 2) ? remap_op(ins.b) : ins.b;

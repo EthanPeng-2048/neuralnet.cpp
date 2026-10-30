@@ -1,6 +1,6 @@
 // ── cli_precision_warning.hpp — 危险精度组合启动期告警（仅警告，不拒绝）─────
 //
-// 口径见 docs/todo/24-f16-training-defects.md §2.3 / §5 F1：
+// 口径见 docs/internal/24-f16-training-defects.md §2.3 / §5 F1：
 //   · 触发集合 = `optimizer = F16`（四字段全 f16 必含 optimizer=F16，故被覆盖）；
 //   · `stable = F16` **单独**出现不触发（小模型健康，大词表才 ~200 步 NaN，
 //     是否单列见 24 §5 F1 备注）——但若与触发字段同时出现，会在同一条警告里
@@ -38,7 +38,7 @@ namespace nn::cli
 
         std::string w;
         w += "[精度警告] 检测到危险精度组合（仅提醒，不阻断训练，详见 "
-             "docs/todo/24-f16-training-defects.md §2）：\n";
+             "docs/internal/24-f16-training-defects.md §2）：\n";
         w += std::string("  · optimizer=") + nn::precision_name(p.optimizer) +
              "：Adam 二阶矩 v≈g²~1e-10 在 f16 下溢为 0 → 更新量 -lr·m̂/(√v̂+eps) "
              "爆炸 → loss 发散/NaN。\n";

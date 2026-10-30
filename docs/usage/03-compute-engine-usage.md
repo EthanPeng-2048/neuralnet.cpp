@@ -7,6 +7,8 @@
 > **不覆盖**：引擎内部实现（`*_impl`、shader、内存池算法）、Layer/Loss/Optimizer 的算法语义、IR/代码生成管线细节。这些见 §23"相关文档"。
 >
 > **版本锚**：以 `include/neuralnet.cpp/compute_engine.hpp`（2021 行）、`expr_dsl.hpp`（1655 行）、`compute_tensor.hpp`、`precision.hpp`、`core_config.hpp`、`core_errors.hpp` 的当前实现为准。任何与本手册不符的代码行为以源码为准，并请同步修订本手册。
+> **读者**：要用本库跑训练/推理的调用者。总索引见 [`../README.md`](../README.md)；历史归档在 [`../history/history.md`](../history/history.md)。
+> **状态**：现行。
 
 ---
 
@@ -116,7 +118,7 @@ nn::CpuEngine& engine = *engine_owner;
 > **但优化器与模型之间仍需顺序**：`Optimizer` 的 `params_/grads_` 是 Model
 > 内 Tensor 的非拥有引用，**必须早于 Model 销毁**（Model 先析构 → `step()`
 > UAF）。由 `nn::TrainingSession` 统一拥有两者可结构性避免
-> （[`todo/29`](../todo/29-session-architecture.md)）。
+> （[`internal/29`](../internal/29-session-architecture.md)）。
 
 **统一工厂**（CLI 入口用的写法，可直接复用）：
 
@@ -261,7 +263,7 @@ struct nn::PrecisionProfile {
 //                  / profile_master_weights() / profile_all_f16()
 ```
 
-> **三值 `T1_58` 与 f16/f32 正交（docs/todo/21-quantized-weights.md）**：f16 是"换更窄的
+> **三值 `T1_58` 与 f16/f32 正交（docs/internal/21-quantized-weights.md）**：f16 是"换更窄的
 > 容器"（舍入，全算子统一 P）；`T1_58` 是"换一种权重表示"（按逐行 absmean 尺度把权重投影到
 > `{-1,0,+1}`，需要额外尺度 γ）。因此它**不进提升序**（`precision_rank()` 对它无定义，
 > `max_precision` 直接 fail-fast），在 P1 里也只作为 `PrecisionProfile.param` 的一句**声明**
@@ -1236,7 +1238,7 @@ auto back = engine.rearrange_3d(*ctx, heads * d_k, batch, seq, true);   // inver
 
 > **接口约定泄漏提示**：状态块偏移（`0 / BHdk / 2*BHdk / 4*BHdk`）是引擎契约的一部分，Layer 必须按上表手工切块——`compute_layer_rapt.hpp:535-785` 的复杂度很大一部分来自这里。
 
-算法细节见 `docs/development/06-rapt-algorithm.md`。
+算法细节见 `docs/development/08-rapt-algorithm.md`。
 
 ---
 
@@ -1702,13 +1704,13 @@ if (nn::dsl::env_flag("NN_PREC_TRACE"))
 
 | 文档 | 何时读 |
 |---|---|
-| `docs/development/01-compute-engine-development.md` | 想**扩展引擎**（加新原语）而不是使用它 |
-| `docs/todo/12-compute-engine-inventory.md` | 引擎 52 个 virtual 方法的盘点与 Layer 直调分类（复现：`bench/doc_inventory.ps1`） |
+| `docs/development/04-compute-engine-development.md` | 想**扩展引擎**（加新原语）而不是使用它 |
+| `docs/internal/12-compute-engine-inventory.md` | 引擎 52 个 virtual 方法的盘点与 Layer 直调分类（复现：`bench/doc_inventory.ps1`） |
 | `docs/development/05-mixed-precision.md` | 多精度类型系统、f16 语义锚与实测结论（§12 已知限制） |
-| `docs/todo/02-operator-fusion.md` + `03-ir-optimization.md` | 表达式融合与 IR 细节 |
-| `docs/todo/17-unified-tensor-engine.md` | 统一张量/引擎总纲：访问不变量（铁律 #11）、Matrix 降级（铁律 #12）、InitSpec、批量读写、内存契约 |
-| `docs/development/06-rapt-algorithm.md` | 扫描原语的算法背景 |
-| `docs/todo/08-pitfalls-and-lessons.md` | 踩坑警示录（改代码前读） |
+| `docs/internal/02-operator-fusion.md` + `03-ir-optimization.md` | 表达式融合与 IR 细节 |
+| `docs/internal/17-unified-tensor-engine.md` | 统一张量/引擎总纲：访问不变量（铁律 #11）、Matrix 降级（铁律 #12）、InitSpec、批量读写、内存契约 |
+| `docs/development/08-rapt-algorithm.md` | 扫描原语的算法背景 |
+| `docs/contributors/pitfalls.md` | 踩坑警示录（改代码前读） |
 | `docs/introduction/01-architecture.md` | 完整分层架构与数据流 |
 | `docs/usage/01-quickstart-model.md` | 用现成 Layer 搭模型的教程 |
 | `docs/usage/02-quickstart-train-infer.md` | 训练/推理 CLI + C++ API + GUI |

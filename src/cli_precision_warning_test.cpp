@@ -1,6 +1,6 @@
 // ── cli_precision_warning_test — 危险精度组合启动期告警（仅警告，不拒绝）────
 //
-// 验收（docs/todo/24-f16-training-defects.md §2.3 / §5 F1）：
+// 验收（docs/internal/24-f16-training-defects.md §2.3 / §5 F1）：
 //   [1] 触发集合 = optimizer=f16（四字段全 f16 被其覆盖）；stable=f16 单独不触发。
 //   [2] 危险组合打印含字段/取值 + 风险 + 文档指引的警告；`--f16` 与合法组合静默。
 //   [3] 行为 = 仅 stderr 文本：**不改变退出码、不阻断训练、不静默降级**。
@@ -141,7 +141,7 @@ void test_helper_matrix()
     CHECK(!opt_only.empty(), "optimizer=f16 必须触发告警");
     CHECK(opt_only.find("optimizer=f16") != std::string::npos,
           "告警应含命中的字段与取值 optimizer=f16");
-    CHECK(opt_only.find("docs/todo/24-f16-training-defects.md") != std::string::npos,
+    CHECK(opt_only.find("docs/internal/24-f16-training-defects.md") != std::string::npos,
           "告警应指回 24 号台账 §2");
     CHECK(opt_only.find("数值性冻结") == std::string::npos,
           "非全 f16 不应出现'数值性冻结'（那是全 f16 的形态）");

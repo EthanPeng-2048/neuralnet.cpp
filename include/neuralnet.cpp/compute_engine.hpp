@@ -115,7 +115,7 @@ enum class ReduceOp : uint32_t
     return expr_prec_sig_make(bits, P == Precision::F16);
 }
 
-// ── InitSpec — 声明式张量初始化（M2，docs/todo/17 §4.4）──────────────
+// ── InitSpec — 声明式张量初始化（M2，docs/internal/17 §4.4）──────────────
 // 分工（铁律 #3）：**层算分布参数**（limit / mean / stddev 这类层语义留在
 // Layer），**引擎负责填数**（只管把 shape×precision×分布的数填出来）。
 // 初始化策略（host 生成后上传 vs 设备端原生生成）由引擎自选，调用方不可见
@@ -237,7 +237,7 @@ struct EngineInfo
 class ComputeEngine : public std::enable_shared_from_this<ComputeEngine>
 {
 public:
-    // ── 生命周期与设备域（docs/todo/28-lifecycle-v3.md）──────────────────
+    // ── 生命周期与设备域（docs/internal/28-lifecycle-v3.md）──────────────────
     // 引擎必须由 shared_ptr 管理（CpuEngine::create / GpuEngine::create）。
     // 会解引用引擎的 Layer / Model / Optimizer / ExprGraph / ExprSegment 保存
     // keepalive()；Tensor 不保存引擎身份——设备域从**存储**派生。
@@ -397,7 +397,7 @@ public:
 
     // ── 张量工厂（统一接口，§6.4, §6.5）────────────────────────────────
     // P 由调用方显式指定（§8.5）：无隐式推导，无 Auto
-    // 公共非虚入口在尾部统一做设备域检查（v3，docs/todo/28 §4.3），
+    // 公共非虚入口在尾部统一做设备域检查（v3，docs/internal/28 §4.3），
     // 引擎只实现 create_tensor_impl / from_matrix_impl（protected）——避免
     // 每个 override 各自漏 stamp。to_matrix 输出 Matrix（宿主），不参与 stamp。
     // RV-02（工厂错误协议收敛）：错误**结构化**上抛，不再"空张量 + stderr"。
@@ -507,7 +507,7 @@ public:
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // I/O 分组（M3，docs/todo/17 §4.3 D3/D9 + §3 D11）：
+    // I/O 分组（M3，docs/internal/17 §4.3 D3/D9 + §3 D11）：
     //   from_matrix / to_matrix / import / read / write / get_index / set_index
     // 宿主数据进出张量只准经本组动词；D9：from_matrix/to_matrix 保留原名
     // （Matrix = 宿主 I/O 载体），批量 read/write 为**本体**，索引级
@@ -572,7 +572,7 @@ protected:
     //
     // 问题：Layer 的"参数派生物"（BitLinear 的 τ/wq）只在**参数变过**时才需要
     // 重算，而 forward 每步都会被调用（梯度累积 N 次、自回归生成每 token 一次
-    // ——见 docs/todo/21 §4.11）。判断"变没变"必须有一个便宜且**不漏
+    // ——见 docs/internal/21 §4.11）。判断"变没变"必须有一个便宜且**不漏
     // 报**的信号。
     //
     // 机制：Tensor 的存储对象（MatrixT / GpuBuffer）持有一个单调计数
@@ -749,7 +749,7 @@ public:
         return write(t, std::span<const Scalar>(buf));
     }
 
-    // ── reshape（M1，docs/todo/17 §3 D10：修改类操作一律引擎方法）──
+    // ── reshape（M1，docs/internal/17 §3 D10：修改类操作一律引擎方法）──
     // 语义同原 Tensor::reshape：GPU 共享底层 buffer（零拷贝视图）、CPU 按
     // precision_ 复制数据到新形状；设备域随存储派生（v3），空槽保持无效
     // 的输入形状由引擎校验。元素数不匹配返回错误（原 NN_ASSERT 升级）。
@@ -1180,7 +1180,7 @@ public:
     //
     // BitLinear 的"有效权重"是 τ∘W（W 三值、τ 逐行 absmean）。打包后权重容器
     // 只占 **0.25 B/权重**（f16 稠密缓冲 2 B/权重），代价是必须由专用内核解码
-    // —— docs/todo/21 §4.6 的"T1_58 张量只进量化 GEMM"在这里落地为
+    // —— docs/internal/21 §4.6 的"T1_58 张量只进量化 GEMM"在这里落地为
     // "打包容器只进 matmul_q"（布局见 ternary_pack.hpp）。
     //
     //   trit_pack(w (R,K) f32, τ (R,1) f32) → 容器 (R, ceil(K/16)) f32
@@ -1817,7 +1817,7 @@ protected:
         }
     }
 
-    // ── 设备域检查（生命周期 v3，docs/todo/28-lifecycle-v3.md §4.3）──────
+    // ── 设备域检查（生命周期 v3，docs/internal/28-lifecycle-v3.md §4.3）──────
     // 每个 public NVI 入口逐个操作数比较 `Tensor::device_domain_()` 与本引擎
     // 域：空/无效张量（域 = 0）豁免（交由各入口既有的无效/形状检查拒绝）；
     // 其余必须**等于本引擎域**。跨域入口只有 `import`（CPU→GPU 上载）与

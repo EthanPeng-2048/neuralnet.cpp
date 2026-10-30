@@ -1,7 +1,7 @@
 // ───────────────────────────────────────────────────────────────────────────
-//  expr_matmul_test.cpp — 算子融合二期（docs/todo/02）：matmul 参与 IR 融合
+//  expr_matmul_test.cpp — 算子融合二期（docs/internal/02）：matmul 参与 IR 融合
 //
-//  对应 docs/todo/02-operator-fusion.md（IR 地基 + CPU 正确性两步）：
+//  对应 docs/internal/02-operator-fusion.md（IR 地基 + CPU 正确性两步）：
 //    1. ExprSpec 增加 MatmulSpec（前置 matmul 段）+ ExprOperandKind::Matmul：
 //       C = op(A,B) 作为逐元素链的"虚拟寄存器 0"，链内按 (r,c) 读取。
 //    2. CpuEngine::eval_expr 支持 matmul 段（matmul 预计算 + 逐元素链），

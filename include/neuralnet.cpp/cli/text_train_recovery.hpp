@@ -1,10 +1,10 @@
 // ── text_train_recovery.hpp — `--resume` 恢复路径（TDR 重启 / 分段续训）───────
 //
-// P1-1 拆出的 recovery 模块（docs/todo/18-roadmap.md §4.2）：
+// P1-1 拆出的 recovery 模块（docs/internal/18-roadmap.md §4.2）：
 //   ① **断点状态采纳**（P1-2 第三刀 B）：`--resume` 指向带训练状态段的断点时，
 //      形状/配方/起点一律由状态段决定，显式给出 A/B 类旗标即报错；数据集身份
 //      不一致硬报错（无逃生阀）；优化器状态（含 `t`）随之恢复。
-//      角色语义（v8，docs/todo/23 §2.1.1）：`.nnckpt` = 断点续训、
+//      角色语义（v8，docs/internal/23 §2.1.1）：`.nnckpt` = 断点续训、
 //      `.nnmodel` = warm start（SFT，CLI 全权）。**P1-7 起没有需要拒绝的组合**：
 //      三值 `.nnmodel` 的打包载荷在载入时按文件 τ 反量化成 f32 latent
 //      （`WeightLoadIntent::Trainable`）⇒ 同样可续训。v5/v6/v7 老文件放行（零破坏）。
@@ -42,7 +42,7 @@
 
 namespace nn::cli
 {
-// ── 角色语义（v8；2026-10-16 裁定，docs/todo/23 §2.1.1）──────────────────
+// ── 角色语义（v8；2026-10-16 裁定，docs/internal/23 §2.1.1）──────────────────
 //   · Checkpoint（`.nnckpt`）⇒ **断点续训**：状态段是唯一权威（A/B 类参数禁列）。
 //   · Model（`.nnmodel`）⇒ **warm start**（CLI 全权）：SFT / 换数据集续训的入口，
 //     优化器冷启动、step/lr 从 0 起算。三值模型同样走这里 —— 打包载荷在载入时
@@ -171,7 +171,7 @@ struct ResumeStateAdoption
     }
     else
     {
-        // docs/todo/30：旧状态的 batch_size 是 micro-batch；还原成等效 global。
+        // docs/internal/30：旧状态的 batch_size 是 micro-batch；还原成等效 global。
         // 旧断点若落在累积中间，pending gradients 不在文件里，只能从最近的
         // 已完成 update 边界继续。
         if (s.recipe.accum_steps == 0)
@@ -217,7 +217,7 @@ struct ResumeStateAdoption
     return result;
 }
 
-// ── 数据集身份门禁（硬错、无逃生阀；docs/todo/23 §2.1.1）────────────────
+// ── 数据集身份门禁（硬错、无逃生阀；docs/internal/23 §2.1.1）────────────────
 // 数据集一变 ⇒ 窗口数变 ⇒ steps_per_epoch 变 ⇒ step 级调度的 total_steps、
 // `global_step` 的语义、epoch 边界**同时**改变 ⇒ "同一断点 + 不同数据集"
 // 不存在正确的续训语义。合法出口 = 从 `.nnmodel` 开新一轮。

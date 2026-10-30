@@ -2,7 +2,7 @@
 
 // ── rl_policy.hpp — categorical policy distribution 与 objective 组件 ──────
 //
-// docs/todo/31 RL-1b：
+// docs/internal/31 RL-1b：
 //   · logits: (actions, T)，action/advantage/log-prob/mask: (1,T) 或同形；
 //   · policy objective 的上下文入口强类型接收 PolicyBatchView；
 //   · 继续适配现有 Loss：forward(pred,target) 在没有 RL 上下文时明确报错；

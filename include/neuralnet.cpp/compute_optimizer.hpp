@@ -205,7 +205,7 @@ public:
         return {};
     }
 
-    // ══ 断点状态导出/载入（P1-2，docs/todo/18 §4.2 / docs/todo/23 §2.1.1）══
+    // ══ 断点状态导出/载入（P1-2，docs/internal/18 §4.2 / docs/internal/23 §2.1.1）══
     // 契约（改这四个函数前先读）：
     //   · 张量**顺序**是格式契约：一旦随版本发布就不得改变（要改 = 升
     //     `TRAIN_STATE_VERSION` 并在载入侧分支）。当前顺序：
@@ -383,7 +383,7 @@ protected:
     //     1.7e5] —— m 稳在 f16 正常区，v 的下缘远离次正规区（这正是要修的）；
     //   · 上缘 1.7e5 > 65504 ⇒ **|g| ≳ 0.0625 时 v 会溢出**。该边界与
     //     `--precision-optimizer f16` 的危险性同源，已由启动期精度告警提示
-    //     （docs/todo/24 §2）；实践上配 `--max-norm` 梯度裁剪即可约束 |g|。
+    //     （docs/internal/24 §2）；实践上配 `--max-norm` 梯度裁剪即可约束 |g|。
     //   · S 取 2 的幂 → 与 g 的相乘在 f16 下**无损**（指数平移），不引入额外舍入。
     [[nodiscard]] Scalar optimizer_state_scale_() const noexcept
     {
@@ -447,7 +447,7 @@ protected:
         //     但当 param 槽不是"存储精度"时必须以张量自身为准 —— 例如 BitLinear 的
         //     T1_58（latent 恒 f32）：照搬 p_.param 会拿非存储精度去建张量
         //     （CPU 走 f32 兜底、GPU 在 check_precision_supported 处硬报错 =
-        //      两端行为不一致）。见 docs/todo/21-quantized-weights.md §4.3.2。
+        //      两端行为不一致）。见 docs/internal/21-quantized-weights.md §4.3.2。
         const Precision upd_prec = (precision_bytes(p_.param) != 0)
                                        ? p_.param
                                        : params_[i].get().precision();

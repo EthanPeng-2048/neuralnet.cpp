@@ -16,7 +16,7 @@
 // 只用**指针形式** `std::any_cast<T>(&payload)` 读取（返回 nullptr，不抛异常；
 // -fno-exceptions 下安全）。骨架不解释载荷内容，只透传给域自己的 StepFn。
 //
-// 与 TrainingSession（docs/todo/30）的分工：本头只管"取样顺序 + 装配"，
+// 与 TrainingSession（docs/internal/30）的分工：本头只管"取样顺序 + 装配"，
 // 不碰梯度 / 归一化 / 裁剪 —— 后者仍是 Session 的职责。
 // ─────────────────────────────────────────────────────────────────────────
 
@@ -72,7 +72,7 @@ public:
 
 // ── 预置适配器：样本表 + 每 epoch shuffle + 按下标装配（文本/视觉复用）────
 //
-// 语义与 TextTrainer::fit 的取样顺序一致（docs/todo/30 可观测行为锚）：
+// 语义与 TextTrainer::fit 的取样顺序一致（docs/internal/30 可观测行为锚）：
 //   · 步网格 = ceil(sample_count / batch_size)；
 //   · 每 epoch 重排样本顺序（epoch 作种子 ⇒ 同 seed 跨续训可复现）；
 //   · 末批不满（samples < batch_size）；

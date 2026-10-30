@@ -226,7 +226,7 @@ enum class AttnMaskKind
 //   掩码（`NN_ATTN_MASK_KIND_LIST`）× {无偏置, 位置偏置} × {MHA, GQA}
 // 其中"无掩码 + 位置偏置"不是本仓会构造的组合（无层路径），故实际为 5×2 = 10
 // 条结构。形状/运行期参数（seq/dk/bh 与 kv_ratio 的具体值）**不进 key** → 一
-// 组代表值即覆盖所有形状（docs/todo/22 §3.2 P2；GQA 的 HeadGroup 视图种类进
+// 组代表值即覆盖所有形状（docs/internal/22 §3.2 P2；GQA 的 HeadGroup 视图种类进
 // key，比本身不进 → MHA/GQA 各一条）。
 // 可用 `-DNN_SCAN_NO_ANCHOR` 关掉（与 FusedAnchor 同一 A/B 开关：只影响登记
 // 集合、不改语义）。
@@ -489,7 +489,7 @@ public:
 protected:
     std::size_t d_model_;
     std::size_t num_heads_;
-    // ── GQA（分组查询注意力，docs/todo/22 §3.2）─────────────────────
+    // ── GQA（分组查询注意力，docs/internal/22 §3.2）─────────────────────
     // n_head_kv_ == num_heads_ 时退化为 MHA（既有路径逐位不变）。
     // 头映射 = 块映射：query head h 用 KV head `h / (num_heads_/n_head_kv_)`
     //（llama.cpp FA 内核 `ik2 = iq2 / rk2` 与 HF `repeat_kv` 的 reshape 一致）。
@@ -527,7 +527,7 @@ protected:
     // ── 分数掩码策略（构造期/配置期定型；热路径只调用，不判断变体）──
     std::unique_ptr<AttnScoreMask> mask_;
 
-    // ── SubLN（BitNet b1.58 的"子层归一化"，docs/todo/22 §3.1）──────
+    // ── SubLN（BitNet b1.58 的"子层归一化"，docs/internal/22 §3.1）──────
     // **子层内部**的额外归一化：挂在 attention 输出（宽 d_model）与输出投影
     // w_o_ 之间。默认 nullptr = 关（既有路径逐位不变）。类型跟随模型的
     // norm_type（2B4T = RMSNorm）——与 GPTBlock 的 norm1_/norm2_ 同一工厂。

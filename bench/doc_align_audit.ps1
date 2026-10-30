@@ -39,7 +39,7 @@ $historicalFiles = @('compute_cuda_engine.hpp','compute_cuda_backend.hpp','cuda_
                      'offload_primitive_test.cpp','offload_test.cpp','broadcast.comp',
                      'compute_precision_engine.hpp',   # P-1 随 PrecisionEngine 下沉删除
                      'compute_layer_zipt.hpp','domain_zipt.hpp',   # ZiPT 移除（分支 legacy/zipt）
-                     'ternary_deploy.hpp')  # NNQT 独立部署格式，随库级清理（docs/todo/23）删除
+                     'ternary_deploy.hpp')  # NNQT 独立部署格式，随库级清理（docs/internal/23）删除
 
 # ── [A] 文档引用的文件是否存在 ──────────────────────────────────────────
 Write-Host '=== [A] 文档引用但仓库中不存在的文件 ==='
@@ -170,7 +170,7 @@ $removedFlags  = @('--cuda','--tdr-retry','--max-tdr-retries',
                    '--osc-guard','--osc-window','--osc-threshold',
                    '--no-cache','--test-file','--loss-scope',
                    # --export-deploy : NNQT 独立部署格式的导出口，随库级清理
-                   #   （docs/todo/23，2026-10-11）删除 → 文件角色
+                   #   （docs/internal/23，2026-10-11）删除 → 文件角色
                    #   .nnmodel/.nnckpt 取代
                    '--export-deploy')
 # 已在 26 §8.B.7 明确标注“计划中、默认关闭、尚未实现”的参数。它们不得出现在
@@ -245,7 +245,7 @@ $missTests = 0
 $histTests = 0
 # 历史/已并入的测试名（历史交付表中的当时目标名，勿再报警）
 #   zipt_* : 随 ZiPT 移除（历史文档提及属正常）
-#   ternary_deploy_test : NNQT 部署格式测试，随库级清理（docs/todo/23）删除（并入 model_roles_test）
+#   ternary_deploy_test : NNQT 部署格式测试，随库级清理（docs/internal/23）删除（并入 model_roles_test）
 $historicalTests = @('expr_fuse_test','expr_graph_test','expr_spec_test','matmul_fusion_test','offload_primitive_test',
                     'zipt_test','zipt_gradcheck','zipt_smoke_test','zipt_consistency_test','zipt_doc_test',
                     'ternary_deploy_test')

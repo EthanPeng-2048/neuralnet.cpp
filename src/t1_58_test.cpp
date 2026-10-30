@@ -1,5 +1,5 @@
 // ── t1_58_test — 三值（T1_58）精度与 BitLinear ──────────────────────────────
-// 设计依据：docs/todo/21-quantized-weights.md（P1 验收 §5/§7）
+// 设计依据：docs/internal/21-quantized-weights.md（P1 验收 §5/§7）
 //
 // 覆盖：
 //   [1] PrecisionSet / PrecisionSupport 语义（默认集合 = {f16,f32} × 四槽）

@@ -1,6 +1,6 @@
 #pragma once
 
-// ── tensor_schema.hpp — 有序张量字段 schema（docs/todo/31 §3）──────────────
+// ── tensor_schema.hpp — 有序张量字段 schema（docs/internal/31 §3）──────────────
 //
 // 公共语义：
 //   · 字段按稳定顺序保存；名称只允许在 setup/deserialize 期解析；

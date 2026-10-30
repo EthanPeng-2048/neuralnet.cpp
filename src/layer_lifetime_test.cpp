@@ -1,6 +1,6 @@
 // ── layer_lifetime_test — 生命周期 v3：设备域模型与强所有权 ────────────────
 //
-// v3 契约（docs/todo/28-lifecycle-v3.md §4）：
+// v3 契约（docs/internal/28-lifecycle-v3.md §4）：
 //   [1] 域从存储派生：CPU 张量 → kHostDomain；空/无效 = 0（唯一豁免）；
 //       Tensor 不再保存任何引擎身份字段
 //   [2] 引擎不可栈上构造（必须由 create() 的 shared_ptr 管理）

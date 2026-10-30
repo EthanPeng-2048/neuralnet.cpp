@@ -2,7 +2,7 @@
 
 > 本文写给**不是本仓作者**的人：想用库、报 bug、提 PR、加层/加原语、写文档、或把一份实验结果放进 `research/`。
 > 只回答「我怎么参与」。**项目自身的开发规范**（14 条铁律、分层依赖、门禁口径、踩坑）在
-> [`AGENTS.md`](AGENTS.md) 与 [`docs/todo/10-development-standards.md`](docs/todo/10-development-standards.md)；
+> [`AGENTS.md`](AGENTS.md) 与 [`docs/contributors/cpp-standards.md`](docs/contributors/cpp-standards.md)；
 > 文档分册定位（哪篇写给谁看）在 [`docs/README.md`](docs/README.md)。
 
 ---
@@ -11,13 +11,13 @@
 
 | 你想做什么 | 从这里开始 |
 |-----------|-----------|
-| 用库写自己的模型/训练 | [`docs/development/cpp-api-manual.md`](docs/development/cpp-api-manual.md)、[`docs/usage/`](docs/usage/) |
-| 把库嵌进自己的 CMake 工程 | [`docs/development/cmake-integration.md`](docs/development/cmake-integration.md)、[`docs/usage/05-consume-as-library.md`](docs/usage/05-consume-as-library.md) |
-| 写自己的层 | [`docs/development/write-a-custom-layer.md`](docs/development/write-a-custom-layer.md) |
-| 扩展引擎原语 / 改 GPU 后端 | [`docs/development/01-compute-engine-development.md`](docs/development/01-compute-engine-development.md) + `AGENTS.md` §7 |
+| 用库写自己的模型/训练 | [`docs/development/02-cpp-api-manual.md`](docs/development/02-cpp-api-manual.md)、[`docs/usage/`](docs/usage/) |
+| 把库嵌进自己的 CMake 工程 | [`docs/development/01-cmake-integration.md`](docs/development/01-cmake-integration.md)、[`docs/usage/05-consume-as-library.md`](docs/usage/05-consume-as-library.md) |
+| 写自己的层 | [`docs/development/03-write-a-custom-layer.md`](docs/development/03-write-a-custom-layer.md) |
+| 扩展引擎原语 / 改 GPU 后端 | [`docs/development/04-compute-engine-development.md`](docs/development/04-compute-engine-development.md) + `AGENTS.md` §7 |
 | **改本仓的代码** | [`AGENTS.md`](AGENTS.md)（**先读 §5 铁律与 §10 高频坑**） |
-| 看"下一步该做什么" | [`docs/todo/18-roadmap.md`](docs/todo/18-roadmap.md) |
-| 提发布 / 定版本号 | [`docs/todo/33-version-branch-and-release-policy.md`](docs/todo/33-version-branch-and-release-policy.md)（**版本号必须由人提出，agent 不得擅自发布**；`dev` 不写版本号，发布只在 `main`）+ [`docs/todo/25-release-requirements.md`](docs/todo/25-release-requirements.md) |
+| 看"下一步该做什么" | [`docs/internal/18-roadmap.md`](docs/internal/18-roadmap.md) |
+| 提发布 / 定版本号 | [`docs/contributors/release-policy.md`](docs/contributors/release-policy.md)（**版本号必须由人提出，agent 不得擅自发布**；`dev` 不写版本号，发布只在 `main`）+ [`docs/contributors/release-requirements.md`](docs/contributors/release-requirements.md) |
 | 看"为什么当初这么改" | [`docs/history/history.md`](docs/history/history.md)（全仓唯一历史归档） |
 
 ---
@@ -49,7 +49,7 @@ cmake -B build -G Ninja && cmake --build build            # 默认 Release
 cmake -B build -G Ninja -DNN_ENABLE_TESTS=ON && cmake --build build && ctest --test-dir build
 ```
 
-常用开关（完整列表见 [`docs/development/cmake-integration.md`](docs/development/cmake-integration.md)）：
+常用开关（完整列表见 [`docs/development/01-cmake-integration.md`](docs/development/01-cmake-integration.md)）：
 
 | 开关 | 默认 | 用途 |
 |------|------|------|
@@ -69,7 +69,7 @@ ctest --test-dir build -R gradcheck   # 只跑匹配的
 ```
 
 **本地必须跑**：CI 目前只做「构建 + 打包可执行文件」（见 §6），**不跑 ctest**——
-那是 [`docs/todo/18-roadmap.md`](docs/todo/18-roadmap.md) 里 P0-1 的待办。所以测试是你自己的门禁。
+那是 [`docs/internal/18-roadmap.md`](docs/internal/18-roadmap.md) 里 P0-1 的待办。所以测试是你自己的门禁。
 
 改到下面这些区域时，请把对应专项测试一起跑（都在 ctest 里）：
 
@@ -77,7 +77,7 @@ ctest --test-dir build -R gradcheck   # 只跑匹配的
 |---------|--------|
 | 引擎原语 / 张量 | `*_test`（含 `f16_precision_test`、`write_epoch_test`） |
 | 训练/反向 | 各 `gradcheck*`、`*_train_test` |
-| GPU 后端 / DSL 融合 | 带 `--gpu` 的变体（见 [`docs/todo/12-compute-engine-inventory.md`](docs/todo/12-compute-engine-inventory.md) 的清单） |
+| GPU 后端 / DSL 融合 | 带 `--gpu` 的变体（见 [`docs/internal/12-compute-engine-inventory.md`](docs/internal/12-compute-engine-inventory.md) 的清单） |
 | 三值 / BitLinear | `bitnet_struct_test`、`ternary_*`、`adam_quant_test` |
 | 序列化 / 数据集 | `train_state_test`、`model_roles_test`（容器格式本体已下沉子仓，见下） |
 | 子仓（`extern/{base,threadpool,kvrecord,dataset,tokenizer}`） | 进入子仓目录独立构建 + ctest（见各子仓 README「构建与测试」）；主仓 ctest 不再包含子仓单测 |
@@ -105,7 +105,7 @@ NN_VULKAN_DEVICE=850M ./build/test/bitnet_struct_test --gpu     # 显式选卡
 
 ### 3.2 代码风格
 
-风格规则写在 [`docs/todo/10-development-standards.md`](docs/todo/10-development-standards.md) §8
+风格规则写在 [`docs/contributors/cpp-standards.md`](docs/contributors/cpp-standards.md) §8
 （命名 / 缩进 4 空格 / include 顺序 / 注释语言），机器可读版本是同目录的 [`.clang-format`](.clang-format)。
 
 ```bash
@@ -151,12 +151,12 @@ clang-format -i path/to/new_file.hpp
 
    其他历史分支命名（`feat/`、`fix/`、`docs/` 等）已废止。文档类改动可直接在 `main` 提 PR。
 
-   **版本号与发布规则**（正文与真源表见 [`docs/todo/33-version-branch-and-release-policy.md`](docs/todo/33-version-branch-and-release-policy.md)）：
+   **版本号与发布规则**（正文与真源表见 [`docs/contributors/release-policy.md`](docs/contributors/release-policy.md)）：
    ① 版本号格式 `v1.<API 变化>.<漏洞修复>`（位定义见 [`docs/release-notes/README.md`](docs/release-notes/README.md) §1），**版本权威 = `git tag`**；
    ② **`dev` 及其上的功能分支从不写版本号**——不 bump `project(VERSION ...)`、不建 release note 册、不打 tag；定档与发布**只发生在 `main`**；
    ③ **发布版本号必须由人提出并明确给出**，agent（AI 编码助手）不得自行决定版本号或执行发布动作（`git tag` / `gh release` 等）。
-2. **一次 PR 一件事**。大改动请先在 issue/讨论里对齐设计——本仓有「先写设计稿进 `docs/todo/`，
-   裁定后再实施」的习惯（`docs/todo/` 就是项目开发者的工作区）。
+2. **一次 PR 一件事**。大改动请先在 issue/讨论里对齐设计——本仓有「先写设计稿进 `docs/internal/`，
+   裁定后再实施」的习惯（`docs/internal/` 就是项目开发者的工作区）。
 3. 提交前自查：
    ```bash
    cmake --preset dev && cmake --build --preset dev && ctest --preset dev   # 测试必须绿（当前口径：无 Vulkan 62 项 / 开 GPU 64 项）
@@ -176,9 +176,9 @@ clang-format -i path/to/new_file.hpp
    **基线对照**工具：看**你改动的那几行**有没有新增 E，别指望整仓绿。要让它成为可执行门禁，得先给
    这些 C 边界补 `// nn-allow: <原因>` 豁免（脚本支持该机制，当前全仓 0 处豁免）——那是独立的一批改动，
    不在功能 PR 里顺手做。
-   Windows 侧另有 `pwsh -File bench/doc_align_audit.ps1`（文档 ↔ 代码对齐审计：
-   文件/符号/CLI/数字/测试名）与 `bench/doc_inventory.ps1`（引擎接口盘点 + L2 分层门禁），
-   需要 PowerShell 7，改了文档或引擎接口时跑。
+   改了文档必跑 `python scripts/doc_audit.py`（文档 ↔ 代码对齐 + 文档规范审计，跨平台；
+   `--report` 另生成代码示例人工复核清单）。Windows 侧另有 `pwsh -File bench/doc_inventory.ps1`
+   （引擎接口盘点 + L2 分层门禁，需要 PowerShell 7），改了引擎接口时跑。
 4. PR 描述里写：**动机 → 改了什么 → 怎么验证的 → 影响面/兼容性**（模型文件格式、CLI 参数、
    数值结果是否有变化）。破坏性变更请附迁移说明。
 
@@ -215,25 +215,32 @@ clang-format -i path/to/new_file.hpp
 
 **大版本发布**（版本号 `1.x.y → 1.(x+1).0`）在 CI 门禁之上还有一份必做清单——端到端模型训练测试
 （这类测试**不进默认 ctest**）、发布文档、完整 ctest + **Debug** 构建、多编译器 × 标准库矩阵——
-见 [`docs/todo/25-release-requirements.md`](docs/todo/25-release-requirements.md)。
+见 [`docs/contributors/release-requirements.md`](docs/contributors/release-requirements.md)。
 
 ---
 
 ## 7. 文档贡献
 
-分册定位只有一条总则（[`docs/README.md`](docs/README.md)）：
-**除 `todo/` 与 `history/history.md` 外，`docs/` 下的文档都是写给"库外的人"的。**
+**规范正文在 [`docs/contributors/documentation-standard.md`](docs/contributors/documentation-standard.md)**
+（分册职责 / 编号制度 / 单篇模板 / 代码示例标注 / 历史性记载禁令 / 审查口径），写任何文档前先读。
+要点速览：
 
 | 目录 | 读者 | 收什么 |
 |------|------|--------|
-| `docs/introduction/` `docs/usage/` | 调用者 | 总览、教程 |
+| `docs/introduction/` `docs/usage/` | 调用者 | 总览、教程（编号 = 阅读顺序，连续不留洞） |
 | `docs/development/` | **调用者**（扩展库的人） | 接入、API 手册、写自定义层、精度契约 |
-| `docs/todo/` | 项目开发者 | 设计稿、路线图、盘点、规范、踩坑、整改 |
-| `docs/history/history.md` | 项目开发者 | 全仓唯一历史归档（演进/勘误/被否决方案/A-B 数字） |
+| `docs/contributors/` | 贡献者 / 维护者 / agent | 长期规范与治理（无编号主题名） |
+| `docs/internal/` | 项目开发者 | 设计稿、路线图、盘点、故障、整改（编号 = 稳定 ID，新增续最大号） |
+| `docs/history/history.md` | 项目开发者 | 全仓**唯一**历史归档（演进/勘误/被否决方案/A-B 数字） |
 
-一句话判断：**这篇文档的读者是"库外的人"还是"改库的人"？** 后者进 `todo/`。
+- **头部模板强制**：每篇必须有 `> **读者**：` / `> **一句话结论**：` / `> **状态**：`
+  （词表：现行 / 冻结 / TODO / 转发页 / 已归档）。
+- **历史性记载禁令**：`history/` 之外（含代码注释）不得写"xxx 已在 commit xxx 修复"式叙事<!-- doc-audit: allow H -->，
+  一律改写为当前事实。
+- **登记义务**：新增/删除文档必须同步分册 README + `docs/README.md` 两处索引。
 
-顺手能做的：文档里的 CLI 参数、文件路径、符号名请与代码核对（`bench/doc_align_audit.ps1` 就是干这个的）。
+**改完文档必跑** `python scripts/doc_audit.py`（文件/链接、CLI 参数、nn:: 符号、头部模板、
+索引登记、历史性记载、代码示例清单八类检查；`--report` 生成代码示例人工复核清单）。
 
 ---
 

@@ -8,7 +8,7 @@
 //
 // ⚠ 这是**整洁性**入口，**不省 parse**：各头的依赖闭包本就相互牵连（如
 //   `compute_tensor.hpp` 无条件引用 Vulkan 后端头），真正省时间要按依赖
-//   重切（另案，见 docs/todo/18-roadmap.md P0-4 / 编译提速）。
+//   重切（另案，见 docs/internal/18-roadmap.md P0-4 / 编译提速）。
 //
 // 提供：`ComputeEngine`（原语接口）、`CpuEngine`，以及 GPU 构建下的 `GpuEngine`。
 // 用法：

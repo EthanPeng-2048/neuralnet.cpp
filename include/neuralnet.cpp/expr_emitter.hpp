@@ -3,7 +3,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 //  expr_emitter.hpp — 后端 emitter 抽象（IR-D）
 //
-//  对应文档 `docs/todo/03-ir-optimization.md` IR-D：把后端代码生成从 GLSL 专用
+//  对应文档 `docs/internal/03-ir-optimization.md` IR-D：把后端代码生成从 GLSL 专用
 //  抽象为 emitter 接口，实现"一份 canonical IR → 多后端代码"：
 //
 //      IR (canonical ExprSpec) → GlslEmitter（当前唯一注册后端）

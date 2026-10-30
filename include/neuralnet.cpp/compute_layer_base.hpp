@@ -163,7 +163,7 @@ struct TernaryProfileSplit
                  std::string("层 ") + layer_name + "：收到 param=t1_58，但该层不是"
                  "三值模式（weight_quant=None）—— 三值权重只对 BitLinear 有意义；"
                  "请以 weight_quant=t1_58 构造该层，或把 param 改回 f16/f32"
-                 "（docs/todo/21-quantized-weights.md §4.8.3）");
+                 "（docs/internal/21-quantized-weights.md §4.8.3）");
     }
     TernaryProfileSplit out{profile, profile};
     if (out.self.param == Precision::T1_58) out.self.param = Precision::F32;
@@ -191,7 +191,7 @@ struct TernaryProfileSplit
 }
 
 // ══════════════════════════════════════════════════════════════════════════
-// 参数形态协议（v7 文件角色；docs/todo/23 §2.2）
+// 参数形态协议（v7 文件角色；docs/internal/23 §2.2）
 //
 // 一句话：**kind 是参数级的**。序列化层按 `Model::parameters()` 的顺序逐条读写
 //   `[kind][precision][rows][cols][aux][payload]`，由**拥有该参数的那个层**
@@ -290,7 +290,7 @@ protected:
     // 层在 `init(engine)` 时绑定（公共 init 是 NVI 包装，绑定后转 init_impl），
     // forward/backward/zero_grad/forward_recompute 不再收 engine 形参。
     //
-    // **生命周期契约（09-engine-ownership.md）**：engine_ 是强引用。层存活
+    // **生命周期契约（07-engine-ownership.md）**：engine_ 是强引用。层存活
     // 期间引擎不会析构；init 时从 ComputeEngine& 的 weak_from_this() 提升。
     std::shared_ptr<ComputeEngine> engine_;
     BindingState binding_state_ = BindingState::unbound;
@@ -349,7 +349,7 @@ public:
             NN_UNWRAP(false,
                      std::string("set_precision_profile: 层已 init，精度 profile 之后不可变（层=")
                          + layer_name() + "）—— 请在 init(engine) 之前注入"
-                         "（docs/todo/21-quantized-weights.md §4.3.2(b)）");
+                         "（docs/internal/21-quantized-weights.md §4.3.2(b)）");
         }
         p_ = profile;
         for (Layer* c : param_children())
@@ -369,7 +369,7 @@ public:
 
     [[nodiscard]] virtual Result<Tensor> backward(const Tensor& grad_output) = 0;
 
-    // ── 具名多输出协议（docs/todo/31 RL-0）─────────────────────────────
+    // ── 具名多输出协议（docs/internal/31 RL-0）─────────────────────────────
     // 默认层是单端口 "output"；复合层（OutputBundleLayer）覆盖下列入口。
     // 不接受 schema 的重载只供单层直接使用；序列中的最后一层由 Model 把
     // ModelSpec 中登记的 schema 显式传入。
@@ -731,7 +731,7 @@ public:
                         + layer_name() + " 的 " + t.shape_str() + " 实际 "
                         + precision_name(t.precision()) + "，但 param="
                         + precision_name(p_.param)
-                        + "（硬编码 F32 会让 --f16 在该层静默失效；见 docs/todo/18 P1-6 R2）");
+                        + "（硬编码 F32 会让 --f16 在该层静默失效；见 docs/internal/18 P1-6 R2）");
         }
         return {};
     }
@@ -760,7 +760,7 @@ protected:
         NN_FAIL(std::string("精度能力校验失败: 层 ") + layer_name()
                 + " 不支持 " + slot + "=" + precision_name(got)
                 + "（该槽允许: " + allowed.to_string()
-                + "）—— 见 docs/todo/21-quantized-weights.md §4.2");
+                + "）—— 见 docs/internal/21-quantized-weights.md §4.2");
     }
 
 public:

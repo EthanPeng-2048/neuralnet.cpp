@@ -1,6 +1,6 @@
 // ── text_trainer_test — 训练工厂（TextTrainer）端到端回归 ───────────────────
 //
-// P2b 验收（docs/todo/29 §8）：数据集**直接接入**训练工厂；样本概念归一；
+// P2b 验收（docs/internal/29 §8）：数据集**直接接入**训练工厂；样本概念归一；
 // 训练状态由工厂装配、Session 持有。本测试锁住：
 //   [1] create(dataset)：内部建样本集 / 载词表 / 数据身份（num_samples、steps）
 //   [2] fit()：步数 = ceil(样本数/batch)、参数移动、epoch 汇总 + 测试评估输出

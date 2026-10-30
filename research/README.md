@@ -72,7 +72,7 @@
   [`poc_binary_ste.cpp`](ternary_ste/poc_binary_ste.cpp)（`dsl::compute` + `select` + `rparam` + `matmul`）。
 * **重跑**：报告 §1「复现」（一条 `clang++` 命令；两个程序毫秒级跑完 3000 步）。
 * **边界**：**只证明算法路径可行，不证明性能**——全部是 CPU、f32 存储、单层玩具问题。它是
-  [`../docs/todo/21-quantized-weights.md`](../docs/todo/21-quantized-weights.md) 的**前置证据**，
+  [`../docs/internal/21-quantized-weights.md`](../docs/internal/21-quantized-weights.md) 的**前置证据**，
   不等于三值整机能力（打包内核 / 精度枚举 / 能力声明是另一条线）。
 
 ### 2.4 [`ternary_scale/`](ternary_scale/REPORT.md) — 三值量化的「尺度规则 × 粒度」（D1 裁定依据）
@@ -111,8 +111,8 @@
    结论 + 数字 + 样本量，然后才是过程。
 2. 单列一节 **「本实测不能说明什么」**——边界比结论更常被人误用。
 3. 给出**从零复现**的入口命令（含构建口径、设备、数据集来源）；原始日志与权重不要进仓。
-4. 结论若影响代码/设计决策，在 [`../docs/todo/`](../docs/todo/) 的相应设计稿里引用本报告
-   （例：`ternary_scale` → `docs/todo/21-quantized-weights.md` 的 D1 裁定）。
+4. 结论若影响代码/设计决策，在 [`../docs/internal/`](../docs/internal/) 的相应设计稿里引用本报告
+   （例：`ternary_scale` → `docs/internal/21-quantized-weights.md` 的 D1 裁定）。
 5. 在本文件 §2 加一条索引（结论 / 证据 / 重跑 / 边界 四段式）。
 
 尚未执行的研究可以先用 `TODO` 状态入库，但必须明确：它不提供效果结论，不可被代码/设计稿

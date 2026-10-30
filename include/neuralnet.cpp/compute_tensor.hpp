@@ -12,7 +12,7 @@
 //   - 使用 shared_ptr 内部持有存储，拷贝廉价（零拷贝传递）
 //   - 设备域（v3）：不保存任何身份字段；`device_domain_()` 从**存储**派生
 //     （CPU → kHostDomain；GPU → GpuBuffer 的 backend 标识；空 → 0）。
-//     详见 docs/todo/28-lifecycle-v3.md
+//     详见 docs/internal/28-lifecycle-v3.md
 // ─────────────────────────────────────────────────────────────────────────
 
 #include <algorithm>
@@ -34,14 +34,14 @@ namespace nn
 {
 
 // ComputeEngine 前置声明：Tensor 不保存引擎指针/身份，设备域从存储派生
-//（docs/todo/28-lifecycle-v3.md §4）。
+//（docs/internal/28-lifecycle-v3.md §4）。
 class ComputeEngine;
 class CpuEngine;
 class GpuEngine;
 
 namespace detail
 {
-// 引擎域内通道（M1，docs/todo/17 §4.1 豁免之一）：
+// 引擎域内通道（M1，docs/internal/17 §4.1 豁免之一）：
 // Tensor 存储访问器与静态直构工厂私有化后，DSL 求值器（expr_dsl.hpp 的
 // eval_cpu / 扫描占位 / 求值叶子）经此创建与访问 Tensor 存储。
 // 库外（测试/tools/CLI）禁止使用——绕过引擎的编译期强制靠下方访问器私有化。
@@ -78,7 +78,7 @@ private:
     // 纯元数据（不涉及存储访问，铁律 #11 不适用）；非录制张量恒为 0。
     std::uint64_t virtual_tag_ = 0;
 
-    // ── M1 访问收口（docs/todo/17 §4.1）：存储与创建只对引擎域内开放 ──
+    // ── M1 访问收口（docs/internal/17 §4.1）：存储与创建只对引擎域内开放 ──
     // 公共面只剩形状/精度/设备查询、valid()、shape_str()。
     // 绕过引擎摸存储 = 编译错误（库内豁免：引擎 friend + detail::TensorAccess）。
     friend class ComputeEngine;
@@ -292,7 +292,7 @@ public:
     // 语义："本张量的存储内容**可能已经变了**"的单调计数（存储对象持有：
     // MatrixT::write_epoch_ / GpuBuffer::write_epoch_，故 Tensor 拷贝/别名
     // 共享同一计数）。用途：派生缓冲（如 BitLinear 的三值权重）判断"输入
-    // 是否变过"，从而**只在必要时**重算 —— 见 docs/todo/21 §4.11。
+    // 是否变过"，从而**只在必要时**重算 —— 见 docs/internal/21 §4.11。
     //
     // 契约：只有 **ComputeEngine 的写入口**会推进它（`touch_write_epoch_`
     // 私有，friend 限定）；库外无法直写存储（M1，铁律 #11），因此"版本没变
@@ -416,7 +416,7 @@ private:
     }
 
     // ── reshape（GPU 共享底层 buffer；CPU 复制数据）──────────────────────
-    // M1（docs/todo/17 §3 D10）：移入引擎——公共入口是
+    // M1（docs/internal/17 §3 D10）：移入引擎——公共入口是
     // ComputeEngine::reshape（bind_check 后调用），本实现只对引擎域内可见。
     // 后端无关入口：上层无需直接访问 gpu_tensor() / cpu_matrix() 即可调整形状。
     // GPU：共享底层 buffer，仅改形状元数据（零拷贝）；CPU：Matrix 无"零拷贝
@@ -531,7 +531,7 @@ inline void Tensor::touch_write_epoch_() noexcept
 #endif
 }
 
-// ── 引擎域内访问通道（M1，docs/todo/17 §4.1 豁免之一）──────────────
+// ── 引擎域内访问通道（M1，docs/internal/17 §4.1 豁免之一）──────────────
 // Tensor 的存储访问器/静态直构工厂已私有化；DSL 求值器（expr_dsl.hpp）在
 // friend 关系下经本结构创建与读写存储。库外（测试/tools/CLI）不得使用——
 // 绕过引擎摸张量的正道是 engine.from_matrix / to_matrix / create_tensor。

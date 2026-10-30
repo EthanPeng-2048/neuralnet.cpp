@@ -23,7 +23,7 @@
 namespace nn
 {
 // ══════════════════════════════════════════════════════════════════════════
-// ReLULinearAttention — RLA-2：极简硬截断线性注意力（docs/development/06-rapt-algorithm.md）
+// ReLULinearAttention — RLA-2：极简硬截断线性注意力（docs/development/08-rapt-algorithm.md）
 //
 // 算法（RLA-2，修正版；causal / bidirectional 均支持）：
 //   q' = ReLU(RoPE(q)), k' = ReLU(RoPE(k)), v = W_v·x（V 不做 ReLU）
@@ -32,7 +32,7 @@ namespace nn
 //   out_t = num_t / den_t
 //   其中 S_t = { i<=t }（causal）或 { 全部 }（bidirectional）。
 //
-// 与原版 RLA 的关键差异（06-rapt-algorithm.md §3 家族演进）：
+// 与原版 RLA 的关键差异（08-rapt-algorithm.md §3 家族演进）：
 //   * 分母：Sum 归一化（加权平均）替代 L2 归一化（余弦约束）
 //     → 输出量级恒定（不随 √L 增长），梯度流更平稳。
 //   * 无 A 状态（Σ k'k'^T）：分母仅依赖 z = Σk'，无需二次型。
@@ -423,7 +423,7 @@ public:
         }
 
         // RLA-2：RMSNorm on Q and K（per-head, dk blocks）
-        // 稳定数值分布，减少神经元死亡，保持 ReLU 硬截断纯粹性（06-rapt-algorithm.md §3）。
+        // 稳定数值分布，减少神经元死亡，保持 ReLU 硬截断纯粹性（08-rapt-algorithm.md §3）。
         // checkpoint 模式：不驻留任何 backward 缓存，交由 forward_recompute 重建。
         {
             const std::size_t BHrms = batch * num_heads_;

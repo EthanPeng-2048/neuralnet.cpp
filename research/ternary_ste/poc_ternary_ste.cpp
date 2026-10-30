@@ -1,5 +1,5 @@
 // ── poc_ternary_ste.cpp — 三值（1.58-bit）权重的 STE 训练最小探针 ─────────────
-// 配套报告：research/ternary_ste/REPORT.md；设计文档：docs/todo/21-quantized-weights.md
+// 配套报告：research/ternary_ste/REPORT.md；设计文档：docs/internal/21-quantized-weights.md
 //
 // 目的：用**现有公开 API**（无库改动）证明"Layer 级三值量化 + STE backward"在本引擎上可行。
 // 任务：学一个教师三元线性映射 y = W_t · x（W_t ∈ {-0.5, 0, +0.5}），训练后逐项比对教师模式。

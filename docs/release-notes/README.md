@@ -1,6 +1,8 @@
 # Release Notes 与版本号规范
 
 > 本目录按版本一册：`v<主>.<API 变化>.<漏洞修复>.md`。预发布候选用 `v1.10.0-rc0.1.md` 形式。
+> **读者**：查版本变更与版本号规则的调用者。本分册定位见 [`README.md`](README.md)；历史归档在 [`../history/history.md`](../history/history.md)。
+> **状态**：现行。
 
 ## 1. 版本号定义
 
@@ -19,18 +21,25 @@
 3. **已发布版本不重打**：tag 一旦发布即冻结；发布后发现的问题以勘误块追加在该版本 release note 顶部，并指向修复版本（例：见 `v1.10.0.md` 勘误）。
 4. **子仓库**（`extern/base` 等 5 个 submodule）遵循同一 `v1.<API 变化>.<漏洞修复>` 规范，各自独立编号；基线 `v1.0.0` 已锁定于与主仓库 v1.13.0 同期的快照。
 5. 每册 release note 的头部固定给出：发布范围（上一 tag → 本 tag）、主题、兼容性评级、验收基线。
-6. **发布治理**：版本号的定档与发布必须由**人**明确提出，**agent 不得擅自决定版本号或执行发布**（`git tag` / `gh release` 等）；`dev` 与功能分支不写版本号，定档与发布只发生在 `main`。正文见 [`../todo/33-version-branch-and-release-policy.md`](../todo/33-version-branch-and-release-policy.md)。
+6. **发布治理**：版本号的定档与发布必须由**人**明确提出，**agent 不得擅自决定版本号或执行发布**（`git tag` / `gh release` 等）；`dev` 与功能分支不写版本号，定档与发布只发生在 `main`。正文见 [`../contributors/release-policy.md`](../contributors/release-policy.md)。
 
 ## 2. 目录索引
 
 | 版本 | 主题 |
 |---|---|
-| [v1.13.0](v1.13.0.md) | （见该册） |
-| [v1.12.0](v1.12.0.md) | （见该册） |
+| [v1.13.0](v1.13.0.md) | 子仓拆分（core / threadpool / kvrecord / dataset / tokenizer → `extern/` submodule） |
+| [v1.12.0](v1.12.0.md) | RL 与可组合训练基础设施（具名多输出 / experience / objectives / `TrainingGroupSession`） |
 | [v1.11.0](v1.11.0.md) | batch/step 计数语义统一 + 梯度累积归一化修复 |
 | [v1.10.0](v1.10.0.md) | 对象生命周期 v3 + `TrainingSession` + `TextTrainer` |
+| [v1.10.0-rc0.1](v1.10.0-rc0.1.md) | 预发布候选：Session 层 P2b（`TrainState` 归属） |
+| [v1.10.0-rc0](v1.10.0-rc0.md) | 预发布候选：生命周期 v3 core |
 | [v1.9.0](v1.9.0.md) | （见该册） |
-| [v1.8.x](v1.8.2.md) | （见该册） |
-| [v1.7.x](v1.7.1.md) | （见该册） |
-| [v1.6.x](v1.6.1.md) | （见该册） |
-| [v1.5.x](v1.5.1.md) | （见该册） |
+| [v1.8.2](v1.8.2.md) | 漏洞修复 |
+| [v1.8.1](v1.8.1.md) | 漏洞修复（补写） |
+| [v1.8.0](v1.8.0.md) | （见该册；2026-10-18 补写） |
+| [v1.7.1](v1.7.1.md) | 漏洞修复（补写） |
+| [v1.7.0](v1.7.0.md) | （见该册） |
+| [v1.6.1](v1.6.1.md) | 漏洞修复（补写） |
+| [v1.6.0](v1.6.0.md) | （见该册） |
+| [v1.5.1](v1.5.1.md) | 漏洞修复（补写） |
+| [v1.5.0](v1.5.0.md) | （见该册） |

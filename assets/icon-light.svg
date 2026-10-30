@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <!-- 白底 -->
+  <rect width="64" height="64" fill="#ffffff"/>
+
+  <!-- 底板：3x3 神经网络中未被 N 路径经过的 4 个边中点（浅灰，小尺寸下隐去） -->
+  <g fill="#d4d4d8">
+    <circle cx="32" cy="10" r="2.5"/>
+    <circle cx="10" cy="32" r="2.5"/>
+    <circle cx="54" cy="32" r="2.5"/>
+    <circle cx="32" cy="54" r="2.5"/>
+  </g>
+
+  <!-- N 的三条主笔画：左竖 / 斜杠 / 右竖 -->
+  <g stroke="#111111" stroke-width="4.5" stroke-linecap="round" fill="none">
+    <line x1="10" y1="10" x2="10" y2="54"/>
+    <line x1="10" y1="10" x2="54" y2="54"/>
+    <line x1="54" y1="10" x2="54" y2="54"/>
+  </g>
+
+  <!-- N 路径上的 5 个节点（4 角 + 中心） -->
+  <g fill="#111111">
+    <circle cx="10" cy="10" r="5.5"/>
+    <circle cx="10" cy="54" r="5.5"/>
+    <circle cx="32" cy="32" r="5.5"/>
+    <circle cx="54" cy="10" r="5.5"/>
+    <circle cx="54" cy="54" r="5.5"/>
+  </g>
+</svg>

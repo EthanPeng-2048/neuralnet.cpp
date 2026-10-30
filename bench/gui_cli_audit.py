@@ -62,7 +62,7 @@ EXES = ["mnist_train", "mnist_infer", "text_train", "text_infer",
 #                   不再需要套一个 stdin 循环（进程内的历史 GUI 也拿不到）
 #   --t1_58       : 三值预设的**别名**（等价 --precision-param t1_58）；GUI 的
 #                   "精度预设"下拉填的是 precision_param 字段，三条命令在
-#                   docs/todo/21 §4.10 里已声明等价，故此处不算缺口
+#                   docs/internal/21 §4.10 里已声明等价，故此处不算缺口
 INTENTIONAL_GAPS = {"--interactive", "--t1_58"}
 
 

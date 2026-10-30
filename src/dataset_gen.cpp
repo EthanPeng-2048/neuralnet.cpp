@@ -1,6 +1,6 @@
 // ── 文本数据集生成器（dataset_gen）────────────────────────────────────────
 //
-// 文本 + 词表 → .nndataset（docs/todo/19-unified-dataset.md §6.1）：
+// 文本 + 词表 → .nndataset（docs/internal/19-unified-dataset.md §6.1）：
 //   读文本 → trim/过滤 → 并行 tokenize（保序）→ 掩码（--loss-scope assistant）
 //   → 打包写 .nndataset（词表/来源/生成参数作配套层层嵌套 kvrec）。
 //

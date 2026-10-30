@@ -2,6 +2,8 @@
 
 > 面向**把 neuralnet.cpp 放进自己工程**的使用者。目标形态：CMake 两行 + 源码一个 include。
 > 本仓自身的构建/测试见 `AGENTS.md` §2；本文只讲消费侧。
+> **读者**：要用本库跑训练/推理的调用者。总索引见 [`../README.md`](../README.md)；历史归档在 [`../history/history.md`](../history/history.md)。
+> **状态**：现行。
 
 ## 1. 快速开始
 
@@ -117,7 +119,7 @@ nn_enable_gpu_fusion(my_app MAIN ${CMAKE_CURRENT_SOURCE_DIR}/my_app_main.cpp)
   `cxx_std_26`；MSVC cl 不识别 `cxx_std_26`，降级传 `cxx_std_23`——其映射即
   `/std:c++latest`，C++26 预览全开）。MSVC 下消费方源码也须为 UTF-8（`/utf-8` 已传）。
 - **install / `find_package` 尚不支持**：当前只支持源码嵌入（add_subdirectory /
-  FetchContent）。`install()`/export 见 `docs/todo/18-roadmap.md` P0-4 的剩余部分
+  FetchContent）。`install()`/export 见 `docs/internal/18-roadmap.md` P0-4 的剩余部分
   （`CMakePresets.json` 已于 2026-10-11 落地，但它是**本仓开发**用的构建口径，
   消费方不需要它——你只要 `add_subdirectory` + 链 `neuralnet::nn`）。
 - **只支持 CPU / Vulkan 双后端**（无 CUDA）。

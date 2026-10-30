@@ -1,5 +1,7 @@
 # 算法参考：Layer / Loss / Optimizer
 
+> **读者**：想了解本库架构/性能/算法的读者（调用者视角的总览）。总索引见 [`../README.md`](../README.md)；历史归档在 [`../history/history.md`](../history/history.md)。
+> **状态**：现行。
 本文档详细解析 neuralnet.cpp 中每个计算组件的数学原理、实现细节和引擎原语分解。
 
 ---

@@ -1,6 +1,6 @@
 // ── dataset_samples.hpp — 训练样本视图：Dataset → 样本（窗口）→ batch ───────
 //
-// P2b 的"样本概念"（docs/todo/29 §8、docs/todo/19 §0 裁决 #2/#3）：
+// P2b 的"样本概念"（docs/internal/29 §8、docs/internal/19 §0 裁决 #2/#3）：
 //   · **存储单位 = doc**（`.nndataset` 里的一行文本）；
 //   · **训练单位 = sample**（一个 seq_len 的滑动窗口，可能跨 doc 边界）；
 //   · **step = ceil(sample_count / batch_size)** —— 派生量，不是数据集概念。

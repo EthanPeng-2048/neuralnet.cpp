@@ -10,7 +10,7 @@
 //    2. Tensor 占位标记经公共元数据访问器（virtual_tag/
 //       set_virtual_tag），存储访问收口在引擎域内。
 //
-//  对应文档 `docs/todo/03-ir-optimization.md` IR-C：把扁平 ExprSpec 演进为图 IR
+//  对应文档 `docs/internal/03-ir-optimization.md` IR-C：把扁平 ExprSpec 演进为图 IR
 //  （DAG），为 begin_expr/end_expr 提供多表达式融合分析。
 //
 //  图结构：

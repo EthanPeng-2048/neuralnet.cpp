@@ -33,7 +33,7 @@
 
 namespace nn
 {
-    // ── 宿主直配账本（M5，docs/todo/17 §4.5 D5）──────────────────────
+    // ── 宿主直配账本（M5，docs/internal/17 §4.5 D5）──────────────────────
     // CPU 侧没有内存池：`MatrixT` 的存储走 `std::make_unique_for_overwrite`
     // 直配。为了让 `ComputeEngine::pool_stats()` 在**所有**引擎上语义完整
     // （17 §2 目标 4"内存契约统一"），这里把每一次宿主分配/释放记账：
@@ -88,7 +88,7 @@ namespace nn
     //    - L2+ 计算层使用 Result<T> 进行运行时错误处理（用户输入校验）
     //    - 原因：Matrix 是底层原语，一次 size_t 比较不影响 Release 性能；
     //            上层需要向用户报告错误，故使用 Result<T>
-    //    - 参见 docs/todo/10-development-standards.md "分层职责单一" 章节
+    //    - 参见 docs/contributors/cpp-standards.md "分层职责单一" 章节
     // ═══════════════════════════════════════════════════════════════════════
     // ── MatrixT<P> — 类型化矩阵存储（docs/development/05-mixed-precision.md D2：存储精度是 P）──
     // element = elem<P>（f16 / f32）；F32 实例即按 float 连续存储的普通矩阵。

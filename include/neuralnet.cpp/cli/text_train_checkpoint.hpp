@@ -1,6 +1,6 @@
 // ── text_train_checkpoint.hpp — text_train 的两类模型产出（.nnckpt / .nnmodel）─
 //
-// P1-1 拆出的 checkpoint 模块（docs/todo/18-roadmap.md §4.2）。职责：
+// P1-1 拆出的 checkpoint 模块（docs/internal/18-roadmap.md §4.2）。职责：
 //   * **断点路径派生**：`--save` 的 .nnmodel 路径 → 同名 .nnckpt；
 //   * **断点保存的记账语义**：一次写失败**不终止训练**（磁盘抖动不该毁掉整轮），
 //     但收尾必须让进程非零退出——否则"断点没落盘"会被脚本/CI/训练包当成"这轮
@@ -28,7 +28,7 @@
 
 namespace nn::cli
 {
-// ── 训练断点路径派生（docs/todo/23 §2.1 文件角色）────────────────────────
+// ── 训练断点路径派生（docs/internal/23 §2.1 文件角色）────────────────────────
 // `--save` 的路径换扩展名为 .nnckpt（`gpt_model.nnmodel` → `gpt_model.nnckpt`）；
 // 非 .nnmodel 路径一律追加 .nnckpt。
 [[nodiscard]] inline std::string text_train_ckpt_path(const std::string& save_path)
@@ -48,7 +48,7 @@ class TextTrainCheckpointLog
 public:
     // 保存一次训练断点（Checkpoint 角色：含训练参数，三值层写 f32 latent）。
     // P1-2 起同时写**训练状态段**（`TrainState` + 优化器状态张量）：断点是
-    // "训练的可续点"，续训时以状态段为唯一权威（docs/todo/23 §2.1.1）。
+    // "训练的可续点"，续训时以状态段为唯一权威（docs/internal/23 §2.1.1）。
     // 失败不终止——打印一行（带"第 N 次"）并计数；成功静默（与旧行为逐字一致）。
     void save(const std::string& path, nn::Model& model, const nn::ModelSpec& spec,
               const std::string& tokenizer_bytes, const nn::TrainState& state,

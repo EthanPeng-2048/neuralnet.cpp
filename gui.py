@@ -108,7 +108,7 @@ GPT_NORM_OPTIONS = ["layernorm", "rmsnorm"]  # GPT 仅支持 LayerNorm/RMSNorm
 # 混合精度选项（compute/stable/optimizer 三槽：只接受数值精度）
 PRECISION_OPTIONS = ["f32", "f16"]
 # param 槽额外接受三值权重（1.58-bit，BitLinear）：
-#   t1_58 = 权重三值化 + STE（docs/todo/21-quantized-weights.md）。
+#   t1_58 = 权重三值化 + STE（docs/internal/21-quantized-weights.md）。
 #   已接线：文本侧 GPT（--model gpt：4 投影 + fc1/fc2 + 未 tie 的 LM head）、
 #   图像侧 --arch mlp。未接线（选它=明确报错，非静默失效）：--model rapt 前置拒绝，
 #   --arch transformer/cnn 在层能力校验处报错。
@@ -300,7 +300,7 @@ def _v(key, note=""):                     return Field(key, note, "virtual")
 
 # ── P1-2：断点续训（`.nnckpt`）的禁列（与 CLI 同一口径）──────────────────
 # 指向带训练状态段的断点时，形状 / 配方 / 计数器一律由断点决定；显式给出即报错
-# （docs/todo/18 §4.2 P1-2、docs/todo/23 §2.1.1）。**唯一真源** =
+# （docs/internal/18 §4.2 P1-2、docs/internal/23 §2.1.1）。**唯一真源** =
 # `include/neuralnet.cpp/cli/text_train_config.hpp` 的 `kForbiddenResumeFlags`
 # （本集合存的是 kwargs 键；→ CLI 旗标的映射由各字段的 arg/name 决定，
 #  门禁 `bench/gui_cli_audit.py` [6] 节按该映射核对两边一致）。

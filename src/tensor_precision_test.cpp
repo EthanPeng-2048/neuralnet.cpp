@@ -1,5 +1,5 @@
 // ── tensor_precision_test.cpp — D3：Tensor 精度属性 + 引擎 I/O 往返 ──────────
-// M1 访问收口（docs/todo/17 §4.1）后，Tensor 存储访问器与静态直构
+// M1 访问收口（docs/internal/17 §4.1）后，Tensor 存储访问器与静态直构
 // 工厂已私有：本测试全部经 ComputeEngine 创建/读写（upload/download/create_tensor/
 // reshape），验收口径同步修订（原 docs/development/05 §13 中依赖 cpu_matrix/
 // cpu_shared 直读的条目改为"经引擎往返"等价验证）：

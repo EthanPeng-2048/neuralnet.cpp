@@ -675,7 +675,7 @@ if(NN_BUILD_APPS OR NN_ENABLE_TESTS)
     nn_add_executable(layer_lifetime_test src/layer_lifetime_test.cpp)
     list(APPEND NN_TEST_TARGETS layer_lifetime_test)
 
-    # ── P0 生命周期契约负例（docs/todo/28 §5 P0）──────────────────────────
+    # ── P0 生命周期契约负例（docs/internal/28 §5 P0）──────────────────────────
     # 覆盖：ExprSegment 强引用（录制段内丢外部引擎句柄仍可 end）、
     # ActivationOffloader 状态机（未 import 的重复 export = fail-fast；
     # discard 作废通道）与精度门（slab 恒 f32 ⇒ 非 F32 激活拒绝）、
@@ -683,11 +683,11 @@ if(NN_BUILD_APPS OR NN_ENABLE_TESTS)
     nn_add_executable(lifetime_contract_test src/lifetime_contract_test.cpp)
     list(APPEND NN_TEST_TARGETS lifetime_contract_test)
 
-    # -- P2a: TrainingSession (Model + Optimizer 同生共死, docs/todo/29) --
+    # -- P2a: TrainingSession (Model + Optimizer 同生共死, docs/internal/29) --
     nn_add_executable(training_session_test src/training_session_test.cpp)
     list(APPEND NN_TEST_TARGETS training_session_test)
 
-    # ── RL 公共基础：有序 tensor schema / 具名张量 / 梯度包（docs/todo/31 §3）
+    # ── RL 公共基础：有序 tensor schema / 具名张量 / 梯度包（docs/internal/31 §3）
     nn_add_executable(tensor_schema_test src/tensor_schema_test.cpp)
     list(APPEND NN_TEST_TARGETS tensor_schema_test)
 
@@ -729,7 +729,7 @@ if(NN_BUILD_APPS OR NN_ENABLE_TESTS)
                       src/rl_training_integration_test.cpp)
     list(APPEND NN_TEST_TARGETS rl_training_integration_test)
 
-    # ── F1：危险精度组合启动期告警（仅警告，不拒绝；docs/todo/24 §2.3）────
+    # ── F1：危险精度组合启动期告警（仅警告，不拒绝；docs/internal/24 §2.3）────
     # [1][2] 头文件函数组合矩阵（含 all=f16）单测；[3] 子进程跑 text_train/
     # mnist_train，捕获 stderr 断言告警出现 + 退出码不变；二进制缺失 → 77 = SKIP
     nn_add_executable(cli_precision_warning_test src/cli_precision_warning_test.cpp)
@@ -1101,7 +1101,7 @@ if(Vulkan_FOUND)
     #
     # ⚠ 收集器**必须保留库内收集逻辑**：实测 84 个结构里只有 13 个来自
     #   编译期锚点，71 个来自 dry-run/模型 pass（见 docs/history/history.md 与
-    #   docs/todo/02）。纯锚点收集器会漏掉库自身的结构。
+    #   docs/internal/02）。纯锚点收集器会漏掉库自身的结构。
     #
     # ── 树外可用性（CMake 函数作用域）────────────────────────────────────
     # CMake 函数体在**调用方作用域**求值：消费方在自己的 CMakeLists 里调用

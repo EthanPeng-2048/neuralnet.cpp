@@ -1,6 +1,6 @@
 # 文档盘点探针：统计 ComputeEngine 接口规模与 Layer 直调算子集合。
 # 用法：pwsh -File bench/doc_inventory.ps1
-# 与 docs/todo/12-compute-engine-inventory.md §2 配套（改接口后重跑核对数字）。
+# 与 docs/internal/12-compute-engine-inventory.md §2 配套（改接口后重跑核对数字）。
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 $eng = Join-Path $root 'include\neuralnet.cpp\compute_engine.hpp'
@@ -29,7 +29,7 @@ $unused = $uv | Where-Object { $calls -notcontains $_ }
 Write-Output "not layer-called: $($unused.Count)"
 Write-Output ($unused -join ', ')
 
-# 4) L2+ 分层审计：Matrix 降级（docs/todo/17 §4.6 / §5 M4；AGENTS.md 铁律 #12）
+# 4) L2+ 分层审计：Matrix 降级（docs/internal/17 §4.6 / §5 M4；AGENTS.md 铁律 #12）
 #    规则：Layer / Loss / Optimizer / Model（L2 计算路径）头文件中——
 #      [硬] 不得出现 Matrix / MatrixT 类型（不持有、不构造、不交换）
 #      [硬] 不得出现 Matrix 型 I/O 动词 from_matrix / to_matrix / copy_from

@@ -1,347 +1,162 @@
+<div align="center">
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/icon-dark.svg">
+  <img src="assets/icon-light.svg" alt="neuralnet.cpp logo" width="96">
+</picture>
+
 # neuralnet.cpp
 
-一个从零实现的 C++26 神经网络库，支持 CPU/GPU 双后端、多层 Transformer、GPT 语言模型训练与推理。
+**从零实现的 C++26 神经网络库**——不依赖 PyTorch/CUDA，CPU 与 Vulkan GPU 双后端，
+覆盖 MLP 到 GPT 的训练与推理全流程，header-only，可两行嵌进你自己的工程。
 
-## 许可证
+[![CMake (Clang, C++26)](https://github.com/neuralnet-cpp-dev/neuralnet.cpp/actions/workflows/cmake-single-platform.yml/badge.svg)](https://github.com/neuralnet-cpp-dev/neuralnet.cpp/actions/workflows/cmake-single-platform.yml)
+[![C++26](https://img.shields.io/badge/C%2B%2B-26-00599C?logo=c%2B%2B&logoColor=white)](https://en.cppreference.com/w/cpp/26)
+[![Vulkan](https://img.shields.io/badge/GPU-Vulkan%20Compute-AC162C?logo=vulkan&logoColor=white)](https://www.khronos.org/vulkan/)
+[![License: LGPL v3](https://img.shields.io/badge/license-LGPL--3.0-blue.svg)](LICENSE)
 
-本项目采用 [GNU Lesser General Public License v3.0](LICENSE)（LGPL-3.0，全文包含 GPL-3.0 条款），版权归 © 2026 EthanPeng-2048 所有。你可以自由使用、修改、分发本项目，闭源应用也可以链接本库；但对**本库本身**的修改必须以本许可证继续开源，分发时需保留版权声明并附带许可证文本。
+[快速开始](#-快速-start) · [为什么选它](#为什么选它) · [它不做什么](#它不做什么) · [文档](#文档) · [参与](#参与)
 
-> **数据集说明**：`scripts/` 下的下载脚本仅负责从第三方来源拉取数据（如 TinyStories、OpenWebText、中文 wiki 等），这些数据集各自拥有独立的许可证，不随本项目代码的 LGPL 许可分发。使用时请自行遵守相应数据集的许可条款。
+</div>
 
-## 🤖 AI 工具致谢
+---
 
-本项目的部分代码由 AI 辅助生成。当前使用（且目前限于）以下 AI 工具：
-
-- **DeepSeek V4 系列**
-- **DeepSeek V4.1 系列**
-- **Mi Mimo v2.5 系列**
-- **Mi Mimo v2.6 系列**
-- **Qwen3.8 系列**
-- **VS Code Copilot**
-- **ChatGPT Codex**
-
-> AI 仅作为辅助工具，所有代码的所有权与最终版权归本项目作者（EthanPeng-2048）所有，不影响上述 LGPL 许可证的效力。
-
-## 📚 文档
-
-| 文档 | 说明 |
-|------|------|
-| [架构设计](docs/introduction/01-architecture.md) | 项目分层架构、引擎化设计、数据流、模块详解 |
-| [性能优化](docs/introduction/02-performance.md) | 自适应并行、线程池、缓存分块、GPU 加速、算子融合等 |
-| [算法解析](docs/introduction/03-algorithm-reference.md) | 每个 Layer/Loss/Optimizer 的数学原理与原语分解 |
-| [创新设计](docs/introduction/04-innovative-designs.md) | 引擎化、AOT 融合、多精度等创新全景 |
-| [C++ API 手册](docs/development/cpp-api-manual.md) | **库使用者首选**：引擎/张量/精度/层/模型/损失/优化器/训练/模型文件/数据集/分词器/生成，每节带代码片段 |
-| [构建集成](docs/development/cmake-integration.md) | 把库接进自己的 CMake 工程：接入两行、全部构建开关、GPU 语义、自研算子融合注册 |
-| [写自定义层](docs/development/write-a-custom-layer.md) | 自定义层的完整示例 + 接入契约 + 数值梯度自检 + GPU 检查清单 |
-| [计算引擎开发](docs/development/01-compute-engine-development.md) | ComputeEngine 接口详解、实现模式、添加新原语 |
-| [多精度计算](docs/development/05-mixed-precision.md) | f16/混合精度语义契约：Precision 类型系统、PrecisionProfile、已知数值限制 |
-| [线性注意力](docs/development/06-rapt-algorithm.md) | RLA → RAPT → RLA-2 概览 + GPU 扫描原语落地；详细定义见 [research/rla](research/rla/README.md) |
-| [写自定义层](docs/development/20-custom-layer-ergonomics.md) | 库外使用者视角的接入契约与实测摩擦点 |
-| [快速上手：构建模型](docs/usage/01-quickstart-model.md) | ComputeEngine/Layer/Model 三件套使用教程 |
-| [快速上手：训练与推理](docs/usage/02-quickstart-train-infer.md) | MNIST/GPT 训练推理命令行 + C++ API 示例 + GUI 操作指南 |
-| [计算引擎使用](docs/usage/03-compute-engine-usage.md) | 张量操作、矩阵运算、表达式融合 |
-| [训练包](docs/usage/04-train-package.md) | 用 `.nnpkg` 打包超参+训练集，跨设备一键复现训练 |
-| [作为库嵌入](docs/usage/05-consume-as-library.md) | 把本库嵌进自己的工程（`neuralnet::nn` 门面 / FetchContent） |
-| [强化学习与可组合训练](docs/usage/06-reinforcement-learning.md) | 具名多输出、GAE、REINFORCE/PPO/GRPO、多模型 Session 与 rollout pipeline |
-| [线程安全契约](docs/usage/07-thread-safety.md) | 每个对象的并发口径矩阵 + 服务化下游设计模板 |
-| [研究档案索引](research/README.md) | **可引用的实验结论** + 算法定义基线与研究 TODO（MNIST / f16 / 三值 / RLA）：证据、重跑命令与边界 |
-| [参与本项目](CONTRIBUTING.md) | 给非作者的入口：构建、测试、代码规范、提 PR、CI 口径 |
-
-> **文档分册定位**：`introduction` / `usage` / `development` 写给**调用者**；
-> 项目内部的设计 / 路线图 / 盘点 / 规范 / 踩坑 / 故障 / 整改在 [`docs/todo/`](docs/todo/README.md)；
-> 历史归档在 [`docs/history/history.md`](docs/history/history.md)。**总索引见 [`docs/README.md`](docs/README.md)。**
-> `research/` 是可引用的研究档案归口：实测结论、算法定义基线与明确标注的 TODO（索引见 [`research/README.md`](research/README.md)），
-> 参与方式/门禁见 [`CONTRIBUTING.md`](CONTRIBUTING.md)。
-
-## 项目结构
-
-```
-neuralnet.cpp/
-├── CMakeLists.txt
-├── README.md
-├── docs/
-│   ├── README.md             ← 文档总索引与分册定位
-│   ├── history/history.md            ← 全仓唯一历史归档
-│   ├── introduction/          ← 介绍类（调用者）
-│   │   ├── 01-architecture.md            ← 架构设计文档
-│   │   ├── 02-performance.md             ← 性能优化文档
-│   │   ├── 03-algorithm-reference.md     ← 算法解析参考
-│   │   └── 04-innovative-designs.md      ← 创新设计全景
-│   ├── development/          ← 开发类（**调用者**：扩展/接入库）
-│   │   ├── cpp-api-manual.md             ← 全功能 C++ API 手册
-│   │   ├── cmake-integration.md          ← 接入与构建（CMake / 开关 / GPU / 融合注册）
-│   │   ├── write-a-custom-layer.md       ← 写自定义层指南
-│   │   ├── 01-compute-engine-development.md ← 引擎开发指南（加新原语）
-│   │   ├── 05-mixed-precision.md         ← 多精度语义契约
-│   │   ├── 06-rapt-algorithm.md          ← RLA / RAPT / RLA-2 算法
-│   │   └── 20-custom-layer-ergonomics.md ← 写自定义层实测报告
-│   ├── usage/                 ← 使用类（调用者）
-│       ├── 01-quickstart-model.md        ← 模型构建教程
-│       ├── 02-quickstart-train-infer.md  ← 训练推理教程
-│       ├── 03-compute-engine-usage.md    ← 引擎使用指南
-│       ├── 04-train-package.md           ← .nnpkg 训练包
-│       ├── 05-consume-as-library.md      ← 作为库嵌入自己的工程
-│       └── 06-reinforcement-learning.md  ← RL 与可组合训练基础设施
-│   └── todo/                  ← 内部工作区（**项目开发者**：设计/路线图/盘点/规范/踩坑/故障/整改）
-├── gui.py                       ← 图形化操作界面 (CustomTkinter)
-├── include/neuralnet.cpp/
-│   ├── nn.hpp                   ← 统一入口头文件
-│   ├── core_config.hpp          ← 自适应并行、BLOCK_SIZE
-│   ├── compute_tensor.hpp       ← 统一跨设备张量
-│   ├── compute_engine.hpp       ← 引擎抽象接口
-│   ├── compute_cpu_engine.hpp   ← CPU 引擎
-│   ├── compute_gpu_engine.hpp   ← GPU 引擎 (Vulkan)
-│   ├── compute_layer.hpp        ← Layer 聚合头
-│   ├── compute_layer_{base,mlp,conv,softmax,attention,feedforward,transformer,gpt,rapt}.hpp ← 各层域
-│   ├── compute_loss.hpp         ← 损失函数
-│   ├── compute_optimizer.hpp    ← 优化器 (SGD/Adam/AdamW/Muon)
-│   ├── model_container.hpp      ← Model 容器
-│   ├── model_spec.hpp           ← 架构描述
-│   ├── model_serialization.hpp  ← 二进制序列化
-│   ├── model_keyvalue_record.hpp ← 自描述键值记录
-│   ├── domain_mnist.hpp         ← MNIST 模型工厂
-│   ├── domain_gpt.hpp           ← GPT 模型工厂
-│   ├── domain_tokenizer.hpp     ← 分词器
-│   ├── algebra_matrix.hpp       ← 矩阵类
-│   ├── algebra_ops.hpp          ← 逐元素算子定义（DSL 复用）
-│   ├── algebra_span.hpp         ← Span 抽象
-│   ├── core_threadpool.hpp      ← 全局线程池
-│   ├── core_errors.hpp          ← Result<T>
-│   ├── core_assert.hpp          ← 断言宏
-│   ├── core_file.hpp            ← 文件工具
-│   ├── core_observer_ptr.hpp    ← 观察者指针
-│   └── backend/                 ← GPU 后端 (Vulkan)
-├── src/
-│   ├── mnist_train.cpp          ← MNIST 训练
-│   ├── mnist_infer.cpp          ← MNIST 推理
-│   ├── text_train.cpp           ← GPT 文本训练
-│   ├── text_infer.cpp           ← GPT 文本推理
-│   ├── tokenizer_train.cpp      ← 分词器训练
-│   ├── tokenizer_infer.cpp      ← 分词器推理
-│   ├── dataset_gen.cpp          ← 数据集生成（文本+词表 → .nndataset）
-│   ├── dataset_convert.cpp      ← 旧格式转换（JSON 词表 → .nnvocab 等）
-│   └── gpu_test.cpp             ← GPU 后端测试
-├── datasets/                    ← 训练数据
-├── pretrained/                  ← 预训练模型
-├── research/                    ← 可引用的研究档案（定义 / 结论 + 证据 + 重跑命令 + 边界 / TODO）
-├── scripts/                     ← 数据处理/训练辅助脚本
-├── shaders/                     ← GPU Compute Shader
-├── compare_with_torch/          ← PyTorch 对比实现
-├── CMakePresets.json            ← 预设构建（cmake --preset dev / portable / cpu / probes ...）
-├── CONTRIBUTING.md              ← 给非作者的参与入口
-└── CODE_OF_CONDUCT.md           ← 行为准则
-```
-
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/EthanPeng-2048/neuralnet.cpp)
-
-## 依赖
-
-- **编译器**: 任意支持 C++26 的编译器（Clang / GCC / MSVC 均可）
-- **C++ 标准**: C++26
-- **构建工具**: CMake ≥ 3.30 + Ninja
-- **GUI** (可选): Python 3.10+，customtkinter（`pip install customtkinter`），Pillow（`pip install Pillow`）
-
-## 构建与运行
-
-### 克隆（含子仓 submodule）
-
-本仓自 v1.13.0 起把 core / threadpool / kvrecord / dataset / tokenizer 拆为
-独立子仓（`extern/` 下的嵌套 submodule）。**克隆必须递归初始化**，否则
-`extern/*/include` 为空、编译时报 `neuralnet.cpp/core_errors.hpp` 等头找不到：
+## 🚀 快速开始
 
 ```bash
 git clone --recurse-submodules git@github.com:neuralnet-cpp-dev/neuralnet.cpp.git
-# 已 clone 但漏了子仓时补救：
+cd neuralnet.cpp
+cmake --preset dev && cmake --build --preset dev        # 需要 CMake ≥3.30 + Ninja + C++26 编译器
+```
+
+训练你的第一个模型（MNIST，默认数据目录 `datasets/mnist_data/`）：
+
+```bash
+./build/dev/mnist_train --gpu --epochs 10               # GPU 训练（无 GPU 去掉 --gpu）
+./build/dev/mnist_infer my_digit.csv --model mnist_model.nnmodel
+```
+
+把它当库用——三行核心代码构建一个 MLP：
+
+```cpp
+#include <neuralnet.cpp/nn.hpp>
+
+auto engine = nn::CpuEngine::create();                  // GPU: nn::GpuBackend::shared()
+nn::Model model(*engine);
+model.add<nn::Linear>(784, 128);                        // add<T>(args...) 返回 Result<void>，
+model.add<nn::ReLU>();                                 //   构造后自动 init(engine)
+model.add<nn::Linear>(128, 10);
+auto pred = model.forward(input);                       // engine 在 Model 内自动传递
+```
+
+<details>
+<summary>准备训练数据（MNIST / 文本语料）</summary>
+
+- MNIST：从 [Releases](https://github.com/EthanPeng-2048/neuralnet.cpp/releases) 下载
+  `mnist_data` 压缩包，解压到 `datasets/mnist_data/`（`train.csv` / `test.csv`）。
+- 文本语料：`scripts/` 下的 `download_*.py` 脚本；GPT 训练数据统一为 `.nndataset`：
+
+  ```bash
+  ./build/dev/tokenizer_train corpus.txt --vocab-size 10000 --output my_bpe.nnvocab
+  ./build/dev/dataset_gen corpus.txt --vocab my_bpe.nnvocab -o corpus.nndataset
+  ./build/dev/text_train corpus.nndataset --gpu
+  ```
+
+</details>
+
+<details>
+<summary>克隆后 extern/ 为空？</summary>
+
+v1.13.0 起 core / threadpool / kvrecord / dataset / tokenizer 是 `extern/` 下的嵌套 submodule。
+已 clone 但漏了子仓时补救：
+
+```bash
 git submodule update --init --recursive
 ```
 
-### 构建 C++ 项目
+</details>
 
-```powershell
-cmake -B build -G Ninja
-```
+## 为什么选它
 
-### 准备数据
-
-- MNIST 数据：从 [Releases](https://github.com/EthanPeng-2048/neuralnet.cpp/releases)
-  下载 `mnist_data` 压缩包，解压到 `datasets/mnist_data/`（`train.csv` / `test.csv`）
-- 文本语料：使用 `scripts/` 下的 `download_*.py` 脚本下载
-- GPT 训练数据统一为 **`.nndataset`**（token/词表/loss 掩码/test 子集都在生成期定好，
-  见 `docs/todo/19-unified-dataset.md`）：
-
-  ```powershell
-  ./build/tokenizer_train corpus.txt --vocab-size 10000 --output my_bpe.nnvocab
-  ./build/dataset_gen corpus.txt --vocab my_bpe.nnvocab -o corpus.nndataset
-  ```
-
-### 运行训练
-
-```bash
-# 从头开始训练 MLP（默认: 10轮, 学习率0.001, 批大小64, Adam优化器）
-./build/mnist_train
-
-# 训练 Transformer 模型
-./build/mnist_train --arch transformer --epochs 20
-
-# 从已有模型恢复训练
-./build/mnist_train --resume pretrained/mnist_model.bin
-
-# 自定义参数
-./build/mnist_train --epochs 20 --lr 0.001 --batch-size 32 --optimizer adam --save my_model.bin
-
-# 支持的优化器: sgd / sgd_momentum / adam
-./build/mnist_train --optimizer sgd_momentum
-```
-
-### 运行推理
-
-推理入口接受单张 CSV（`784` 像素一行）；随机试一张自己画/导出的图即可，
-GUI 自带的手写板也能直接识别。
-
-```bash
-# 指定模型文件（架构由模型内自描述的 spec 决定，无需再传类型）
-./build/mnist_infer my_digit.csv --model mnist_model.bin --topk 3
-
-# 显示 Top-5 预测结果
-./build/mnist_infer my_digit.csv --topk 5
-
-# 调试模式：显示像素矩阵
-./build/mnist_infer my_digit.csv --show-pixels
-```
-
-### 🖥️ 图形化界面 (GUI)
-
-基于 CustomTkinter 的全功能图形化界面，覆盖 MNIST 训练/推理、GPT 训练/推理、分词器训练/推理，无需记忆命令行参数。
-
-```bash
-# 启动 GUI
-python gui.py
-```
-
-> **前提**: 需要先构建 C++ 项目（`cmake -B build -G Ninja`），GUI 会调用 `build/` 目录下的可执行文件。
-
-#### GUI 功能一览
-
-| Tab | 功能 |
-|-----|------|
-| 🏋️ **MNIST 训练** | MNIST 模型训练：MLP / Transformer 架构、超参数调节、恢复训练、学习率调度（fixed / cosine）、GPU 加速、评估样本数；实时 loss / acc 曲线 |
-| 🔍 **MNIST 推理** | MNIST 图片推理 + 图片查看：推理某张图片自动显示该图、Top-K 置信度条形图、目录翻页导航；内置 ✍️ **手写板**，鼠标书写数字即刻识别 |
-| 📝 **GPT 训练** | GPT 语言模型训练：位置编码（learned / sinusoidal / alibi）、激活（GeLU / SwiGLU）、归一化（LayerNorm / RMSNorm）、梯度累积、滑动窗口 stride、学习率调度（fixed / cosine / step_cosine）、TDR 防护、梯度裁剪；实时 loss 曲线 |
-| 💬 **GPT 推理** | GPT 文本生成：温度 / top-k / top-p / 重复惩罚 / 种子、**多轮对话（上下文不丢）**、单次生成、Token ID 调试输出 |
-| 🔤 **分词器训练** | 训练 BPE / CharBPE 分词器，配置词表大小和最小合并频率 |
-| 🔡 **分词器推理** | 分词器编码/解码测试，支持文本编码、ID 解码、文件编码 |
-
-#### GUI 操作流程
-
-**MNIST 训练：**
-1. 选择数据集目录（默认 `datasets/mnist_data`）和模型保存路径
-2. 配置超参数：轮数、学习率、批大小、优化器（`sgd`/`adam`/`adamw`/`muon`）
-3. 选择模型类型：`mlp`（自定义层维度）或 `transformer`（模型维度/头数/层数/FFN/Patch）
-4. 可选：恢复训练、GPU 加速、学习率调度、振荡抑制
-5. 点击 **"▶ 开始训练"**，日志面板实时输出，下方曲线图绘制 loss / accuracy
-6. 训练中可随时点击 **"⏹ 停止"** 终止
-
-**MNIST 推理：**
-1. 选择训练好的模型文件（`.bin`），设置 Top-K 与 GPU
-2. 选择单张 CSV 图片或包含多张图片的目录
-3. 点击 **"🔍 推理当前图片"** → 自动显示该图片 + Top-K 置信度条形图；目录模式可用 **上一张 / 下一张** 翻页浏览（已推理过的图片会缓存预测）
-4. 点击 **"▶ 推理整个目录"** 可批量推理并逐个自动显示
-5. **手写板模式**：在白色画布上书写数字 → 点击 **"🔍 识别手写数字"**，即刻得到预测
-
-**GPT 训练：**
-1. 选择 `.nndataset` 数据集文件（由 `dataset_gen` 生成；词表/loss 掩码/test 子集随数据集）
-2. 配置模型架构（维度/头数/层数/FFN）和位置编码
-3. 点击 **"▶ 开始训练"**，实时显示 loss 曲线
-
-**GPT 推理：**
-1. 选择模型文件（v4+ 自动使用内嵌词表），模型未嵌入时指定 `.nnvocab` 词表；设置采样参数（温度 / top-k / top-p / 重复惩罚 / 种子）
-2. 单次生成：输入提示文本，点击 **"▶ 生成文本"**
-3. **多轮对话**：输入这一轮的话，点击 **"💬 发送（多轮）"** —— 每轮把整段历史交给 CLI，
-   连续 N 轮上下文不丢（"对话记录"面板显示历史与轮数）；**"🧹 清空对话"** 开新一场对话；
-   系统提示用「系统提示（多轮对话）」框设置
-
-**分词器训练/推理：**
-- 训练：选择文本文件 → 设置类型（`bpe`/`charbpe`）和词表大小 → 点击训练
-- 推理：选择词表 → 输入文本或 ID → 选择编码/解码 → 点击执行
-
-## 网络结构
-
-支持三种模型架构（通过 `--arch mlp|transformer|cnn` 切换，实现见 `domain_mnist.hpp`）；下面详述 MLP 与 Transformer（CNN 见 `--cnn-*` 系列参数）：
-
-归一化分两维，两者默认 **`auto`（= 按架构取最合适，4 epoch A/B 实测，见 `docs/history/history.md`）**：**类型** `--norm auto|layernorm|rmsnorm|batchnorm`（auto：MLP/ViT = layernorm、CNN = batchnorm）与**挂载位置** `--norm-place auto|none|conv|head|both|final`（auto：CNN = `conv`、ViT = `final`；`conv`/`head`/`both` 属 CNN、`final` 属 ViT；MLP 的挂载位置由结构固定，只接受 `none`/`auto`）。**旧模型文件没有 `norm_place` 键 → 读回 `none`**：参数布局与旧实现逐位一致，旧 checkpoint 仍可加载。
-
-### MLP（默认）
-
-归一化层可通过 `--norm` 切换（`auto` → MLP 默认 LayerNorm）：
-
-```
-输入 (784)
-→ Linear(784 → 512) + Norm + GeLU
-→ Linear(512 → 256) + Norm + GeLU
-→ Linear(256 → 128) + Norm + GeLU
-→ Linear(128 → 64)  + Norm + GeLU
-→ Linear(64  → 10)
-→ CrossEntropy Loss (含 Softmax)
-```
-
-- `LayerNorm`：按特征维归一化（GPT-2 风格，默认）
-- `RMSNorm`：无均值、更轻量（LLaMA 风格）
-- `BatchNorm`：按 batch 维归一化，训练时更新 running 统计、推理时使用
-
-### Transformer（ViT-like）
-
-```
-输入 (784) — 展平的 28×28 图像
-→ PatchEmbedding: 28×28 → 16 个 7×7 patch → 投影到 d_model=64
-→ TransformerEncoder ×2 层:
-    ├── MultiHeadAttention(d_model=64, heads=4)
-    ├── LayerNorm + FeedForward(d_model=64 → d_ff=128 → 64)
-    └── 残差连接 + 位置编码
-→ [--norm-place final] 归一化（默认开：编码器末端的 final norm，池化之前）
-→ 池化 (seq_len → 1)
-→ Linear(64 → 10)
-→ CrossEntropy Loss (含 Softmax)
-```
-
-## 提供的组件
-
-| 组件 | 说明 |
+| 亮点 | 说明 |
 |------|------|
-| `nn::Matrix` | 行主序矩阵，支持并行加/减/乘/转置、预分配缓冲区、`std::span` 访问 |
-| `nn::Model` | 网络容器，支持链式 `add<LayerType>()` 构建 |
-| `nn::Linear` | 全连接层（含 Xavier 均匀初始化、融合 bias 计算） |
-| `nn::ReLU` | ReLU 激活函数 |
-| `nn::GeLU` | QuickGeLU 激活函数（`x · σ(1.702x)`） |
-| `nn::LayerNorm` | 层归一化（含可学习 γ/β 参数） |
-| `nn::Softmax` | Softmax 激活层（数值稳定，含反向传播） |
-| `nn::MultiHeadAttention` | 多头注意力层（Transformer 用，`d_model × seq_len` 输入输出） |
-| `nn::PositionalEncoding` | 正弦/余弦位置编码（Transformer 用） |
-| `nn::MSELoss` | 均方误差损失 |
-| `nn::CrossEntropyLoss` | 交叉熵损失（含数值稳定 Softmax，`compute_loss.hpp` 中定义） |
-| `nn::SGD` | 随机梯度下降优化器 |
-| `nn::SGDWithMomentum` | 动量 SGD 优化器 |
-| `nn::Adam` | Adam 优化器（一阶/二阶矩估计） |
-| `nn::parallel_for_blocks` / `nn::parallel_for_samples` | 自适应并行分发（`PARALLEL_THRESHOLD = 524288` 门控；旧文档称「SmartPolicy」） |
-| `nn::ThreadPool` | 全局单例线程池（懒初始化） |
-| `nn::save_model` / `nn::load_model` | 二进制模型序列化 |
+| **从零实现，全程可读** | 计算引擎、表达式 DSL、AOT kernel 融合、Vulkan 后端、BPE 分词器、训练循环全部自研——想搞懂"框架底层发生了什么"，每一层都有源码与文档 |
+| **CPU / Vulkan GPU 双后端** | 同一套模型代码切换后端；GPU 侧表达式录制 → AOT 融合单 kernel；f16 混合精度 |
+| **C++26 header-only** | 单一聚合头 `nn.hpp`；`FetchContent` / `add_subdirectory` 两行接入；零手动内存管理 |
+| **训练 + 推理闭环** | MLP / CNN / ViT / Transformer / GPT；SGD/Adam/AdamW/Muon；`.nnpkg` 训练包跨设备复现；GUI 图形界面 |
+| **RL 与可组合训练** | GAE、REINFORCE/PPO/GRPO、具名多输出、多模型 Session 与可替换 rollout pipeline |
+| **严谨的工程口径** | 数值梯度自检、CPU/GPU 位级一致门禁、可引用的研究档案（每个结论带证据 + 重跑命令 + 边界，见 [`research/`](research/README.md)） |
 
-## 📐 开发规范
+## 它不做什么
 
-本项目遵循严格的 C++ 开发规范，详见 [开发规范](docs/todo/10-development-standards.md)。
+诚实设定边界，避免不匹配的预期：
 
-### 核心原则
+- **不做分布式训练**——单机单卡/CPU 为主，没有多机多卡、模型并行或流水线并行；
+- **不追吞吐排名**——与 PyTorch 的 f32 训练吞吐差距约 2.1×（见 [基准报告](docs/benchmarks/2026-10-06-vulkan-vs-torch.md)），
+  本项目的价值在**可读、自研、可嵌入**，不是 benchmark 榜单；
+- **不是 Python 生态替代品**——没有 autograd 图、没有 pip 包、不兼容 ONNX/checkpoint 格式生态；
+- **GPU 只走 Vulkan**——不做 CUDA/Metal 后端；部分精度路径（全 f16 训练）有已知数值限制，
+  现状见 [`research/`](research/README.md) 与 [多精度文档](docs/development/05-mixed-precision.md)。
 
-1. **零手动内存管理** - 完全消除显式指针操作和手动内存管理
-2. **模块化设计** - 清晰的职责分离，简洁的接口设计
-3. **高性能优先** - 预分配、缓存友好、并行化
-4. **紧跟最新标准** - 始终使用最新的 C++ 标准（当前：C++26）
+## 文档
 
-### 快速参考
+**总索引见 [`docs/README.md`](docs/README.md)**（按读者分册）。最常去的入口：
 
-| 规范 | 要求 |
+| 我想… | 去看 |
+|-------|------|
+| 跑通训练/推理（CLI + GUI） | [docs/usage/02-quickstart-train-infer.md](docs/usage/02-quickstart-train-infer.md) |
+| 用 C++ API 写自己的模型 | [docs/development/02-cpp-api-manual.md](docs/development/02-cpp-api-manual.md) |
+| 把库嵌进自己的工程 | [docs/development/01-cmake-integration.md](docs/development/01-cmake-integration.md) |
+| 了解架构与数据流 | [docs/introduction/01-architecture.md](docs/introduction/01-architecture.md) |
+| 引用本仓的实测结论 | [research/README.md](research/README.md) |
+
+## 依赖
+
+| 组件 | 要求 |
 |------|------|
-| 内存管理 | 禁止 `new`/`delete`，使用 `std::vector`、`std::unique_ptr`、`std::span` |
-| 接口设计 | 流式 API、两级访问（安全 + 快速） |
-| 性能优化 | 预分配缓冲区、缓存友好分块算法、智能并行化 |
-| C++ 标准 | C++26，积极使用 ranges、concepts、std::print 等新特性 |
-| 命名规范 | 类名 CamelCase，函数/变量 snake_case，私有成员尾部下划线 |
+| 编译器 | 任意 C++26 编译器（Clang / GCC / MSVC 均可；CI 主矩阵 = Clang） |
+| 构建 | CMake ≥ 3.30 + Ninja（预设：`cmake --preset dev` 等，见 [CMakePresets.json](CMakePresets.json)） |
+| GPU（可选） | Vulkan SDK；无 GPU 用 `--preset cpu` 纯 CPU 构建 |
+| GUI（可选） | Python 3.10+ + `pip install customtkinter pillow` |
+
+<details>
+<summary>项目结构</summary>
+
+```
+neuralnet.cpp/
+├── include/neuralnet.cpp/   ← header-only 库（nn.hpp 统一聚合入口；backend/ = Vulkan 后端）
+├── src/                     ← 可执行入口：mnist/text 训练与推理、tokenizer、数据集工具
+├── shaders/                 ← GPU compute shader（AOT 融合产物 + 手写原语）
+├── docs/                    ← 文档总索引（docs/README.md）：usage / development / contributors / internal / history
+├── research/                ← 可引用的研究档案（定义基线 / 实测结论 / 明确标注的 TODO）
+├── gui.py                   ← 图形化操作界面（CustomTkinter）
+├── extern/                  ← 子仓：core / threadpool / kvrecord / dataset / tokenizer
+├── datasets/ · pretrained/  ← 训练数据 · 预训练模型
+├── scripts/ · bench/ · compare_with_torch/  ← 数据脚本 · 基准测试 · torch 对拍
+└── CMakePresets.json        ← 预设构建（dev / portable / cpu / probes ...）
+```
+
+</details>
+
+## 参与
+
+- **用库遇到问题**：提 issue，附最小复现与构建环境（编译器版本 + preset）。
+- **想贡献代码**：入口是 [CONTRIBUTING.md](CONTRIBUTING.md)（构建、测试口径、PR 自查清单）；
+  改代码前先读 [C++ 开发规范](docs/contributors/cpp-standards.md) 与 [踩坑警示录](docs/contributors/pitfalls.md)。
+- **维护者**：@EthanPeng-2048。发布与版本号规则见 [release-policy](docs/contributors/release-policy.md)
+  （**版本号由人提出，agent 不得擅自发布**）。
+- 所有参与方须遵守 [行为准则](CODE_OF_CONDUCT.md)。
+
+## 许可证
+
+[GNU Lesser General Public License v3.0](LICENSE)（LGPL-3.0，含 GPL-3.0 条款），
+© 2026 EthanPeng-2048。闭源应用可以链接本库；对**本库本身**的修改须以本许可证继续开源。
+
+> **数据集说明**：`scripts/` 的下载脚本仅从第三方拉取数据（TinyStories、OpenWebText、中文 wiki 等），
+> 数据集各自持有独立许可证，不随本项目 LGPL 分发，请自行遵守其条款。
+
+## 🤖 AI 工具致谢
+
+本项目的部分代码由 AI 辅助生成，当前使用：DeepSeek V4 / V4.1、Mi Mimo v2.5 / v2.6、
+Qwen3.8、VS Code Copilot、ChatGPT Codex。AI 仅作为辅助工具，代码所有权与最终版权
+归 EthanPeng-2048，不影响 LGPL 许可证效力。
