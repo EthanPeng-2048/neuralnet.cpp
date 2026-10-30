@@ -553,9 +553,17 @@ if(NN_BUILD_APPS OR NN_ENABLE_TESTS)
     nn_add_executable(adam_quant_test src/adam_quant_test.cpp)
     list(APPEND NN_TEST_TARGETS adam_quant_test)
 
+    # ── Embedding 层（issue #32：查表 / 伴随散射 / padding / 整数入口）──
+    nn_add_executable(embedding_test src/embedding_test.cpp)
+    list(APPEND NN_TEST_TARGETS embedding_test)
+
     # ── Attention（梯度检查 + forward 一致性 + batch 行号回归）──────────
     nn_add_executable(attn_test src/attn_test.cpp)
     list(APPEND NN_TEST_TARGETS attn_test)
+
+    # ── CrossAttention（issue #33：双输入 / 矩形 / 双路梯度）─────────────
+    nn_add_executable(cross_attention_test src/cross_attention_test.cpp)
+    list(APPEND NN_TEST_TARGETS cross_attention_test)
 
     # ── 基础层数值梯度检查（SwiGLU / RMSNorm / Softmax）─────────────────
     nn_add_executable(layer_gradcheck_test src/layer_gradcheck_test.cpp)
@@ -741,6 +749,10 @@ if(NN_BUILD_APPS OR NN_ENABLE_TESTS)
     # [8] 剥成 v7 后仍可加载（零破坏）。全 CPU、秒级、临时目录自建自清。
     nn_add_executable(train_state_test src/train_state_test.cpp)
     list(APPEND NN_TEST_TARGETS train_state_test)
+
+    # ── TrainingSession 断点编排（issue #37：save_checkpoint/resume）──
+    nn_add_executable(session_checkpoint_test src/session_checkpoint_test.cpp)
+    list(APPEND NN_TEST_TARGETS session_checkpoint_test)
 
     # ── issue #39 RFC 32 阶段 B：BatchSource 数据供给契约 ──────────────────
     nn_add_executable(batch_source_test src/batch_source_test.cpp)

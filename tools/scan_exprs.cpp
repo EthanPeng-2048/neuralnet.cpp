@@ -388,6 +388,39 @@ int main(int argc, char* argv[])
         }
     }
 
+    // ── CrossAttention（issue #33：矩形 cross 注意力）──────────────
+    //   表达式结构与 MHA 同 key（Plain fold / 裸 S / R / X 均同构；seq_q/
+    //   seq_kv 是形状参数不进 key）——本 dry-run 的职责是**显式登记**
+    //   seq_q ≠ seq_kv 的矩形路径（闭合世界按"注册过才存在"口径），并在
+    //   构建期验证 forward_pair/backward_pair 在矩形形状下可跑通。
+    {
+        const std::size_t d_model = 16, heads = 2, seq_q = 4, seq_kv = 6,
+                          batch = 2;
+        nn::CrossAttention attn(d_model, heads, /*seq_len=*/seq_q,
+                                /*seq_kv_len=*/seq_kv);
+        attn.set_precision_profile(scan_prof);   // 扫描期精度（f16 pass 收集变体）
+        (void)attn.init(engine);
+        nn::Tensor q = scan_tensor(d_model, batch * seq_q);
+        nn::Tensor mem = scan_tensor(d_model, batch * seq_kv);
+        auto fr = attn.forward_pair(q, mem);
+        if (!fr)
+        {
+            std::fprintf(stderr, "[scan] CrossAttention forward FAILED: %s\n",
+                         fr.error().message.c_str());
+            std::fflush(stderr);
+            std::abort();
+        }
+        nn::Tensor grad = scan_tensor(d_model, batch * seq_q);
+        auto br = attn.backward_pair(grad);
+        if (!br)
+        {
+            std::fprintf(stderr, "[scan] CrossAttention backward FAILED: %s\n",
+                         br.error().message.c_str());
+            std::fflush(stderr);
+            std::abort();
+        }
+    }
+
     // ── CrossEntropyLoss 稀疏 forward（IR 组合 denom/loss_vec/grad）──
     // 结构不依赖形状；含 mask 与 label 越界修正的统一 mask 构造。
     {
