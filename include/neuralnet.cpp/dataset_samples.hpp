@@ -197,16 +197,14 @@ public:
 
     // 只统计目标位置的 loss 有效数，不物化 batch。
     // Global-batch 训练需要先知道整个 update 的归一化单位，再拆分 micro-batch。
-    [[nodiscard]] Result<std::size_t>
-    valid_target_count(std::span<const std::size_t> indices) const
+    [[nodiscard]] Result<std::size_t> valid_target_count(std::span<const std::size_t> indices) const
     {
         std::size_t valid = 0;
         for (std::size_t idx : indices)
         {
             if (idx >= offsets_.size())
-                NN_FAIL("TextSampleSet::valid_target_count: 样本下标越界（" +
-                        std::to_string(idx) + " >= " +
-                        std::to_string(offsets_.size()) + "）");
+                NN_FAIL("TextSampleSet::valid_target_count: 样本下标越界（" + std::to_string(idx) +
+                        " >= " + std::to_string(offsets_.size()) + "）");
             const std::size_t offset = offsets_[idx];
             const std::size_t valid_len =
                 std::min(cfg_.seq_len, corpus_.token_flow.size() - offset);

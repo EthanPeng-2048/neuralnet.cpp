@@ -20,7 +20,8 @@
 #include <string>
 #include <vector>
 
-namespace {
+namespace
+{
 
 bool cnn_all_finite(const nn::Matrix& m)
 {
@@ -41,7 +42,8 @@ int main(int argc, char* argv[])
         const std::string a = argv[i];
         if (a == "--gpu") use_gpu = true;
         else if (a == "--f16") use_f16 = true;
-        else if (a == "--steps" && i + 1 < argc) steps = static_cast<std::size_t>(std::atoi(argv[++i]));
+        else if (a == "--steps" && i + 1 < argc)
+            steps = static_cast<std::size_t>(std::atoi(argv[++i]));
         else if (a == "--help")
         {
             std::cout << "用法: cnn_smoke_test [--gpu] [--f16] [--steps N]\n";
@@ -61,10 +63,10 @@ int main(int argc, char* argv[])
     // 输入 12×12：conv3 → 10 → pool2 → 5 → conv3 → 3 → pool2 → 1（每层卷积后都池化）
     nn::CnnConfig cfg;
     cfg.in_channels = 1;
-    cfg.in_size     = 12;
-    cfg.pool        = 2;
-    cfg.convs       = {{4, 3, 1, 0}, {8, 3, 1, 0}};   // {out_channels, kernel, stride, padding}
-    cfg.fc_dims     = {16, 10};                        // flatten(8) → 16 → 10
+    cfg.in_size = 12;
+    cfg.pool = 2;
+    cfg.convs = {{4, 3, 1, 0}, {8, 3, 1, 0}};   // {out_channels, kernel, stride, padding}
+    cfg.fc_dims = {16, 10};                        // flatten(8) → 16 → 10
     // P2-3：`--f16` 走 profile_f16()（Conv2D 权重/梯度按 param=f16 建，
     // 融合算子按 compute=f16）
     if (use_f16)
@@ -84,11 +86,9 @@ int main(int argc, char* argv[])
         return 1;
     }
     auto cfg2 = nn::cnn_config_from_spec(spec);
-    if (!cfg2 ||
-        cfg2->in_channels != cfg.in_channels || cfg2->in_size != cfg.in_size ||
+    if (!cfg2 || cfg2->in_channels != cfg.in_channels || cfg2->in_size != cfg.in_size ||
         cfg2->pool != cfg.pool || cfg2->convs.size() != cfg.convs.size() ||
-        cfg2->convs[1].out_channels != cfg.convs[1].out_channels ||
-        cfg2->fc_dims != cfg.fc_dims)
+        cfg2->convs[1].out_channels != cfg.convs[1].out_channels || cfg2->fc_dims != cfg.fc_dims)
     {
         std::cerr << "cnn_config_from_spec 往返不一致\n";
         return 1;
@@ -100,14 +100,15 @@ int main(int argc, char* argv[])
     for (std::size_t i = 0; i < model.num_layers(); ++i)
     {
         nn::Layer& l = model.layer_at(i);
-        if (dynamic_cast<nn::Conv2D*>(&l))    ++n_conv;
+        if (dynamic_cast<nn::Conv2D*>(&l)) ++n_conv;
         if (dynamic_cast<nn::MaxPool2D*>(&l)) ++n_pool;
-        if (dynamic_cast<nn::Linear*>(&l))    ++n_linear;
+        if (dynamic_cast<nn::Linear*>(&l)) ++n_linear;
         if (dynamic_cast<nn::LayerNorm*>(&l) || dynamic_cast<nn::RMSNorm*>(&l) ||
-            dynamic_cast<nn::BatchNorm*>(&l)) ++n_norm;
+            dynamic_cast<nn::BatchNorm*>(&l))
+            ++n_norm;
     }
-    std::printf("layers=%zu  Conv2D=%zu  MaxPool2D=%zu  Linear=%zu  Norm=%zu\n",
-                model.num_layers(), n_conv, n_pool, n_linear, n_norm);
+    std::printf("layers=%zu  Conv2D=%zu  MaxPool2D=%zu  Linear=%zu  Norm=%zu\n", model.num_layers(),
+                n_conv, n_pool, n_linear, n_norm);
     if (n_conv != cfg.convs.size() || n_pool != cfg.convs.size() || n_linear < 2)
     {
         std::cerr << "层组成与配置不符\n";
@@ -124,12 +125,11 @@ int main(int argc, char* argv[])
     // ── 2b. 归一化挂载（NormPlace）：both → 卷积后各 1 + FC 隐藏层 1 ───
     {
         nn::CnnConfig ncfg = cfg;
-        ncfg.norm_type  = nn::NormType::RMSNorm;
+        ncfg.norm_type = nn::NormType::RMSNorm;
         ncfg.norm_place = nn::NormPlace::Both;
 
-        auto nspec = nn::make_cnn_spec(ncfg.in_channels, ncfg.in_size, ncfg.pool,
-                                       ncfg.convs, ncfg.fc_dims,
-                                       ncfg.norm_type, ncfg.norm_place);
+        auto nspec = nn::make_cnn_spec(ncfg.in_channels, ncfg.in_size, ncfg.pool, ncfg.convs,
+                                       ncfg.fc_dims, ncfg.norm_type, ncfg.norm_place);
         auto nmodel_r = nn::build_cnn_model_from_spec(eng, nspec);
         NN_EXIT(nmodel_r, 1, "norm CNN 构建失败: ");
         nn::Model& nmodel = *nmodel_r;
@@ -157,7 +157,8 @@ int main(int argc, char* argv[])
         nn::Matrix nxm(ncfg.in_channels * ncfg.in_size * ncfg.in_size, nbatch);
         std::mt19937_64 nrng{20261003};
         std::uniform_real_distribution<nn::Scalar> ndist(-1.0f, 1.0f);
-        for (std::size_t i = 0; i < nxm.size(); ++i) nxm.span()[i] = ndist(nrng);
+        for (std::size_t i = 0; i < nxm.size(); ++i)
+            nxm.span()[i] = ndist(nrng);
         std::vector<std::size_t> nlabels(nbatch);
         for (std::size_t i = 0; i < nbatch; ++i)
             nlabels[i] = static_cast<std::size_t>(nrng() % ncfg.fc_dims.back());
@@ -167,8 +168,7 @@ int main(int argc, char* argv[])
         auto nlogits = nmodel.forward(*nx);
         NN_EXIT(nlogits, 1, "norm forward 失败: ");
         nn::CrossEntropyLoss nce;
-        auto nloss = nce.forward_sparse(eng, *nlogits, nlabels, {},
-                                        ncfg.fc_dims.back());
+        auto nloss = nce.forward_sparse(eng, *nlogits, nlabels, {}, ncfg.fc_dims.back());
         NN_EXIT(nloss, 1, "norm loss 失败\n");
         auto ngrad = nce.backward();
         NN_EXIT(ngrad, 1, "norm CE backward 失败\n");
@@ -178,9 +178,17 @@ int main(int argc, char* argv[])
         for (auto& g : nmodel.param_gradients())
         {
             auto gm = eng.to_matrix(g.get());
-            if (!gm) { finite = false; break; }
+            if (!gm)
+            {
+                finite = false;
+                break;
+            }
             for (auto v : gm->span())
-                if (!std::isfinite(v)) { finite = false; break; }
+                if (!std::isfinite(v))
+                {
+                    finite = false;
+                    break;
+                }
             if (!finite) break;
         }
         NN_EXIT(finite, 1, "norm CNN 梯度含 NaN/Inf\n");
@@ -194,20 +202,21 @@ int main(int argc, char* argv[])
     std::uniform_real_distribution<nn::Scalar> dist(-1.0f, 1.0f);
 
     nn::Matrix xm(cfg.in_channels * cfg.in_size * cfg.in_size, batch);
-    for (std::size_t i = 0; i < xm.size(); ++i) xm.span()[i] = dist(rng);
+    for (std::size_t i = 0; i < xm.size(); ++i)
+        xm.span()[i] = dist(rng);
     std::vector<std::size_t> labels(batch);
-    for (std::size_t i = 0; i < batch; ++i) labels[i] = static_cast<std::size_t>(rng() % classes);
+    for (std::size_t i = 0; i < batch; ++i)
+        labels[i] = static_cast<std::size_t>(rng() % classes);
 
     auto x = eng.from_matrix(xm);
     NN_EXIT(x, 1, "from_matrix 失败\n");
 
-    auto optimizer = nn::create_optimizer(
-        "sgd", eng, model.parameters(), model.param_gradients(), nn::Scalar{0.1});
+    auto optimizer = nn::create_optimizer("sgd", eng, model.parameters(), model.param_gradients(),
+                                          nn::Scalar{0.1});
     NN_EXIT(optimizer, 1, "optimizer 创建失败\n");
 
     nn::CrossEntropyLoss ce;
-    if (use_f16)
-        ce.set_precision_profile(nn::profile_f16());
+    if (use_f16) ce.set_precision_profile(nn::profile_f16());
     nn::Scalar first_loss = 0, last_loss = 0;
     for (std::size_t step = 0; step < steps; ++step)
     {

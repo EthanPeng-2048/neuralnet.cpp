@@ -21,12 +21,14 @@
 #include <neuralnet.cpp/core_errors.hpp>
 
 static int g_fail = 0;
-#define CHECK(cond, msg)                                                          \
-    do {                                                                          \
-        if (!(cond)) {                                                            \
-            std::cout << "    [FAIL] " << (msg) << "  (" << #cond << ")\n";       \
-            ++g_fail;                                                             \
-        }                                                                         \
+#define CHECK(cond, msg)                                                    \
+    do                                                                      \
+    {                                                                       \
+        if (!(cond))                                                        \
+        {                                                                   \
+            std::cout << "    [FAIL] " << (msg) << "  (" << #cond << ")\n"; \
+            ++g_fail;                                                       \
+        }                                                                   \
     } while (0)
 
 namespace
@@ -42,7 +44,8 @@ void test_step_grid()
         {
             // 载荷 = 下标和（便于断言）；单位 = 下标个数
             std::size_t sum = 0;
-            for (std::size_t i : ix) sum += i;
+            for (std::size_t i : ix)
+                sum += i;
             return std::make_pair(std::any(sum), ix.size());
         });
     CHECK(src_r.has_value(), "create 合法参数成功");
@@ -68,8 +71,8 @@ void test_step_grid()
 void test_shuffle_determinism()
 {
     std::cout << "\n── [2] 每 epoch shuffle：同 seed/epoch 复现，跨 epoch 变化 ──\n";
-    auto assemble = [](std::span<const std::size_t> ix)
-        -> nn::Result<std::pair<std::any, std::size_t>>
+    auto assemble =
+        [](std::span<const std::size_t> ix) -> nn::Result<std::pair<std::any, std::size_t>>
     { return std::make_pair(std::any(), ix.size()); };
 
     auto a_r = nn::IndexedBatchSource::create(32, 8, 42, assemble);
@@ -109,8 +112,7 @@ void test_rewind_validation()
     std::cout << "\n── [3] rewind：start_step 越界报错 ──\n";
     auto src_r = nn::IndexedBatchSource::create(
         10, 4, 1,
-        [](std::span<const std::size_t> ix)
-            -> nn::Result<std::pair<std::any, std::size_t>>
+        [](std::span<const std::size_t> ix) -> nn::Result<std::pair<std::any, std::size_t>>
         { return std::make_pair(std::any(), ix.size()); });
     CHECK(src_r.has_value(), "create 成功");
     if (!src_r) return;
@@ -123,16 +125,13 @@ void test_rewind_validation()
 void test_ctor_validation()
 {
     std::cout << "\n── [4] 构造期校验：batch_size=0 / sample=0 / 空回调 ──\n";
-    auto assemble = [](std::span<const std::size_t> ix)
-        -> nn::Result<std::pair<std::any, std::size_t>>
+    auto assemble =
+        [](std::span<const std::size_t> ix) -> nn::Result<std::pair<std::any, std::size_t>>
     { return std::make_pair(std::any(), ix.size()); };
 
-    CHECK(!nn::IndexedBatchSource::create(10, 0, 1, assemble).has_value(),
-          "batch_size=0 → 报错");
-    CHECK(!nn::IndexedBatchSource::create(0, 4, 1, assemble).has_value(),
-          "sample_count=0 → 报错");
-    CHECK(!nn::IndexedBatchSource::create(10, 4, 1, nullptr).has_value(),
-          "空装配回调 → 报错");
+    CHECK(!nn::IndexedBatchSource::create(10, 0, 1, assemble).has_value(), "batch_size=0 → 报错");
+    CHECK(!nn::IndexedBatchSource::create(0, 4, 1, assemble).has_value(), "sample_count=0 → 报错");
+    CHECK(!nn::IndexedBatchSource::create(10, 4, 1, nullptr).has_value(), "空装配回调 → 报错");
 
     auto ok = nn::IndexedBatchSource::create(5, 2, 0, assemble);
     CHECK(ok && ok->steps_per_epoch() == 3, "5/2 → 3 步");
@@ -144,8 +143,7 @@ void test_payload()
     std::cout << "\n── [5] 载荷：any 指针形式（-fno-exceptions 安全）──\n";
     auto src_r = nn::IndexedBatchSource::create(
         6, 3, 9,
-        [](std::span<const std::size_t> ix)
-            -> nn::Result<std::pair<std::any, std::size_t>>
+        [](std::span<const std::size_t> ix) -> nn::Result<std::pair<std::any, std::size_t>>
         {
             std::string tag = "batch:" + std::to_string(ix.size());
             return std::make_pair(std::any(std::move(tag)), ix.size() * 10);
@@ -158,8 +156,7 @@ void test_payload()
     {
         const auto* tag = std::any_cast<std::string>(&b->payload);
         CHECK(tag != nullptr && *tag == "batch:3", "指针形式读出域载荷");
-        CHECK(std::any_cast<std::size_t>(&b->payload) == nullptr,
-              "类型不符 → nullptr（不抛）");
+        CHECK(std::any_cast<std::size_t>(&b->payload) == nullptr, "类型不符 → nullptr（不抛）");
         CHECK(b->units == 30, "域回调给出归一化单位");
     }
 }
@@ -187,7 +184,8 @@ void test_pull_source()
     CHECK(!src.steps_per_epoch().has_value(), "无固定 epoch → nullopt");
     auto b = src.next(0);
     CHECK(b && !b->epoch_done && b->samples == 4, "步进驱动：无 epoch 完成语义");
-    CHECK(b && std::any_cast<std::size_t>(&b->payload) && *std::any_cast<std::size_t>(&b->payload) == 0,
+    CHECK(b && std::any_cast<std::size_t>(&b->payload) &&
+              *std::any_cast<std::size_t>(&b->payload) == 0,
           "载荷可透传任意域数据");
     CHECK(src.rewind(0, 0).has_value(), "默认 rewind = 空实现（合法）");
 }

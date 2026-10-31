@@ -41,22 +41,18 @@ private:
     ActivationOffloader offloader_;
 
 public:
-    GPTBlock(std::size_t d_model, std::size_t num_heads,
-             std::size_t d_ff, std::size_t max_len = 1024,
-             std::size_t seq_len = 0,
+    GPTBlock(std::size_t d_model, std::size_t num_heads, std::size_t d_ff,
+             std::size_t max_len = 1024, std::size_t seq_len = 0,
              PosEncodingType pos_enc = PosEncodingType::Learned,
              ActivationType activation = ActivationType::GeLU,
              NormType norm_type = NormType::LayerNorm,
-             PrecisionProfile precision = PrecisionProfile{},
-             bool subln = false,
-             std::size_t n_head_kv = 0,
-             WeightQuant weight_quant = WeightQuant::None)
-        : self_attn_(d_model, num_heads, max_len, seq_len, pos_enc, subln, norm_type,
-                     n_head_kv, weight_quant),
+             PrecisionProfile precision = PrecisionProfile{}, bool subln = false,
+             std::size_t n_head_kv = 0, WeightQuant weight_quant = WeightQuant::None)
+        : self_attn_(d_model, num_heads, max_len, seq_len, pos_enc, subln, norm_type, n_head_kv,
+                     weight_quant),
           norm1_(make_norm_layer(d_model, norm_type)),
           ff_(d_model, d_ff, activation, subln, norm_type, weight_quant),
-          norm2_(make_norm_layer(d_model, norm_type)),
-          weight_quant_(weight_quant)
+          norm2_(make_norm_layer(d_model, norm_type)), weight_quant_(weight_quant)
     {
         // D7：将精度配置注入所有子层（§9.2）—— override 内已逐子层下传
         set_precision_profile(precision);
@@ -71,8 +67,8 @@ public:
     // 那一份；attention/FF 是"线性层持有者"，拿三值那一份（它们各自再分流）。
     void set_precision_profile(const PrecisionProfile& profile) override
     {
-        const TernaryProfileSplit sp = split_ternary_profile(
-            layer_name(), profile, weight_quant_ == WeightQuant::T1_58);
+        const TernaryProfileSplit sp =
+            split_ternary_profile(layer_name(), profile, weight_quant_ == WeightQuant::T1_58);
         Layer::set_precision_profile(sp.self);
         self_attn_.set_precision_profile(sp.linear);
         if (norm1_) norm1_->set_precision_profile(sp.self);
@@ -91,30 +87,21 @@ public:
 
     std::vector<TensorRef> parameters() override
     {
-        return collect_refs(self_attn_.parameters(),
-                            norm1_->parameters(),
-                            ff_.parameters(),
+        return collect_refs(self_attn_.parameters(), norm1_->parameters(), ff_.parameters(),
                             norm2_->parameters());
     }
 
     // 子层结构（部署格式的完整遍历；顺序 = 上面 `parameters()` 的拼接顺序）
     [[nodiscard]] std::vector<Layer*> param_children() noexcept override
-    {
-        return {&self_attn_, norm1_.get(), &ff_, norm2_.get()};
-    }
+    { return {&self_attn_, norm1_.get(), &ff_, norm2_.get()}; }
 
     // 文档感知：把每样本文档 id 转发给内部自注意力（用于块对角掩码）
-    void set_doc_ids(std::span<const std::size_t> ids) override
-    {
-        self_attn_.set_doc_ids(ids);
-    }
+    void set_doc_ids(std::span<const std::size_t> ids) override { self_attn_.set_doc_ids(ids); }
 
     std::vector<TensorRef> param_gradients() override
     {
-        return collect_refs(self_attn_.param_gradients(),
-                            norm1_->param_gradients(),
-                            ff_.param_gradients(),
-                            norm2_->param_gradients());
+        return collect_refs(self_attn_.param_gradients(), norm1_->param_gradients(),
+                            ff_.param_gradients(), norm2_->param_gradients());
     }
 
     // 梯度检查点：把模式传播给内部注意力/归一化/FFN
@@ -130,8 +117,7 @@ public:
     // GPTBlock 可作为“重计算单元”：从保存的块输入重算 forward 重建缓存
     [[nodiscard]] bool recompute_supported() const override { return true; }
 
-    [[nodiscard]] Result<Tensor> forward_recompute(
-        const Tensor& saved_input) override
+    [[nodiscard]] Result<Tensor> forward_recompute(const Tensor& saved_input) override
     {
         // 临时关闭本块及其子层的 checkpoint 模式，使 forward 重建缓存
         set_checkpoint_mode(false);
@@ -152,10 +138,14 @@ public:
     std::vector<TensorRef> activation_cache() override
     {
         std::vector<TensorRef> r;
-        auto a = self_attn_.activation_cache(); r.insert(r.end(), a.begin(), a.end());
-        auto n1 = norm1_->activation_cache(); r.insert(r.end(), n1.begin(), n1.end());
-        auto f = ff_.activation_cache(); r.insert(r.end(), f.begin(), f.end());
-        auto n2 = norm2_->activation_cache(); r.insert(r.end(), n2.begin(), n2.end());
+        auto a = self_attn_.activation_cache();
+        r.insert(r.end(), a.begin(), a.end());
+        auto n1 = norm1_->activation_cache();
+        r.insert(r.end(), n1.begin(), n1.end());
+        auto f = ff_.activation_cache();
+        r.insert(r.end(), f.begin(), f.end());
+        auto n2 = norm2_->activation_cache();
+        r.insert(r.end(), n2.begin(), n2.end());
         if (residual2_cache_.valid()) r.emplace_back(residual2_cache_);
         return r;
     }
@@ -167,50 +157,37 @@ public:
     // 导出/导入：委托给通用 ActivationOffloader（见 compute_layer_base.hpp）。
     // 参与 offload 的缓存集合 = 本块 activation_cache()。
     [[nodiscard]] Result<void> export_activations(ComputeEngine& engine)
-    {
-        return offloader_.export_activations(engine, activation_cache());
-    }
+    { return offloader_.export_activations(engine, activation_cache()); }
 
     [[nodiscard]] Result<void> import_activations(ComputeEngine& engine)
-    {
-        return offloader_.import_activations(engine);
-    }
+    { return offloader_.import_activations(engine); }
 
     // 实际 slab 字节数（诊断用；未创建时 0）
     [[nodiscard]] std::size_t offload_slab_bytes() const noexcept
-    {
-        return offloader_.slab_bytes();
-    }
+    { return offloader_.slab_bytes(); }
 
     // 新一轮 forward 入口：上一轮导出未被 backward 消费（推理/评估）时作废
     void discard_offloaded_activations() noexcept { offloader_.discard(); }
 
-    [[nodiscard]] Result<Tensor> forward(
-        const Tensor& input) override
+    [[nodiscard]] Result<Tensor> forward(const Tensor& input) override
     {
         ComputeEngine& engine = engine_ref();
         // 残差分支 1（Pre-Norm + 自注意力），与 TransformerEncoderLayer/RAPTBlock 同骨架
         NN_TRY(r2, prenorm_residual_forward_(engine, input, *norm1_, self_attn_, p_.compute));
         Tensor res2 = std::move(*r2);
-        if (!checkpoint_mode_)
-            residual2_cache_ = res2;
+        if (!checkpoint_mode_) residual2_cache_ = res2;
         // 残差分支 2（Pre-Norm + FFN）
         return prenorm_residual_forward_(engine, res2, *norm2_, ff_, p_.compute);
     }
 
-    [[nodiscard]] Result<Tensor> backward(
-        const Tensor& grad_output) override
+    [[nodiscard]] Result<Tensor> backward(const Tensor& grad_output) override
     {
         ComputeEngine& engine = engine_ref();
         // activation offload：从 host 恢复激活再反向（替代重计算）
-        if (offloader_.offloaded())
-        {
-            NN_TRY(im, import_activations(engine));
-        }
+        if (offloader_.offloaded()) { NN_TRY(im, import_activations(engine)); }
 
         // 两处残差分流 + 子层正反向（与 TransformerEncoderLayer / RAPTBlock 同一骨架）
-        return prenorm_residual_backward_(engine, grad_output,
-                                          *norm1_, self_attn_, *norm2_, ff_,
+        return prenorm_residual_backward_(engine, grad_output, *norm1_, self_attn_, *norm2_, ff_,
                                           p_.compute);
     }
 
@@ -220,29 +197,23 @@ public:
     //   x = x + FFN(LN₂(x))
     // 输入: x_new (d_model, 1)
     // 输出: (d_model, 1)
-    [[nodiscard]] Result<Tensor> forward_step(
-        ComputeEngine& engine,
-        const Tensor& x_new,
-        Tensor& k_cache,
-        Tensor& v_cache,
-        std::size_t cur_len)
+    [[nodiscard]] Result<Tensor> forward_step(ComputeEngine& engine, const Tensor& x_new,
+                                              Tensor& k_cache, Tensor& v_cache, std::size_t cur_len)
     {
         NN_TRY(n1, norm1_->forward(x_new));
 
         NN_TRY(a, self_attn_.forward_step(engine, *n1, k_cache, v_cache, cur_len));
 
-        auto r2 = dsl::compute(engine,
-            dsl::leaf(x_new) + dsl::leaf(*a),
-            x_new.rows(), x_new.cols(), p_.compute);
+        auto r2 = dsl::compute(engine, dsl::leaf(x_new) + dsl::leaf(*a), x_new.rows(), x_new.cols(),
+                               p_.compute);
         NN_TRY_CHECK(r2);
 
         NN_TRY(n2, norm2_->forward(*r2));
 
         NN_TRY(f, ff_.forward(*n2));
 
-        return dsl::compute(engine,
-            dsl::leaf(*r2) + dsl::leaf(*f),
-            r2->rows(), r2->cols(), p_.compute);
+        return dsl::compute(engine, dsl::leaf(*r2) + dsl::leaf(*f), r2->rows(), r2->cols(),
+                            p_.compute);
     }
 };
 
@@ -319,11 +290,9 @@ private:
     // 多份 f32 副本 → OOM）。
     [[nodiscard]] Result<Tensor> head_forward_(ComputeEngine& engine, const Tensor& x)
     {
-        if (!tie_embeddings_)
-            return lm_head_->forward(x);
-        return dsl::compute(engine,
-            dsl::matmul(token_emb_, x, /*transA=*/false, /*transB=*/false),
-            vocab_size_, x.cols(), p_.stable);
+        if (!tie_embeddings_) return lm_head_->forward(x);
+        return dsl::compute(engine, dsl::matmul(token_emb_, x, /*transA=*/false, /*transB=*/false),
+                            vocab_size_, x.cols(), p_.stable);
     }
 
 public:
@@ -332,16 +301,14 @@ public:
              PosEncodingType pos_enc_type = PosEncodingType::Learned,
              ActivationType activation = ActivationType::GeLU,
              NormType norm_type = NormType::LayerNorm,
-             PrecisionProfile precision = PrecisionProfile{},
-             bool subln = false,
-             std::size_t n_head_kv = 0,
-             bool tie_embeddings = false,
+             PrecisionProfile precision = PrecisionProfile{}, bool subln = false,
+             std::size_t n_head_kv = 0, bool tie_embeddings = false,
              WeightQuant weight_quant = WeightQuant::None)
         : vocab_size_(vocab_size), d_model_(d_model), seq_len_(seq_len),
           ln_f_(make_norm_layer(d_model, norm_type)),
           // 三值模式：`precision.param == T1_58` 与显式 weight_quant 等价（唯一判据）
-          lm_head_(make_linear_layer(
-              d_model, vocab_size, effective_weight_quant(precision, weight_quant))),
+          lm_head_(make_linear_layer(d_model, vocab_size,
+                                     effective_weight_quant(precision, weight_quant))),
           weight_quant_(effective_weight_quant(precision, weight_quant)),
           tie_embeddings_(tie_embeddings)
     {
@@ -350,8 +317,8 @@ public:
         //（param=T1_58 只对 BitLinear 有意义）——构造器里两处"辅助对象/LM head"
         // 的注入必须用同一份口径，否则会把 T1_58 打到 norm / 位置编码表上
         //（它们要建张量 → 引擎拒绝"非存储精度"）。
-        const TernaryProfileSplit sp = split_ternary_profile(
-            layer_name(), precision, weight_quant_ == WeightQuant::T1_58);
+        const TernaryProfileSplit sp =
+            split_ternary_profile(layer_name(), precision, weight_quant_ == WeightQuant::T1_58);
         set_precision_profile(precision);
         // ── LM head（词表投影）：计算精度强制 = stable ────────────────────
         // logits 是 (vocab, batch·seq) —— 全模型最大的张量，且被 loss 链**多次**
@@ -377,9 +344,8 @@ public:
         blocks_.reserve(num_layers);
         for (std::size_t i = 0; i < num_layers; ++i)
         {
-            blocks_.emplace_back(d_model, num_heads, d_ff, seq_len, seq_len,
-                                 pos_enc_type, activation, norm_type, precision,
-                                 subln, n_head_kv, weight_quant_);
+            blocks_.emplace_back(d_model, num_heads, d_ff, seq_len, seq_len, pos_enc_type,
+                                 activation, norm_type, precision, subln, n_head_kv, weight_quant_);
         }
 
         // 位置编码器是辅助对象（非 Layer）→ profile 需单独下传：
@@ -401,8 +367,8 @@ public:
         // P1.5 三值分流（§4.8.3）：本模型自身（token 嵌入按 param 建张量）与
         // 各 norm/位置编码拿 param 归一化为 f32 的那一份；LM head 是线性层，
         // 三值模式下拿 param=T1_58；块是"线性层持有者"，拿同一份（块内再分流）。
-        const TernaryProfileSplit sp = split_ternary_profile(
-            layer_name(), profile, weight_quant_ == WeightQuant::T1_58);
+        const TernaryProfileSplit sp =
+            split_ternary_profile(layer_name(), profile, weight_quant_ == WeightQuant::T1_58);
         Layer::set_precision_profile(sp.self);
         if (ln_f_) ln_f_->set_precision_profile(sp.self);
         if (!tie_embeddings_)
@@ -411,7 +377,8 @@ public:
             head_prof.compute = sp.self.stable;
             lm_head_->set_precision_profile(head_prof);
         }
-        for (auto& b : blocks_) b.set_precision_profile(sp.self);
+        for (auto& b : blocks_)
+            b.set_precision_profile(sp.self);
         if (pos_encoder_) pos_encoder_->set_precision_profile(sp.self);
     }
 
@@ -421,34 +388,25 @@ public:
         constexpr Scalar emb_init_std = 0.02;
         token_emb_ = engine.create_tensor(vocab_size_, d_model_, p_.param,
                                           InitSpec::normal(0, emb_init_std, kInitSeed));
-        if (!token_emb_.valid())
-            NN_FAIL("GPTModel: token_emb 初始化失败");
+        if (!token_emb_.valid()) NN_FAIL("GPTModel: token_emb 初始化失败");
         grad_token_emb_ = engine.create_tensor(vocab_size_, d_model_, p_.param, InitSpec::zero());
-        if (!grad_token_emb_.valid())
-            NN_FAIL("GPTModel: token_emb 梯度缓冲初始化失败");
+        if (!grad_token_emb_.valid()) NN_FAIL("GPTModel: token_emb 梯度缓冲初始化失败");
         // 初始化子层
-        if (pos_encoder_)
-        {
-            NN_TRY(r, pos_encoder_->init(engine));
-        }
+        if (pos_encoder_) { NN_TRY(r, pos_encoder_->init(engine)); }
         for (auto& block : blocks_)
         {
             NN_TRY(r, block.init(engine));
         }
-        if (ln_f_)
-        {
-            NN_TRY(r, ln_f_->init(engine));
-        }
+        if (ln_f_) { NN_TRY(r, ln_f_->init(engine)); }
         if (!tie_embeddings_) { NN_TRY(r, lm_head_->init(engine)); }
         return {};
     }
 
     std::vector<TensorRef> parameters() override
     {
-        auto refs = collect_refs(token_emb_,
-                                 pos_encoder_->parameters(),
-                                 collect_block_refs_(blocks_, &GPTBlock::parameters),
-                                 ln_f_->parameters());
+        auto refs =
+            collect_refs(token_emb_, pos_encoder_->parameters(),
+                         collect_block_refs_(blocks_, &GPTBlock::parameters), ln_f_->parameters());
         if (!tie_embeddings_)
         {
             auto h = lm_head_->parameters();
@@ -464,17 +422,16 @@ public:
     {
         std::vector<Layer*> r;
         r.reserve(r.size() + blocks_.size() + 2);
-        for (auto& b : blocks_) r.push_back(static_cast<Layer*>(&b));
+        for (auto& b : blocks_)
+            r.push_back(static_cast<Layer*>(&b));
         if (ln_f_) r.push_back(static_cast<Layer*>(ln_f_.get()));
-        if (!tie_embeddings_ && lm_head_)
-            r.push_back(static_cast<Layer*>(lm_head_.get()));
+        if (!tie_embeddings_ && lm_head_) r.push_back(static_cast<Layer*>(lm_head_.get()));
         return r;
     }
 
     std::vector<TensorRef> param_gradients() override
     {
-        auto refs = collect_refs(grad_token_emb_,
-                                 pos_encoder_->param_gradients(),
+        auto refs = collect_refs(grad_token_emb_, pos_encoder_->param_gradients(),
                                  collect_block_refs_(blocks_, &GPTBlock::param_gradients),
                                  ln_f_->param_gradients());
         if (!tie_embeddings_)
@@ -489,19 +446,23 @@ public:
     // 传入空 span 清除文档感知（退化为纯因果）。在 forward 前调用。
     void set_doc_ids(std::span<const std::size_t> ids) override
     {
-        if (ids.empty()) { doc_ids_.clear(); return; }
+        if (ids.empty())
+        {
+            doc_ids_.clear();
+            return;
+        }
         doc_ids_.assign(ids.begin(), ids.end());
     }
 
-    [[nodiscard]] Result<Tensor> forward(
-        const Tensor& input) override
+    [[nodiscard]] Result<Tensor> forward(const Tensor& input) override
     {
         ComputeEngine& engine = engine_ref();
         // 新一轮 forward：上一轮 offload 的激活若未被 backward 消费（推理/评估
         // 路径），其 slab 数据已作废——入口统一丢弃，保证 export 状态机从
         // Idle 开始；否则本轮 export 会被 fail-fast 拒绝 / backward 导回旧激活。
         if (activation_offload_)
-            for (auto& b : blocks_) b.discard_offloaded_activations();
+            for (auto& b : blocks_)
+                b.discard_offloaded_activations();
         const std::size_t seq_len = input.rows();
         batch_size_ = input.cols();
         // ── 1. gather 所有 token 的 embedding（统一采用 batch-major 列序） ──
@@ -578,8 +539,7 @@ public:
         return head_forward_(engine, x);
     }
 
-    [[nodiscard]] Result<Tensor> backward(
-        const Tensor& grad_output) override
+    [[nodiscard]] Result<Tensor> backward(const Tensor& grad_output) override
     {
         ComputeEngine& engine = engine_ref();
         const std::size_t seq_len = seq_len_;
@@ -596,18 +556,19 @@ public:
         if (tie_embeddings_)
         {
             // dX = W_embᵀ·g
-            auto dx = dsl::compute(engine,
-                dsl::matmul(token_emb_, grad_output, /*transA=*/true, /*transB=*/false),
+            auto dx = dsl::compute(
+                engine, dsl::matmul(token_emb_, grad_output, /*transA=*/true, /*transB=*/false),
                 d_model_, grad_output.cols(), p_.stable);
             NN_TRY_CHECK(dx);
             grad_x = std::move(*dx);
             // dW_emb += g·xᵀ —— 与第 5 步的 scatter_add_rows **累加到同一张
             // grad_token_emb_**（token_emb_ 同时充当输入嵌入与输出权重）。
-            auto dw = dsl::compute_into(engine,
-                dsl::leaf(grad_token_emb_)
-                    + dsl::matmul(grad_output, head_input_cache_, /*transA=*/false,
-                                  /*transB=*/true),
-                grad_token_emb_);
+            auto dw =
+                dsl::compute_into(engine,
+                                  dsl::leaf(grad_token_emb_) +
+                                      dsl::matmul(grad_output, head_input_cache_, /*transA=*/false,
+                                                  /*transB=*/true),
+                                  grad_token_emb_);
             NN_TRY_CHECK(dw);
         }
         else
@@ -665,10 +626,9 @@ public:
         NN_TRY(sr, engine.scatter_add_rows(grad_token_emb_, stored_tokens_tensor_, *grad_T));
 
         // grad_input: token IDs 无梯度，返回零张量（仅用于接口一致性）
-        Tensor grad_input = engine.create_tensor(seq_len, batch_size_, Precision::F32,
-                                                 InitSpec::zero());
-        if (!grad_input.valid())
-            NN_FAIL("GPT token_emb backward: 梯度张量分配失败");
+        Tensor grad_input =
+            engine.create_tensor(seq_len, batch_size_, Precision::F32, InitSpec::zero());
+        if (!grad_input.valid()) NN_FAIL("GPT token_emb backward: 梯度张量分配失败");
         return grad_input;
     }
 
@@ -688,7 +648,8 @@ public:
     void set_activation_offload(bool enabled) override
     {
         activation_offload_ = enabled;
-        for (auto& b : blocks_) b.set_offload_enabled(enabled);
+        for (auto& b : blocks_)
+            b.set_offload_enabled(enabled);
     }
     [[nodiscard]] bool activation_offload() const noexcept { return activation_offload_; }
 
@@ -706,14 +667,16 @@ public:
     void set_checkpoint_mode(bool enabled) override
     {
         Layer::set_checkpoint_mode(enabled);
-        for (auto& b : blocks_) b.set_checkpoint_mode(enabled);
+        for (auto& b : blocks_)
+            b.set_checkpoint_mode(enabled);
         ln_f_->set_checkpoint_mode(enabled);
         lm_head_->set_checkpoint_mode(enabled);
     }
 
     void clear_cache() override
     {
-        for (auto& b : blocks_) b.clear_cache();
+        for (auto& b : blocks_)
+            b.clear_cache();
         ln_f_->clear_cache();
         lm_head_->clear_cache();
         head_input_cache_ = Tensor{};
@@ -724,13 +687,9 @@ public:
     // 流程: token_emb[token] [+ pos_emb[pos]] → N × GPTBlock.forward_step
     //       → ln_f → lm_head → (vocab_size, 1)
     // 每层的 KV cache 由调用方维护，forward_step 只负责写入和计算。
-    [[nodiscard]] Result<Tensor> forward_step(
-        ComputeEngine& engine,
-        std::size_t token_id,
-        std::size_t pos,
-        std::vector<Tensor>& k_caches,
-        std::vector<Tensor>& v_caches,
-        std::size_t cur_len)
+    [[nodiscard]] Result<Tensor> forward_step(ComputeEngine& engine, std::size_t token_id,
+                                              std::size_t pos, std::vector<Tensor>& k_caches,
+                                              std::vector<Tensor>& v_caches, std::size_t cur_len)
     {
         // 1. token embedding 查表 → (1, d_model) → transpose → (d_model, 1)
         std::vector<Scalar> id_v(1);                  // 宿主桥（17 §3 D11）
@@ -747,13 +706,11 @@ public:
         Tensor x = std::move(*x_new);
         for (std::size_t i = 0; i < blocks_.size(); ++i)
         {
-            auto r = blocks_[i].forward_step(
-                engine, x, k_caches[i], v_caches[i], cur_len);
+            auto r = blocks_[i].forward_step(engine, x, k_caches[i], v_caches[i], cur_len);
             NN_TRY_CHECK(r);
             x = std::move(*r);
             // 按 flush_interval 拆分提交（防 TDR）
-            if (flush_interval_ > 0 &&
-                (i + 1) % flush_interval_ == 0 && i + 1 < blocks_.size())
+            if (flush_interval_ > 0 && (i + 1) % flush_interval_ == 0 && i + 1 < blocks_.size())
             {
                 NN_TRY(fr, engine.flush_batch());
             }
@@ -807,8 +764,7 @@ public:
 
         // ── prefill: 截断到 seq_len_ 长度（滑动窗口初始） ──────────────
         std::size_t start_init = 0;
-        if (context.size() > seq_len_)
-            start_init = context.size() - seq_len_;
+        if (context.size() > seq_len_) start_init = context.size() - seq_len_;
         std::size_t cur_len = 0;
         Tensor last_logits_t;
 
@@ -822,8 +778,7 @@ public:
             NN_TRY(br, engine.begin_batch());
             for (std::size_t i = start; i < context.size(); ++i)
             {
-                auto r = forward_step(engine, context[i], cur_len,
-                                      k_caches, v_caches, cur_len);
+                auto r = forward_step(engine, context[i], cur_len, k_caches, v_caches, cur_len);
                 if (!r)
                 {
                     (void)engine.end_batch();  // 出错也收尾，避免录制状态泄漏
@@ -845,8 +800,14 @@ public:
             // Sliding window: rebuild cache when full (keep last seq_len_-1 tokens)
             if (cur_len >= seq_len_)
             {
-                for (auto& kc : k_caches) { NN_TRY(r, engine.zero(kc)); }
-                for (auto& vc : v_caches) { NN_TRY(r, engine.zero(vc)); }
+                for (auto& kc : k_caches)
+                {
+                    NN_TRY(r, engine.zero(kc));
+                }
+                for (auto& vc : v_caches)
+                {
+                    NN_TRY(r, engine.zero(vc));
+                }
                 cur_len = 0;
                 const std::size_t keep = seq_len_ - 1;
                 const std::size_t start_new = (context.size() > keep) ? (context.size() - keep) : 0;
@@ -868,16 +829,15 @@ public:
 
             context.push_back(next_token);
 
-            if (step >= min_new_tokens && next_token == eos_token_id)
-                break;
+            if (step >= min_new_tokens && next_token == eos_token_id) break;
 
             generated.push_back(next_token);
 
             // Run forward_step for next_token to write KV cache and get new logits
             NN_TRY(br, engine.begin_batch());
 
-            auto logits_res = forward_step(engine, next_token, cur_len,
-                                           k_caches, v_caches, cur_len);
+            auto logits_res =
+                forward_step(engine, next_token, cur_len, k_caches, v_caches, cur_len);
             NN_TRY_CHECK(logits_res);
 
             NN_TRY(er, engine.end_batch());

@@ -32,27 +32,27 @@ namespace nn
 enum class ExprOp : uint8_t
 {
     // 一元
-    Neg   = 0,  // -x
-    Exp   = 1,  // e^x
-    Log   = 2,  // ln(x)
-    Sqrt  = 3,  // √x
+    Neg = 0,  // -x
+    Exp = 1,  // e^x
+    Log = 2,  // ln(x)
+    Sqrt = 3,  // √x
     Rsqrt = 4,  // 1/√x
-    Abs   = 5,  // |x|
-    Tanh  = 6,  // tanh(x)
+    Abs = 5,  // |x|
+    Tanh = 6,  // tanh(x)
     // 二元
-    Add   = 7,  // a + b
-    Sub   = 8,  // a - b
-    Mul   = 9,  // a * b
-    Div   = 10, // a / b
-    Max   = 11, // max(a, b)
-    Min   = 12, // min(a, b)
+    Add = 7,  // a + b
+    Sub = 8,  // a - b
+    Mul = 9,  // a * b
+    Div = 10, // a / b
+    Max = 11, // max(a, b)
+    Min = 12, // min(a, b)
     // 比较（输出 1.0 / 0.0 到寄存器，供 Select 使用）
-    Lt    = 13, // a <  b
-    Le    = 14, // a <= b
-    Gt    = 15, // a >  b
-    Ge    = 16, // a >= b
-    Eq    = 17, // a == b
-    Ne    = 18, // a != b
+    Lt = 13, // a <  b
+    Le = 14, // a <= b
+    Gt = 15, // a >  b
+    Ge = 16, // a >= b
+    Eq = 17, // a == b
+    Ne = 18, // a != b
     // 选择：dst = (a != 0) ? b : c
     Select = 19,
     // ── 新增：归约指令（dst 为隐式"每行/每列一个标量"的归约向量，
@@ -67,23 +67,29 @@ enum class ExprOp : uint8_t
 // 归约指令：dst 是"每行/每列一个标量"的隐式向量，供 Reduce 操作数广播引用。
 [[nodiscard]] inline constexpr bool expr_op_is_reduce(ExprOp op) noexcept
 {
-    return op == ExprOp::ColSum || op == ExprOp::ColMax ||
-           op == ExprOp::RowSum || op == ExprOp::RowMax;
+    return op == ExprOp::ColSum || op == ExprOp::ColMax || op == ExprOp::RowSum ||
+           op == ExprOp::RowMax;
 }
 // 该归约指令产出的向量方向：true=按列归约 → (1, cols)，false=按行归约 → (rows, 1)
 [[nodiscard]] inline constexpr bool expr_op_reduces_cols(ExprOp op) noexcept
-{
-    return op == ExprOp::ColSum || op == ExprOp::ColMax;
-}
+{ return op == ExprOp::ColSum || op == ExprOp::ColMax; }
 // 指令实际使用的操作数个数（未用的 b/c 保持默认 {0,0}，不可当作 Reg(0) 引用）
 // constexpr：供 expr_op_table.hpp 的算子元数据一致性编译期断言复用（RV-07）
 [[nodiscard]] inline constexpr std::size_t expr_instr_num_operands(ExprOp op) noexcept
 {
     switch (op)
     {
-    case ExprOp::Neg: case ExprOp::Exp: case ExprOp::Log:
-    case ExprOp::Sqrt: case ExprOp::Rsqrt: case ExprOp::Abs: case ExprOp::Tanh:
-    case ExprOp::ColSum: case ExprOp::ColMax: case ExprOp::RowSum: case ExprOp::RowMax:
+    case ExprOp::Neg:
+    case ExprOp::Exp:
+    case ExprOp::Log:
+    case ExprOp::Sqrt:
+    case ExprOp::Rsqrt:
+    case ExprOp::Abs:
+    case ExprOp::Tanh:
+    case ExprOp::ColSum:
+    case ExprOp::ColMax:
+    case ExprOp::RowSum:
+    case ExprOp::RowMax:
         return 1;
     case ExprOp::Select:
         return 3;
@@ -95,9 +101,9 @@ enum class ExprOp : uint8_t
 // ── 操作数 ─────────────────────────────────────────────────────────────────
 enum class ExprOperandKind : uint8_t
 {
-    Reg    = 0,  // 引用前驱指令的输出寄存器
-    Input  = 1,  // 引用第 idx 个输入 Tensor（按 views[idx] 视图访问）
-    Const  = 2,  // 引用常量池第 idx 项
+    Reg = 0,  // 引用前驱指令的输出寄存器
+    Input = 1,  // 引用第 idx 个输入 Tensor（按 views[idx] 视图访问）
+    Const = 2,  // 引用常量池第 idx 项
     Fanout = 3,  // 引用前驱结果寄存器（语义同 Reg，显式表达 fanout 语义）
     // ── 新增：引用一个"行/列归约结果"，自动按行或按列广播 ──
     Reduce = 4,  // 引用某归约指令 dst（idx 指向归约指令的目标寄存器号）
@@ -113,8 +119,8 @@ enum class ExprOperandKind : uint8_t
     //   Batch = 批次下标（batched matmul 段网格的 batch 维；无 matmul 段 = 0）
     // 用于上三角掩码 select(Col > Row, -inf, 0)、按 batch 取斜率的线性偏置
     //   -slope*(Col-Row) 等位置相关的键域改写。
-    Row   = 6,
-    Col   = 7,
+    Row = 6,
+    Col = 7,
     Batch = 8,
     // 运行时标量参数（RParam，形状无关融合的标量推广）──
     // 引用 spec.rparams 第 idx 项。与视图参数（RowMod 周期 / RotateHalf
@@ -137,7 +143,7 @@ enum class ExprOperandKind : uint8_t
 struct ExprOperand
 {
     uint8_t kind = 0;  // ExprOperandKind
-    uint8_t idx  = 0;  // 寄存器号 / 输入下标 / 常量池下标
+    uint8_t idx = 0;  // 寄存器号 / 输入下标 / 常量池下标
 
     friend bool operator==(const ExprOperand&, const ExprOperand&) = default;
 };
@@ -148,11 +154,11 @@ struct ExprOperand
 // Tensor 的关键；未来 VM 中视图即廉价索引映射，无需物化。
 enum class ExprViewKind : uint8_t
 {
-    Linear       = 0,  // data[r*cols + c]（默认）
-    RotateHalf   = 1,  // 按 param(block_rows) 分块，块内前后半行交换；
+    Linear = 0,  // data[r*cols + c]（默认）
+    RotateHalf = 1,  // 按 param(block_rows) 分块，块内前后半行交换；
                        //   negate_first_half=true 时，目标行 rl<block_rows/2
                        //   读取源 rl+block_rows/2 并取负（LLaMA 式 rotate_half）
-    RowMod       = 2,  // 行取模广播：读取 data[(r % param)*cols + c]
+    RowMod = 2,  // 行取模广播：读取 data[(r % param)*cols + c]
                        //   用于 cos/sin 频率表 ((d_k,seq)) 平铺到 (batch*H*d_k,seq)
     // ── 新增：归约视图（该输入被归约为每列/每行一个标量，自动广播）──
     // 求值期代表一个"每行/每列一个标量"的广播向量：
@@ -174,8 +180,8 @@ enum class ExprViewKind : uint8_t
     // BatchCol = 11：读取 data[uint(batch) * param + col]（param = 每批列数，
     //   输入 (1, batch*param)，如 doc_ids (1, batch*seq) 按 (batch, col) 切片）。
     RowGather = 9,
-    BatchMod  = 10,
-    BatchCol  = 11,
+    BatchMod = 10,
+    BatchCol = 11,
     // RowAccess = 12：行偏移+取模访问：读取 data[(offset + r % mod)*cols + c]。
     //   param = mod（取模数），param2 = offset（行偏移）。
     //   用于共享内存 SwiGLU 等"同一 (2·d_ff) 输入按半个偏移读取"的行切分：
@@ -223,13 +229,9 @@ enum class ExprViewKind : uint8_t
 }
 // 该归约视图按行归约（输出 (rows,1)，按 r 广播）；false=按列归约（输出 (1,cols)，按 c 广播）
 [[nodiscard]] inline constexpr bool expr_view_reduces_rows(ExprViewKind k) noexcept
-{
-    return k == ExprViewKind::RowReduceSum || k == ExprViewKind::RowReduceMax;
-}
+{ return k == ExprViewKind::RowReduceSum || k == ExprViewKind::RowReduceMax; }
 [[nodiscard]] inline constexpr bool expr_view_is_broadcast(ExprViewKind k) noexcept
-{
-    return k == ExprViewKind::RowBroadcast || k == ExprViewKind::ColBroadcast;
-}
+{ return k == ExprViewKind::RowBroadcast || k == ExprViewKind::ColBroadcast; }
 
 struct ExprView
 {
@@ -244,8 +246,8 @@ struct ExprView
 // ── 指令 ───────────────────────────────────────────────────────────────────
 struct ExprInstr
 {
-    uint8_t op   = 0;  // ExprOp
-    uint8_t dst  = 0;  // 目标寄存器号
+    uint8_t op = 0;  // ExprOp
+    uint8_t dst = 0;  // 目标寄存器号
     ExprOperand a;     // 源操作数 1
     ExprOperand b;     // 源操作数 2
     ExprOperand c;     // 仅 Select 使用
@@ -282,10 +284,10 @@ struct MatmulSpec
 {
     std::uint8_t a_input = 0;  // A 是第几个输入（0-based，指向 views/inputs）
     std::uint8_t b_input = 0;  // B 是第几个输入
-    std::uint8_t transA  = 0;  // 1 = A 存储为 (K, M)，按 A^T 使用
-    std::uint8_t transB  = 0;  // 1 = B 存储为 (N, K)，按 B^T 使用
-    std::uint32_t k      = 0;  // 求和维度（形状参数，运行时 push constant）
-    std::uint32_t batch  = 1;  // 批量数（形状参数，运行时 push constant）
+    std::uint8_t transA = 0;  // 1 = A 存储为 (K, M)，按 A^T 使用
+    std::uint8_t transB = 0;  // 1 = B 存储为 (N, K)，按 B^T 使用
+    std::uint32_t k = 0;  // 求和维度（形状参数，运行时 push constant）
+    std::uint32_t batch = 1;  // 批量数（形状参数，运行时 push constant）
 
     friend bool operator==(const MatmulSpec&, const MatmulSpec&) = default;
 };
@@ -299,11 +301,11 @@ struct MatmulSpec
 // 引擎只认此结构、不认任何算法名。
 struct VecAccSpec
 {
-    std::uint8_t vec_state  = 0;  // 目标行向量态槽（双域恒 0；多槽留位）
+    std::uint8_t vec_state = 0;  // 目标行向量态槽（双域恒 0；多槽留位）
     std::uint8_t weight_reg = 0;  // body 产出的 (row, j) 权重寄存器号
-    std::uint8_t b_input    = 0;  // 收缩侧输入槽（(k, vec_state_len) 行主序）
-    std::uint8_t scale_reg  = 0;  // 行标量缩放寄存器（rescale α）
-    std::uint8_t has_scale  = 1;  // 0=仅累加；1=先 vec*=scale 再累加
+    std::uint8_t b_input = 0;  // 收缩侧输入槽（(k, vec_state_len) 行主序）
+    std::uint8_t scale_reg = 0;  // 行标量缩放寄存器（rescale α）
+    std::uint8_t has_scale = 1;  // 0=仅累加；1=先 vec*=scale 再累加
 
     friend bool operator==(const VecAccSpec&, const VecAccSpec&) = default;
 };
@@ -333,22 +335,22 @@ struct VecAccSpec
 //   constant；veclen 进 key 会让每个 dk 一个 shader，见 expr_spec_key 注释）。
 struct FoldSpec
 {
-    std::uint8_t        num_state = 1;  // 行标量态数（前缀寄存器 0..num_state-1）
-    std::uint32_t       k = 0;          // 收缩轴长度（形状参数，运行时 push constant）
+    std::uint8_t num_state = 1;  // 行标量态数（前缀寄存器 0..num_state-1）
+    std::uint32_t k = 0;          // 收缩轴长度（形状参数，运行时 push constant）
     std::vector<Scalar> inits;          // 标量态初值，size == num_state（进 key）
     std::vector<ExprInstr> body;        // 键域块指令序列
     std::vector<ExprInstr> finalize;    // 向量域收尾指令（veclen=0 时单列执行）
     // ── fold v2 双域扩展（默认值 = 纯 fold v1 行为）──
-    std::uint32_t                vec_state_len = 0;  // 行向量态长度（0=无；输出列数）
-    std::optional<MatmulSpec>    matmul;   // 键域内层收缩段（块局部，N=k 全轴）
-    std::optional<VecAccSpec>    vecacc;   // 行向量态块更新
+    std::uint32_t vec_state_len = 0;  // 行向量态长度（0=无；输出列数）
+    std::optional<MatmulSpec> matmul;   // 键域内层收缩段（块局部，N=k 全轴）
+    std::optional<VecAccSpec> vecacc;   // 行向量态块更新
     // 行界整块跳过 / tri_skip（上三角类掩码的 codegen 恒等优化；仅注意力
     //   fold 构造非 Plain 置位；进 key——结构/codegen 分歧点）：生成器把块内
     //   valid 钳到 min(BLOCK, fold_k-k0, qt+1-k0)，qt = row%m_per（行在
     //   batched 网格内的位置），k0>qt 的整块空转。被跳过的 j 恰为链内 select
     //   屏蔽项（-inf/0）→ max 加 -inf、sum 加 0、w=0 时 +0·V=+0 均为恒等
     //   → 与全量计算逐位一致。CPU 不钳（全量算，等价性同上）。
-    bool                            tri_skip = false;
+    bool tri_skip = false;
 
     friend bool operator==(const FoldSpec&, const FoldSpec&) = default;
 };
@@ -359,64 +361,58 @@ struct FoldSpec
 // 源必须全为行标量——否则同一状态被各 kb/各线程覆盖（未定义）。静态单遍
 // 传递即可判定（指令序内 src 类别已知）。
 // 返回 reg_elem[r]（1=元素类）；状态收到元素源 → unexpected。
-[[nodiscard]] inline Result<std::vector<uint8_t>> expr_fold_classify(
-    const FoldSpec& f, std::uint32_t num_regs)
+[[nodiscard]] inline Result<std::vector<uint8_t>> expr_fold_classify(const FoldSpec& f,
+                                                                     std::uint32_t num_regs)
 {
     std::vector<uint8_t> is_elem(num_regs, 0);
     std::vector<uint8_t> is_reduce_dst(num_regs, 0);
     const auto src_elem = [&](const ExprOperand& op) -> int
     {
         const auto k = static_cast<ExprOperandKind>(op.kind);
-        if (k == ExprOperandKind::Input)
-            return 1;
+        if (k == ExprOperandKind::Input) return 1;
         // fold v2：依赖网格列（=块内 kb）的都算元素类——Matmul 段（N=全轴列）、
         //   Col（全局列索引）。Row / Batch 派生自行号（行固定 → 行标量）。
         //   BatchMod/BatchCol 是**视图 kind**（经 Input 操作数访问，Input 已=1，
         //   保守偏元素类：掩码链只进权重/归约源、不直接写状态，无碍）。
         //   VecState 不允许出现在 body（validate 拒）。
-        if (k == ExprOperandKind::Matmul || k == ExprOperandKind::Col)
-            return 1;
+        if (k == ExprOperandKind::Matmul || k == ExprOperandKind::Col) return 1;
         if (k == ExprOperandKind::Row || k == ExprOperandKind::Batch ||
             k == ExprOperandKind::Const || k == ExprOperandKind::RParam)
             return 0;
-        if (k == ExprOperandKind::VecState)
-            return -1;
+        if (k == ExprOperandKind::VecState) return -1;
         if (k == ExprOperandKind::Reg || k == ExprOperandKind::Fanout)
         {
             if (op.idx >= num_regs) return -1;
             if (is_reduce_dst[op.idx]) return 0;   // 块归约 dst = 行标量
             return is_elem[op.idx];
         }
-        if (k == ExprOperandKind::Reduce)
-            return (op.idx < num_regs) ? 0 : -1;   // 归约结果 = 行标量
-        return -1;                                 // 未知 kind → 域错误
+        if (k == ExprOperandKind::Reduce) return (op.idx < num_regs) ? 0 : -1; // 归约结果 = 行标量
+        return -1; // 未知 kind → 域错误
     };
     for (const auto& ins : f.body)
     {
         const ExprOp op = static_cast<ExprOp>(ins.op);
-        const std::size_t nops = expr_op_is_reduce(op) ? 1
-            : expr_instr_num_operands(op);
+        const std::size_t nops = expr_op_is_reduce(op) ? 1 : expr_instr_num_operands(op);
         const ExprOperand* ops[3] = {&ins.a, &ins.b, &ins.c};
         int e = 0;
         for (std::size_t oi = 0; oi < nops; ++oi)
         {
             const int se = src_elem(*ops[oi]);
-            if (se < 0)
-                NN_FAIL("expr_fold_classify: operand domain error");
+            if (se < 0) NN_FAIL("expr_fold_classify: operand domain error");
             if (se > e) e = se;
         }
-        if (ins.dst >= num_regs)
-            NN_FAIL("expr_fold_classify: dst out of range");
+        if (ins.dst >= num_regs) NN_FAIL("expr_fold_classify: dst out of range");
         if (expr_op_is_reduce(op))
         {
             is_reduce_dst[ins.dst] = 1;
-            is_elem[ins.dst] = 0;                  // 归约输出恒为行标量
+            is_elem[ins.dst] = 0; // 归约输出恒为行标量
         }
         else
         {
             if (ins.dst < f.num_state && e != 0)
-                NN_FAIL("expr_fold_classify: state written from element-class source (kb-dependent overwrite)");
-            if (e != 0) is_elem[ins.dst] = 1;      // 类别单调升为元素（跨指令保守）
+                NN_FAIL("expr_fold_classify: state written from element-class source (kb-dependent "
+                        "overwrite)");
+            if (e != 0) is_elem[ins.dst] = 1; // 类别单调升为元素（跨指令保守）
         }
     }
     return is_elem;
@@ -441,14 +437,14 @@ struct FoldSpec
 //   - 指令 ≤ 64，寄存器 ≤ 16，输入 ≤ 8，常量 ≤ 16
 struct ExprSpec
 {
-    std::vector<ExprInstr>      instrs;
-    std::vector<ExprView>       views;   // 与 inputs 一一对应
-    std::vector<Scalar>         consts;
-    std::vector<Scalar>         rparams; // 运行时标量参数（不进 key，运行时按实际值填充）
-    std::uint32_t               num_regs = 0;
-    std::optional<MatmulSpec>   matmul;  // 前置 matmul 段（可选；缺省=无）
-    std::optional<FoldSpec>     fold;    // 分块状态归约段（可选；缺省=无）
-    std::vector<std::uint8_t>   extras;  // P2 额外输出寄存器（槽 1..k；见上）
+    std::vector<ExprInstr> instrs;
+    std::vector<ExprView> views; // 与 inputs 一一对应
+    std::vector<Scalar> consts;
+    std::vector<Scalar> rparams; // 运行时标量参数（不进 key，运行时按实际值填充）
+    std::uint32_t num_regs = 0;
+    std::optional<MatmulSpec> matmul; // 前置 matmul 段（可选；缺省=无）
+    std::optional<FoldSpec> fold; // 分块状态归约段（可选；缺省=无）
+    std::vector<std::uint8_t> extras; // P2 额外输出寄存器（槽 1..k；见上）
 };
 
 // 多输出上限（Adam 金刚石 = 3 extras：m/v/delta，主输出 p）
@@ -464,15 +460,14 @@ inline constexpr std::size_t EXPR_MAX_EXTRA_OUT = 4;
 // k/batch 不进 key，作为 push constant 运行时填充（与 RowMod/RotateHalf
 // 同一处理）。**双域 fold 自带 matmul 段同语义**（spec.fold
 // 的段优先于顶层——fold spec 顶层恒无 matmul，两处不冲突）。
-[[nodiscard]] inline std::optional<std::uint32_t> expr_spec_runtime_matmul_k(
-    const ExprSpec& s) noexcept
+[[nodiscard]] inline std::optional<std::uint32_t>
+expr_spec_runtime_matmul_k(const ExprSpec& s) noexcept
 {
     if (s.matmul) return s.matmul->k;
     if (s.fold && s.fold->matmul) return s.fold->matmul->k;
     return std::nullopt;
 }
-[[nodiscard]] inline std::uint32_t expr_spec_runtime_matmul_batch(
-    const ExprSpec& s) noexcept
+[[nodiscard]] inline std::uint32_t expr_spec_runtime_matmul_batch(const ExprSpec& s) noexcept
 {
     if (s.matmul) return s.matmul->batch;
     if (s.fold && s.fold->matmul) return s.fold->matmul->batch;
@@ -483,18 +478,15 @@ inline constexpr std::size_t EXPR_MAX_EXTRA_OUT = 4;
 // （见 generate_glsl_matmul / generate_glsl_reduce 的 PC `mm_trans`）。
 // ⚠ **双域 fold 自带的 matmul 段不在此列**：fold 的 transA/transB 仍进 key
 // （生成期定死，见 expr_spec_key 的 fold 分支），此处只描述顶层 matmul 段。
-[[nodiscard]] inline std::uint32_t expr_spec_runtime_matmul_trans(
-    const ExprSpec& s) noexcept
+[[nodiscard]] inline std::uint32_t expr_spec_runtime_matmul_trans(const ExprSpec& s) noexcept
 {
     if (!s.matmul) return 0u;
     return (s.matmul->transA ? 1u : 0u) | (s.matmul->transB ? 2u : 0u);
 }
 // fold 收缩轴长度（形状参数，不进 key → push constant 运行时填充）
-[[nodiscard]] inline std::optional<std::uint32_t> expr_spec_runtime_fold_k(
-    const ExprSpec& s) noexcept
-{
-    return s.fold ? std::optional<std::uint32_t>{s.fold->k} : std::nullopt;
-}
+[[nodiscard]] inline std::optional<std::uint32_t>
+expr_spec_runtime_fold_k(const ExprSpec& s) noexcept
+{ return s.fold ? std::optional<std::uint32_t>{s.fold->k} : std::nullopt; }
 // batched 网格的"每 batch 行数"（M）：rows 为输出总行（batch*M）
 [[nodiscard]] inline std::size_t expr_spec_rows_per_batch(const ExprSpec& s,
                                                           std::size_t rows) noexcept
@@ -519,21 +511,15 @@ inline constexpr std::size_t EXPR_MAX_EXTRA_OUT = 4;
     // 分组归约的 R（= 池化窗口面积）同理：运行期循环取代编译期展开链。
     return k == ExprViewKind::RowMod || k == ExprViewKind::RotateHalf ||
            k == ExprViewKind::BatchMod || k == ExprViewKind::BatchCol ||
-           k == ExprViewKind::HeadGroup ||
-           k == ExprViewKind::RowAccess ||
-           k == ExprViewKind::GroupedReduceSum ||
-           k == ExprViewKind::GroupedReduceMax ||
+           k == ExprViewKind::HeadGroup || k == ExprViewKind::RowAccess ||
+           k == ExprViewKind::GroupedReduceSum || k == ExprViewKind::GroupedReduceMax ||
            k == ExprViewKind::Transpose;
 }
 // 该视图消耗的运行时视图参数槽位数（RowAccess 用 offset+mod 两个 vp 槽）
-[[nodiscard]] inline constexpr std::uint32_t expr_view_runtime_param_slots(
-    ExprViewKind k) noexcept
-{
-    return (k == ExprViewKind::RowAccess) ? 2u : 1u;
-}
+[[nodiscard]] inline constexpr std::uint32_t expr_view_runtime_param_slots(ExprViewKind k) noexcept
+{ return (k == ExprViewKind::RowAccess) ? 2u : 1u; }
 // 该 spec 的运行时视图参数个数（= 融合 shader 的 push constant vp 槽位数）
-[[nodiscard]] inline std::uint32_t expr_spec_runtime_view_param_count(
-    const ExprSpec& s) noexcept
+[[nodiscard]] inline std::uint32_t expr_spec_runtime_view_param_count(const ExprSpec& s) noexcept
 {
     std::uint32_t n = 0;
     for (const auto& v : s.views)
@@ -544,30 +530,24 @@ inline constexpr std::size_t EXPR_MAX_EXTRA_OUT = 4;
 // ── GQA：该输入的"头分组比"（docs/internal/22 §3.2 P2）────────────────
 // HeadGroup 视图的 param 即该操作数的头分组比 n_rep（1 = 恒等/非 GQA）。
 // GPU 生成器与 CPU 参考都从这里取——单一真源，避免两侧口径漂移。
-[[nodiscard]] inline std::uint32_t gqa_ratio_of(const ExprSpec& s,
-                                                std::size_t view_idx) noexcept
+[[nodiscard]] inline std::uint32_t gqa_ratio_of(const ExprSpec& s, std::size_t view_idx) noexcept
 {
-    if (view_idx >= s.views.size())
-        return 1;
-    if (static_cast<ExprViewKind>(s.views[view_idx].kind) != ExprViewKind::HeadGroup)
-        return 1;
+    if (view_idx >= s.views.size()) return 1;
+    if (static_cast<ExprViewKind>(s.views[view_idx].kind) != ExprViewKind::HeadGroup) return 1;
     return s.views[view_idx].param != 0 ? s.views[view_idx].param : 1;
 }
 
 // 按视图顺序提取运行时视图参数（RowMod 周期 / RotateHalf 块大小 / RowAccess
 // 的 mod+offset），运行时 eval_expr 用它填充融合 shader 的 push constant vp 槽。
-[[nodiscard]] inline std::vector<std::uint32_t> expr_spec_runtime_view_params(
-    const ExprSpec& s)
+[[nodiscard]] inline std::vector<std::uint32_t> expr_spec_runtime_view_params(const ExprSpec& s)
 {
     std::vector<std::uint32_t> out;
     for (const auto& v : s.views)
     {
         const auto k = static_cast<ExprViewKind>(v.kind);
-        if (!expr_view_has_runtime_param(k))
-            continue;
-        out.push_back(v.param);               // RowMod/RotateHalf: mod/block；RowAccess: mod
-        if (k == ExprViewKind::RowAccess)
-            out.push_back(v.param2);          // RowAccess 额外 offset 槽
+        if (!expr_view_has_runtime_param(k)) continue;
+        out.push_back(v.param); // RowMod/RotateHalf: mod/block；RowAccess: mod
+        if (k == ExprViewKind::RowAccess) out.push_back(v.param2); // RowAccess 额外 offset 槽
     }
     return out;
 }
@@ -579,16 +559,14 @@ inline constexpr std::size_t EXPR_MAX_EXTRA_OUT = 4;
     int axis = -1;
     for (const auto& v : s.views)
     {
-        if (!expr_view_is_reduce(static_cast<ExprViewKind>(v.kind)))
-            continue;
+        if (!expr_view_is_reduce(static_cast<ExprViewKind>(v.kind))) continue;
         const int a = expr_view_reduces_rows(static_cast<ExprViewKind>(v.kind)) ? 0 : 1;
         if (axis == -1) axis = a;
         else if (axis != a) return -2;
     }
     for (const auto& in : s.instrs)
     {
-        if (!expr_op_is_reduce(static_cast<ExprOp>(in.op)))
-            continue;
+        if (!expr_op_is_reduce(static_cast<ExprOp>(in.op))) continue;
         const int a = expr_op_reduces_cols(static_cast<ExprOp>(in.op)) ? 1 : 0;
         if (axis == -1) axis = a;
         else if (axis != a) return -2;
@@ -602,10 +580,7 @@ inline constexpr std::size_t EXPR_MAX_EXTRA_OUT = 4;
 // 复合结构——optimizer 主力）；只发 V0 全 f32（f16/混精度走既有逐 kernel 路径）。
 // **生成器（fused_generate）与运行期分组（execute_fused_graph）同源用本函数**。
 [[nodiscard]] inline bool expr_spec_batchable(const ExprSpec& s)
-{
-    return expr_spec_reduce_axis(s) == -1 && !s.fold && !s.matmul &&
-           !s.instrs.empty();
-}
+{ return expr_spec_reduce_axis(s) == -1 && !s.fold && !s.matmul && !s.instrs.empty(); }
 
 // ── 表达式规格相等比较（GPU AOT 匹配用）────────────────────────────────
 // 两个 ExprSpec 相等 ⟺ 指令序列、输入视图、常量池、运行时参数、寄存器数、
@@ -613,20 +588,14 @@ inline constexpr std::size_t EXPR_MAX_EXTRA_OUT = 4;
 // 用于运行时 eval_expr 判断"该表达式是否有预生成融合 shader"。
 [[nodiscard]] inline bool expr_spec_equal(const ExprSpec& a, const ExprSpec& b)
 {
-    return a.instrs == b.instrs && a.views == b.views &&
-           a.consts == b.consts && a.rparams == b.rparams &&
-           a.num_regs == b.num_regs &&
-           a.matmul == b.matmul &&
-           a.fold == b.fold &&
-           a.extras == b.extras;
+    return a.instrs == b.instrs && a.views == b.views && a.consts == b.consts &&
+           a.rparams == b.rparams && a.num_regs == b.num_regs && a.matmul == b.matmul &&
+           a.fold == b.fold && a.extras == b.extras;
 }
 
 // 该 spec 的运行时标量参数个数（= 融合 shader 的 push constant 浮点 p 槽位数）
-[[nodiscard]] inline std::uint32_t expr_spec_runtime_param_count(
-    const ExprSpec& s) noexcept
-{
-    return static_cast<std::uint32_t>(s.rparams.size());
-}
+[[nodiscard]] inline std::uint32_t expr_spec_runtime_param_count(const ExprSpec& s) noexcept
+{ return static_cast<std::uint32_t>(s.rparams.size()); }
 
 // ── 规范结构 key（AOT 收集/匹配的单一依据）──────────────────────────────
 // 把 ExprSpec 的**结构**（指令、视图、常量池**个数**、寄存器数；不含输入张量、
@@ -638,7 +607,7 @@ inline constexpr std::size_t EXPR_MAX_EXTRA_OUT = 4;
 // 逐字段字节级串接（不用 memcpy 整个 struct，避免 padding/平台差异）。
 [[nodiscard]] inline std::string expr_spec_key(const ExprSpec& s)
 {
-    std::uint64_t h = 0xcbf29ce484222325ull;  // FNV-1a 64 offset basis
+    std::uint64_t h = 0xcbf29ce484222325ull; // FNV-1a 64 offset basis
     const auto feed = [&h](const void* p, std::size_t n)
     {
         const auto* b = static_cast<const std::uint8_t*>(p);
@@ -653,13 +622,14 @@ inline constexpr std::size_t EXPR_MAX_EXTRA_OUT = 4;
     feed_u32(s.num_regs);
     // P2 多输出（extras）：寄存器号是结构（决定 shader 的额外输出存储）→ 进 key
     feed_u32(static_cast<std::uint32_t>(s.extras.size()));
-    for (const auto& e : s.extras) feed(&e, 1);
+    for (const auto& e : s.extras)
+        feed(&e, 1);
     feed_u32(static_cast<std::uint32_t>(s.instrs.size()));
     for (const auto& in : s.instrs)
     {
         feed(&in.op, 1);
         feed(&in.dst, 1);
-        feed(&in.a, sizeof(in.a));  // ExprOperand: 2 字节 POD
+        feed(&in.a, sizeof(in.a)); // ExprOperand: 2 字节 POD
         feed(&in.b, sizeof(in.b));
         feed(&in.c, sizeof(in.c));
     }
@@ -750,8 +720,7 @@ inline constexpr std::size_t EXPR_MAX_EXTRA_OUT = 4;
     }
 
     char buf[17];
-    std::snprintf(buf, sizeof(buf), "%016llx",
-                  static_cast<unsigned long long>(h));
+    std::snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(h));
     return std::string(buf);
 }
 
@@ -766,16 +735,13 @@ inline constexpr std::size_t EXPR_MAX_EXTRA_OUT = 4;
 //   bit 0..15  第 i 个输入是 F16（i = 输入槽位，与 views 顺序一一对应）
 //   bit 16     输出是 F16
 //   全 0 = 全 f32：key 不加后缀、registry 不生成额外变体。
-inline constexpr std::uint32_t EXPR_PREC_SIG_OUT_BIT    = 16u;
+inline constexpr std::uint32_t EXPR_PREC_SIG_OUT_BIT = 16u;
 inline constexpr std::uint32_t EXPR_PREC_SIG_INPUT_MASK = 0xFFFFu;
 using ExprPrecSig = std::uint32_t;
 
-[[nodiscard]] inline constexpr ExprPrecSig expr_prec_sig_make(
-    std::uint32_t input_bits, bool out_f16) noexcept
-{
-    return (out_f16 ? (1u << EXPR_PREC_SIG_OUT_BIT) : 0u)
-         | (input_bits & EXPR_PREC_SIG_INPUT_MASK);
-}
+[[nodiscard]] inline constexpr ExprPrecSig expr_prec_sig_make(std::uint32_t input_bits,
+                                                              bool out_f16) noexcept
+{ return (out_f16 ? (1u << EXPR_PREC_SIG_OUT_BIT) : 0u) | (input_bits & EXPR_PREC_SIG_INPUT_MASK); }
 
 // 是否全 f32（sig == 0）
 [[nodiscard]] inline constexpr bool expr_prec_sig_is_f32(ExprPrecSig s) noexcept
@@ -849,12 +815,8 @@ inline constexpr const char* EXPR_MM_KSPLIT_REDUCE_SUFFIX = "#kr";
 // ⚠ in_f16 必须先与 EXPR_PREC_SIG_INPUT_MASK 相与：EXPR_PREC_SIG_DISPATCH
 // （0x00020000）是**哨兵**而非位图，不对齐输入字段就会把 bit 17 读成
 // "第 17 个输入是 f16"（EXPR_MAX_INPUTS=16 时侥幸为假，改上限即踩雷）。
-[[nodiscard]] inline constexpr bool expr_prec_sig_in_f16(ExprPrecSig s,
-                                                         std::size_t i) noexcept
-{
-    return i < EXPR_PREC_SIG_OUT_BIT &&
-           ((s & EXPR_PREC_SIG_INPUT_MASK) >> i & 1u) != 0u;
-}
+[[nodiscard]] inline constexpr bool expr_prec_sig_in_f16(ExprPrecSig s, std::size_t i) noexcept
+{ return i < EXPR_PREC_SIG_OUT_BIT && ((s & EXPR_PREC_SIG_INPUT_MASK) >> i & 1u) != 0u; }
 [[nodiscard]] inline constexpr bool expr_prec_sig_out_f16(ExprPrecSig s) noexcept
 { return ((s >> EXPR_PREC_SIG_OUT_BIT) & 1u) != 0u; }
 
@@ -865,25 +827,21 @@ inline constexpr const char* EXPR_MM_KSPLIT_REDUCE_SUFFIX = "#kr";
 [[nodiscard]] inline constexpr bool expr_variant_out_f16(ExprPrecSig variant_sig,
                                                          ExprPrecSig runtime_sig) noexcept
 {
-    return expr_prec_sig_is_dispatch(variant_sig)
-        ? expr_prec_sig_out_f16(runtime_sig)
-        : expr_prec_sig_out_f16(variant_sig);
+    return expr_prec_sig_is_dispatch(variant_sig) ? expr_prec_sig_out_f16(runtime_sig)
+                                                  : expr_prec_sig_out_f16(variant_sig);
 }
 
 // 变体索引 key：全 f32 → 结构 key 本身；否则加 "#xxxx"
-[[nodiscard]] inline std::string expr_prec_sig_key(const std::string& spec_key,
-                                                   ExprPrecSig sig)
+[[nodiscard]] inline std::string expr_prec_sig_key(const std::string& spec_key, ExprPrecSig sig)
 {
-    if (sig == 0u)
-        return spec_key;
+    if (sig == 0u) return spec_key;
     char buf[16];
     std::snprintf(buf, sizeof(buf), "#%04x", static_cast<unsigned>(sig));
     return spec_key + buf;
 }
 
 // ── 诊断用：把签名渲染成 "in=[f16,f32,...] out=f16"
-[[nodiscard]] inline std::string expr_prec_sig_str(ExprPrecSig sig,
-                                                   std::size_t num_inputs)
+[[nodiscard]] inline std::string expr_prec_sig_str(ExprPrecSig sig, std::size_t num_inputs)
 {
     std::string s = "in=[";
     for (std::size_t i = 0; i < num_inputs; ++i)
@@ -903,14 +861,11 @@ inline constexpr const char* EXPR_MM_KSPLIT_REDUCE_SUFFIX = "#kr";
 // 检查：结构内每个输入都是 f16 且输出 f16。含 fold / matmul / 归约 / rparams
 // 的结构同样适用（这正是 `#a` 覆盖不到、而 `#s` 要覆盖的部分）——数值语义与
 // `#x` 的 f16 分支逐字相同，所以没有任何额外的结构禁忌。
-[[nodiscard]] inline bool expr_prec_sig_all_f16(const ExprSpec& spec,
-                                                ExprPrecSig sig) noexcept
+[[nodiscard]] inline bool expr_prec_sig_all_f16(const ExprSpec& spec, ExprPrecSig sig) noexcept
 {
-    if (sig == 0u || expr_prec_sig_is_dispatch(sig) || !expr_prec_sig_out_f16(sig))
-        return false;
+    if (sig == 0u || expr_prec_sig_is_dispatch(sig) || !expr_prec_sig_out_f16(sig)) return false;
     for (std::size_t i = 0; i < spec.views.size(); ++i)
-        if (!expr_prec_sig_in_f16(sig, i))
-            return false;
+        if (!expr_prec_sig_in_f16(sig, i)) return false;
     return true;
 }
 
@@ -942,31 +897,24 @@ inline constexpr const char* EXPR_MM_KSPLIT_REDUCE_SUFFIX = "#kr";
 // 设备要求：shaderFloat16（VulkanDevice 已查询 + 启用，NN_VULKAN_NO_16BIT_ALU
 // 逃生阀可关）。不支持 → 后端跳过该变体 pipeline → supports_expr_precision_
 // variant=false → 基类 NVI 入口回退边界 cast（正确性不变，拿不到原生收益）。
-[[nodiscard]] inline bool expr_prec_sig_native16(const ExprSpec& spec,
-                                                 ExprPrecSig sig)
+[[nodiscard]] inline bool expr_prec_sig_native16(const ExprSpec& spec, ExprPrecSig sig)
 {
-    if (sig == 0u || !expr_prec_sig_out_f16(sig))
-        return false;
-    if (spec.fold || spec.matmul)
-        return false;
-    if (expr_spec_reduce_axis(spec) != -1)
-        return false;
-    if (!spec.rparams.empty())
-        return false;
+    if (sig == 0u || !expr_prec_sig_out_f16(sig)) return false;
+    if (spec.fold || spec.matmul) return false;
+    if (expr_spec_reduce_axis(spec) != -1) return false;
+    if (!spec.rparams.empty()) return false;
     for (std::size_t i = 0; i < spec.views.size(); ++i)
-        if (!expr_prec_sig_in_f16(sig, i))
-            return false;
+        if (!expr_prec_sig_in_f16(sig, i)) return false;
     for (const auto& c : spec.consts)
     {
         const float a = std::fabs(c);
-        if (a != 0.0f && a < 5.9e-8f)   // f16 最小次正规边界下方 → 会变 0
+        if (a != 0.0f && a < 5.9e-8f) // f16 最小次正规边界下方 → 会变 0
             return false;
     }
     for (const auto& ins : spec.instrs)
     {
         const ExprOperand* ops[3] = {&ins.a, &ins.b, &ins.c};
-        const std::size_t nops =
-            expr_instr_num_operands(static_cast<ExprOp>(ins.op));
+        const std::size_t nops = expr_instr_num_operands(static_cast<ExprOp>(ins.op));
         for (std::size_t o = 0; o < nops; ++o)
         {
             const auto k = ops[o]->kind;
@@ -980,18 +928,20 @@ inline constexpr const char* EXPR_MM_KSPLIT_REDUCE_SUFFIX = "#kr";
 }
 
 // ── 上限（GPU 资源 / 校验共用）───────────────────────────────────────────
-inline constexpr std::size_t EXPR_MAX_INPUTS = 16;  // 树型 DSL 重复叶子上限（绑定按 spec 实际 views 动态创建，非固定）
+inline constexpr std::size_t EXPR_MAX_INPUTS =
+    16; // 树型 DSL 重复叶子上限（绑定按 spec 实际 views 动态创建，非固定）
 inline constexpr std::size_t EXPR_MAX_CONSTS = 16;
-inline constexpr std::size_t EXPR_MAX_REGS   = 32;  // 全融合分支 select 表达式（如 SwiGLU backward）所需；shader 仅声明实际 num_regs
+inline constexpr std::size_t EXPR_MAX_REGS =
+    32; // 全融合分支 select 表达式（如 SwiGLU backward）所需；shader 仅声明实际 num_regs
 inline constexpr std::size_t EXPR_MAX_INSTRS = 64;
 // fold 段上限（body/finalize 独立计数，不占顶层 instrs 预算——
 //   两者在 GPU 上分别生成块循环体与收尾段，资源约束与主链解耦）
-inline constexpr std::size_t FOLD_MAX_BODY    = 48;
+inline constexpr std::size_t FOLD_MAX_BODY = 48;
 inline constexpr std::size_t FOLD_MAX_FINALIZE = 16;
-inline constexpr std::size_t FOLD_MAX_STATE   = 8;
-inline constexpr std::size_t FOLD_MAX_VEC     = 1024;  // 行向量态长度上限（=输出列数）
-inline constexpr std::uint32_t FOLD_MAX_MMK   = 1024;  // fold mm 段内层 k 上限
-    // （A 操作数行预载 shared Ash[1024] 的编译期尺寸——d_k 超限在 validate 静态拒）
+inline constexpr std::size_t FOLD_MAX_STATE = 8;
+inline constexpr std::size_t FOLD_MAX_VEC = 1024; // 行向量态长度上限（=输出列数）
+inline constexpr std::uint32_t FOLD_MAX_MMK = 1024; // fold mm 段内层 k 上限
+// （A 操作数行预载 shared Ash[1024] 的编译期尺寸——d_k 超限在 validate 静态拒）
 // fold 块大小：CPU 执行器与 GPU 生成器**共用**的常量（不进 key——分块是
 // 实现细节，但两侧必须同值以对齐分块边界与 max 类逐位；sum 类 GPU subgroup
 // 蝶形结合序异于 CPU 串行 → 对拍仍走小容差（1e-4~1e-6），并非全逐位）。
@@ -1016,8 +966,8 @@ inline constexpr std::uint32_t EXPR_FOLD_ROWS_PER_WG = 2;
 //   - K 方向每块 32（BK=32，barrier 减半）
 // 后端 dispatch 按输出块缩放：(ceil(cols/BLOCK), ceil(rows/BLOCK), 1)，
 // 与生成器必须保持一致。
-inline constexpr std::uint32_t EXPR_MATMUL_TILE   = 16;
-inline constexpr std::uint32_t EXPR_MATMUL_BLOCK  = 64;
+inline constexpr std::uint32_t EXPR_MATMUL_TILE = 16;
+inline constexpr std::uint32_t EXPR_MATMUL_BLOCK = 64;
 // ── matmul 细 tile 变体（P0 wgrad 网格饥饿，键后缀 EXPR_MM_FINE_SUFFIX）──
 // 反传 wgrad 形状（M,N = 64..256 × K=16384）在 64-tile 下只派
 // ceil(N/64)×ceil(M/64) = 1~4 个工作组，40HX（34 SM）大面积空转
@@ -1031,7 +981,7 @@ inline constexpr std::uint32_t EXPR_MATMUL_BLOCK  = 64;
 // warp 工作组，169 GFLOPS 比不修还差；R=1（16×16 线程）305~439 也不如
 // R=2 预期。逐输出元素的 K 累加序与 64-tile 一致（逐 k 标量升序 FMA）
 // → 结果逐位一致，字节锚不移动。
-inline constexpr std::uint32_t EXPR_MATMUL_TILE_FINE  = 8;
+inline constexpr std::uint32_t EXPR_MATMUL_TILE_FINE = 8;
 inline constexpr std::uint32_t EXPR_MATMUL_BLOCK_FINE = 16;
 // 饥饿判据：64-tile 网格的工作组数（含 batch 维）低于该阈值 → 派细 tile
 // 变体。32 ≈ 40HX 的 SM 数（34）——低于它基本必有一波 SM 空转；高于它
@@ -1050,30 +1000,24 @@ inline constexpr std::uint32_t EXPR_MATMUL_FINE_MIN_WGS = 32;
 // 运行期可用 NN_MM_KSPLIT_S=<n> 强制 S（A/B 调参）、NN_MM_NO_KSPLIT=1
 // 关闭（回落细 tile 路径）。
 inline constexpr std::uint32_t EXPR_MATMUL_KSPLIT_MIN_WGS = 256;
-inline constexpr std::uint32_t EXPR_MATMUL_KSPLIT_MAX_S   = 8;
+inline constexpr std::uint32_t EXPR_MATMUL_KSPLIT_MAX_S = 8;
 
 // ── 校验 ──────────────────────────────────────────────────────────────────
 // 返回 unexpected(Error) 描述首个非法点。Layer 侧可在提交前调用以尽早报错。
-[[nodiscard]] inline Result<void> validate_expr_spec(const ExprSpec& spec,
-                                                     std::size_t num_inputs)
+[[nodiscard]] inline Result<void> validate_expr_spec(const ExprSpec& spec, std::size_t num_inputs)
 {
     // matmul 段或 fold 段存在时允许空指令表（输出 = 段结果本身；
     //   fold 的 finalize 序列即其尾链）
     if (spec.instrs.empty() && !spec.matmul && !spec.fold)
         NN_FAIL("validate_expr_spec: empty instruction list");
-    if (spec.instrs.size() > EXPR_MAX_INSTRS)
-        NN_FAIL("validate_expr_spec: too many instructions");
-    if (spec.num_regs > EXPR_MAX_REGS)
-        NN_FAIL("validate_expr_spec: too many registers");
-    if (num_inputs > EXPR_MAX_INPUTS)
-        NN_FAIL("validate_expr_spec: too many inputs");
-    if (spec.consts.size() > EXPR_MAX_CONSTS)
-        NN_FAIL("validate_expr_spec: too many constants");
+    if (spec.instrs.size() > EXPR_MAX_INSTRS) NN_FAIL("validate_expr_spec: too many instructions");
+    if (spec.num_regs > EXPR_MAX_REGS) NN_FAIL("validate_expr_spec: too many registers");
+    if (num_inputs > EXPR_MAX_INPUTS) NN_FAIL("validate_expr_spec: too many inputs");
+    if (spec.consts.size() > EXPR_MAX_CONSTS) NN_FAIL("validate_expr_spec: too many constants");
     // 运行时标量参数同样受限（PC 浮点槽位有限）
     if (spec.rparams.size() > EXPR_MAX_CONSTS)
         NN_FAIL("validate_expr_spec: too many runtime params");
-    if (spec.views.size() != num_inputs)
-        NN_FAIL("validate_expr_spec: views count != inputs count");
+    if (spec.views.size() != num_inputs) NN_FAIL("validate_expr_spec: views count != inputs count");
     // P2 多输出（extras，IR-C 写穿物化）：仅纯逐元素 spec；额外输出寄存器须
     // 被某指令定义、槽互异、且不与主输出（instrs.back().dst）重复。
     if (!spec.extras.empty())
@@ -1095,9 +1039,12 @@ inline constexpr std::uint32_t EXPR_MATMUL_KSPLIT_MAX_S   = 8;
                     NN_FAIL("validate_expr_spec: duplicate extra output reg");
             bool defined = false;
             for (const auto& ins : spec.instrs)
-                if (ins.dst == spec.extras[k]) { defined = true; break; }
-            if (!defined)
-                NN_FAIL("validate_expr_spec: extra output reg never defined");
+                if (ins.dst == spec.extras[k])
+                {
+                    defined = true;
+                    break;
+                }
+            if (!defined) NN_FAIL("validate_expr_spec: extra output reg never defined");
         }
     }
     // matmul 段：A/B 输入下标必须在输入范围内（形状由引擎按实际张量推导）
@@ -1105,15 +1052,14 @@ inline constexpr std::uint32_t EXPR_MATMUL_KSPLIT_MAX_S   = 8;
     {
         if (spec.matmul->a_input >= num_inputs || spec.matmul->b_input >= num_inputs)
             NN_FAIL("validate_expr_spec: matmul input out of range");
-        if (spec.matmul->batch == 0)
-            NN_FAIL("validate_expr_spec: matmul batch must be > 0");
+        if (spec.matmul->batch == 0) NN_FAIL("validate_expr_spec: matmul batch must be > 0");
     }
     // 分组归约视图：组长度 R 必须 > 0（R=0 时 GLSL 展开循环无下界、CPU 除零）
     for (const auto& v : spec.views)
     {
         const auto vk = static_cast<ExprViewKind>(v.kind);
-        if ((vk == ExprViewKind::GroupedReduceSum || vk == ExprViewKind::GroupedReduceMax)
-            && v.param == 0)
+        if ((vk == ExprViewKind::GroupedReduceSum || vk == ExprViewKind::GroupedReduceMax) &&
+            v.param == 0)
             NN_FAIL("validate_expr_spec: grouped reduce R must be > 0");
     }
 
@@ -1128,14 +1074,12 @@ inline constexpr std::uint32_t EXPR_MATMUL_KSPLIT_MAX_S   = 8;
         if (f.num_state == 0 || f.num_state > FOLD_MAX_STATE ||
             f.inits.size() != static_cast<std::size_t>(f.num_state))
             NN_FAIL("validate_expr_spec: fold state count/init mismatch");
-        if (f.k == 0)
-            NN_FAIL("validate_expr_spec: fold k must be > 0");
+        if (f.k == 0) NN_FAIL("validate_expr_spec: fold k must be > 0");
         if (f.body.empty() || f.body.size() > FOLD_MAX_BODY)
             NN_FAIL("validate_expr_spec: fold body size out of range");
         if (f.finalize.empty() || f.finalize.size() > FOLD_MAX_FINALIZE)
             NN_FAIL("validate_expr_spec: fold finalize size out of range");
-        if (spec.num_regs < f.num_state)
-            NN_FAIL("validate_expr_spec: fold num_regs < num_state");
+        if (spec.num_regs < f.num_state) NN_FAIL("validate_expr_spec: fold num_regs < num_state");
         // 双域字段
         if (f.vec_state_len > FOLD_MAX_VEC)
             NN_FAIL("validate_expr_spec: fold vec_state_len out of range");
@@ -1145,8 +1089,7 @@ inline constexpr std::uint32_t EXPR_MATMUL_KSPLIT_MAX_S   = 8;
         {
             if (f.matmul->a_input >= num_inputs || f.matmul->b_input >= num_inputs)
                 NN_FAIL("validate_expr_spec: fold matmul input out of range");
-            if (f.matmul->batch == 0)
-                NN_FAIL("validate_expr_spec: fold matmul batch must be > 0");
+            if (f.matmul->batch == 0) NN_FAIL("validate_expr_spec: fold matmul batch must be > 0");
             if (f.matmul->k > FOLD_MAX_MMK)
                 NN_FAIL("validate_expr_spec: fold matmul k exceeds shared preload cap (1024)");
         }
@@ -1176,8 +1119,10 @@ inline constexpr std::uint32_t EXPR_MATMUL_KSPLIT_MAX_S   = 8;
             if (k == ExprOperandKind::Matmul && !has_mm)
                 NN_FAIL("validate_expr_spec: fold: Matmul operand without fold matmul segment");
             if ((k == ExprOperandKind::Row || k == ExprOperandKind::Col ||
-                 k == ExprOperandKind::Batch) && !has_mm)
-                NN_FAIL("validate_expr_spec: fold: index operands require fold matmul segment (batch 网格语义)");
+                 k == ExprOperandKind::Batch) &&
+                !has_mm)
+                NN_FAIL("validate_expr_spec: fold: index operands require fold matmul segment "
+                        "(batch 网格语义)");
             // VecState 的 body/finalize 区分不在这里做：本 lambda 两处共用——
             //   body 侧由 expr_fold_classify 拒（src_elem(VecState) = -1 域错误），
             //   finalize 侧由下方主链做域校验（veclen/单槽）。
@@ -1195,12 +1140,11 @@ inline constexpr std::uint32_t EXPR_MATMUL_KSPLIT_MAX_S   = 8;
         {
             const ExprOp op = static_cast<ExprOp>(ins.op);
             if (expr_op_is_reduce(op) && expr_op_reduces_cols(op))
-                NN_FAIL("validate_expr_spec: fold body: col-reduce not allowed (block axis is the row-reduce axis)");
-            if (ins.dst >= spec.num_regs)
-                NN_FAIL("validate_expr_spec: fold body dst out of range");
+                NN_FAIL("validate_expr_spec: fold body: col-reduce not allowed (block axis is the "
+                        "row-reduce axis)");
+            if (ins.dst >= spec.num_regs) NN_FAIL("validate_expr_spec: fold body dst out of range");
             const ExprOperand* ops[3] = {&ins.a, &ins.b, &ins.c};
-            const std::size_t nops = expr_op_is_reduce(op) ? 1
-                : expr_instr_num_operands(op);
+            const std::size_t nops = expr_op_is_reduce(op) ? 1 : expr_instr_num_operands(op);
             for (std::size_t oi = 0; oi < nops; ++oi)
             {
                 const ExprOperand& opnd = *ops[oi];
@@ -1211,16 +1155,19 @@ inline constexpr std::uint32_t EXPR_MATMUL_KSPLIT_MAX_S   = 8;
                     if (opnd.idx >= spec.num_regs || opnd.idx == ins.dst)
                         NN_FAIL("validate_expr_spec: fold body reduce ref invalid");
                     if (!body_reduce_dst[opnd.idx])
-                        NN_FAIL("validate_expr_spec: fold body Reduce operand must reference a prior block-reduce instr");
+                        NN_FAIL("validate_expr_spec: fold body Reduce operand must reference a "
+                                "prior block-reduce instr");
                 }
                 else if (k == ExprOperandKind::Reg || k == ExprOperandKind::Fanout)
                 {
                     if (opnd.idx >= spec.num_regs)
                         NN_FAIL("validate_expr_spec: fold body reg out of range");
                     if (body_reduce_dst[opnd.idx])
-                        NN_FAIL("validate_expr_spec: fold body reg ref to block-reduce dst (use Reduce operand)");
+                        NN_FAIL("validate_expr_spec: fold body reg ref to block-reduce dst (use "
+                                "Reduce operand)");
                     if (!defined[opnd.idx])
-                        NN_FAIL("validate_expr_spec: fold body use before def (or block-local reg read)");
+                        NN_FAIL("validate_expr_spec: fold body use before def (or block-local reg "
+                                "read)");
                 }
                 else if (k == ExprOperandKind::Input)
                 {
@@ -1230,15 +1177,14 @@ inline constexpr std::uint32_t EXPR_MATMUL_KSPLIT_MAX_S   = 8;
                     if (expr_view_is_reduce(vk))
                         NN_FAIL("validate_expr_spec: fold body: reduce-view input not allowed");
                     if (vk == ExprViewKind::Linear || vk == ExprViewKind::HeadGroup ||
-                        vk == ExprViewKind::RowMod ||
-                        vk == ExprViewKind::RowBroadcast ||
+                        vk == ExprViewKind::RowMod || vk == ExprViewKind::RowBroadcast ||
                         vk == ExprViewKind::Transpose)
-                        ;  // 标量域恒允许；RowBroadcast = 行参数向量（b[row]，
-                           //   无列依赖——doc_col 等行级掩码参数恒可用）；
-                           //   Transpose = 转置读（data[col*param+row]，通用索引）
-                    else if ((vk == ExprViewKind::BatchMod ||
-                              vk == ExprViewKind::BatchCol) && has_mm)
-                        ;  // 双域：掩码钩子消费（ALiBi 斜率 / doc_ids），需 batch 网格
+                        ; // 标量域恒允许；RowBroadcast = 行参数向量（b[row]，
+                    //   无列依赖——doc_col 等行级掩码参数恒可用）；
+                    //   Transpose = 转置读（data[col*param+row]，通用索引）
+                    else if ((vk == ExprViewKind::BatchMod || vk == ExprViewKind::BatchCol) &&
+                             has_mm)
+                        ; // 双域：掩码钩子消费（ALiBi 斜率 / doc_ids），需 batch 网格
                     else
                         NN_FAIL("validate_expr_spec: fold body: view kind outside supported scope");
                 }
@@ -1253,15 +1199,14 @@ inline constexpr std::uint32_t EXPR_MATMUL_KSPLIT_MAX_S   = 8;
                         NN_FAIL("validate_expr_spec: fold body rparam out of range");
                 }
             }
-            if (expr_op_is_reduce(op))
-                body_reduce_dst[ins.dst] = 1;
+            if (expr_op_is_reduce(op)) body_reduce_dst[ins.dst] = 1;
             defined[ins.dst] = 1;
         }
 
         // finalize：只读状态/常量/rparam/Row——禁归约、禁 Input、禁块内临时
         //   （链内临时 = 各指令 dst，def-before-use 可读，见下）
-        std::vector<uint8_t> fin_def(spec.num_regs, 0);   // 本列已写（def-before-use）
-        std::vector<int> fin_write_max(spec.num_regs, -1);// 任一写的位置（污染判定）
+        std::vector<uint8_t> fin_def(spec.num_regs, 0); // 本列已写（def-before-use）
+        std::vector<int> fin_write_max(spec.num_regs, -1); // 任一写的位置（污染判定）
         for (std::size_t fi = 0; fi < f.finalize.size(); ++fi)
             if (f.finalize[fi].dst < spec.num_regs)
                 fin_write_max[f.finalize[fi].dst] = static_cast<int>(fi);
@@ -1287,10 +1232,12 @@ inline constexpr std::uint32_t EXPR_MATMUL_KSPLIT_MAX_S   = 8;
                 if (k == ExprOperandKind::VecState)
                 {
                     if (f.vec_state_len == 0)
-                        NN_FAIL("validate_expr_spec: fold finalize: VecState without vec_state_len");
+                        NN_FAIL(
+                            "validate_expr_spec: fold finalize: VecState without vec_state_len");
                     if (opnd.idx != 0)
-                        NN_FAIL("validate_expr_spec: fold finalize: VecState multi-slot unsupported");
-                    continue;  // 单槽域校验通过
+                        NN_FAIL(
+                            "validate_expr_spec: fold finalize: VecState multi-slot unsupported");
+                    continue; // 单槽域校验通过
                 }
                 if (k == ExprOperandKind::Reg || k == ExprOperandKind::Fanout)
                 {
@@ -1306,10 +1253,12 @@ inline constexpr std::uint32_t EXPR_MATMUL_KSPLIT_MAX_S   = 8;
                     //     全错值）。单列（=0）无跨迭代，fold v1 的状态自复制
                     //     finalize（同指令读写状态）合法。
                     if (opnd.idx >= f.num_state && !fin_def[opnd.idx])
-                        NN_FAIL("validate_expr_spec: fold finalize reads undefined chain temp (def-before-use)");
-                    if (opnd.idx < f.num_state && !fin_def[opnd.idx] &&
-                        f.vec_state_len > 0 && fin_write_max[opnd.idx] >= 0)
-                        NN_FAIL("validate_expr_spec: fold finalize: written reg also read "                         "(multi-column loop would read its own prior output)");
+                        NN_FAIL("validate_expr_spec: fold finalize reads undefined chain temp "
+                                "(def-before-use)");
+                    if (opnd.idx < f.num_state && !fin_def[opnd.idx] && f.vec_state_len > 0 &&
+                        fin_write_max[opnd.idx] >= 0)
+                        NN_FAIL("validate_expr_spec: fold finalize: written reg also read "
+                                "(multi-column loop would read its own prior output)");
                 }
                 else if (k == ExprOperandKind::Const && opnd.idx >= spec.consts.size())
                     NN_FAIL("validate_expr_spec: fold finalize const out of range");
@@ -1337,21 +1286,23 @@ inline constexpr std::uint32_t EXPR_MATMUL_KSPLIT_MAX_S   = 8;
     }
     for (const auto& ins : spec.instrs)
     {
-        if (ins.dst >= spec.num_regs)
-            NN_FAIL("validate_expr_spec: dst reg out of range");
+        if (ins.dst >= spec.num_regs) NN_FAIL("validate_expr_spec: dst reg out of range");
         const ExprOperand* ops[3] = {&ins.a, &ins.b, &ins.c};
         const std::size_t nops = expr_instr_num_operands(static_cast<ExprOp>(ins.op));
         for (std::size_t oi = 0; oi < nops; ++oi)
         {
             const ExprOperand& op = *ops[oi];
             if ((op.kind == static_cast<uint8_t>(ExprOperandKind::Reg) ||
-                 op.kind == static_cast<uint8_t>(ExprOperandKind::Fanout)) && op.idx >= spec.num_regs)
+                 op.kind == static_cast<uint8_t>(ExprOperandKind::Fanout)) &&
+                op.idx >= spec.num_regs)
                 NN_FAIL("validate_expr_spec: src reg out of range");
             if (op.kind == static_cast<uint8_t>(ExprOperandKind::Input) && op.idx >= num_inputs)
                 NN_FAIL("validate_expr_spec: input index out of range");
-            if (op.kind == static_cast<uint8_t>(ExprOperandKind::Const) && op.idx >= spec.consts.size())
+            if (op.kind == static_cast<uint8_t>(ExprOperandKind::Const) &&
+                op.idx >= spec.consts.size())
                 NN_FAIL("validate_expr_spec: const index out of range");
-            if (op.kind == static_cast<uint8_t>(ExprOperandKind::RParam) && op.idx >= spec.rparams.size())
+            if (op.kind == static_cast<uint8_t>(ExprOperandKind::RParam) &&
+                op.idx >= spec.rparams.size())
                 NN_FAIL("validate_expr_spec: rparam index out of range");
             if (op.kind == static_cast<uint8_t>(ExprOperandKind::Matmul) && !spec.matmul)
                 NN_FAIL("validate_expr_spec: Matmul operand without matmul segment");
@@ -1365,8 +1316,8 @@ inline constexpr std::uint32_t EXPR_MATMUL_KSPLIT_MAX_S   = 8;
     //      按行/列广播访问）——拒绝，避免引擎侧产生歧义。
     //   3. 归约指令只需源操作数 a，b/c 忽略。
     {
-        std::vector<uint8_t> reduce_dst(spec.num_regs, 0);  // dst -> 是否为归约结果
-        std::vector<uint8_t> elem_dst(spec.num_regs, 0);    // dst -> 是否为逐元素结果
+        std::vector<uint8_t> reduce_dst(spec.num_regs, 0); // dst -> 是否为归约结果
+        std::vector<uint8_t> elem_dst(spec.num_regs, 0); // dst -> 是否为逐元素结果
         for (const auto& ins : spec.instrs)
         {
             const ExprOp op = static_cast<ExprOp>(ins.op);
@@ -1374,8 +1325,7 @@ inline constexpr std::uint32_t EXPR_MATMUL_KSPLIT_MAX_S   = 8;
             (is_reduce ? reduce_dst : elem_dst)[ins.dst] = 1;
 
             const ExprOperand* ops[3] = {&ins.a, &ins.b, &ins.c};
-            const std::size_t nops = is_reduce ? 1
-                : expr_instr_num_operands(op);
+            const std::size_t nops = is_reduce ? 1 : expr_instr_num_operands(op);
             for (std::size_t oi = 0; oi < nops; ++oi)
             {
                 const ExprOperand& opnd = *ops[oi];
@@ -1383,10 +1333,10 @@ inline constexpr std::uint32_t EXPR_MATMUL_KSPLIT_MAX_S   = 8;
                 {
                     if (opnd.idx >= spec.num_regs)
                         NN_FAIL("validate_expr_spec: reduce ref out of range");
-                    if (opnd.idx == ins.dst)
-                        NN_FAIL("validate_expr_spec: reduce self-reference");
+                    if (opnd.idx == ins.dst) NN_FAIL("validate_expr_spec: reduce self-reference");
                     if (!reduce_dst[opnd.idx] || elem_dst[opnd.idx])
-                        NN_FAIL("validate_expr_spec: Reduce operand must reference a prior reduce instruction");
+                        NN_FAIL("validate_expr_spec: Reduce operand must reference a prior reduce "
+                                "instruction");
                 }
                 else if ((opnd.kind == static_cast<uint8_t>(ExprOperandKind::Reg) ||
                           opnd.kind == static_cast<uint8_t>(ExprOperandKind::Fanout)) &&
@@ -1403,47 +1353,65 @@ inline constexpr std::uint32_t EXPR_MATMUL_KSPLIT_MAX_S   = 8;
 // ── 便捷构造（避免 Layer 写魔法数）──────────────────────────────────────
 namespace expr
 {
-    inline constexpr ExprOperand reg(std::uint8_t r)   { return {0, r}; }
-    inline constexpr ExprOperand input(std::uint8_t i) { return {1, i}; }
-    inline constexpr ExprOperand cst(std::uint8_t c)   { return {2, c}; }
-    inline constexpr ExprOperand fanout(std::uint8_t r){ return {3, r}; }
-    inline constexpr ExprOperand reduce(std::uint8_t r){ return {4, r}; }  // 引用归约指令 dst
-    inline constexpr ExprOperand matmul_op()           { return {5, 0}; }  // 引用前置 matmul 段输出
-    inline constexpr ExprOperand row()                 { return {6, 0}; }  // 当前行号（batch 内）
-    inline constexpr ExprOperand col()                 { return {7, 0}; }  // 当前列号
-    inline constexpr ExprOperand batch()               { return {8, 0}; }  // 当前批次下标
-    // 运行时标量参数（RParam）：运行时按实际 spec.rparams[idx] 填充
-    inline constexpr ExprOperand rval(std::uint8_t r)  { return {9, r}; }
-    // fold 行向量态：按向量域当前输出列读单槽向量态
-    inline constexpr ExprOperand vec_state(std::uint8_t slot = 0) { return {10, slot}; }
-    inline constexpr ExprView linear()                 { return {0, 0, 0}; }
-    inline constexpr ExprView rotate_half(std::uint32_t block_rows, bool negate_first_half = true)
-    { return {1, negate_first_half ? std::uint8_t{1} : std::uint8_t{0}, block_rows}; }
-    inline constexpr ExprView row_mod(std::uint32_t modulo)
-    { return {2, 0, modulo}; }
-    // RowAccess(offset, mod)：source_row = offset + (r % mod)；param=mod, param2=offset
-    inline constexpr ExprView row_access(std::uint32_t offset, std::uint32_t modulo)
-    { return {12, 0, modulo, offset}; }
-    inline constexpr ExprView col_reduce_sum() { return {3, 0, 0}; }
-    inline constexpr ExprView col_reduce_max() { return {4, 0, 0}; }
-    inline constexpr ExprView row_reduce_sum() { return {5, 0, 0}; }
-    inline constexpr ExprView row_reduce_max() { return {6, 0, 0}; }
-    inline constexpr ExprView row_broadcast()  { return {7, 0, 0}; }
-    inline constexpr ExprView col_broadcast()  { return {8, 0, 0}; }
-    // 标签行收集（param = 标签输入槽）与按批次索引/切片
-    inline constexpr ExprView row_gather(std::uint8_t label_slot)
-    { return {9, 0, label_slot}; }
-    inline constexpr ExprView batch_mod(std::uint32_t modulo)
-    { return {10, 0, modulo}; }
-    inline constexpr ExprView batch_col(std::uint32_t per_batch_cols)
-    { return {11, 0, per_batch_cols}; }
-    // 转置读（param = 存储行距；运行期 vp 槽、不进 key）
-    // ⚠ 视图种类**一律用符号名**，不要在这里写数字字面量：本文件合并
-    //   （2026-10-11）时 HeadGroup / Transpose 的枚举值各占 15 → Transpose 顺延
-    //   为 16，写死的 `{15, …}` 会让 trans() 静默构造出 HeadGroup 视图
-    //   （症状 = CE 的 lse fold 在 CPU 端报 "input shape mismatch"）。
-    inline constexpr ExprView trans(std::uint32_t row_stride)
-    { return {static_cast<std::uint8_t>(ExprViewKind::Transpose), 0, row_stride}; }
+inline constexpr ExprOperand reg(std::uint8_t r)
+{ return {0, r}; }
+inline constexpr ExprOperand input(std::uint8_t i)
+{ return {1, i}; }
+inline constexpr ExprOperand cst(std::uint8_t c)
+{ return {2, c}; }
+inline constexpr ExprOperand fanout(std::uint8_t r)
+{ return {3, r}; }
+inline constexpr ExprOperand reduce(std::uint8_t r)
+{ return {4, r}; } // 引用归约指令 dst
+inline constexpr ExprOperand matmul_op()
+{ return {5, 0}; } // 引用前置 matmul 段输出
+inline constexpr ExprOperand row()
+{ return {6, 0}; } // 当前行号（batch 内）
+inline constexpr ExprOperand col()
+{ return {7, 0}; } // 当前列号
+inline constexpr ExprOperand batch()
+{ return {8, 0}; } // 当前批次下标
+// 运行时标量参数（RParam）：运行时按实际 spec.rparams[idx] 填充
+inline constexpr ExprOperand rval(std::uint8_t r)
+{ return {9, r}; }
+// fold 行向量态：按向量域当前输出列读单槽向量态
+inline constexpr ExprOperand vec_state(std::uint8_t slot = 0)
+{ return {10, slot}; }
+inline constexpr ExprView linear()
+{ return {0, 0, 0}; }
+inline constexpr ExprView rotate_half(std::uint32_t block_rows, bool negate_first_half = true)
+{ return {1, negate_first_half ? std::uint8_t{1} : std::uint8_t{0}, block_rows}; }
+inline constexpr ExprView row_mod(std::uint32_t modulo)
+{ return {2, 0, modulo}; }
+// RowAccess(offset, mod)：source_row = offset + (r % mod)；param=mod, param2=offset
+inline constexpr ExprView row_access(std::uint32_t offset, std::uint32_t modulo)
+{ return {12, 0, modulo, offset}; }
+inline constexpr ExprView col_reduce_sum()
+{ return {3, 0, 0}; }
+inline constexpr ExprView col_reduce_max()
+{ return {4, 0, 0}; }
+inline constexpr ExprView row_reduce_sum()
+{ return {5, 0, 0}; }
+inline constexpr ExprView row_reduce_max()
+{ return {6, 0, 0}; }
+inline constexpr ExprView row_broadcast()
+{ return {7, 0, 0}; }
+inline constexpr ExprView col_broadcast()
+{ return {8, 0, 0}; }
+// 标签行收集（param = 标签输入槽）与按批次索引/切片
+inline constexpr ExprView row_gather(std::uint8_t label_slot)
+{ return {9, 0, label_slot}; }
+inline constexpr ExprView batch_mod(std::uint32_t modulo)
+{ return {10, 0, modulo}; }
+inline constexpr ExprView batch_col(std::uint32_t per_batch_cols)
+{ return {11, 0, per_batch_cols}; }
+// 转置读（param = 存储行距；运行期 vp 槽、不进 key）
+// ⚠ 视图种类**一律用符号名**，不要在这里写数字字面量：本文件合并
+//   （2026-10-11）时 HeadGroup / Transpose 的枚举值各占 15 → Transpose 顺延
+//   为 16，写死的 `{15, …}` 会让 trans() 静默构造出 HeadGroup 视图
+//   （症状 = CE 的 lse fold 在 CPU 端报 "input shape mismatch"）。
+inline constexpr ExprView trans(std::uint32_t row_stride)
+{ return {static_cast<std::uint8_t>(ExprViewKind::Transpose), 0, row_stride}; }
 } // namespace expr
 
 } // namespace nn

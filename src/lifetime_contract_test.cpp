@@ -64,8 +64,7 @@ void test_offload_state_machine()
     auto r2 = off.export_activations(*engine, {a, b});
     CHECK(!r2, "未 import 的重复 export 必须 fail-fast");
     if (!r2)
-        CHECK(r2.error().message.find("尚未 import") != std::string::npos,
-              "错误信息点明未 import");
+        CHECK(r2.error().message.find("尚未 import") != std::string::npos, "错误信息点明未 import");
 
     // forward 入口的作废通道：discard 后状态复位，可重新导出
     off.discard();
@@ -98,9 +97,7 @@ void test_offload_rejects_cpu_engine()
     off.set_enabled(true);
     auto r = off.export_activations(*engine, {a});
     CHECK(!r, "CPU 引擎 export 必须 fail-fast");
-    if (!r)
-        CHECK(r.error().message.find("仅支持") != std::string::npos,
-              "错误信息说明仅支持 GPU");
+    if (!r) CHECK(r.error().message.find("仅支持") != std::string::npos, "错误信息说明仅支持 GPU");
     CHECK(!off.offloaded(), "失败后状态保持 Idle");
     CHECK(a.valid(), "失败路径不得改动激活张量");
 }
@@ -115,9 +112,7 @@ void test_offload_rejects_non_f32()
     off.set_enabled(true);
     auto r = off.export_activations(*engine, {h});
     CHECK(!r, "非 F32 激活导出必须 fail-fast");
-    if (!r)
-        CHECK(r.error().message.find("f16") != std::string::npos,
-              "错误信息带出实际精度");
+    if (!r) CHECK(r.error().message.find("f16") != std::string::npos, "错误信息带出实际精度");
     CHECK(!off.offloaded(), "失败后状态保持 Idle");
     CHECK(h.valid(), "失败路径不得改动激活张量");
 }
@@ -153,9 +148,7 @@ int main()
     test_offload_rejects_non_f32();
     test_optimizer_before_model_order();
 
-    if (g_fail == 0)
-        std::printf("lifetime_contract_test: ALL PASS\n");
-    else
-        std::printf("lifetime_contract_test: %d failure(s)\n", g_fail);
+    if (g_fail == 0) std::printf("lifetime_contract_test: ALL PASS\n");
+    else std::printf("lifetime_contract_test: %d failure(s)\n", g_fail);
     return g_fail == 0 ? 0 : 1;
 }

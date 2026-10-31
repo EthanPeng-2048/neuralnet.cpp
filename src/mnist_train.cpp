@@ -45,8 +45,7 @@ using nn::Scalar;
 // allow_t1_58：三值（T1_58）**只适用于 param 槽**（"该层权重是三值"），
 // compute/stable/optimizer 出现它一律在参数解析处拒绝，而不是拖到 init 期才报
 // 能力校验错误（docs/internal/21-quantized-weights.md §4.1）。
-nn::Precision parse_precision(const std::string& name, const char* flag,
-                              bool allow_t1_58 = false)
+nn::Precision parse_precision(const std::string& name, const char* flag, bool allow_t1_58 = false)
 {
     if (name == "f16" || name == "half") return nn::Precision::F16;
     if (name == "f32" || name == "float") return nn::Precision::F32;
@@ -57,15 +56,20 @@ nn::Precision parse_precision(const std::string& name, const char* flag,
                   << "，可选: f16, f32\n";
         std::exit(1);
     }
-    std::cerr << "无效 --" << flag << ": " << name << "，可选: "
-              << (allow_t1_58 ? "f16, f32, t1_58" : "f16, f32") << "\n";
+    std::cerr << "无效 --" << flag << ": " << name
+              << "，可选: " << (allow_t1_58 ? "f16, f32, t1_58" : "f16, f32") << "\n";
     std::exit(1);
 }
 
-enum class ArchType { MLP, Transformer, CNN };
+enum class ArchType
+{
+    MLP,
+    Transformer,
+    CNN
+};
 
 // ==================== 帮助信息 ====================
-void print_usage(const char *prog)
+void print_usage(const char* prog)
 {
     nn::cli::Help help(std::cout, prog, "MNIST 手写数字训练程序 (MLP / Transformer / CNN)");
 
@@ -73,28 +77,40 @@ void print_usage(const char *prog)
 
     help.section("选项");
     help.opt("--arch <name>", "模型架构: mlp/transformer/cnn (默认: mlp)");
-    help.opt("--resume <path>", "从已有模型恢复训练 (自动读取模型规格与架构；\n推理模型 .nnmodel 没有训练参数，会被明确拒绝)");
-    help.opt("--save <path>", "推理模型保存路径 (默认: mnist_model.nnmodel；\n只含推理所需参数——三值层写打包形态，不含训练参数)");
+    help.opt("--resume <path>", "从已有模型恢复训练 (自动读取模型规格与架构；\n推理模型 .nnmodel "
+                                "没有训练参数，会被明确拒绝)");
+    help.opt("--save <path>",
+             "推理模型保存路径 (默认: "
+             "mnist_model.nnmodel；\n只含推理所需参数——三值层写打包形态，不含训练参数)");
     help.opt("--dataset <path>", "数据集目录 (默认: datasets/mnist_data)");
     help.opt("--epochs <n>", "训练轮数 (默认: 10)");
     help.opt("--lr <lr>", "学习率 (默认: 0.001)");
     help.opt("--batch-size <n>", "批大小 (默认: 64)");
     // RV-04：名单文本由 nn::optimizer_table()（唯一真源）生成，不再手抄
-    help.opt("--optimizer <name>",
-             "优化器: " + nn::optimizer_names("/") +
-                 " (默认: adam)\nadamwquant: 量化状态的 AdamW（状态 4 B/权重 vs 8 B；见 docs/internal/21 §4.13）");
+    help.opt("--optimizer <name>", "优化器: " + nn::optimizer_names("/") +
+                                       " (默认: adam)\nadamwquant: 量化状态的 AdamW（状态 4 B/权重 "
+                                       "vs 8 B；见 docs/internal/21 §4.13）");
     help.opt("--weight-decay <w>", "AdamW 权重衰减系数 (默认: 0.01)");
     help.opt("--max-samples <n>", "限制训练样本数 (默认: 全部，用于快速测试)");
     help.opt("--shuffle-steps <true|false>", "每 epoch 打乱 batch 顺序 (默认: true)");
-    help.opt("--gpu [索引|名称]", "启用 GPU 加速 (需要 Vulkan SDK)\n空格形式只收枚举索引；名称子串用 --gpu=<名称>，如 --gpu=NVIDIA / --gpu=40HX");
+    help.opt("--gpu [索引|名称]",
+             "启用 GPU 加速 (需要 Vulkan SDK)\n空格形式只收枚举索引；名称子串用 --gpu=<名称>，如 "
+             "--gpu=NVIDIA / --gpu=40HX");
     help.opt("--help, -h", "显示此帮助信息");
 
     help.section("MLP 专用");
     help.opt("--layer-dims <d1,d2,...>", "各层维度，逗号分隔 (默认: 784,512,256,128,64,10)");
 
     help.section("归一化");
-    help.opt("--norm <type>", "归一化层: auto/layernorm/rmsnorm/batchnorm (默认: auto)\nauto = 按架构取最合适: MLP/ViT = layernorm, CNN = batchnorm\nlayernorm: 按特征维归一化\nrmsnorm: 无均值、更轻量\nbatchnorm: 沿 batch 维归一化");
-    help.opt("--norm-place <where>", "归一化挂载位置: auto/none/conv/head/both/final (默认: auto)\nauto = 按架构: CNN = conv, ViT = final, MLP = 结构内置(不额外加)\nconv: CNN 每个卷积(+池化)之后; head: CNN 全连接头 Linear→Norm→ReLU; both: 两者\nfinal: ViT 编码器末端 final norm (全局平均池化之前)\nMLP 的挂载位置由结构固定，只接受 none/auto");
+    help.opt("--norm <type>",
+             "归一化层: auto/layernorm/rmsnorm/batchnorm (默认: auto)\nauto = 按架构取最合适: "
+             "MLP/ViT = layernorm, CNN = batchnorm\nlayernorm: 按特征维归一化\nrmsnorm: "
+             "无均值、更轻量\nbatchnorm: 沿 batch 维归一化");
+    help.opt("--norm-place <where>",
+             "归一化挂载位置: auto/none/conv/head/both/final (默认: auto)\nauto = 按架构: CNN = "
+             "conv, ViT = final, MLP = 结构内置(不额外加)\nconv: CNN 每个卷积(+池化)之后; head: "
+             "CNN 全连接头 Linear→Norm→ReLU; both: 两者\nfinal: ViT 编码器末端 final norm "
+             "(全局平均池化之前)\nMLP 的挂载位置由结构固定，只接受 none/auto");
 
     help.section("Transformer 专用");
     help.opt("--d-model <n>", "模型维度 (默认: 64)");
@@ -111,14 +127,17 @@ void print_usage(const char *prog)
     help.opt("--cnn-fc <d1,d2,...>", "展平后的全连接头 (默认: 120,10；末位为类别数)");
 
     help.section("学习率调度");
-    help.opt("--lr-schedule <type>", "学习率调度: fixed/constant/cosine (默认: fixed)\ncosine: 余弦退火 (epoch 级)，lr 从初始值衰减到 min-lr");
+    help.opt("--lr-schedule <type>", "学习率调度: fixed/constant/cosine (默认: fixed)\ncosine: "
+                                     "余弦退火 (epoch 级)，lr 从初始值衰减到 min-lr");
     help.opt("--warmup-epochs <n>", "线性预热轮数 (默认: 0，即不预热)");
     help.opt("--min-lr <lr>", "余弦退火最低学习率 (默认: 1e-6)");
     help.opt("--lr-per-epoch <v1,v2,...>", "手动指定每轮学习率 (逗号分隔，优先级最高)");
 
     help.section("混合精度 (docs/development/05-mixed-precision.md)");
     help.opt("--f16", "快捷方式: f16 存储 (param/compute=F16，stable/optimizer=F32)");
-    help.opt("--t1_58", "快捷方式: 精度预设 t1_58 = f16 存储 + 三值权重\n(param=T1_58，compute=F16，stable/optimizer=F32；等价于 --f16 再把 param 换成 t1_58)");
+    help.opt("--t1_58", "快捷方式: 精度预设 t1_58 = f16 存储 + "
+                        "三值权重\n(param=T1_58，compute=F16，stable/optimizer=F32；等价于 --f16 "
+                        "再把 param 换成 t1_58)");
     help.opt("--precision-param <f16|f32|t1_58>",
              "权重/参数精度 (默认: f32)；t1_58 = 三值权重 BitLinear（1.58-bit）；"
              "本入口仅 MLP 架构支持（transformer/CNN 由层能力校验报错），"
@@ -163,8 +182,8 @@ struct TrainConfig
 
     // CNN 参数（LeNet-5 风格默认）
     std::size_t cnn_in_channels = 1;
-    std::size_t cnn_in_size     = 28;
-    std::size_t cnn_pool        = 2;
+    std::size_t cnn_in_size = 28;
+    std::size_t cnn_pool = 2;
     std::vector<std::size_t> cnn_channels;  // 每卷积输出通道
     std::vector<std::size_t> cnn_kernels;   // 每卷积核大小
     std::vector<std::size_t> cnn_fc_dims;   // 全连接头（不含展平输入）
@@ -179,7 +198,7 @@ struct TrainConfig
     nn::PrecisionProfile precision;     // 默认全 F32（零回归）
 };
 
-TrainConfig parse_args(int argc, char *argv[])
+TrainConfig parse_args(int argc, char* argv[])
 {
     TrainConfig cfg;
     nn::cli::TrainCommonArgs common;
@@ -198,19 +217,13 @@ TrainConfig parse_args(int argc, char *argv[])
             std::exit(0);
         }
         // 通用训练参数委托给 nn::cli::parse_train_common_args
-        else if (nn::cli::parse_train_common_args(argc, argv, i, common))
-        {
-            continue;
-        }
+        else if (nn::cli::parse_train_common_args(argc, argv, i, common)) { continue; }
         else if (arg == "--arch" && i + 1 < argc)
         {
             std::string v = argv[++i];
-            if (v == "mlp")
-                cfg.arch = ArchType::MLP;
-            else if (v == "transformer" || v == "tf")
-                cfg.arch = ArchType::Transformer;
-            else if (v == "cnn")
-                cfg.arch = ArchType::CNN;
+            if (v == "mlp") cfg.arch = ArchType::MLP;
+            else if (v == "transformer" || v == "tf") cfg.arch = ArchType::Transformer;
+            else if (v == "cnn") cfg.arch = ArchType::CNN;
             else
             {
                 std::cerr << "未知 --arch: " << v << "，可选: mlp, transformer, cnn\n";
@@ -222,14 +235,8 @@ TrainConfig parse_args(int argc, char *argv[])
             cfg.resume_path = argv[++i];
             cfg.load_existing = true;
         }
-        else if (arg == "--save" && i + 1 < argc)
-        {
-            cfg.save_path = argv[++i];
-        }
-        else if (arg == "--dataset" && i + 1 < argc)
-        {
-            cfg.dataset_path = argv[++i];
-        }
+        else if (arg == "--save" && i + 1 < argc) { cfg.save_path = argv[++i]; }
+        else if (arg == "--dataset" && i + 1 < argc) { cfg.dataset_path = argv[++i]; }
         else if (arg == "--layer-dims" && i + 1 < argc)
         {
             std::string dims_str = argv[++i];
@@ -238,8 +245,16 @@ TrainConfig parse_args(int argc, char *argv[])
             while (std::getline(ss, token, ','))
             {
                 auto v = nn::parse_number<std::size_t>(token);
-                if (!v) { std::cerr << "无效层维度: " << v.error().message << "\n"; std::exit(1); }
-                if (*v == 0) { std::cerr << "层维度不能为 0\n"; std::exit(1); }
+                if (!v)
+                {
+                    std::cerr << "无效层维度: " << v.error().message << "\n";
+                    std::exit(1);
+                }
+                if (*v == 0)
+                {
+                    std::cerr << "层维度不能为 0\n";
+                    std::exit(1);
+                }
                 cfg.layer_dims.push_back(*v);
             }
             if (cfg.layer_dims.size() < 2)
@@ -251,29 +266,26 @@ TrainConfig parse_args(int argc, char *argv[])
         else if (arg == "--norm" && i + 1 < argc)
         {
             std::string v = argv[++i];
-            if (v == "auto")
-                cfg.norm_type = std::nullopt;          // 回到按架构默认
-            else if (v == "layernorm")
-                cfg.norm_type = nn::NormType::LayerNorm;
-            else if (v == "rmsnorm")
-                cfg.norm_type = nn::NormType::RMSNorm;
-            else if (v == "batchnorm")
-                cfg.norm_type = nn::NormType::BatchNorm;
+            if (v == "auto") cfg.norm_type = std::nullopt;          // 回到按架构默认
+            else if (v == "layernorm") cfg.norm_type = nn::NormType::LayerNorm;
+            else if (v == "rmsnorm") cfg.norm_type = nn::NormType::RMSNorm;
+            else if (v == "batchnorm") cfg.norm_type = nn::NormType::BatchNorm;
             else
             {
-                std::cerr << "无效 --norm: " << v << "，可选: auto, layernorm, rmsnorm, batchnorm\n";
+                std::cerr << "无效 --norm: " << v
+                          << "，可选: auto, layernorm, rmsnorm, batchnorm\n";
                 std::exit(1);
             }
         }
         else if (arg == "--norm-place" && i + 1 < argc)
         {
             std::string v = argv[++i];
-            if (v == "auto")        cfg.norm_place = std::nullopt;   // 回到按架构默认
-            else if (v == "none")   cfg.norm_place = nn::NormPlace::None;
-            else if (v == "conv")   cfg.norm_place = nn::NormPlace::Conv;
-            else if (v == "head")   cfg.norm_place = nn::NormPlace::Head;
-            else if (v == "both")   cfg.norm_place = nn::NormPlace::Both;
-            else if (v == "final")  cfg.norm_place = nn::NormPlace::Final;
+            if (v == "auto") cfg.norm_place = std::nullopt;   // 回到按架构默认
+            else if (v == "none") cfg.norm_place = nn::NormPlace::None;
+            else if (v == "conv") cfg.norm_place = nn::NormPlace::Conv;
+            else if (v == "head") cfg.norm_place = nn::NormPlace::Head;
+            else if (v == "both") cfg.norm_place = nn::NormPlace::Both;
+            else if (v == "final") cfg.norm_place = nn::NormPlace::Final;
             else
             {
                 std::cerr << "无效 --norm-place: " << v
@@ -284,35 +296,55 @@ TrainConfig parse_args(int argc, char *argv[])
         else if (arg == "--d-model" && i + 1 < argc)
         {
             auto v = nn::parse_number<std::size_t>(argv[++i]);
-            if (!v) { std::cerr << "无效 --d-model: " << v.error().message << "\n"; std::exit(1); }
+            if (!v)
+            {
+                std::cerr << "无效 --d-model: " << v.error().message << "\n";
+                std::exit(1);
+            }
             cfg.d_model = *v;
         }
         else if (arg == "--num-heads" && i + 1 < argc)
         {
             auto v = nn::parse_number<std::size_t>(argv[++i]);
-            if (!v) { std::cerr << "无效 --num-heads: " << v.error().message << "\n"; std::exit(1); }
+            if (!v)
+            {
+                std::cerr << "无效 --num-heads: " << v.error().message << "\n";
+                std::exit(1);
+            }
             cfg.num_heads = *v;
         }
         else if (arg == "--num-layers" && i + 1 < argc)
         {
             auto v = nn::parse_number<std::size_t>(argv[++i]);
-            if (!v) { std::cerr << "无效 --num-layers: " << v.error().message << "\n"; std::exit(1); }
+            if (!v)
+            {
+                std::cerr << "无效 --num-layers: " << v.error().message << "\n";
+                std::exit(1);
+            }
             cfg.num_layers = *v;
         }
         else if (arg == "--d-ff" && i + 1 < argc)
         {
             auto v = nn::parse_number<std::size_t>(argv[++i]);
-            if (!v) { std::cerr << "无效 --d-ff: " << v.error().message << "\n"; std::exit(1); }
+            if (!v)
+            {
+                std::cerr << "无效 --d-ff: " << v.error().message << "\n";
+                std::exit(1);
+            }
             cfg.d_ff = *v;
         }
         else if (arg == "--patch-size" && i + 1 < argc)
         {
             auto v = nn::parse_number<std::size_t>(argv[++i]);
-            if (!v) { std::cerr << "无效 --patch-size: " << v.error().message << "\n"; std::exit(1); }
+            if (!v)
+            {
+                std::cerr << "无效 --patch-size: " << v.error().message << "\n";
+                std::exit(1);
+            }
             if (*v == 0 || nn::MNIST_IMG_SIZE % *v != 0)
             {
-                std::cerr << "--patch-size 必须能整除 " << nn::MNIST_IMG_SIZE
-                          << "（当前: " << *v << "）\n";
+                std::cerr << "--patch-size 必须能整除 " << nn::MNIST_IMG_SIZE << "（当前: " << *v
+                          << "）\n";
                 std::exit(1);
             }
             cfg.patch_size = *v;
@@ -320,13 +352,21 @@ TrainConfig parse_args(int argc, char *argv[])
         else if (arg == "--max-samples" && i + 1 < argc)
         {
             auto v = nn::parse_number<int>(argv[++i]);
-            if (!v) { std::cerr << "无效 --max-samples: " << v.error().message << "\n"; std::exit(1); }
+            if (!v)
+            {
+                std::cerr << "无效 --max-samples: " << v.error().message << "\n";
+                std::exit(1);
+            }
             cfg.max_train_samples = *v;
         }
         else if (arg == "--eval-samples" && i + 1 < argc)
         {
             auto v = nn::parse_number<std::size_t>(argv[++i]);
-            if (!v) { std::cerr << "无效 --eval-samples: " << v.error().message << "\n"; std::exit(1); }
+            if (!v)
+            {
+                std::cerr << "无效 --eval-samples: " << v.error().message << "\n";
+                std::exit(1);
+            }
             cfg.eval_samples = *v;
         }
         else if (arg == "--cnn-channels" && i + 1 < argc)
@@ -337,11 +377,23 @@ TrainConfig parse_args(int argc, char *argv[])
             while (std::getline(ss, token, ','))
             {
                 auto v = nn::parse_number<std::size_t>(token);
-                if (!v) { std::cerr << "无效 --cnn-channels: " << v.error().message << "\n"; std::exit(1); }
-                if (*v == 0) { std::cerr << "--cnn-channels 不能为 0\n"; std::exit(1); }
+                if (!v)
+                {
+                    std::cerr << "无效 --cnn-channels: " << v.error().message << "\n";
+                    std::exit(1);
+                }
+                if (*v == 0)
+                {
+                    std::cerr << "--cnn-channels 不能为 0\n";
+                    std::exit(1);
+                }
                 cfg.cnn_channels.push_back(*v);
             }
-            if (cfg.cnn_channels.empty()) { std::cerr << "--cnn-channels 至少需要一个值\n"; std::exit(1); }
+            if (cfg.cnn_channels.empty())
+            {
+                std::cerr << "--cnn-channels 至少需要一个值\n";
+                std::exit(1);
+            }
         }
         else if (arg == "--cnn-kernels" && i + 1 < argc)
         {
@@ -351,16 +403,32 @@ TrainConfig parse_args(int argc, char *argv[])
             while (std::getline(ss, token, ','))
             {
                 auto v = nn::parse_number<std::size_t>(token);
-                if (!v) { std::cerr << "无效 --cnn-kernels: " << v.error().message << "\n"; std::exit(1); }
-                if (*v == 0) { std::cerr << "--cnn-kernels 不能为 0\n"; std::exit(1); }
+                if (!v)
+                {
+                    std::cerr << "无效 --cnn-kernels: " << v.error().message << "\n";
+                    std::exit(1);
+                }
+                if (*v == 0)
+                {
+                    std::cerr << "--cnn-kernels 不能为 0\n";
+                    std::exit(1);
+                }
                 cfg.cnn_kernels.push_back(*v);
             }
-            if (cfg.cnn_kernels.empty()) { std::cerr << "--cnn-kernels 至少需要一个值\n"; std::exit(1); }
+            if (cfg.cnn_kernels.empty())
+            {
+                std::cerr << "--cnn-kernels 至少需要一个值\n";
+                std::exit(1);
+            }
         }
         else if (arg == "--cnn-pool" && i + 1 < argc)
         {
             auto v = nn::parse_number<std::size_t>(argv[++i]);
-            if (!v) { std::cerr << "无效 --cnn-pool: " << v.error().message << "\n"; std::exit(1); }
+            if (!v)
+            {
+                std::cerr << "无效 --cnn-pool: " << v.error().message << "\n";
+                std::exit(1);
+            }
             if (*v != 0 && *v > nn::MNIST_IMG_SIZE)
             {
                 std::cerr << "--cnn-pool 不能大于输入边长 " << nn::MNIST_IMG_SIZE
@@ -377,19 +445,29 @@ TrainConfig parse_args(int argc, char *argv[])
             while (std::getline(ss, token, ','))
             {
                 auto v = nn::parse_number<std::size_t>(token);
-                if (!v) { std::cerr << "无效 --cnn-fc: " << v.error().message << "\n"; std::exit(1); }
-                if (*v == 0) { std::cerr << "--cnn-fc 不能为 0\n"; std::exit(1); }
+                if (!v)
+                {
+                    std::cerr << "无效 --cnn-fc: " << v.error().message << "\n";
+                    std::exit(1);
+                }
+                if (*v == 0)
+                {
+                    std::cerr << "--cnn-fc 不能为 0\n";
+                    std::exit(1);
+                }
                 cfg.cnn_fc_dims.push_back(*v);
             }
-            if (cfg.cnn_fc_dims.size() < 2) { std::cerr << "--cnn-fc 至少需要 2 个维度\n"; std::exit(1); }
+            if (cfg.cnn_fc_dims.size() < 2)
+            {
+                std::cerr << "--cnn-fc 至少需要 2 个维度\n";
+                std::exit(1);
+            }
         }
         else if (arg == "--shuffle-steps" && i + 1 < argc)
         {
             std::string v = argv[++i];
-            if (v == "true" || v == "1")
-                cfg.shuffle_steps = true;
-            else if (v == "false" || v == "0")
-                cfg.shuffle_steps = false;
+            if (v == "true" || v == "1") cfg.shuffle_steps = true;
+            else if (v == "false" || v == "0") cfg.shuffle_steps = false;
             else
             {
                 std::cerr << "无效 --shuffle-steps: " << v << "，可选: true, false\n";
@@ -447,28 +525,22 @@ TrainConfig parse_args(int argc, char *argv[])
 
 // ==================== 构建模型规格 ====================
 // 从 CLI 配置构建 CNN 配置（未指定的项用 LeNet-5 默认补齐）
-nn::CnnConfig build_cnn_config(const TrainConfig &cfg)
+nn::CnnConfig build_cnn_config(const TrainConfig& cfg)
 {
     nn::CnnConfig c;
     c.in_channels = cfg.cnn_in_channels;
-    c.in_size     = cfg.cnn_in_size;
-    c.pool        = cfg.cnn_pool;
+    c.in_size = cfg.cnn_in_size;
+    c.pool = cfg.cnn_pool;
 
     std::vector<std::size_t> channels = cfg.cnn_channels;
-    std::vector<std::size_t> kernels  = cfg.cnn_kernels;
+    std::vector<std::size_t> kernels = cfg.cnn_kernels;
     if (channels.empty() && kernels.empty())
     {
         channels = {6, 16};
-        kernels  = {5, 5};
+        kernels = {5, 5};
     }
-    else if (channels.empty())
-    {
-        channels.assign(kernels.size(), 6);
-    }
-    else if (kernels.empty())
-    {
-        kernels.assign(channels.size(), 5);
-    }
+    else if (channels.empty()) { channels.assign(kernels.size(), 6); }
+    else if (kernels.empty()) { kernels.assign(channels.size(), 5); }
     else if (channels.size() != kernels.size())
     {
         std::cerr << "--cnn-channels 与 --cnn-kernels 长度必须一致\n";
@@ -481,7 +553,7 @@ nn::CnnConfig build_cnn_config(const TrainConfig &cfg)
     return c;
 }
 
-nn::ModelSpec build_spec(const TrainConfig &cfg)
+nn::ModelSpec build_spec(const TrainConfig& cfg)
 {
     if (cfg.arch == ArchType::Transformer)
     {
@@ -494,8 +566,7 @@ nn::ModelSpec build_spec(const TrainConfig &cfg)
             std::exit(1);
         }
         return nn::make_mnist_transformer_spec(
-            cfg.patch_size,
-            cfg.d_model, cfg.num_heads, cfg.d_ff, cfg.num_layers,
+            cfg.patch_size, cfg.d_model, cfg.num_heads, cfg.d_ff, cfg.num_layers,
             cfg.norm_type.value_or(nn::NormType::LayerNorm), place);
     }
     if (cfg.arch == ArchType::CNN)
@@ -509,11 +580,11 @@ nn::ModelSpec build_spec(const TrainConfig &cfg)
             std::exit(1);
         }
         nn::CnnConfig c = build_cnn_config(cfg);
-        c.norm_type  = cfg.norm_type.value_or(nn::NormType::BatchNorm);
+        c.norm_type = cfg.norm_type.value_or(nn::NormType::BatchNorm);
         c.norm_place = place;
         std::vector<nn::CnnConvSpec> convs = c.convs;
-        return nn::make_cnn_spec(c.in_channels, c.in_size, c.pool, convs, c.fc_dims,
-                                 c.norm_type, c.norm_place);
+        return nn::make_cnn_spec(c.in_channels, c.in_size, c.pool, convs, c.fc_dims, c.norm_type,
+                                 c.norm_place);
     }
     if (cfg.norm_place && *cfg.norm_place != nn::NormPlace::None)
     {
@@ -523,26 +594,25 @@ nn::ModelSpec build_spec(const TrainConfig &cfg)
     }
     // MLP（结构内置 Linear→Norm→激活；auto = layernorm）
     nn::ModelSpec spec;
-    auto &m = spec.emplace<nn::MlpSpec>();
+    auto& m = spec.emplace<nn::MlpSpec>();
     m.layer_dims = cfg.layer_dims.empty() ? nn::MNIST_LAYER_DIMS : cfg.layer_dims;
     m.norm_type = cfg.norm_type.value_or(nn::NormType::LayerNorm);
     // 三值权重：param=t1_58 → 线性层用 BitLinear（规格是加载时的权威来源，
     // 缺键 = None 保证旧文件零破坏）。见 docs 21 §4.7。
-    m.weight_quant = (cfg.precision.param == nn::Precision::T1_58)
-                         ? nn::WeightQuant::T1_58 : nn::WeightQuant::None;
+    m.weight_quant = (cfg.precision.param == nn::Precision::T1_58) ? nn::WeightQuant::T1_58
+                                                                   : nn::WeightQuant::None;
     return spec;
 }
 
 // ==================== 主函数 ====================
-int main(int argc, char *argv[])
+int main(int argc, char* argv[])
 {
     TrainConfig cfg = parse_args(argc, argv);
 
     // ── 危险精度组合启动期告警（仅警告，不拒绝；docs/internal/24 §2.3 F1）────
     // optimizer=f16（含四字段全 f16）只打印一次到 stderr：不改变退出码、不阻断
     // 训练、不静默降级；`--f16` 与合法组合返回空串（静默）。
-    if (const std::string warn = nn::cli::dangerous_precision_warning(cfg.precision);
-        !warn.empty())
+    if (const std::string warn = nn::cli::dangerous_precision_warning(cfg.precision); !warn.empty())
         std::cerr << warn;
 
     // ── 构建规格 ─────────────────────────────────────────────
@@ -579,7 +649,7 @@ int main(int argc, char *argv[])
                 std::cout << "从模型文件读取 Transformer 规格\n";
                 spec = std::move(*spec_result);
                 cfg.arch = ArchType::Transformer;
-                const auto *t = spec.as<nn::TransformerSpec>();
+                const auto* t = spec.as<nn::TransformerSpec>();
                 cfg.norm_type = t->norm_type;
                 cfg.norm_place = t->norm_place;
                 cfg.patch_size = t->patch_size != 0 ? t->patch_size : nn::MNIST_PATCH_SIZE;
@@ -593,20 +663,19 @@ int main(int argc, char *argv[])
                 std::cout << "从模型文件读取 CNN 规格\n";
                 spec = std::move(*spec_result);
                 cfg.arch = ArchType::CNN;
-                const auto *c = spec.as<nn::CnnSpec>();
+                const auto* c = spec.as<nn::CnnSpec>();
                 cfg.norm_type = c->norm_type;
                 cfg.norm_place = c->norm_place;
                 cfg.cnn_in_channels = c->cnn_in_channels;
-                cfg.cnn_in_size     = c->cnn_in_size;
-                cfg.cnn_pool        = c->cnn_pool;
-                cfg.cnn_channels    = c->cnn_channels;
-                cfg.cnn_kernels     = c->cnn_kernels;
-                cfg.cnn_fc_dims     = c->layer_dims;
+                cfg.cnn_in_size = c->cnn_in_size;
+                cfg.cnn_pool = c->cnn_pool;
+                cfg.cnn_channels = c->cnn_channels;
+                cfg.cnn_kernels = c->cnn_kernels;
+                cfg.cnn_fc_dims = c->layer_dims;
             }
             else
             {
-                std::cerr << "模型文件类型不支持 (type=" << spec_result->type_name()
-                          << ")\n";
+                std::cerr << "模型文件类型不支持 (type=" << spec_result->type_name() << ")\n";
                 return 1;
             }
         }
@@ -621,8 +690,11 @@ int main(int argc, char *argv[])
     std::cout << "========================================\n";
     std::cout << "  MNIST 手写数字训练\n";
     std::cout << "========================================\n";
-    std::cout << "  架构: " << (cfg.arch == ArchType::Transformer ? "Transformer (ViT)"
-                            : cfg.arch == ArchType::CNN ? "CNN (LeNet)" : "MLP") << "\n";
+    std::cout << "  架构: "
+              << (cfg.arch == ArchType::Transformer ? "Transformer (ViT)"
+                  : cfg.arch == ArchType::CNN       ? "CNN (LeNet)"
+                                                    : "MLP")
+              << "\n";
 
     if (cfg.arch == ArchType::CNN)
     {
@@ -646,23 +718,21 @@ int main(int argc, char *argv[])
     {
         const std::size_t grid = nn::MNIST_IMG_SIZE / cfg.patch_size;
         const std::size_t num_patches = grid * grid;
-        std::cout << "  Patch: " << nn::MNIST_IMG_SIZE << "/" << cfg.patch_size
-                  << " → " << grid << "×" << grid << "=" << num_patches << " patches\n";
-        std::cout << "  d_model: " << cfg.d_model
-                  << "  heads: " << cfg.num_heads
-                  << "  layers: " << cfg.num_layers
-                  << "  d_ff: " << cfg.d_ff << "\n";
+        std::cout << "  Patch: " << nn::MNIST_IMG_SIZE << "/" << cfg.patch_size << " → " << grid
+                  << "×" << grid << "=" << num_patches << " patches\n";
+        std::cout << "  d_model: " << cfg.d_model << "  heads: " << cfg.num_heads
+                  << "  layers: " << cfg.num_layers << "  d_ff: " << cfg.d_ff << "\n";
     }
     else
     {
-        const auto &dims =
+        const auto& dims =
             spec.is_mlp() ? spec.as<nn::MlpSpec>()->layer_dims : nn::MNIST_LAYER_DIMS;
-        const auto p_norm = spec.is_mlp()   ? spec.as<nn::MlpSpec>()->norm_type
+        const auto p_norm = spec.is_mlp()           ? spec.as<nn::MlpSpec>()->norm_type
                             : spec.is_transformer() ? spec.as<nn::TransformerSpec>()->norm_type
                                                     : spec.as<nn::CnnSpec>()->norm_type;
-        const std::string_view norm_name =
-            (p_norm == nn::NormType::RMSNorm) ? "RMSNorm" :
-            (p_norm == nn::NormType::BatchNorm) ? "BatchNorm" : "LayerNorm";
+        const std::string_view norm_name = (p_norm == nn::NormType::RMSNorm)     ? "RMSNorm"
+                                           : (p_norm == nn::NormType::BatchNorm) ? "BatchNorm"
+                                                                                 : "LayerNorm";
         std::cout << "  网络: ";
         for (std::size_t i = 0; i < dims.size(); ++i)
         {
@@ -670,10 +740,8 @@ int main(int argc, char *argv[])
             // norm+GeLU 挂在隐藏层 Linear 的输出维度上：dims[1]..dims[size-2]。
             // 首元素 dims[0] 是输入、末元素 dims[size-1] 是 logits 输出，
             // 两者都不挂 norm/激活（CE 损失需要原始 logits）。
-            if (i > 0 && i < dims.size() - 1)
-                std::cout << "(" << norm_name << "+GeLU)";
-            if (i < dims.size() - 1)
-                std::cout << " -> ";
+            if (i > 0 && i < dims.size() - 1) std::cout << "(" << norm_name << "+GeLU)";
+            if (i < dims.size() - 1) std::cout << " -> ";
         }
         std::cout << "\n";
     }
@@ -685,17 +753,17 @@ int main(int argc, char *argv[])
                          : spec.is_cnn()       ? spec.as<nn::CnnSpec>()->norm_place
                                                : nn::NormPlace::None;
     std::cout << "  归一化: "
-              << ((q_norm == nn::NormType::RMSNorm) ? "RMSNorm" :
-                  (q_norm == nn::NormType::BatchNorm) ? "BatchNorm" : "LayerNorm");
-    if (q_place != nn::NormPlace::None)
-        std::cout << " @ " << nn::norm_place_name(q_place);
+              << ((q_norm == nn::NormType::RMSNorm)     ? "RMSNorm"
+                  : (q_norm == nn::NormType::BatchNorm) ? "BatchNorm"
+                                                        : "LayerNorm");
+    if (q_place != nn::NormPlace::None) std::cout << " @ " << nn::norm_place_name(q_place);
     std::cout << "\n";
     std::cout << "  优化器: " << cfg.optimizer_name << "  学习率: " << cfg.lr << "\n";
     std::cout << "  轮数: " << cfg.epochs << "  批大小: " << cfg.batch_size << "\n";
     std::cout << "  GPU: " << (cfg.gpu_enabled ? "启用" : "禁用")
               << "  打乱: " << (cfg.shuffle_steps ? "启用" : "禁用") << "\n";
-    std::cout << "  模型: " << (cfg.load_existing ? cfg.resume_path : "(从头训练)")
-              << " -> " << cfg.save_path << "\n";
+    std::cout << "  模型: " << (cfg.load_existing ? cfg.resume_path : "(从头训练)") << " -> "
+              << cfg.save_path << "\n";
     std::cout << "========================================\n\n";
 
     // ── 创建计算引擎 ─────────────────────────────────────────
@@ -716,10 +784,8 @@ int main(int argc, char *argv[])
                      "latent 恒 f32）\n"
                      "  [范围] P1 支持 MLP 路径；docs/internal/21-quantized-weights.md\n";
     }
-    if (cfg.precision.param == nn::Precision::F16 ||
-        cfg.precision.compute == nn::Precision::F16 ||
-        cfg.precision.stable == nn::Precision::F16 ||
-        cfg.precision.optimizer == nn::Precision::F16)
+    if (cfg.precision.param == nn::Precision::F16 || cfg.precision.compute == nn::Precision::F16 ||
+        cfg.precision.stable == nn::Precision::F16 || cfg.precision.optimizer == nn::Precision::F16)
     {
         std::cout << "[精度] f16 存储已启用（基类边界 cast）\n"
                      "  [注意] 边界 cast 的 transient 放大：峰值可能高于 f32，"
@@ -738,7 +804,8 @@ int main(int argc, char *argv[])
     auto csv_test_result = nn::cli::load_mnist_csv(cfg.dataset_path + "/test.csv");
     NN_EXIT(csv_test_result, 1, "Error: ");
     auto [test_x, test_y] = std::move(*csv_test_result);
-    std::cout << "训练集: " << train_x.cols() << " 样本, 测试集: " << test_x.cols() << " 样本\n" << std::endl;
+    std::cout << "训练集: " << train_x.cols() << " 样本, 测试集: " << test_x.cols() << " 样本\n"
+              << std::endl;
 
     // ── 构建模型（绑定引擎） ─────────────────────────────────
     // 显式告知而不是静默失效：CNN 构建器目前**不接收**精度 profile
@@ -779,14 +846,11 @@ int main(int argc, char *argv[])
         // （mnist 侧的 role 语义接线是 P1-2 的遗留项，见 docs/history/history.md）。
         auto load_result = nn::load_model(cfg.resume_path, model, nullptr, nullptr,
                                           nn::WeightLoadIntent::Trainable);
-        if (load_result)
-        {
-            std::cout << "已加载模型: " << cfg.resume_path << "\n" << std::endl;
-        }
+        if (load_result) { std::cout << "已加载模型: " << cfg.resume_path << "\n" << std::endl; }
         else
         {
-            std::cerr << "加载模型失败: " << load_result.error().message
-                      << "，将从头训练。\n" << std::endl;
+            std::cerr << "加载模型失败: " << load_result.error().message << "，将从头训练。\n"
+                      << std::endl;
         }
     }
 
@@ -823,8 +887,8 @@ int main(int argc, char *argv[])
     const std::size_t num_batches = train_x.cols() / cfg.batch_size;
     if (num_batches == 0)
     {
-        std::cerr << "训练样本数 (" << train_x.cols() << ") 小于 batch_size ("
-                  << cfg.batch_size << ")，请减小 --batch-size 或增大 --max-samples\n";
+        std::cerr << "训练样本数 (" << train_x.cols() << ") 小于 batch_size (" << cfg.batch_size
+                  << ")，请减小 --batch-size 或增大 --max-samples\n";
         return 1;
     }
 
@@ -913,14 +977,16 @@ int main(int argc, char *argv[])
             NN_EXIT(obb, 1, "\nbegin_batch (optimizer) failed: ");
 
             auto step_result = session.step();
-            if (!step_result) {
+            if (!step_result)
+            {
                 std::cerr << "\n优化器 step 失败: " << step_result.error().message << '\n';
                 (void)engine->end_batch();
                 return 1;
             }
 
             auto zero_result = session.zero_grad();
-            if (!zero_result) {
+            if (!zero_result)
+            {
                 std::cerr << "\n优化器 zero_grad 失败: " << zero_result.error().message << '\n';
                 (void)engine->end_batch();
                 return 1;
@@ -933,11 +999,12 @@ int main(int argc, char *argv[])
             if ((batch + 1) % 10 == 0 || batch + 1 == num_batches)
             {
                 auto batch_now = std::chrono::steady_clock::now();
-                Scalar batch_ms = std::chrono::duration<Scalar, std::milli>(batch_now - ep_start).count();
-                std::cout << "\r  Epoch " << epoch + 1 << "/" << cfg.epochs
-                          << "  batch " << batch + 1 << "/" << num_batches
-                          << "  loss: " << std::fixed << std::setprecision(4) << loss
-                          << "  time: " << std::setprecision(0) << batch_ms << "ms"
+                Scalar batch_ms =
+                    std::chrono::duration<Scalar, std::milli>(batch_now - ep_start).count();
+                std::cout << "\r  Epoch " << epoch + 1 << "/" << cfg.epochs << "  batch "
+                          << batch + 1 << "/" << num_batches << "  loss: " << std::fixed
+                          << std::setprecision(4) << loss << "  time: " << std::setprecision(0)
+                          << batch_ms << "ms"
                           << "   " << std::flush;
             }
         }
@@ -950,24 +1017,25 @@ int main(int argc, char *argv[])
         // 评估分块大小取训练 batch：CNN 的 im2col 展开是 k²·C_in 倍，
         // 不分块时全量 60000 样本单次 forward 需 ~6.4 GB 显存 → OOM。
         const std::size_t eval_n = (cfg.arch == ArchType::Transformer) ? cfg.eval_samples : 0;
-        auto train_acc_r = nn::cli::evaluate_mnist(session.model(), *engine, train_x, train_y, eval_n, cfg.batch_size);
-        auto test_acc_r  = nn::cli::evaluate_mnist(session.model(), *engine, test_x, test_y, eval_n, cfg.batch_size);
+        auto train_acc_r = nn::cli::evaluate_mnist(session.model(), *engine, train_x, train_y,
+                                                   eval_n, cfg.batch_size);
+        auto test_acc_r = nn::cli::evaluate_mnist(session.model(), *engine, test_x, test_y, eval_n,
+                                                  cfg.batch_size);
         if (!train_acc_r || !test_acc_r)
         {
-            const auto &err = !train_acc_r ? train_acc_r.error() : test_acc_r.error();
+            const auto& err = !train_acc_r ? train_acc_r.error() : test_acc_r.error();
             std::cerr << "\n  评估失败: " << err.message << std::endl;
             return 1;
         }
         Scalar train_acc = *train_acc_r;
-        Scalar test_acc  = *test_acc_r;
+        Scalar test_acc = *test_acc_r;
 
-        std::cout << "\r  Epoch " << epoch + 1 << "/" << cfg.epochs
-                  << "  lr=" << std::scientific << std::setprecision(4) << optimizer_current_lr
-                  << "  loss=" << std::fixed << std::setprecision(4) << avg_loss
-                  << "  train_acc=" << std::setprecision(2) << train_acc * 100.0 << "%"
+        std::cout << "\r  Epoch " << epoch + 1 << "/" << cfg.epochs << "  lr=" << std::scientific
+                  << std::setprecision(4) << optimizer_current_lr << "  loss=" << std::fixed
+                  << std::setprecision(4) << avg_loss << "  train_acc=" << std::setprecision(2)
+                  << train_acc * 100.0 << "%"
                   << "  test_acc=" << test_acc * 100.0 << "%"
-                  << "  time=" << std::setprecision(1) << ep_sec << "s"
-                  << std::endl;
+                  << "  time=" << std::setprecision(1) << ep_sec << "s" << std::endl;
     }
 
     auto t_end = std::chrono::steady_clock::now();
@@ -975,10 +1043,11 @@ int main(int argc, char *argv[])
 
     // ── 保存模型 ─────────────────────────────────────────────
     // 推理模型（Model 角色）：三值层写打包形态 + τ（不含训练参数）
-    auto save_result = nn::save_model(cfg.save_path, session.model(), spec, {},
-                                      nn::ModelRole::Model);
+    auto save_result =
+        nn::save_model(cfg.save_path, session.model(), spec, {}, nn::ModelRole::Model);
     NN_EXIT(save_result, 1, "保存模型失败: ");
-    std::cout << "\n训练完成! 总耗时: " << std::fixed << std::setprecision(1) << total_sec << "s" << std::endl;
+    std::cout << "\n训练完成! 总耗时: " << std::fixed << std::setprecision(1) << total_sec << "s"
+              << std::endl;
 
     return 0;
 }

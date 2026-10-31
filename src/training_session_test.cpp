@@ -31,7 +31,8 @@ std::vector<nn::Scalar> snapshot_params(nn::CpuEngine& eng, nn::Model& model)
     {
         auto m = eng.to_matrix(t.get(), nn::Precision::F32);
         NN_ASSERT_ALWAYS(m, "snapshot_params: to_matrix failed");
-        for (auto v : m->span()) out.push_back(v);
+        for (auto v : m->span())
+            out.push_back(v);
     }
     return out;
 }
@@ -99,30 +100,32 @@ void test_create_and_train()
     CHECK(infer.has_value(), "session.model().forward 推理可用");
 }
 
-[[nodiscard]] nn::Result<nn::TrainingStepReport>
-run_mse_step(nn::TrainingSession& session, const nn::Tensor& x,
-             std::size_t normalization_units, bool force_update = false)
+[[nodiscard]] nn::Result<nn::TrainingStepReport> run_mse_step(nn::TrainingSession& session,
+                                                              const nn::Tensor& x,
+                                                              std::size_t normalization_units,
+                                                              bool force_update = false)
 {
     nn::TrainingStepOptions opts;
     opts.normalization_units = normalization_units;
     opts.force_update = force_update;
-    return session.train_step(
-        x, opts,
-        [&](nn::Model& model, nn::ComputeEngine& engine, const nn::Tensor& input)
-            -> nn::Result<nn::TrainingStepOutput> {
-            auto logits_r = model.forward(input);
-            NN_TRY_CHECK(logits_r);
-            nn::MSELoss loss;
-            auto target = make_tensor(engine, logits_r->rows(), logits_r->cols(), 0.f, 0.f);
-            auto loss_r = loss.forward(engine, *logits_r, target);
-            NN_TRY_CHECK(loss_r);
-            auto grad_r = loss.backward();
-            NN_TRY_CHECK(grad_r);
-            nn::TrainingStepOutput out;
-            out.grad = std::move(*grad_r);
-            out.gradient_units = logits_r->size();
-            return out;
-        });
+    return session.train_step(x, opts,
+                              [&](nn::Model& model, nn::ComputeEngine& engine,
+                                  const nn::Tensor& input) -> nn::Result<nn::TrainingStepOutput>
+                              {
+                                  auto logits_r = model.forward(input);
+                                  NN_TRY_CHECK(logits_r);
+                                  nn::MSELoss loss;
+                                  auto target = make_tensor(engine, logits_r->rows(),
+                                                            logits_r->cols(), 0.f, 0.f);
+                                  auto loss_r = loss.forward(engine, *logits_r, target);
+                                  NN_TRY_CHECK(loss_r);
+                                  auto grad_r = loss.backward();
+                                  NN_TRY_CHECK(grad_r);
+                                  nn::TrainingStepOutput out;
+                                  out.grad = std::move(*grad_r);
+                                  out.gradient_units = logits_r->size();
+                                  return out;
+                              });
 }
 
 void test_accumulation_and_session_state()
@@ -158,14 +161,16 @@ void test_global_batch_normalization()
 {
     auto engine = nn::CpuEngine::create();
 
-    auto make_zero_model = [&]() {
+    auto make_zero_model = [&]()
+    {
         nn::Model model(*engine);
         NN_ASSERT_ALWAYS(model.add<nn::Linear>(1, 1), "norm: add");
         for (auto& p : model.parameters())
             NN_ASSERT_ALWAYS(engine->zero(p.get()), "norm: zero parameter");
         return model;
     };
-    auto make_sgd_session = [&](std::size_t accum) {
+    auto make_sgd_session = [&](std::size_t accum)
+    {
         nn::TrainingConfig cfg;
         cfg.optimizer = "sgd";
         cfg.lr = 0.1f;
@@ -230,23 +235,24 @@ void test_before_update_abort()
     nn::TrainingStepOptions opts;
     opts.normalization_units = 6;
     opts.before_update = []() -> nn::Result<bool> { return true; };
-    auto r = s->train_step(
-        x, std::move(opts),
-        [&](nn::Model& m, nn::ComputeEngine& e, const nn::Tensor& input)
-            -> nn::Result<nn::TrainingStepOutput> {
-            auto logits = m.forward(input);
-            NN_TRY_CHECK(logits);
-            nn::MSELoss loss;
-            auto target = make_tensor(e, logits->rows(), logits->cols(), 0.f, 0.f);
-            auto l = loss.forward(e, *logits, target);
-            NN_TRY_CHECK(l);
-            auto g = loss.backward();
-            NN_TRY_CHECK(g);
-            nn::TrainingStepOutput out;
-            out.grad = std::move(*g);
-            out.gradient_units = logits->size();
-            return out;
-        });
+    auto r = s->train_step(x, std::move(opts),
+                           [&](nn::Model& m, nn::ComputeEngine& e,
+                               const nn::Tensor& input) -> nn::Result<nn::TrainingStepOutput>
+                           {
+                               auto logits = m.forward(input);
+                               NN_TRY_CHECK(logits);
+                               nn::MSELoss loss;
+                               auto target =
+                                   make_tensor(e, logits->rows(), logits->cols(), 0.f, 0.f);
+                               auto l = loss.forward(e, *logits, target);
+                               NN_TRY_CHECK(l);
+                               auto g = loss.backward();
+                               NN_TRY_CHECK(g);
+                               nn::TrainingStepOutput out;
+                               out.grad = std::move(*g);
+                               out.gradient_units = logits->size();
+                               return out;
+                           });
     CHECK(r && r->aborted && !r->parameters_updated, "abort: 回调可在 update 前中止");
     CHECK(s->step_count() == 0, "abort: optimizer step 未推进");
     CHECK(s->state().microsteps_in_update == 0 && !s->state().accumulation_dirty,
@@ -315,8 +321,7 @@ void test_precision_passthrough()
     if (!session_r) return;
     nn::TrainingSession session = std::move(*session_r);
 
-    CHECK(session.config().precision.compute == nn::Precision::F16,
-          "config 保留调用方精度配方");
+    CHECK(session.config().precision.compute == nn::Precision::F16, "config 保留调用方精度配方");
     CHECK(session.model().parameters()[0].get().precision() == nn::Precision::F16,
           "模型参数按 f16 存储");
 
@@ -395,9 +400,7 @@ int main()
     test_errors();
     test_destroy_order();
 
-    if (g_fail == 0)
-        std::printf("training_session_test: ALL PASS\n");
-    else
-        std::printf("training_session_test: %d failure(s)\n", g_fail);
+    if (g_fail == 0) std::printf("training_session_test: ALL PASS\n");
+    else std::printf("training_session_test: %d failure(s)\n", g_fail);
     return g_fail == 0 ? 0 : 1;
 }

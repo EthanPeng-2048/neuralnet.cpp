@@ -22,21 +22,20 @@
 #include <vector>
 #include "test_common.hpp"
 
-using nn::Scalar;
+using nn::ComputeEngine;
 using nn::Matrix;
+using nn::ReLULinearAttention;
+using nn::Scalar;
 using nn::Tensor;
 using nn::TensorRef;
-using nn::ComputeEngine;
-using nn::ReLULinearAttention;
 
-namespace {
-
+namespace
+{
 
 
-bool check_param(ComputeEngine& engine,
-                 const std::function<Scalar()>& eval_loss,
-                 Tensor& param, const Matrix& base, const Matrix& ana,
-                 const std::string& name, Scalar eps, Scalar tol)
+bool check_param(ComputeEngine& engine, const std::function<Scalar()>& eval_loss, Tensor& param,
+                 const Matrix& base, const Matrix& ana, const std::string& name, Scalar eps,
+                 Scalar tol)
 {
     bool ok = true;
     std::size_t bad = 0, skipped = 0;
@@ -51,10 +50,12 @@ bool check_param(ComputeEngine& engine,
             const Scalar orig = base.at_unchecked(r, c);
             if (!engine.write(param, base.span())) return false;
             const Scalar f0 = eval_loss();
-            Matrix pp = base; pp.set_value_unchecked(r, c, orig + eps);
+            Matrix pp = base;
+            pp.set_value_unchecked(r, c, orig + eps);
             if (!engine.write(param, pp.span())) return false;
             const Scalar fp = eval_loss();
-            Matrix pm = base; pm.set_value_unchecked(r, c, orig - eps);
+            Matrix pm = base;
+            pm.set_value_unchecked(r, c, orig - eps);
             if (!engine.write(param, pm.span())) return false;
             const Scalar fm = eval_loss();
             if (!engine.write(param, base.span())) return false;
@@ -74,32 +75,36 @@ bool check_param(ComputeEngine& engine,
             {
                 ok = false;
                 if (bad < 5)
-                    std::cout << "  [FAIL] " << name << "(" << r << "," << c
-                              << ") num=" << num << " ana=" << ana_v
-                              << " err=" << err << "\n";
+                    std::cout << "  [FAIL] " << name << "(" << r << "," << c << ") num=" << num
+                              << " ana=" << ana_v << " err=" << err << "\n";
                 ++bad;
             }
         }
     }
-    std::cout << "  " << name << ": " << (ok ? "OK" : "FAIL")
-              << "  max_err=" << max_err << "  bad=" << bad
-              << "  skipped(kink)=" << skipped << "\n";
+    std::cout << "  " << name << ": " << (ok ? "OK" : "FAIL") << "  max_err=" << max_err
+              << "  bad=" << bad << "  skipped(kink)=" << skipped << "\n";
     return ok;
 }
 
-bool check_all_params(ComputeEngine& engine,
-                      const std::function<Scalar()>& eval_loss,
-                      std::vector<TensorRef>& params,
-                      std::vector<TensorRef>& grads,
-                      Scalar eps, Scalar tol)
+bool check_all_params(ComputeEngine& engine, const std::function<Scalar()>& eval_loss,
+                      std::vector<TensorRef>& params, std::vector<TensorRef>& grads, Scalar eps,
+                      Scalar tol)
 {
     bool ok = true;
     for (std::size_t i = 0; i < params.size(); ++i)
     {
         auto base = engine.to_matrix(params[i]);
-        if (!base) { std::cerr << "  to_matrix failed\n"; return false; }
+        if (!base)
+        {
+            std::cerr << "  to_matrix failed\n";
+            return false;
+        }
         auto ana = engine.to_matrix(grads[i]);
-        if (!ana) { std::cerr << "  to_matrix(grad) failed\n"; return false; }
+        if (!ana)
+        {
+            std::cerr << "  to_matrix(grad) failed\n";
+            return false;
+        }
         ok &= check_param(engine, eval_loss, params[i], *base, *ana,
                           "param[" + std::to_string(i) + "]", eps, tol);
     }
@@ -108,8 +113,7 @@ bool check_all_params(ComputeEngine& engine,
 
 // 用固定种子重设全部参数，使 gradcheck 跨运行可复现
 // （ReLU 层拐点附近的有限差分梯度不稳定，固定权重避免随机初始化抖动）
-bool reseed_params(ComputeEngine& engine, std::vector<TensorRef>& params,
-                   unsigned seed)
+bool reseed_params(ComputeEngine& engine, std::vector<TensorRef>& params, unsigned seed)
 {
     std::mt19937_64 rng{seed};
     std::normal_distribution<Scalar> dist(0.0, 0.5);
@@ -118,7 +122,8 @@ bool reseed_params(ComputeEngine& engine, std::vector<TensorRef>& params,
         auto m = engine.to_matrix(p);
         if (!m) return false;
         auto sp = m->span();
-        for (auto& v : sp) v = dist(rng);
+        for (auto& v : sp)
+            v = dist(rng);
         if (!engine.write(p, m->span())) return false;
     }
     return true;
@@ -148,30 +153,48 @@ int main(int argc, char* argv[])
     {
         std::cout << "=== ReLULinearAttention (causal) gradcheck ===\n";
         const std::size_t d_model = 8, heads = 2, seq = 4, batch = 2;
-        ReLULinearAttention attn(d_model, heads, seq, /*causal=*/true,
-                                 nn::PosEncodingType::RoPE);
-        if (!attn.init(eng)) { std::cerr << "  init failed\n"; return 1; }
-        { auto prm = attn.parameters(); if (!reseed_params(eng, prm, 101)) return 1; }
+        ReLULinearAttention attn(d_model, heads, seq, /*causal=*/true, nn::PosEncodingType::RoPE);
+        if (!attn.init(eng))
+        {
+            std::cerr << "  init failed\n";
+            return 1;
+        }
+        {
+            auto prm = attn.parameters();
+            if (!reseed_params(eng, prm, 101)) return 1;
+        }
 
         std::mt19937_64 rng{7};
         std::normal_distribution<Scalar> dist(0.0, 1.0);
         Matrix x_m(d_model, batch * seq);
-        { auto sp = x_m.span(); for (auto& v : sp) v = dist(rng); }
+        {
+            auto sp = x_m.span();
+            for (auto& v : sp)
+                v = dist(rng);
+        }
         auto x_t = eng.from_matrix(x_m);
         NN_EXIT(x_t, 1);
         Matrix go_m(d_model, batch * seq);
-        { auto sp = go_m.span(); for (auto& v : sp) v = dist(rng); }
+        {
+            auto sp = go_m.span();
+            for (auto& v : sp)
+                v = dist(rng);
+        }
         auto go_t = eng.from_matrix(go_m);
         NN_EXIT(go_t, 1);
 
-        auto eval_loss = [&]() -> Scalar {
+        auto eval_loss = [&]() -> Scalar
+        {
             auto y = attn.forward(*x_t);
             auto ym = eng.to_matrix(*y);
             return dot(*ym, go_m);
         };
 
         auto grads = attn.param_gradients();
-        for (auto& g : grads) { if (!eng.zero(g)) return 1; }
+        for (auto& g : grads)
+        {
+            if (!eng.zero(g)) return 1;
+        }
         auto y0 = attn.forward(*x_t);
         NN_EXIT(y0, 1, "  fwd failed\n");
         auto gx = attn.backward(*go_t);
@@ -185,30 +208,48 @@ int main(int argc, char* argv[])
     {
         std::cout << "=== ReLULinearAttention (bidirectional) gradcheck ===\n";
         const std::size_t d_model = 8, heads = 2, seq = 4, batch = 1;
-        ReLULinearAttention attn(d_model, heads, seq, /*causal=*/false,
-                                 nn::PosEncodingType::RoPE);
-        if (!attn.init(eng)) { std::cerr << "  init failed\n"; return 1; }
-        { auto prm = attn.parameters(); if (!reseed_params(eng, prm, 202)) return 1; }
+        ReLULinearAttention attn(d_model, heads, seq, /*causal=*/false, nn::PosEncodingType::RoPE);
+        if (!attn.init(eng))
+        {
+            std::cerr << "  init failed\n";
+            return 1;
+        }
+        {
+            auto prm = attn.parameters();
+            if (!reseed_params(eng, prm, 202)) return 1;
+        }
 
         std::mt19937_64 rng{9};
         std::normal_distribution<Scalar> dist(0.0, 1.0);
         Matrix x_m(d_model, batch * seq);
-        { auto sp = x_m.span(); for (auto& v : sp) v = dist(rng); }
+        {
+            auto sp = x_m.span();
+            for (auto& v : sp)
+                v = dist(rng);
+        }
         auto x_t = eng.from_matrix(x_m);
         NN_EXIT(x_t, 1);
         Matrix go_m(d_model, batch * seq);
-        { auto sp = go_m.span(); for (auto& v : sp) v = dist(rng); }
+        {
+            auto sp = go_m.span();
+            for (auto& v : sp)
+                v = dist(rng);
+        }
         auto go_t = eng.from_matrix(go_m);
         NN_EXIT(go_t, 1);
 
-        auto eval_loss = [&]() -> Scalar {
+        auto eval_loss = [&]() -> Scalar
+        {
             auto y = attn.forward(*x_t);
             auto ym = eng.to_matrix(*y);
             return dot(*ym, go_m);
         };
 
         auto grads = attn.param_gradients();
-        for (auto& g : grads) { if (!eng.zero(g)) return 1; }
+        for (auto& g : grads)
+        {
+            if (!eng.zero(g)) return 1;
+        }
         auto y0 = attn.forward(*x_t);
         NN_EXIT(y0, 1, "  fwd failed\n");
         auto gx = attn.backward(*go_t);
@@ -223,37 +264,61 @@ int main(int argc, char* argv[])
     {
         std::cout << "=== ReLULinearAttention (causal + doc-aware) gradcheck ===\n";
         const std::size_t d_model = 8, heads = 2, seq = 4, batch = 2;
-        ReLULinearAttention attn(d_model, heads, seq, /*causal=*/true,
-                                 nn::PosEncodingType::RoPE);
-        if (!attn.init(eng)) { std::cerr << "  init failed\n"; return 1; }
-        { auto prm = attn.parameters(); if (!reseed_params(eng, prm, 404)) return 1; }
+        ReLULinearAttention attn(d_model, heads, seq, /*causal=*/true, nn::PosEncodingType::RoPE);
+        if (!attn.init(eng))
+        {
+            std::cerr << "  init failed\n";
+            return 1;
+        }
+        {
+            auto prm = attn.parameters();
+            if (!reseed_params(eng, prm, 404)) return 1;
+        }
 
         // 文档边界（batch-major）：batch0=[0,0,1,1]，batch1=[2,2,2,3]
         // → 边界位置：batch0 t0,t2；batch1 t0,t3
         std::vector<std::size_t> doc_ids(batch * seq);
-        doc_ids[0]=0; doc_ids[1]=0; doc_ids[2]=1; doc_ids[3]=1;
-        doc_ids[4]=2; doc_ids[5]=2; doc_ids[6]=2; doc_ids[7]=3;
+        doc_ids[0] = 0;
+        doc_ids[1] = 0;
+        doc_ids[2] = 1;
+        doc_ids[3] = 1;
+        doc_ids[4] = 2;
+        doc_ids[5] = 2;
+        doc_ids[6] = 2;
+        doc_ids[7] = 3;
         attn.set_doc_ids(doc_ids);
 
         std::mt19937_64 rng{13};
         std::normal_distribution<Scalar> dist(0.0, 1.0);
         Matrix x_m(d_model, batch * seq);
-        { auto sp = x_m.span(); for (auto& v : sp) v = dist(rng); }
+        {
+            auto sp = x_m.span();
+            for (auto& v : sp)
+                v = dist(rng);
+        }
         auto x_t = eng.from_matrix(x_m);
         NN_EXIT(x_t, 1);
         Matrix go_m(d_model, batch * seq);
-        { auto sp = go_m.span(); for (auto& v : sp) v = dist(rng); }
+        {
+            auto sp = go_m.span();
+            for (auto& v : sp)
+                v = dist(rng);
+        }
         auto go_t = eng.from_matrix(go_m);
         NN_EXIT(go_t, 1);
 
-        auto eval_loss = [&]() -> Scalar {
+        auto eval_loss = [&]() -> Scalar
+        {
             auto y = attn.forward(*x_t);
             auto ym = eng.to_matrix(*y);
             return dot(*ym, go_m);
         };
 
         auto grads = attn.param_gradients();
-        for (auto& g : grads) { if (!eng.zero(g)) return 1; }
+        for (auto& g : grads)
+        {
+            if (!eng.zero(g)) return 1;
+        }
         auto y0 = attn.forward(*x_t);
         NN_EXIT(y0, 1, "  fwd failed\n");
         auto gx = attn.backward(*go_t);
@@ -263,7 +328,6 @@ int main(int argc, char* argv[])
         all_ok &= check_all_params(eng, eval_loss, params, grads, eps, tol);
     }
 
-    std::cout << (all_ok ? "\nALL RAPT GRADCHECKS PASSED\n"
-                         : "\nSOME RAPT GRADCHECKS FAILED\n");
+    std::cout << (all_ok ? "\nALL RAPT GRADCHECKS PASSED\n" : "\nSOME RAPT GRADCHECKS FAILED\n");
     return all_ok ? 0 : 1;
 }

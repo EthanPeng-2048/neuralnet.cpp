@@ -28,9 +28,7 @@ int g_failures = 0;
 
 
 bool is_all(nn::PrecisionProfile p, nn::Precision v)
-{
-    return p.param == v && p.compute == v && p.stable == v && p.optimizer == v;
-}
+{ return p.param == v && p.compute == v && p.stable == v && p.optimizer == v; }
 } // namespace
 
 int main()
@@ -55,7 +53,7 @@ int main()
 
     const PrecisionProfile mw = nn::profile_master_weights();
     CHECK(mw.param == Precision::F32 && mw.compute == Precision::F16 &&
-          mw.stable == Precision::F32 && mw.optimizer == Precision::F32,
+              mw.stable == Precision::F32 && mw.optimizer == Precision::F32,
           "profile_master_weights 应为 F32/F16/F32/F32（混合，参数仍 f32）");
 
     // ── CLI `--t1_58` 语义：param + 其余三槽照抄 --f16 ───────────────────
@@ -73,8 +71,8 @@ int main()
     // 各配方两两可区分：锁定 --f16 = f16 存储配方，不被改成混合/全 f16
     const auto same = [](const PrecisionProfile& a, const PrecisionProfile& b)
     {
-        return a.param == b.param && a.compute == b.compute &&
-               a.stable == b.stable && a.optimizer == b.optimizer;
+        return a.param == b.param && a.compute == b.compute && a.stable == b.stable &&
+               a.optimizer == b.optimizer;
     };
     CHECK(!same(f16, mw), "profile_f16 与 profile_master_weights 必须可区分");
     CHECK(!same(f16, all16), "profile_f16 与 profile_all_f16 必须可区分");

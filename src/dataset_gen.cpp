@@ -23,7 +23,7 @@
 #include <vector>
 
 // ==================== 帮助信息 ====================
-void print_usage(const char *prog)
+void print_usage(const char* prog)
 {
     nn::cli::Help help(std::cout, prog, "文本数据集生成器（文本 + 词表 → .nndataset）");
 
@@ -33,10 +33,15 @@ void print_usage(const char *prog)
     help.item("<text-file>", "训练文本文件路径 (UTF-8，每行 = 一篇 doc)");
 
     help.section("选项");
-    help.opt("--vocab <v.nnvocab>", "词表文件路径 (.nnvocab，必需)\n词表从配套嵌入数据集，故必须先有词表 (tokenizer_train 先行)");
+    help.opt("--vocab <v.nnvocab>",
+             "词表文件路径 (.nnvocab，必需)\n词表从配套嵌入数据集，故必须先有词表 (tokenizer_train "
+             "先行)");
     help.opt("-o, --output <path>", "输出 .nndataset 路径 (必需)");
     help.opt("--test <test-file>", "测试集文本 (可选第二输入 → test 子集，结构与 train 相同)");
-    help.opt("--loss-scope <scope>", "loss 计算范围: all / assistant (默认: all)\nall: 全部有效 token 参与 loss (预训练，不写 mask 段)\nassistant: 仅 <|assistant|>…<|end_of_assistant|> 段参与 (对话 SFT；\n逐 doc 写入 mask 段，语义在生成期决定，训练端不再选)");
+    help.opt("--loss-scope <scope>",
+             "loss 计算范围: all / assistant (默认: all)\nall: 全部有效 token 参与 loss "
+             "(预训练，不写 mask 段)\nassistant: 仅 <|assistant|>…<|end_of_assistant|> 段参与 "
+             "(对话 SFT；\n逐 doc 写入 mask 段，语义在生成期决定，训练端不再选)");
     help.opt("--license <file>", "许可文本文件 (可选；全文原样写入配套 license 字段)");
     help.opt("--source <name>", "来源名称 (默认: 训练文本文件路径)");
     help.opt("--help, -h", "显示此帮助信息");
@@ -54,7 +59,7 @@ struct Config
     std::string source_name;
 };
 
-Config parse_args(int argc, char *argv[])
+Config parse_args(int argc, char* argv[])
 {
     Config cfg;
     for (int i = 1; i < argc; ++i)
@@ -65,28 +70,21 @@ Config parse_args(int argc, char *argv[])
             print_usage(argv[0]);
             std::exit(0);
         }
-        else if (arg == "--vocab" && i + 1 < argc)
-            cfg.vocab_path = argv[++i];
-        else if ((arg == "-o" || arg == "--output") && i + 1 < argc)
-            cfg.output_path = argv[++i];
-        else if (arg == "--test" && i + 1 < argc)
-            cfg.test_path = argv[++i];
+        else if (arg == "--vocab" && i + 1 < argc) cfg.vocab_path = argv[++i];
+        else if ((arg == "-o" || arg == "--output") && i + 1 < argc) cfg.output_path = argv[++i];
+        else if (arg == "--test" && i + 1 < argc) cfg.test_path = argv[++i];
         else if (arg == "--loss-scope" && i + 1 < argc)
         {
             cfg.loss_scope = argv[++i];
             if (cfg.loss_scope != "all" && cfg.loss_scope != "assistant")
             {
-                std::cerr << "未知 --loss-scope: " << cfg.loss_scope
-                          << "，可选: all, assistant\n";
+                std::cerr << "未知 --loss-scope: " << cfg.loss_scope << "，可选: all, assistant\n";
                 std::exit(1);
             }
         }
-        else if (arg == "--license" && i + 1 < argc)
-            cfg.license_path = argv[++i];
-        else if (arg == "--source" && i + 1 < argc)
-            cfg.source_name = argv[++i];
-        else if (!arg.starts_with("--"))
-            cfg.text_path = arg;
+        else if (arg == "--license" && i + 1 < argc) cfg.license_path = argv[++i];
+        else if (arg == "--source" && i + 1 < argc) cfg.source_name = argv[++i];
+        else if (!arg.starts_with("--")) cfg.text_path = arg;
         else
         {
             std::cerr << "未知参数: " << arg << "\n使用 --help 查看用法\n";
@@ -119,30 +117,29 @@ struct SubsetBuild
     std::size_t asst_tokens = 0;
 };
 
-nn::Result<SubsetBuild> build_subset(const nn::Tokenizer &tokenizer,
-                                     const std::vector<std::string> &docs,
-                                     bool need_mask, std::string_view name)
+nn::Result<SubsetBuild> build_subset(const nn::Tokenizer& tokenizer,
+                                     const std::vector<std::string>& docs, bool need_mask,
+                                     std::string_view name)
 {
     SubsetBuild out;
     out.docs = nn::encode_docs_parallel(tokenizer, docs, /*show_progress=*/true,
                                         std::string("Tokenize ") + std::string(name));
-    if (!need_mask)
-        return out;
-    for (const auto &toks : out.docs)
+    if (!need_mask) return out;
+    for (const auto& toks : out.docs)
     {
-        out.masks.push_back(nn::mark_assistant_span(
-            toks, tokenizer.assistant_marker_id(), tokenizer.end_assistant_marker_id()));
+        out.masks.push_back(nn::mark_assistant_span(toks, tokenizer.assistant_marker_id(),
+                                                    tokenizer.end_assistant_marker_id()));
         for (unsigned char m : out.masks.back())
             out.asst_tokens += m;
     }
     if (out.asst_tokens == 0)
         NN_FAIL(std::string(name) + "中未找到 <|assistant|> 段（--loss-scope assistant "
-            "要求语料含对话标记）");
+                                    "要求语料含对话标记）");
     return out;
 }
 
 // ==================== 主函数 ====================
-int main(int argc, char *argv[])
+int main(int argc, char* argv[])
 {
     Config cfg = parse_args(argc, argv);
     const bool need_mask = (cfg.loss_scope == "assistant");
@@ -160,7 +157,7 @@ int main(int argc, char *argv[])
     // ── 读文本（trim/过滤规则与原 text_train read_file_lines 逐字一致）──
     auto train_lines_r = nn::read_text_docs(cfg.text_path);
     NN_EXIT(train_lines_r, 1, "读取训练文本失败: ");
-    const std::vector<std::string> &train_lines = *train_lines_r;
+    const std::vector<std::string>& train_lines = *train_lines_r;
     if (train_lines.empty())
     {
         std::cerr << "训练文本为空: " << cfg.text_path << "\n";
@@ -186,10 +183,12 @@ int main(int argc, char *argv[])
     }
 
     std::size_t train_tokens = 0;
-    for (const auto &d : train_r->docs) train_tokens += d.size();
+    for (const auto& d : train_r->docs)
+        train_tokens += d.size();
     std::size_t test_tokens = 0;
     if (test_build)
-        for (const auto &d : test_build->docs) test_tokens += d.size();
+        for (const auto& d : test_build->docs)
+            test_tokens += d.size();
 
     // ── 配套：源摘要（内容 sha256，不是文件大小）/ license / 生成参数 ──
     auto text_bytes_r = nn::load_text_file(cfg.text_path);
@@ -225,8 +224,7 @@ int main(int argc, char *argv[])
         std::cerr << "无法写输出文件: " << cfg.output_path << "\n";
         return 1;
     }
-    const std::string label = nn::write_file_label(nn::NNDATASET_MAGIC,
-                                                   nn::NNDATASET_FILE_VERSION);
+    const std::string label = nn::write_file_label(nn::NNDATASET_MAGIC, nn::NNDATASET_FILE_VERSION);
     ofs.write(label.data(), static_cast<std::streamsize>(label.size()));
     auto wr = nn::write_nndataset(ofs, build);
     NN_EXIT(wr, 1, "写 .nndataset 失败: ");
@@ -235,14 +233,11 @@ int main(int argc, char *argv[])
     std::cout << "数据集已生成: " << cfg.output_path << "\n"
               << "  kind: text  loss_scope: " << cfg.loss_scope << "\n"
               << "  train: " << train_lines.size() << " docs / " << train_tokens << " tokens";
-    if (need_mask)
-        std::cout << "（assistant 目标 " << train_r->asst_tokens << " tokens）";
+    if (need_mask) std::cout << "（assistant 目标 " << train_r->asst_tokens << " tokens）";
     std::cout << "\n";
     if (test_build)
-        std::cout << "  test:  " << test_lines.size() << " docs / " << test_tokens
-                  << " tokens\n";
-    std::cout << "  词表: " << tokenizer->vocab_size() << " 词（来自 "
-              << cfg.vocab_path << "）\n"
+        std::cout << "  test:  " << test_lines.size() << " docs / " << test_tokens << " tokens\n";
+    std::cout << "  词表: " << tokenizer->vocab_size() << " 词（来自 " << cfg.vocab_path << "）\n"
               << "  source.sha256: " << build.source_sha256.substr(0, 16) << "...\n";
     return 0;
 }

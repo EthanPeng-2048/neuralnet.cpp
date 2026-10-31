@@ -27,14 +27,13 @@
 
 // 测试写在全局作用域（非 namespace nn），避免 ADL 把匹配拉进 nn 命名空间。
 using namespace nn::dsl;
-namespace dsl = nn::dsl;   // 别名：全局作用域可用 dsl::leaf 等限定调用
+namespace dsl = nn::dsl; // 别名：全局作用域可用 dsl::leaf 等限定调用
 using nn::Scalar;
 
 namespace
 {
 
 int g_fail = 0;
-
 
 
 // ── 测试 1：归约视图——按行求和广播 x / row_sum ─────────────────────────
@@ -56,8 +55,10 @@ void test_row_sum_broadcast()
     for (std::size_t r = 0; r < R; ++r)
     {
         float sum = 0.0f;
-        for (std::size_t c = 0; c < C; ++c) sum += xs[r * C + c];
-        for (std::size_t c = 0; c < C; ++c) rs[r * C + c] = xs[r * C + c] / sum;
+        for (std::size_t c = 0; c < C; ++c)
+            sum += xs[r * C + c];
+        for (std::size_t c = 0; c < C; ++c)
+            rs[r * C + c] = xs[r * C + c] / sum;
     }
     check_close(eng, *out, upload(eng, ref), "row_reduce_sum 广播 (x / row_sum)", g_fail);
 }
@@ -80,8 +81,10 @@ void test_row_max_shift()
     for (std::size_t r = 0; r < R; ++r)
     {
         float mx = xs[r * C];
-        for (std::size_t c = 1; c < C; ++c) mx = std::max(mx, xs[r * C + c]);
-        for (std::size_t c = 0; c < C; ++c) rs[r * C + c] = xs[r * C + c] - mx;
+        for (std::size_t c = 1; c < C; ++c)
+            mx = std::max(mx, xs[r * C + c]);
+        for (std::size_t c = 0; c < C; ++c)
+            rs[r * C + c] = xs[r * C + c] - mx;
     }
     check_close(eng, *out, upload(eng, ref), "row_reduce_max 广播 (x - row_max)", g_fail);
 }
@@ -96,8 +99,8 @@ void test_softmax_mixed()
     const std::size_t R = 3, C = 7;
     nn::Tensor x = make_tensor(eng, R, C, -0.8f, 0.11f);
 
-    auto expr = dsl::exp(dsl::leaf(x) - dsl::row_reduce_max(x))
-              / dsl::row_reduce_sum(dsl::exp(dsl::leaf(x) - dsl::row_reduce_max(x)));
+    auto expr = dsl::exp(dsl::leaf(x) - dsl::row_reduce_max(x)) /
+                dsl::row_reduce_sum(dsl::exp(dsl::leaf(x) - dsl::row_reduce_max(x)));
     auto out = dsl::compute(eng, expr, R, C);
     CHECK(out.has_value(), "softmax_mixed: compute failed");
 
@@ -108,10 +111,13 @@ void test_softmax_mixed()
     for (std::size_t r = 0; r < R; ++r)
     {
         float mx = xs[r * C];
-        for (std::size_t c = 1; c < C; ++c) mx = std::max(mx, xs[r * C + c]);
+        for (std::size_t c = 1; c < C; ++c)
+            mx = std::max(mx, xs[r * C + c]);
         float sum = 0.0f;
-        for (std::size_t c = 0; c < C; ++c) sum += std::exp(xs[r * C + c] - mx);
-        for (std::size_t c = 0; c < C; ++c) rs[r * C + c] = std::exp(xs[r * C + c] - mx) / sum;
+        for (std::size_t c = 0; c < C; ++c)
+            sum += std::exp(xs[r * C + c] - mx);
+        for (std::size_t c = 0; c < C; ++c)
+            rs[r * C + c] = std::exp(xs[r * C + c] - mx) / sum;
     }
     check_close(eng, *out, upload(eng, ref), "Softmax（视图 row_max + 指令 row_sum）", g_fail);
 }
@@ -135,8 +141,10 @@ void test_reduce_instr_output()
     for (std::size_t r = 0; r < R; ++r)
     {
         float sum = 0.0f;
-        for (std::size_t c = 0; c < C; ++c) sum += std::exp(xs[r * C + c]);
-        for (std::size_t c = 0; c < C; ++c) rs[r * C + c] = sum;
+        for (std::size_t c = 0; c < C; ++c)
+            sum += std::exp(xs[r * C + c]);
+        for (std::size_t c = 0; c < C; ++c)
+            rs[r * C + c] = sum;
     }
     check_close(eng, *out, upload(eng, ref), "归约指令 row_sum(exp(x)) 输出广播", g_fail);
 }
@@ -159,8 +167,10 @@ void test_col_max_broadcast()
     for (std::size_t c = 0; c < C; ++c)
     {
         float mx = xs[c];
-        for (std::size_t r = 1; r < R; ++r) mx = std::max(mx, xs[r * C + c]);
-        for (std::size_t r = 0; r < R; ++r) rs[r * C + c] = xs[r * C + c] * mx;
+        for (std::size_t r = 1; r < R; ++r)
+            mx = std::max(mx, xs[r * C + c]);
+        for (std::size_t r = 0; r < R; ++r)
+            rs[r * C + c] = xs[r * C + c] * mx;
     }
     check_close(eng, *out, upload(eng, ref), "col_reduce_max 广播 (x * col_max)", g_fail);
 }
@@ -179,11 +189,14 @@ void test_reduce_of_reduce_view()
 
     const nn::Matrix xm = download(eng, x);
     float total = 0.0f;
-    for (auto v : xm.span()) total += v;
+    for (auto v : xm.span())
+        total += v;
     nn::Matrix ref(R, C);
-    for (auto& v : ref.span()) v = total;
+    for (auto& v : ref.span())
+        v = total;
 
-    check_close(eng, *out, upload(eng, ref), "归约指令叠加归约视图 row_sum(col_sum(x)) = 全局和", g_fail);
+    check_close(eng, *out, upload(eng, ref), "归约指令叠加归约视图 row_sum(col_sum(x)) = 全局和",
+                g_fail);
 }
 
 // ── 测试 7：归约与标量混合（均值平移）x - row_mean ─────────────────────
@@ -196,8 +209,8 @@ void test_reduce_with_scalar()
     const float inv = 1.0f / static_cast<float>(C);
 
     // x - (row_sum(x) / C)   —— 归约视图 + 标量除法
-    auto out = dsl::compute(eng,
-        dsl::leaf(x) - (dsl::row_reduce_sum(x) * nn::dsl::ConstLeaf{inv}), R, C);
+    auto out =
+        dsl::compute(eng, dsl::leaf(x) - (dsl::row_reduce_sum(x) * nn::dsl::ConstLeaf{inv}), R, C);
     CHECK(out.has_value(), "reduce_with_scalar: compute failed");
 
     nn::Matrix ref(R, C);
@@ -207,9 +220,11 @@ void test_reduce_with_scalar()
     for (std::size_t r = 0; r < R; ++r)
     {
         float sum = 0.0f;
-        for (std::size_t c = 0; c < C; ++c) sum += xs[r * C + c];
+        for (std::size_t c = 0; c < C; ++c)
+            sum += xs[r * C + c];
         const float mean = sum * inv;
-        for (std::size_t c = 0; c < C; ++c) rs[r * C + c] = xs[r * C + c] - mean;
+        for (std::size_t c = 0; c < C; ++c)
+            rs[r * C + c] = xs[r * C + c] - mean;
     }
     check_close(eng, *out, upload(eng, ref), "归约视图 + 标量 (x - row_mean)", g_fail);
 }
@@ -245,7 +260,8 @@ void test_fold_structure()
               "fold: 指令1 应为 RowSum 归约指令");
         CHECK(spec.instrs[1].a.kind == static_cast<uint8_t>(nn::ExprOperandKind::Reg),
               "fold: RowSum 源应为寄存器");
-        CHECK(spec.views.size() == 1 && spec.views[0].kind == static_cast<uint8_t>(nn::ExprViewKind::Linear),
+        CHECK(spec.views.size() == 1 &&
+                  spec.views[0].kind == static_cast<uint8_t>(nn::ExprViewKind::Linear),
               "fold: row_sum(exp(x)) 视图应为 Linear");
     }
 
@@ -264,10 +280,16 @@ void test_validation()
     {
         nn::ExprSpec spec;
         spec.num_regs = 2;
-        spec.instrs.push_back({static_cast<uint8_t>(nn::ExprOp::RowSum), 0,
-                               nn::expr::input(0), {}, {}});   // r0 = RowSum(input0)
-        spec.instrs.push_back({static_cast<uint8_t>(nn::ExprOp::Neg), 1,
-                               nn::expr::reg(0), {}, {}});     // r1 = -r0  ← 非法：Reg 引用归约 dst
+        spec.instrs.push_back({static_cast<uint8_t>(nn::ExprOp::RowSum),
+                               0,
+                               nn::expr::input(0),
+                               {},
+                               {}}); // r0 = RowSum(input0)
+        spec.instrs.push_back({static_cast<uint8_t>(nn::ExprOp::Neg),
+                               1,
+                               nn::expr::reg(0),
+                               {},
+                               {}}); // r1 = -r0  ← 非法：Reg 引用归约 dst
         spec.views.push_back(nn::expr::linear());
         auto v = nn::validate_expr_spec(spec, 1);
         CHECK(!v.has_value(), "validate: Reg 引用归约 dst 应被拒绝");
@@ -277,10 +299,16 @@ void test_validation()
     {
         nn::ExprSpec spec;
         spec.num_regs = 2;
-        spec.instrs.push_back({static_cast<uint8_t>(nn::ExprOp::Neg), 0,
-                               nn::expr::input(0), {}, {}});   // r0 = -input0（逐元素）
-        spec.instrs.push_back({static_cast<uint8_t>(nn::ExprOp::Mul), 1,
-                               nn::expr::reduce(0), nn::expr::reg(0), {}});  // Reduce(0) 但 r0 非归约
+        spec.instrs.push_back({static_cast<uint8_t>(nn::ExprOp::Neg),
+                               0,
+                               nn::expr::input(0),
+                               {},
+                               {}}); // r0 = -input0（逐元素）
+        spec.instrs.push_back({static_cast<uint8_t>(nn::ExprOp::Mul),
+                               1,
+                               nn::expr::reduce(0),
+                               nn::expr::reg(0),
+                               {}}); // Reduce(0) 但 r0 非归约
         spec.views.push_back(nn::expr::linear());
         auto v = nn::validate_expr_spec(spec, 1);
         CHECK(!v.has_value(), "validate: Reduce 引用非归约 dst 应被拒绝");
@@ -290,8 +318,11 @@ void test_validation()
     {
         nn::ExprSpec spec;
         spec.num_regs = 1;
-        spec.instrs.push_back({static_cast<uint8_t>(nn::ExprOp::RowSum), 0,
-                               nn::expr::reduce(0), {}, {}});  // RowSum 源引用自己
+        spec.instrs.push_back({static_cast<uint8_t>(nn::ExprOp::RowSum),
+                               0,
+                               nn::expr::reduce(0),
+                               {},
+                               {}}); // RowSum 源引用自己
         spec.views.push_back(nn::expr::linear());
         auto v = nn::validate_expr_spec(spec, 1);
         CHECK(!v.has_value(), "validate: Reduce 自引用应被拒绝");
@@ -305,21 +336,17 @@ void test_key_determinism()
     nn::CpuEngine& eng = *eng_owner;
     nn::Tensor x = eng.create_tensor(4, 5);
 
-    auto key_row = nn::expr_spec_key(to_expr_spec(
-        dsl::leaf(x) / dsl::row_reduce_sum(x)).first);
-    auto key_row2 = nn::expr_spec_key(to_expr_spec(
-        dsl::leaf(x) / dsl::row_reduce_sum(x)).first);
-    auto key_col = nn::expr_spec_key(to_expr_spec(
-        dsl::leaf(x) / dsl::col_reduce_sum(x)).first);
+    auto key_row = nn::expr_spec_key(to_expr_spec(dsl::leaf(x) / dsl::row_reduce_sum(x)).first);
+    auto key_row2 = nn::expr_spec_key(to_expr_spec(dsl::leaf(x) / dsl::row_reduce_sum(x)).first);
+    auto key_col = nn::expr_spec_key(to_expr_spec(dsl::leaf(x) / dsl::col_reduce_sum(x)).first);
 
     CHECK(key_row == key_row2, "key: 同结构同 key");
     CHECK(key_row != key_col, "key: 行/列归约 key 不同");
 
     // 归约指令 vs 归约视图：row_sum(exp(x)) 与 exp(x) 的 key 不同
-    auto key_instr = nn::expr_spec_key(to_expr_spec(
-        dsl::row_reduce_sum(dsl::exp(dsl::leaf(x)))).first);
-    auto key_exp = nn::expr_spec_key(to_expr_spec(
-        dsl::exp(dsl::leaf(x))).first);
+    auto key_instr =
+        nn::expr_spec_key(to_expr_spec(dsl::row_reduce_sum(dsl::exp(dsl::leaf(x)))).first);
+    auto key_exp = nn::expr_spec_key(to_expr_spec(dsl::exp(dsl::leaf(x))).first);
     CHECK(key_instr != key_exp, "key: 归约指令参与哈希");
 }
 
@@ -338,9 +365,7 @@ int main()
     test_validation();
     test_key_determinism();
 
-    if (g_fail == 0)
-        std::printf("\n[expr_reduce_test] 全部通过 ✅\n");
-    else
-        std::printf("\n[expr_reduce_test] %d 项失败 ❌\n", g_fail);
+    if (g_fail == 0) std::printf("\n[expr_reduce_test] 全部通过 ✅\n");
+    else std::printf("\n[expr_reduce_test] %d 项失败 ❌\n", g_fail);
     return g_fail == 0 ? 0 : 1;
 }

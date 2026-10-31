@@ -38,10 +38,10 @@ int main(int argc, char* argv[])
     // ── 1. 规格往返校验 ─────────────────────────────────────────────
     nn::RAPTConfig cfg;
     cfg.vocab_size = 32;
-    cfg.d_model    = 16;   // d_k = d_model/heads = 8（偶数，RoPE 约束）
-    cfg.seq_len    = 8;
-    cfg.num_heads  = 2;
-    cfg.d_ff       = 32;
+    cfg.d_model = 16;   // d_k = d_model/heads = 8（偶数，RoPE 约束）
+    cfg.seq_len = 8;
+    cfg.num_heads = 2;
+    cfg.d_ff = 32;
     cfg.num_layers = 2;
     // P2-3：`--f16` 走 profile_f16()（param/compute=F16，stable/optimizer=F32）
     if (use_f16)
@@ -50,8 +50,8 @@ int main(int argc, char* argv[])
         std::cout << "精度: --f16（param/compute=f16）\n";
     }
 
-    auto spec = nn::make_rapt_spec(cfg.vocab_size, cfg.d_model, cfg.seq_len,
-                                   cfg.num_heads, cfg.d_ff, cfg.num_layers);
+    auto spec = nn::make_rapt_spec(cfg.vocab_size, cfg.d_model, cfg.seq_len, cfg.num_heads,
+                                   cfg.d_ff, cfg.num_layers);
     auto model_from_spec = nn::build_rapt_model_from_spec(eng, spec);
     NN_EXIT(model_from_spec, 1, "build_rapt_model_from_spec failed\n");
     if (!nn::spec_matches(spec, *model_from_spec->spec()))
@@ -65,14 +65,13 @@ int main(int argc, char* argv[])
     NN_EXIT(model, 1, "build_rapt_model failed\n");
 
     // ── 2. 训练冒烟：合成数据（causal 下一位置预测），验证 loss 下降 ──
-    auto optimizer = nn::create_optimizer(
-        "adamw", eng, model->parameters(), model->param_gradients(),
-        nn::Scalar{1e-3}, nn::Scalar{0.01});
+    auto optimizer =
+        nn::create_optimizer("adamw", eng, model->parameters(), model->param_gradients(),
+                             nn::Scalar{1e-3}, nn::Scalar{0.01});
     NN_EXIT(optimizer, 1, "optimizer creation failed\n");
 
     nn::CrossEntropyLoss ce;
-    if (use_f16)
-        ce.set_precision_profile(nn::profile_f16());
+    if (use_f16) ce.set_precision_profile(nn::profile_f16());
     std::mt19937_64 rng{123};
     std::uniform_int_distribution<std::size_t> tok(0, cfg.vocab_size - 1);
 
@@ -80,7 +79,8 @@ int main(int argc, char* argv[])
     nn::Matrix in(cfg.seq_len, 1);
     std::vector<std::size_t> labels(cfg.seq_len);
     std::vector<std::size_t> toks(cfg.seq_len);
-    for (std::size_t t = 0; t < cfg.seq_len; ++t) toks[t] = tok(rng);
+    for (std::size_t t = 0; t < cfg.seq_len; ++t)
+        toks[t] = tok(rng);
     for (std::size_t t = 0; t < cfg.seq_len; ++t)
     {
         in.set_value_unchecked(t, 0, static_cast<nn::Scalar>(toks[t]));
@@ -90,7 +90,7 @@ int main(int argc, char* argv[])
     NN_EXIT(x, 1);
 
     nn::Scalar first_loss = 0;
-    nn::Scalar last_loss  = 0;
+    nn::Scalar last_loss = 0;
     for (std::size_t step = 0; step < steps; ++step)
     {
         auto zero = optimizer->zero_grad();
@@ -126,12 +126,12 @@ int main(int argc, char* argv[])
         for (std::size_t b = 0; b < batch; ++b)
         {
             std::vector<std::size_t> bt(cfg.seq_len);
-            for (std::size_t t = 0; t < cfg.seq_len; ++t) bt[t] = tok(rng);
+            for (std::size_t t = 0; t < cfg.seq_len; ++t)
+                bt[t] = tok(rng);
             for (std::size_t t = 0; t < cfg.seq_len; ++t)
             {
                 bin.set_value_unchecked(t, b, static_cast<nn::Scalar>(bt[t]));
-                blabels[b * cfg.seq_len + t] =
-                    (t + 1 < cfg.seq_len) ? bt[t + 1] : tok(rng);
+                blabels[b * cfg.seq_len + t] = (t + 1 < cfg.seq_len) ? bt[t + 1] : tok(rng);
             }
         }
         auto bx = eng.from_matrix(bin);
@@ -145,7 +145,11 @@ int main(int argc, char* argv[])
             NN_EXIT(logits, 1, "batch>1 forward failed: ");
             auto loss = ce.forward_sparse(eng, *logits, blabels, {}, cfg.vocab_size);
             NN_EXIT(loss, 1, "batch>1 loss failed\n");
-            if (!(*loss == *loss)) { std::cerr << "batch>1 loss NaN\n"; return 1; }
+            if (!(*loss == *loss))
+            {
+                std::cerr << "batch>1 loss NaN\n";
+                return 1;
+            }
             auto grad = ce.backward();
             NN_EXIT(grad, 1, "batch>1 loss backward failed\n");
             auto b = model->backward(*grad);
@@ -162,11 +166,19 @@ int main(int argc, char* argv[])
         const std::size_t d_model = 16, heads = 2, L = 6;   // d_k = 8
         nn::ReLULinearAttention attn(d_model, heads, /*seq_len=*/0,
                                      /*causal=*/true, nn::PosEncodingType::RoPE);
-        if (!attn.init(eng)) { std::cerr << "kv attn init failed\n"; return 1; }
+        if (!attn.init(eng))
+        {
+            std::cerr << "kv attn init failed\n";
+            return 1;
+        }
         std::mt19937_64 rng{77};
         std::normal_distribution<nn::Scalar> dist(0.0, 1.0);
         nn::Matrix x_m(d_model, L);
-        { auto sp = x_m.span(); for (auto& v : sp) v = dist(rng); }
+        {
+            auto sp = x_m.span();
+            for (auto& v : sp)
+                v = dist(rng);
+        }
         auto x_t = eng.from_matrix(x_m);
         NN_EXIT(x_t, 1);
         auto full = attn.forward(*x_t);

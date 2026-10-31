@@ -57,17 +57,12 @@ public:
 
     // 每 epoch 步数；nullopt = 无固定 epoch（骨架退化为步进驱动）。
     [[nodiscard]] virtual std::optional<std::size_t> steps_per_epoch() const
-    {
-        return std::nullopt;
-    }
+    { return std::nullopt; }
 
     // 断点定位：把内部游标移到 (epoch, start_step)。无固定 epoch 的域用空实现。
     // 有固定 epoch 的域在此重排样本顺序（每 epoch shuffle）。
-    [[nodiscard]] virtual Result<void> rewind(std::size_t /*epoch*/,
-                                              std::size_t /*start_step*/)
-    {
-        return {};
-    }
+    [[nodiscard]] virtual Result<void> rewind(std::size_t /*epoch*/, std::size_t /*start_step*/)
+    { return {}; }
 };
 
 // ── 预置适配器：样本表 + 每 epoch shuffle + 按下标装配（文本/视觉复用）────
@@ -88,15 +83,12 @@ public:
     // 工厂（参数校验；构造函数私有 —— 与 TrainingSession/TextTrainer 同口径）
     [[nodiscard]] static Result<IndexedBatchSource> create(std::size_t sample_count,
                                                            std::size_t batch_size,
-                                                           std::uint64_t seed,
-                                                           AssembleFn assemble)
+                                                           std::uint64_t seed, AssembleFn assemble)
     {
-        if (batch_size == 0)
-            NN_FAIL("IndexedBatchSource::create: batch_size 必须 > 0");
+        if (batch_size == 0) NN_FAIL("IndexedBatchSource::create: batch_size 必须 > 0");
         if (sample_count == 0)
             NN_FAIL("IndexedBatchSource::create: sample_count 必须 > 0（训练集为空）");
-        if (!assemble)
-            NN_FAIL("IndexedBatchSource::create: 装配回调不能为空");
+        if (!assemble) NN_FAIL("IndexedBatchSource::create: 装配回调不能为空");
         return IndexedBatchSource(sample_count, batch_size, seed, std::move(assemble));
     }
 
@@ -122,9 +114,7 @@ public:
     }
 
     [[nodiscard]] std::optional<std::size_t> steps_per_epoch() const override
-    {
-        return (sample_count_ + batch_size_ - 1) / batch_size_;
-    }
+    { return (sample_count_ + batch_size_ - 1) / batch_size_; }
 
     [[nodiscard]] Result<void> rewind(std::size_t epoch, std::size_t start_step) override
     {
@@ -135,7 +125,8 @@ public:
         // 单 RNG 流语义：从恒等序起，用同一 RNG 依次重放 0..epoch 共 epoch+1 次
         // shuffle —— 与"每 epoch 顺序推进同一 RNG 流"的取样语义一致，同时
         // (seed, epoch) 唯一决定顺序 ⇒ 幂等（重复 rewind 同一 epoch 结果不变）。
-        for (std::size_t i = 0; i < sample_count_; ++i) order_[i] = i;
+        for (std::size_t i = 0; i < sample_count_; ++i)
+            order_[i] = i;
         std::mt19937_64 rng(seed_);
         for (std::size_t e = 0; e <= epoch; ++e)
             std::shuffle(order_.begin(), order_.end(), rng);
@@ -152,13 +143,14 @@ public:
     [[nodiscard]] std::span<const std::size_t> order() const noexcept { return order_; }
 
 private:
-    IndexedBatchSource(std::size_t sample_count, std::size_t batch_size,
-                       std::uint64_t seed, AssembleFn assemble)
+    IndexedBatchSource(std::size_t sample_count, std::size_t batch_size, std::uint64_t seed,
+                       AssembleFn assemble)
         : sample_count_(sample_count), batch_size_(batch_size), seed_(seed),
           assemble_(std::move(assemble))
     {
         order_.resize(sample_count_);
-        for (std::size_t i = 0; i < sample_count_; ++i) order_[i] = i;
+        for (std::size_t i = 0; i < sample_count_; ++i)
+            order_[i] = i;
     }
 
     std::size_t sample_count_ = 0;

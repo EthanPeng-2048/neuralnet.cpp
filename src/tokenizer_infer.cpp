@@ -24,7 +24,7 @@
 #include <vector>
 
 // ==================== 帮助信息 ====================
-void print_usage(const char *prog)
+void print_usage(const char* prog)
 {
     nn::cli::Help help(std::cout, prog, "BPE 分词器推理程序 (编码/解码)");
 
@@ -38,13 +38,15 @@ void print_usage(const char *prog)
     help.item("<text-file>", "直接给文本文件即统计最长行 token 数");
 
     help.section("选项");
-    help.opt("--vocab <path>", "词表 .nnvocab 路径 (默认: bpe_vocab.nnvocab)\n自动识别分词器类型 (bpe / charbpe)");
+    help.opt("--vocab <path>",
+             "词表 .nnvocab 路径 (默认: bpe_vocab.nnvocab)\n自动识别分词器类型 (bpe / charbpe)");
     help.opt("--encode <text>", "编码文本为 token IDs");
     help.opt("--decode <ids>", "解码 token IDs (逗号分隔) 为文本");
     help.opt("--encode-file <path>", "编码整个文件 (同时自动统计最长行 token 数)");
     help.opt("--interactive", "交互模式 (输入 'quit' 退出)");
     help.opt("--top <n>", "最长行排行榜行数 (默认: 10)");
-    help.opt("--threads <n>", "encode 并行度: 0=自动(默认) 1=顺序 >1=指定\n保序并行：任何并行度下输出与顺序执行逐字节一致");
+    help.opt("--threads <n>", "encode 并行度: 0=自动(默认) 1=顺序 "
+                              ">1=指定\n保序并行：任何并行度下输出与顺序执行逐字节一致");
     help.opt("--show-bytes", "显示原始字节 (调试用)");
     help.opt("--help, -h", "显示此帮助信息");
 }
@@ -63,7 +65,7 @@ struct Config
     bool show_bytes = false;
 };
 
-Config parse_args(int argc, char *argv[])
+Config parse_args(int argc, char* argv[])
 {
     Config cfg;
     for (int i = 1; i < argc; ++i)
@@ -74,18 +76,12 @@ Config parse_args(int argc, char *argv[])
             print_usage(argv[0]);
             std::exit(0);
         }
-        else if (arg == "--vocab" && i + 1 < argc)
-            cfg.vocab_path = argv[++i];
-        else if (arg == "--encode" && i + 1 < argc)
-            cfg.encode_text = argv[++i];
-        else if (arg == "--decode" && i + 1 < argc)
-            cfg.decode_ids = argv[++i];
-        else if (arg == "--encode-file" && i + 1 < argc)
-            cfg.encode_file = argv[++i];
-        else if (arg == "--interactive")
-            cfg.interactive = true;
-        else if (arg == "--show-bytes")
-            cfg.show_bytes = true;
+        else if (arg == "--vocab" && i + 1 < argc) cfg.vocab_path = argv[++i];
+        else if (arg == "--encode" && i + 1 < argc) cfg.encode_text = argv[++i];
+        else if (arg == "--decode" && i + 1 < argc) cfg.decode_ids = argv[++i];
+        else if (arg == "--encode-file" && i + 1 < argc) cfg.encode_file = argv[++i];
+        else if (arg == "--interactive") cfg.interactive = true;
+        else if (arg == "--show-bytes") cfg.show_bytes = true;
         else if (arg == "--top" && i + 1 < argc)
         {
             auto v = nn::parse_number<std::size_t>(argv[++i]);
@@ -106,8 +102,7 @@ Config parse_args(int argc, char *argv[])
             }
             cfg.threads = *v;
         }
-        else if (!arg.starts_with("--"))
-            cfg.text_path = arg;
+        else if (!arg.starts_with("--")) cfg.text_path = arg;
         else
         {
             std::cerr << "未知参数: " << arg << "\n使用 --help 查看用法\n";
@@ -118,7 +113,7 @@ Config parse_args(int argc, char *argv[])
 }
 
 // ==================== 解析 token IDs 字符串 ====================
-std::vector<std::size_t> parse_ids(const std::string &s)
+std::vector<std::size_t> parse_ids(const std::string& s)
 {
     std::vector<std::size_t> ids;
     std::stringstream ss(s);
@@ -140,7 +135,7 @@ std::vector<std::size_t> parse_ids(const std::string &s)
 // ==================== 统一输出 token IDs ====================
 // 辅助函数：以 "Tokens (<n>): [id0, id1, ...]" 格式输出 ID 列表，
 // 消除交互模式 / 命令行模式 / 默认编码路径中的重复打印代码。
-void print_token_ids(const std::vector<std::size_t> &ids, std::ostream &os = std::cout)
+void print_token_ids(const std::vector<std::size_t>& ids, std::ostream& os = std::cout)
 {
     os << "  Tokens (" << ids.size() << "): [";
     for (std::size_t i = 0; i < ids.size(); ++i)
@@ -152,7 +147,7 @@ void print_token_ids(const std::vector<std::size_t> &ids, std::ostream &os = std
 }
 
 // ==================== 交互模式 ====================
-void interactive_mode(const nn::Tokenizer &tokenizer, bool show_bytes)
+void interactive_mode(const nn::Tokenizer& tokenizer, bool show_bytes)
 {
     std::cout << "Tokenizer 交互模式 (输入 'quit' 退出)\n";
     std::cout << "  encode <text>  → 编码文本\n";
@@ -162,12 +157,9 @@ void interactive_mode(const nn::Tokenizer &tokenizer, bool show_bytes)
     {
         std::cout << ">>> ";
         std::string line;
-        if (!std::getline(std::cin, line))
-            break;
-        if (line == "quit" || line == "exit")
-            break;
-        if (line.empty())
-            continue;
+        if (!std::getline(std::cin, line)) break;
+        if (line == "quit" || line == "exit") break;
+        if (line.empty()) continue;
 
         if (line.starts_with("encode "))
         {
@@ -176,7 +168,7 @@ void interactive_mode(const nn::Tokenizer &tokenizer, bool show_bytes)
             print_token_ids(ids);
             if (show_bytes)
             {
-                const auto &v = tokenizer.vocab();
+                const auto& v = tokenizer.vocab();
                 std::cout << "  Bytes: ";
                 for (auto id : ids)
                 {
@@ -212,7 +204,8 @@ void interactive_mode(const nn::Tokenizer &tokenizer, bool show_bytes)
 // 逐行编码文本，找出 token 数最多的行，并输出 Top-N 排行榜。
 // 无需额外开关：位置参数传入文本文件、或 --encode-file 都会自动执行。
 
-namespace {
+namespace
+{
 
 // 统计 UTF-8 字符串的字符数（跳过连续字节）
 std::size_t utf8_char_count(std::string_view s) noexcept
@@ -226,7 +219,7 @@ std::size_t utf8_char_count(std::string_view s) noexcept
 
 } // namespace
 
-void longest_lines_mode(const nn::Tokenizer &tokenizer, const std::string &path, std::size_t top_n)
+void longest_lines_mode(const nn::Tokenizer& tokenizer, const std::string& path, std::size_t top_n)
 {
     std::ifstream in(path, std::ios::binary);
     if (!in)
@@ -235,7 +228,8 @@ void longest_lines_mode(const nn::Tokenizer &tokenizer, const std::string &path,
         std::exit(1);
     }
 
-    struct LineStat {
+    struct LineStat
+    {
         std::size_t line_no = 0;
         std::size_t tokens = 0;
         std::size_t bytes = 0;
@@ -245,8 +239,9 @@ void longest_lines_mode(const nn::Tokenizer &tokenizer, const std::string &path,
 
     // 小顶堆：始终保留 token 数最大的 top_n 行（堆顶 = 当前第 top_n 大）。
     // 每行只需 O(log top_n) 的堆操作，而不是对整表 std::sort（O(top_n log top_n)）。
-    struct MinHeap {
-        bool operator()(const LineStat &a, const LineStat &b) const noexcept
+    struct MinHeap
+    {
+        bool operator()(const LineStat& a, const LineStat& b) const noexcept
         {
             return a.tokens > b.tokens;  // 小顶堆：tokens 越小越靠堆顶
         }
@@ -266,17 +261,12 @@ void longest_lines_mode(const nn::Tokenizer &tokenizer, const std::string &path,
 
         auto ids = tokenizer.encode(line);
         total_tokens += ids.size();
-        if (!line.empty())
-            ++nonempty_lines;
-        if (ids.empty() && line.empty())
-            continue;  // 空行不参与排行榜
+        if (!line.empty()) ++nonempty_lines;
+        if (ids.empty() && line.empty()) continue;  // 空行不参与排行榜
 
         LineStat st{line_no, ids.size(), line.size(), utf8_char_count(line), line};
 
-        if (best.size() < top_n)
-        {
-            best.push(std::move(st));
-        }
+        if (best.size() < top_n) { best.push(std::move(st)); }
         else if (st.tokens > best.top().tokens)
         {
             best.pop();               // 踢掉当前第 top_n 大
@@ -310,17 +300,14 @@ void longest_lines_mode(const nn::Tokenizer &tokenizer, const std::string &path,
                   << static_cast<double>(total_tokens) / nonempty_lines << " tokens/行\n";
     if (!top.empty())
     {
-        std::cout << "最长行   : " << top.front().tokens << " tokens (第 "
-                  << top.front().line_no << " 行, "
-                  << top.front().bytes << " 字节, "
-                  << top.front().chars << " 字符)\n";
+        std::cout << "最长行   : " << top.front().tokens << " tokens (第 " << top.front().line_no
+                  << " 行, " << top.front().bytes << " 字节, " << top.front().chars << " 字符)\n";
     }
     std::cout << "\n── 最长行 Top " << top.size() << " ──\n";
     for (std::size_t i = 0; i < top.size(); ++i)
     {
-        const auto &s = top[i];
-        std::cout << "#" << (i + 1)
-                  << "  第 " << s.line_no << " 行 | " << s.tokens << " tokens | "
+        const auto& s = top[i];
+        std::cout << "#" << (i + 1) << "  第 " << s.line_no << " 行 | " << s.tokens << " tokens | "
                   << s.bytes << " 字节 | " << s.chars << " 字符\n";
         const std::size_t preview_limit = 80;
         std::string_view preview = s.text;
@@ -333,11 +320,10 @@ void longest_lines_mode(const nn::Tokenizer &tokenizer, const std::string &path,
             {
                 const auto c = static_cast<unsigned char>(s.text[i]);
                 std::size_t width = 1;
-                if ((c & 0xE0) == 0xC0)      width = 2;   // 2 字节字符
+                if ((c & 0xE0) == 0xC0) width = 2;   // 2 字节字符
                 else if ((c & 0xF0) == 0xE0) width = 3;   // 3 字节字符（中文等）
                 else if ((c & 0xF8) == 0xF0) width = 4;   // 4 字节字符
-                if (i + width > preview_limit)
-                    break;  // 放不下一个完整字符
+                if (i + width > preview_limit) break;  // 放不下一个完整字符
                 i += width;
                 end = i;
             }
@@ -349,7 +335,7 @@ void longest_lines_mode(const nn::Tokenizer &tokenizer, const std::string &path,
 }
 
 // ==================== 主函数 ====================
-int main(int argc, char *argv[])
+int main(int argc, char* argv[])
 {
     Config cfg = parse_args(argc, argv);
 
@@ -412,8 +398,7 @@ int main(int argc, char *argv[])
             return 0;
         }
         std::cout << "压缩率: " << std::fixed << std::setprecision(2)
-                  << static_cast<double>(text_result->size()) / ids.size()
-                  << " bytes/token\n";
+                  << static_cast<double>(text_result->size()) / ids.size() << " bytes/token\n";
         std::cout << '\n';
         // 自动附加最长行 token 统计
         longest_lines_mode(*tokenizer, cfg.encode_file, cfg.top);

@@ -48,12 +48,12 @@ namespace
 
 int run_test()
 {
-    const std::size_t vocab    = 257;
-    const std::size_t d_model  = 64;
-    const std::size_t seq_len  = 16;
-    const std::size_t batch    = 2;
+    const std::size_t vocab = 257;
+    const std::size_t d_model = 64;
+    const std::size_t seq_len = 16;
+    const std::size_t batch = 2;
     const std::size_t num_heads = 4;
-    const std::size_t d_ff     = 128;
+    const std::size_t d_ff = 128;
     const std::size_t num_layers = 6;
 
     auto backend_owner = GpuBackend::shared();
@@ -72,15 +72,12 @@ int run_test()
     std::cout << "========================================\n"
               << "  GPT activation offload 一致性测试\n"
               << "========================================\n";
-    std::cout << "  vocab=" << vocab << " d_model=" << d_model
-              << " seq=" << seq_len << " batch=" << batch
-              << " heads=" << num_heads << " d_ff=" << d_ff
+    std::cout << "  vocab=" << vocab << " d_model=" << d_model << " seq=" << seq_len
+              << " batch=" << batch << " heads=" << num_heads << " d_ff=" << d_ff
               << " layers=" << num_layers << "\n";
 
-    GPTModel model(vocab, d_model, seq_len, num_heads, d_ff, num_layers,
-                   PosEncodingType::Learned,
-                   ActivationType::SwiGLU,
-                   NormType::RMSNorm);
+    GPTModel model(vocab, d_model, seq_len, num_heads, d_ff, num_layers, PosEncodingType::Learned,
+                   ActivationType::SwiGLU, NormType::RMSNorm);
     NN_EXIT(model.init(eng), 1, "GPTModel init 失败: ");
 
     std::mt19937_64 rng(7);
@@ -90,7 +87,8 @@ int run_test()
     for (std::size_t i = 0; i < x_m.size(); ++i)
         x_m.span()[i] = static_cast<Scalar>(rng() % vocab);
     Matrix go_m(vocab, seq_len * batch);
-    for (std::size_t i = 0; i < go_m.size(); ++i) go_m.span()[i] = dist(rng);
+    for (std::size_t i = 0; i < go_m.size(); ++i)
+        go_m.span()[i] = dist(rng);
 
     auto x = eng.from_matrix(x_m);
     NN_EXIT(x, 1, "from_matrix(x) failed\n");
@@ -172,7 +170,5 @@ int run_test()
 } // namespace
 
 int main()
-{
-    return run_test();
-}
+{ return run_test(); }
 #endif

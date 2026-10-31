@@ -34,8 +34,10 @@ void test_f16_matmul_vs_f32()
     nn::Matrix b32(8, 3);
     std::mt19937 rng(42);
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
-    for (auto& v : a32.span()) v = dist(rng);
-    for (auto& v : b32.span()) v = dist(rng);
+    for (auto& v : a32.span())
+        v = dist(rng);
+    for (auto& v : b32.span())
+        v = dist(rng);
 
     // f32 matmul 参考结果
     nn::Matrix c32_ref(4, 3);
@@ -87,7 +89,8 @@ void test_cast_roundtrip()
     nn::Matrix m32(3, 4);
     std::mt19937 rng(123);
     std::uniform_real_distribution<float> dist(-10.0f, 10.0f);
-    for (auto& v : m32.span()) v = dist(rng);
+    for (auto& v : m32.span())
+        v = dist(rng);
 
     auto t32 = upload(engine, m32);
 
@@ -131,7 +134,8 @@ void test_f16_linear_training()
 
     nn::Matrix x_data(D, N);
     nn::Matrix w_true(D, 1);
-    for (auto& v : x_data.span()) v = ndist(rng);
+    for (auto& v : x_data.span())
+        v = ndist(rng);
     w_true.set_value(0, 0, 2.0f);
     w_true.set_value(1, 0, -1.0f);
     w_true.set_value(2, 0, 0.5f);
@@ -149,7 +153,8 @@ void test_f16_linear_training()
 
     // 初始化权重 w（随机）
     nn::Matrix w(D, 1);
-    for (auto& v : w.span()) v = ndist(rng) * 0.1f;
+    for (auto& v : w.span())
+        v = ndist(rng) * 0.1f;
 
     float lr = 0.01f;
     float prev_loss = 1e10f;
@@ -172,25 +177,25 @@ void test_f16_linear_training()
         CHECK(t_pred32_r->is_cpu(), "cast result is CPU");
 
         // loss = mean((pred - y)^2) — 在 f32 融合世界中计算
-        auto t_diff_r = nn::dsl::compute(engine,
-            nn::dsl::leaf(*t_pred32_r) - nn::dsl::leaf(t_y32),
-            t_pred32_r->rows(), t_pred32_r->cols());
+        auto t_diff_r = nn::dsl::compute(engine, nn::dsl::leaf(*t_pred32_r) - nn::dsl::leaf(t_y32),
+                                         t_pred32_r->rows(), t_pred32_r->cols());
         CHECK(t_diff_r.has_value(), "sub");
-        auto t_loss_r = nn::dsl::compute(engine,
-            nn::dsl::leaf(*t_diff_r) * nn::dsl::leaf(*t_diff_r),
-            t_diff_r->rows(), t_diff_r->cols());
+        auto t_loss_r =
+            nn::dsl::compute(engine, nn::dsl::leaf(*t_diff_r) * nn::dsl::leaf(*t_diff_r),
+                             t_diff_r->rows(), t_diff_r->cols());
         CHECK(t_loss_r.has_value(), "sqr");
         // 简化：取所有元素的平均作为 loss（通过 to_matrix 读回 CPU）
         auto loss_mat = engine.to_matrix(*t_loss_r);
         CHECK(loss_mat.has_value(), "to_matrix for loss");
         float loss = 0.0f;
-        for (auto& v : loss_mat->span()) loss += v;
+        for (auto& v : loss_mat->span())
+            loss += v;
         loss /= static_cast<float>(N);
 
         // 反向：grad_w = 2/N * X @ (pred - y)  (f16 matmul)
         // scale 在 f32 融合世界完成，然后 cast 回 f16 做 matmul
-        auto t_scale_r = nn::dsl::compute(engine,
-            nn::dsl::leaf(*t_diff_r) * nn::dsl::rparam(2.0f / static_cast<float>(N)),
+        auto t_scale_r = nn::dsl::compute(
+            engine, nn::dsl::leaf(*t_diff_r) * nn::dsl::rparam(2.0f / static_cast<float>(N)),
             t_diff_r->rows(), t_diff_r->cols());
         CHECK(t_scale_r.has_value(), "scale grad");
         // grad_w = X @ scaled_diff: X(D,N)^T * scaled_diff(N,1) = (D,1)
@@ -235,8 +240,10 @@ void test_f16_batched_matmul()
     nn::Matrix b32(batch * K, N);  // 注意：batched_matmul 要求 b_rows_per = K
     std::mt19937 rng(77);
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
-    for (auto& v : a32.span()) v = dist(rng);
-    for (auto& v : b32.span()) v = dist(rng);
+    for (auto& v : a32.span())
+        v = dist(rng);
+    for (auto& v : b32.span())
+        v = dist(rng);
 
     // f32 batched_matmul 参考
     auto t_a32 = upload(engine, a32);
@@ -250,8 +257,8 @@ void test_f16_batched_matmul()
     auto t_b16 = engine.cast(t_b32, nn::Precision::F16);
     CHECK(t_b16.has_value(), "cast B to f16");
 
-    auto t_c16_r = engine.batched_matmul(*t_a16, *t_b16, batch, false, false, 1.0f,
-                                          nn::Precision::F16);
+    auto t_c16_r =
+        engine.batched_matmul(*t_a16, *t_b16, batch, false, false, 1.0f, nn::Precision::F16);
     CHECK(t_c16_r.has_value(), "f16 batched_matmul");
 
     // cast 回 f32 比较

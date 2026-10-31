@@ -59,37 +59,37 @@ std::string native_path(std::string p)
 #endif
 
 // ── 小工具 ───────────────────────────────────────────────────────────────
-std::string dirname_of(const std::string &path)
+std::string dirname_of(const std::string& path)
 {
     const auto pos = path.find_last_of("/\\");
     return pos == std::string::npos ? std::string(".") : path.substr(0, pos);
 }
 
-bool file_exists(const std::string &p)
+bool file_exists(const std::string& p)
 {
     std::ifstream f(p);
     return f.good();
 }
 
-std::string read_file(const std::string &p)
+std::string read_file(const std::string& p)
 {
     std::ifstream f(p, std::ios::binary);
-    return std::string((std::istreambuf_iterator<char>(f)),
-                       std::istreambuf_iterator<char>());
+    return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
 }
 
 std::string rstrip_newline(std::string s)
 {
-    while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
+    while (!s.empty() && (s.back() == '\n' || s.back() == '\r'))
+        s.pop_back();
     return s;
 }
 
 // 在测试二进制附近寻找同构建的 app（与 cli_precision_warning_test 同款）
-std::string find_app(const std::string &name)
+std::string find_app(const std::string& name)
 {
     const std::string dir = dirname_of(g_self);
     const std::string candidates[] = {dir + "/../" + name, dir + "/" + name, name};
-    for (const auto &c : candidates)
+    for (const auto& c : candidates)
         if (file_exists(c))
         {
 #ifdef _WIN32
@@ -99,7 +99,7 @@ std::string find_app(const std::string &name)
 #endif
         }
 #ifdef _WIN32
-    for (const auto &c : candidates)
+    for (const auto& c : candidates)
         if (file_exists(c + ".exe")) return native_path(c + ".exe");
 #endif
     return {};
@@ -147,7 +147,7 @@ struct PlainTokenizer : nn::BPETokenizer
     void clear_markers() { markers_.system = nn::Tokenizer::npos; }
 };
 
-[[nodiscard]] std::string join_ids(const std::vector<std::size_t> &ids)
+[[nodiscard]] std::string join_ids(const std::vector<std::size_t>& ids)
 {
     std::string s;
     for (std::size_t i = 0; i < ids.size(); ++i)
@@ -158,8 +158,8 @@ struct PlainTokenizer : nn::BPETokenizer
     return s;
 }
 
-[[nodiscard]] bool is_prefix(const std::vector<std::size_t> &pre,
-                             const std::vector<std::size_t> &full)
+[[nodiscard]] bool is_prefix(const std::vector<std::size_t>& pre,
+                             const std::vector<std::size_t>& full)
 {
     if (pre.size() > full.size()) return false;
     for (std::size_t i = 0; i < pre.size(); ++i)
@@ -167,7 +167,7 @@ struct PlainTokenizer : nn::BPETokenizer
     return true;
 }
 
-[[nodiscard]] bool contains_id(const std::vector<std::size_t> &ids, std::size_t id)
+[[nodiscard]] bool contains_id(const std::vector<std::size_t>& ids, std::size_t id)
 {
     for (const auto v : ids)
         if (v == id) return true;
@@ -175,8 +175,8 @@ struct PlainTokenizer : nn::BPETokenizer
 }
 
 // 从 CLI 输出里抽 "[Prompt tokens: a, b, c]" / "[Generated tokens: ...]"
-[[nodiscard]] std::vector<std::size_t> parse_id_list(const std::string &text,
-                                                     const std::string &tag)
+[[nodiscard]] std::vector<std::size_t> parse_id_list(const std::string& text,
+                                                     const std::string& tag)
 {
     const std::string key = "[" + tag + ": ";
     const auto pos = text.find(key);
@@ -205,7 +205,7 @@ void test_dialogue_structure()
     auto tok_r = train_tokenizer(300);
     CHECK(tok_r.has_value(), "训练小 BPE 词表");
     if (!tok_r) return;
-    nn::BPETokenizer &tok = *tok_r;
+    nn::BPETokenizer& tok = *tok_r;
     CHECK(tok.has_dialogue_markers(), "训练出的词表带对话标记");
 
     std::vector<nn::Tokenizer::ChatTurn> turns{
@@ -218,9 +218,8 @@ void test_dialogue_structure()
     // 期望：[BOS]<|system|>SYS<|end_of_system|><|user|>hi<|end_of_user|>
     //       <|assistant|>yo<|end_of_assistant|><|user|>bye<|end_of_user|><|assistant|>
     std::vector<std::size_t> want;
-    const auto push_all = [&want](const std::vector<std::size_t> &v) {
-        want.insert(want.end(), v.begin(), v.end());
-    };
+    const auto push_all = [&want](const std::vector<std::size_t>& v)
+    { want.insert(want.end(), v.begin(), v.end()); };
     want.push_back(tok.bos_id());
     want.push_back(tok.system_marker_id());
     push_all(tok.encode("SYS"));
@@ -236,20 +235,20 @@ void test_dialogue_structure()
     want.push_back(tok.end_user_marker_id());
     want.push_back(tok.assistant_marker_id());   // ★ 末轮 user → 开标记待生成
 
-    CHECK(ids == want, ("模板逐 token 一致（实际: " + join_ids(ids) +
-                        "；期望: " + join_ids(want) + "）").c_str());
+    CHECK(
+        ids == want,
+        ("模板逐 token 一致（实际: " + join_ids(ids) + "；期望: " + join_ids(want) + "）").c_str());
     CHECK(!ids.empty() && ids.back() == tok.assistant_marker_id(),
           "末轮是 user 时以 <|assistant|> 收尾（提示模型作答）");
 
     // system_prompt 为空 → 不产生 system 块（BOS 与各轮次逐 token 不变）
     std::vector<std::size_t> want_no_sys{tok.bos_id()};
     // 去掉的正是 BOS 之后的 <|system|> + SYS + <|end_of_system|> 三段
-    want_no_sys.insert(want_no_sys.end(), want.begin() + 3 + tok.encode("SYS").size(),
-                       want.end());
+    want_no_sys.insert(want_no_sys.end(), want.begin() + 3 + tok.encode("SYS").size(), want.end());
     const auto no_sys = tok.chat_prompt(turns, "");
-    CHECK(no_sys == want_no_sys,
-          ("空 system_prompt ⇒ 无 system 块（实际 " + join_ids(no_sys) + "；期望 " +
-           join_ids(want_no_sys) + "）").c_str());
+    CHECK(no_sys == want_no_sys, ("空 system_prompt ⇒ 无 system 块（实际 " + join_ids(no_sys) +
+                                  "；期望 " + join_ids(want_no_sys) + "）")
+                                     .c_str());
 
     // 末轮是 assistant（完整记录）→ 以 <|end_of_assistant|> 收尾
     std::vector<nn::Tokenizer::ChatTurn> closed(turns.begin(), turns.begin() + 2);
@@ -267,7 +266,7 @@ void test_context_accumulates()
     auto tok_r = train_tokenizer(300);
     CHECK(tok_r.has_value(), "训练小 BPE 词表");
     if (!tok_r) return;
-    nn::BPETokenizer &tok = *tok_r;
+    nn::BPETokenizer& tok = *tok_r;
 
     // 模拟连续 5 轮的闭环（GUI / --interactive 都是这个形状）：
     // 每轮 append 一个 user 轮 → 生成 → append 一个 assistant 轮。
@@ -280,8 +279,8 @@ void test_context_accumulates()
         if (round > 1)
         {
             CHECK(is_prefix(prev_prompt, prompt),
-                  ("第 " + std::to_string(round) +
-                   " 轮的 prompt 必须以上一轮为前缀（上下文丢了）").c_str());
+                  ("第 " + std::to_string(round) + " 轮的 prompt 必须以上一轮为前缀（上下文丢了）")
+                      .c_str());
             CHECK(prompt.size() > prev_prompt.size(),
                   ("第 " + std::to_string(round) + " 轮的 prompt 必须严格更长").c_str());
         }
@@ -308,11 +307,10 @@ void test_tokens_passthrough()
     auto tok_r = train_tokenizer(300);
     CHECK(tok_r.has_value(), "训练小 BPE 词表");
     if (!tok_r) return;
-    nn::BPETokenizer &tok = *tok_r;
+    nn::BPETokenizer& tok = *tok_r;
 
     // 上一轮真实生成的 token（这里用一段合法的 id 序列代表）
-    const std::vector<std::size_t> generated{tok.encode("yo").front(),
-                                             tok.encode(" bye").front()};
+    const std::vector<std::size_t> generated{tok.encode("yo").front(), tok.encode(" bye").front()};
     std::vector<nn::Tokenizer::ChatTurn> turns{
         {true, "hi", {}},
         {false, "", generated},   // ★ tokens 字段优先于 text
@@ -336,7 +334,7 @@ void test_truncation()
     auto tok_r = train_tokenizer(300);
     CHECK(tok_r.has_value(), "训练小 BPE 词表");
     if (!tok_r) return;
-    nn::BPETokenizer &tok = *tok_r;
+    nn::BPETokenizer& tok = *tok_r;
 
     std::vector<nn::Tokenizer::ChatTurn> turns;
     for (int i = 1; i <= 6; ++i)
@@ -349,10 +347,8 @@ void test_truncation()
 
     // 逐级收紧上限：丢弃轮数单调不减，且恒保留 BOS + system 块 + 末轮
     const std::vector<std::size_t> limits{
-        std::max<std::size_t>(1, full.size() - 1),
-        std::max<std::size_t>(1, full.size() / 2),
-        std::max<std::size_t>(1, full.size() / 4),
-        std::size_t{1}};
+        std::max<std::size_t>(1, full.size() - 1), std::max<std::size_t>(1, full.size() / 2),
+        std::max<std::size_t>(1, full.size() / 4), std::size_t{1}};
     std::size_t prev_dropped = 0;
     for (const auto limit : limits)
     {
@@ -364,8 +360,7 @@ void test_truncation()
         CHECK(!is_prefix(full, ids) || ids.size() <= full.size(), "截断只会变短");
         // 恒保留：BOS + system 块
         std::vector<std::size_t> head{tok.bos_id(), tok.system_marker_id()};
-        CHECK(ids.size() >= head.size() &&
-                  std::equal(head.begin(), head.end(), ids.begin()),
+        CHECK(ids.size() >= head.size() && std::equal(head.begin(), head.end(), ids.begin()),
               "BOS 与 system 块恒保留");
         // 恒保留：末轮 ⇒ 仍以 <|assistant|> 收尾
         CHECK(!ids.empty() && ids.back() == tok.assistant_marker_id(),
@@ -382,8 +377,7 @@ void test_truncation()
         std::size_t dropped = 0;
         const auto ids = tok.chat_prompt(turns, "SYS", 1, &dropped);
         CHECK(dropped == 10, "6 轮（11 条轮次）时最多丢 10 条 = 全部非末轮");
-        CHECK(!ids.empty() && ids.back() == tok.assistant_marker_id(),
-              "极限截断下末轮结构完整");
+        CHECK(!ids.empty() && ids.back() == tok.assistant_marker_id(), "极限截断下末轮结构完整");
     }
     // 只有一轮 ⇒ 无可丢
     {
@@ -391,8 +385,7 @@ void test_truncation()
         std::size_t dropped = 99;
         const auto ids = tok.chat_prompt(one, "SYS", 1, &dropped);
         CHECK(dropped == 0, "只有一轮时无可丢（末轮恒保留）");
-        CHECK(!ids.empty() && ids.back() == tok.assistant_marker_id(),
-              "单轮极端截断下结构仍完整");
+        CHECK(!ids.empty() && ids.back() == tok.assistant_marker_id(), "单轮极端截断下结构仍完整");
     }
 }
 
@@ -430,14 +423,14 @@ void test_plain_text_fallback()
         const auto t = plain.encode(turns[i].text);
         want.insert(want.end(), t.begin(), t.end());
     }
-    CHECK(ids == want, ("纯文本：BOS + 轮次文本按 \\n 拼接（实际 " + join_ids(ids) +
-                        "；期望 " + join_ids(want) + "）").c_str());
+    CHECK(ids == want, ("纯文本：BOS + 轮次文本按 \\n 拼接（实际 " + join_ids(ids) + "；期望 " +
+                        join_ids(want) + "）")
+                           .c_str());
 
     // 超限：截尾（保留最近 max_tokens 个 token）
     const auto cut = plain.chat_prompt(turns, "", 3);
     CHECK(cut.size() == 3, "纯文本超限截尾到 max_tokens");
-    CHECK(std::equal(cut.begin(), cut.end(), ids.end() - 3),
-          "截尾保留的是最近的 token（尾部）");
+    CHECK(std::equal(cut.begin(), cut.end(), ids.end() - 3), "截尾保留的是最近的 token（尾部）");
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -450,7 +443,7 @@ struct CliFixture
     std::string vocab_path;
 };
 
-std::string shell_quote(const std::string &s)
+std::string shell_quote(const std::string& s)
 {
 #ifdef _WIN32
     // cmd 会剥掉"整条命令以引号开头"时的首尾引号；无空格路径直接裸写。
@@ -468,7 +461,7 @@ std::string shell_quote(const std::string &s)
 
 // 造一个可推理的 tiny GPT（词表 = 训练出的小 BPE）+ 词表文件；
 // 返回 false = 环境不具备（建模型失败等），调用方据此跳过。
-bool make_cli_fixture(const std::filesystem::path &dir, CliFixture &fx)
+bool make_cli_fixture(const std::filesystem::path& dir, CliFixture& fx)
 {
     auto tok_r = train_tokenizer(300);
     CHECK(tok_r.has_value(), "训练小 BPE 词表");
@@ -487,14 +480,13 @@ bool make_cli_fixture(const std::filesystem::path &dir, CliFixture &fx)
     if (!model_r) return false;
     fx.model_path = (dir / "chat_model.nnmodel").string();
     // 空嵌入词表 ⇒ CLI 走 --vocab（与 GUI 的"模型未嵌入词表"路径一致）
-    auto sr = nn::save_model(fx.model_path, *model_r, spec, std::string{},
-                             nn::ModelRole::Model);
+    auto sr = nn::save_model(fx.model_path, *model_r, spec, std::string{}, nn::ModelRole::Model);
     CHECK(sr.has_value(), "写出 .nnmodel");
     return static_cast<bool>(sr);
 }
 
-void test_cli_multi_turn(const std::string &exe, const std::filesystem::path &dir,
-                         const CliFixture &fx)
+void test_cli_multi_turn(const std::string& exe, const std::filesystem::path& dir,
+                         const CliFixture& fx)
 {
     std::printf("── [6] CLI 端到端：--turn 多轮 + --reply-out ──\n");
     const std::string out1 = (dir / "turn1.out").string();
@@ -506,14 +498,14 @@ void test_cli_multi_turn(const std::string &exe, const std::filesystem::path &di
 
     const std::string sys = "SYS";
     const std::string base = shell_quote(exe) + " --model " + shell_quote(fx.model_path) +
-                             " --vocab " + shell_quote(fx.vocab_path) +
-                             " --system " + shell_quote(sys) +
-                             " --max-tokens 6 --seed 11 --show-tokens";
+                             " --vocab " + shell_quote(fx.vocab_path) + " --system " +
+                             shell_quote(sys) + " --max-tokens 6 --seed 11 --show-tokens";
 
     // ── 单轮（无历史）──
-    const int rc1 = exit_code_of(std::system(
-        (base + " --turn user:\"hi there\" --reply-out " + shell_quote(reply1) +
-         " > " + shell_quote(out1) + " 2> " + shell_quote(err1)).c_str()));
+    const int rc1 = exit_code_of(
+        std::system((base + " --turn user:\"hi there\" --reply-out " + shell_quote(reply1) + " > " +
+                     shell_quote(out1) + " 2> " + shell_quote(err1))
+                        .c_str()));
     CHECK(rc1 == 0, "单轮 --turn 正常退出");
     const std::string log1 = read_file(out1);
     const auto prompt1 = parse_id_list(log1, "Prompt tokens");
@@ -529,23 +521,23 @@ void test_cli_multi_turn(const std::string &exe, const std::filesystem::path &di
     for (char& c : r1)
     {
         const auto u = static_cast<unsigned char>(c);
-        if (u < 0x20 || u >= 0x7F || c == '"' || c == '&' || c == '|' ||
-            c == '<' || c == '>')
+        if (u < 0x20 || u >= 0x7F || c == '"' || c == '&' || c == '|' || c == '<' || c == '>')
             c = ' ';
     }
     if (r1.find_first_not_of(' ') == std::string::npos) r1 = "ok";
-    const int rc3 = exit_code_of(std::system(
-        (base + " --turn user:\"hi there\" --turn assistant:" + shell_quote(r1) +
-         " --turn user:\"bye now\" --reply-out " + shell_quote(reply3) +
-         " > " + shell_quote(out3) + " 2> " + shell_quote(err3)).c_str()));
+    const int rc3 = exit_code_of(
+        std::system((base + " --turn user:\"hi there\" --turn assistant:" + shell_quote(r1) +
+                     " --turn user:\"bye now\" --reply-out " + shell_quote(reply3) + " > " +
+                     shell_quote(out3) + " 2> " + shell_quote(err3))
+                        .c_str()));
     CHECK(rc3 == 0, "三轮 --turn 正常退出");
     const std::string log3 = read_file(out3);
     const auto prompt3 = parse_id_list(log3, "Prompt tokens");
 
     // ★ 上下文不丢（端到端）：单轮 prompt 是三轮 prompt 的前缀，且更短
-    CHECK(is_prefix(prompt1, prompt3),
-          ("CLI 端到端：单轮 prompt 应为三轮 prompt 的前缀（单轮 " + join_ids(prompt1) +
-           " / 三轮 " + join_ids(prompt3) + "）").c_str());
+    CHECK(is_prefix(prompt1, prompt3), ("CLI 端到端：单轮 prompt 应为三轮 prompt 的前缀（单轮 " +
+                                        join_ids(prompt1) + " / 三轮 " + join_ids(prompt3) + "）")
+                                           .c_str());
     CHECK(prompt3.size() > prompt1.size(), "三轮 prompt 严格更长（历史真的进了模型输入）");
 
     // 与库侧同一份 turns 逐 token 一致（接线一致，而不只是"更长"）
@@ -555,25 +547,29 @@ void test_cli_multi_turn(const std::string &exe, const std::filesystem::path &di
         {true, "bye now", {}},
     };
     const auto lib_prompt = fx.tok.chat_prompt(turns, sys, 64);
-    CHECK(lib_prompt == prompt3,
-          ("CLI 的 prompt tokens 与库侧 chat_prompt 逐 token 一致（CLI " +
-           join_ids(prompt3) + " / 库 " + join_ids(lib_prompt) + "）").c_str());
+    CHECK(lib_prompt == prompt3, ("CLI 的 prompt tokens 与库侧 chat_prompt 逐 token 一致（CLI " +
+                                  join_ids(prompt3) + " / 库 " + join_ids(lib_prompt) + "）")
+                                     .c_str());
 
     // ── --reply-out 落盘 = 生成 token 的解码（截到 <|end_of_assistant|>）──
     const auto gen3 = parse_id_list(log3, "Generated tokens");
     CHECK(!gen3.empty(), "三轮输出里有 Generated tokens 列表");
     std::vector<std::size_t> shown = gen3;
     for (std::size_t i = 0; i < shown.size(); ++i)
-        if (shown[i] == fx.tok.end_assistant_marker_id()) { shown.resize(i); break; }
+        if (shown[i] == fx.tok.end_assistant_marker_id())
+        {
+            shown.resize(i);
+            break;
+        }
     const std::string expect_reply = fx.tok.decode(shown);
     const std::string got_reply = rstrip_newline(read_file(reply3));
-    CHECK(got_reply == expect_reply,
-          ("--reply-out 内容 = 生成 token 解码：实际 '" + got_reply + "' 期望 '" +
-           expect_reply + "'").c_str());
+    CHECK(got_reply == expect_reply, ("--reply-out 内容 = 生成 token 解码：实际 '" + got_reply +
+                                      "' 期望 '" + expect_reply + "'")
+                                         .c_str());
 }
 
-void test_cli_rejections(const std::string &exe, const std::filesystem::path &dir,
-                         const CliFixture &fx)
+void test_cli_rejections(const std::string& exe, const std::filesystem::path& dir,
+                         const CliFixture& fx)
 {
     std::printf("── [7] CLI 负例：--turn 形状 / 互斥项不合法即报错 ──\n");
     const std::string out = (dir / "neg.out").string();
@@ -582,9 +578,9 @@ void test_cli_rejections(const std::string &exe, const std::filesystem::path &di
                              " --vocab " + shell_quote(fx.vocab_path) + " --max-tokens 2";
     struct Case
     {
-        const char *args;
-        const char *label;
-        const char *needle;
+        const char* args;
+        const char* label;
+        const char* needle;
     };
     const Case cases[] = {
         {"--turn user:\"hi\" --prompt \"x\"", "--turn 与 --prompt 互斥", "互斥"},
@@ -595,26 +591,23 @@ void test_cli_rejections(const std::string &exe, const std::filesystem::path &di
         {"--turn user", "缺少冒号", "<role>:<text>"},
         {"--turn bot:x", "role 非法", "<role>:<text>"},
     };
-    for (const auto &c : cases)
+    for (const auto& c : cases)
     {
-        const std::string cmd = base + " " + c.args + " > " + shell_quote(out) + " 2> " +
-                                shell_quote(err);
+        const std::string cmd =
+            base + " " + c.args + " > " + shell_quote(out) + " 2> " + shell_quote(err);
         const int rc = exit_code_of(std::system(cmd.c_str()));
         CHECK(rc != 0, (std::string("应非零退出: ") + c.label).c_str());
         const std::string errtxt = read_file(err);
         CHECK(errtxt.find(c.needle) != std::string::npos,
-              (std::string("错误信息应说明原因（含 '") + c.needle + "'）: " + c.label)
-                  .c_str());
+              (std::string("错误信息应说明原因（含 '") + c.needle + "'）: " + c.label).c_str());
     }
 }
 
 } // namespace
 
-int main(int argc, char **argv)
+int main(int argc, char** argv)
 {
-    g_self = (argc > 0 && argv[0] != nullptr)
-        ? std::filesystem::absolute(argv[0]).string()
-        : "";
+    g_self = (argc > 0 && argv[0] != nullptr) ? std::filesystem::absolute(argv[0]).string() : "";
     std::printf("chat_prompt_test（P0-5 尾项：多轮对话闭环）\n");
 
     test_dialogue_structure();
@@ -628,8 +621,7 @@ int main(int argc, char **argv)
     {
         std::printf("\n[skip] 未找到 text_infer（未构建 app / NN_BUILD_APPS=OFF）："
                     "CLI 半边跳过\n");
-        std::printf("\n%s  失败=%d（CLI 半边跳过 = 77）\n",
-                    g_fail == 0 ? "PASS" : "FAIL", g_fail);
+        std::printf("\n%s  失败=%d（CLI 半边跳过 = 77）\n", g_fail == 0 ? "PASS" : "FAIL", g_fail);
         return g_fail == 0 ? kSkip : 1;
     }
     const auto dir = scratch_dir();

@@ -50,8 +50,7 @@ public:
         return r;
     }
 
-    [[nodiscard]] Result<Tensor> forward(
-        const Tensor& input) override
+    [[nodiscard]] Result<Tensor> forward(const Tensor& input) override
     {
         ComputeEngine& engine = engine_ref();
         // 行 softmax（数值稳定）：out = exp(x - row_max) / Σ_c exp(x - row_max)
@@ -59,30 +58,28 @@ public:
         // Tensor（shifted/exp_shift/row_max/row_sum 的物化）由融合 kernel 消解，
         // 仅 input 与 output 落显存。
         // 表达式文本只写在本 Layer；AOT 收集由 scan_exprs dry-run 本方法完成。
-        auto out = dsl::compute(engine,
-            dsl::exp(dsl::leaf(input) - dsl::row_reduce_max(input))
-            / dsl::row_reduce_sum(
-                dsl::exp(dsl::leaf(input) - dsl::row_reduce_max(input))),
+        auto out = dsl::compute(
+            engine,
+            dsl::exp(dsl::leaf(input) - dsl::row_reduce_max(input)) /
+                dsl::row_reduce_sum(dsl::exp(dsl::leaf(input) - dsl::row_reduce_max(input))),
             p_.stable);   // 输出仍是整网格（归约视图按行广播）→ 由表达式推导
         NN_TRY_CHECK(out);
-        if (checkpoint_mode_)
-            return out;
+        if (checkpoint_mode_) return out;
         // 单缓冲：把结果移入 output_cache_（唯一持有者），返回共享同一 buffer
         output_cache_ = std::move(*out);
         return output_cache_;
     }
 
-    [[nodiscard]] Result<Tensor> backward(
-        const Tensor& grad_output) override
+    [[nodiscard]] Result<Tensor> backward(const Tensor& grad_output) override
     {
         ComputeEngine& engine = engine_ref();
         // grad_x = out ⊙ (grad_output - row_dot(out ⊙ grad_output))
         // 单表达式融合：row_dot 为归约指令，消除 ep/gmd 等全尺寸中间 Tensor。
-        auto out = dsl::compute(engine,
-            dsl::leaf(output_cache_)
-            * (dsl::leaf(grad_output)
-               - dsl::row_reduce_sum(dsl::leaf(output_cache_)
-                                     * dsl::leaf(grad_output))),
+        auto out = dsl::compute(
+            engine,
+            dsl::leaf(output_cache_) *
+                (dsl::leaf(grad_output) -
+                 dsl::row_reduce_sum(dsl::leaf(output_cache_) * dsl::leaf(grad_output))),
             p_.stable);   // 输出仍是整网格（归约指令按行广播）→ 由表达式推导
         return out;
     }

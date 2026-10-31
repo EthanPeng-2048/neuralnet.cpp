@@ -38,7 +38,7 @@ public:
     // 默认 64MB/region × DEFAULT_NUM_REGIONS=4（实际分配大小由 initialize()
     // 动态计算，会根据 host-visible 显存大小自动扩容，此值仅作为下限参考）
     static constexpr std::size_t DEFAULT_REGION_SIZE = 64ull * 1024 * 1024; // 64MB
-    static constexpr std::size_t DEFAULT_NUM_REGIONS = 4;  // region 轮转深度，降低 acquire 阻塞概率
+    static constexpr std::size_t DEFAULT_NUM_REGIONS = 4; // region 轮转深度，降低 acquire 阻塞概率
     // host-visible 显存预算占比的倒数（实际取 1/HOST_VISIBLE_FRACTION）
     static constexpr VkDeviceSize HOST_VISIBLE_FRACTION = 16;
     // 动态计算 staging 大小的下限，避免小显存机器分配过小
@@ -94,17 +94,16 @@ private:
     std::vector<Region> regions_;
     std::size_t region_size_;
     std::atomic<std::size_t> current_{0};
-    bool timeline_ = false;  // 用时间线信号量（否则 host 等 fence 回退）
+    bool timeline_ = false; // 用时间线信号量（否则 host 等 fence 回退）
 
 public:
     StagingRing() = default;
 
-    [[nodiscard]] Result<void> initialize(
-        VkDevice device, VkPhysicalDevice physical_device,
-        VkCommandPool cmd_pool, MemoryPool& pool,
-        bool use_timeline = false,
-        std::size_t region_size = DEFAULT_REGION_SIZE,
-        std::size_t num_regions = DEFAULT_NUM_REGIONS)
+    [[nodiscard]] Result<void> initialize(VkDevice device, VkPhysicalDevice physical_device,
+                                          VkCommandPool cmd_pool, MemoryPool& pool,
+                                          bool use_timeline = false,
+                                          std::size_t region_size = DEFAULT_REGION_SIZE,
+                                          std::size_t num_regions = DEFAULT_NUM_REGIONS)
     {
         device_ = device;
         physical_device_ = physical_device;
@@ -134,8 +133,7 @@ public:
 
         // 最终取 用户请求值 与 动态计算值 的较大者
         // （上限已封顶，避免小显存机器被 staging 占满预算）
-        region_size_ = std::max(
-            static_cast<VkDeviceSize>(region_size), calculated_size);
+        region_size_ = std::max(static_cast<VkDeviceSize>(region_size), calculated_size);
 
         regions_.resize(num_regions);
         for (std::size_t i = 0; i < num_regions; ++i)
@@ -154,33 +152,29 @@ public:
             buf_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
             VkResult res = vkCreateBuffer(device_, &buf_info, nullptr, &r.buffer);
-            if (res != VK_SUCCESS)
-                NN_FAIL("vkCreateBuffer failed: " + std::to_string(res));
+            if (res != VK_SUCCESS) NN_FAIL("vkCreateBuffer failed: " + std::to_string(res));
             // 分配内存
             VkMemoryRequirements mem_reqs;
             vkGetBufferMemoryRequirements(device_, r.buffer, &mem_reqs);
 
-            auto alloc_r = pool_->allocate(
-                mem_reqs,
-                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            auto alloc_r = pool_->allocate(mem_reqs, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                                         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
             NN_TRY_CHECK(alloc_r);
             r.alloc = *alloc_r;
 
             // 绑定内存
             res = vkBindBufferMemory(device_, r.buffer, r.alloc.memory, r.alloc.offset);
-            if (res != VK_SUCCESS)
-                NN_FAIL("vkBindBufferMemory failed: " + std::to_string(res));
+            if (res != VK_SUCCESS) NN_FAIL("vkBindBufferMemory failed: " + std::to_string(res));
             // 映射内存
-            res = vkMapMemory(device_, r.alloc.memory, r.alloc.offset, r.alloc.size, 0, &r.mapped_ptr);
-            if (res != VK_SUCCESS)
-                NN_FAIL("vkMapMemory failed: " + std::to_string(res));
+            res = vkMapMemory(device_, r.alloc.memory, r.alloc.offset, r.alloc.size, 0,
+                              &r.mapped_ptr);
+            if (res != VK_SUCCESS) NN_FAIL("vkMapMemory failed: " + std::to_string(res));
             // 创建 fence
             VkFenceCreateInfo fence_info{};
             fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
             fence_info.flags = VK_FENCE_CREATE_SIGNALED_BIT; // 初始状态为 signaled
             res = vkCreateFence(device_, &fence_info, nullptr, &r.fence);
-            if (res != VK_SUCCESS)
-                NN_FAIL("vkCreateFence failed: " + std::to_string(res));
+            if (res != VK_SUCCESS) NN_FAIL("vkCreateFence failed: " + std::to_string(res));
             // 创建跨 submit 信号量（仅时间线模式；初始 value 0 = 未 signal，
             // 见 Region::semaphore 注释）
             if (timeline_)
@@ -214,19 +208,14 @@ public:
 
     ~StagingRing()
     {
-        if (device_ == VK_NULL_HANDLE)
-            return;
+        if (device_ == VK_NULL_HANDLE) return;
 
         for (auto& r : regions_)
         {
-            if (r.fence != VK_NULL_HANDLE)
-                vkDestroyFence(device_, r.fence, nullptr);
-            if (r.semaphore != VK_NULL_HANDLE)
-                vkDestroySemaphore(device_, r.semaphore, nullptr);
-            if (r.cmd != VK_NULL_HANDLE)
-                vkFreeCommandBuffers(device_, cmd_pool_, 1, &r.cmd);
-            if (r.buffer != VK_NULL_HANDLE)
-                vkDestroyBuffer(device_, r.buffer, nullptr);
+            if (r.fence != VK_NULL_HANDLE) vkDestroyFence(device_, r.fence, nullptr);
+            if (r.semaphore != VK_NULL_HANDLE) vkDestroySemaphore(device_, r.semaphore, nullptr);
+            if (r.cmd != VK_NULL_HANDLE) vkFreeCommandBuffers(device_, cmd_pool_, 1, &r.cmd);
+            if (r.buffer != VK_NULL_HANDLE) vkDestroyBuffer(device_, r.buffer, nullptr);
             // MemoryPool 会自动释放内存
         }
     }
@@ -264,8 +253,7 @@ public:
     {
         for (auto& r : regions_)
         {
-            if (!r.in_flight)
-                continue;
+            if (!r.in_flight) continue;
             vkWaitForFences(device_, 1, &r.fence, VK_TRUE, UINT64_MAX);
             vkResetFences(device_, 1, &r.fence);
             r.in_flight = false;
@@ -274,62 +262,50 @@ public:
 
     // 上传数据到 staging region（元素类型无关，memcpy 字节级操作，§6.3）
     template <typename T>
-    [[nodiscard]] Result<void> upload(
-        std::size_t region_idx, std::span<const T> data, VkDeviceSize offset = 0)
+    [[nodiscard]] Result<void> upload(std::size_t region_idx, std::span<const T> data,
+                                      VkDeviceSize offset = 0)
     {
-        if (region_idx >= regions_.size())
-            NN_FAIL("Invalid region index");
+        if (region_idx >= regions_.size()) NN_FAIL("Invalid region index");
         auto& r = regions_[region_idx];
         const std::size_t byte_size = data.size() * sizeof(T);
 
-        if (offset + byte_size > region_size_)
-            NN_FAIL("Upload exceeds staging region size");
+        if (offset + byte_size > region_size_) NN_FAIL("Upload exceeds staging region size");
         std::memcpy(static_cast<char*>(r.mapped_ptr) + offset, data.data(), byte_size);
         return {};
     }
 
     // 从 staging region 下载数据（元素类型无关，memcpy 字节级操作，§6.3）
     template <typename T>
-    [[nodiscard]] Result<void> download(
-        std::size_t region_idx, std::span<T> data, VkDeviceSize offset = 0)
+    [[nodiscard]] Result<void> download(std::size_t region_idx, std::span<T> data,
+                                        VkDeviceSize offset = 0)
     {
-        if (region_idx >= regions_.size())
-            NN_FAIL("Invalid region index");
+        if (region_idx >= regions_.size()) NN_FAIL("Invalid region index");
         auto& r = regions_[region_idx];
         const std::size_t byte_size = data.size() * sizeof(T);
 
-        if (offset + byte_size > region_size_)
-            NN_FAIL("Download exceeds staging region size");
+        if (offset + byte_size > region_size_) NN_FAIL("Download exceeds staging region size");
         std::memcpy(data.data(), static_cast<char*>(r.mapped_ptr) + offset, byte_size);
         return {};
     }
 
     // 获取缓冲区句柄
     [[nodiscard]] VkBuffer buffer(std::size_t region_idx) const noexcept
-    {
-        return regions_[region_idx].buffer;
-    }
+    { return regions_[region_idx].buffer; }
 
     // 获取 fence
     [[nodiscard]] VkFence fence(std::size_t region_idx) const noexcept
-    {
-        return regions_[region_idx].fence;
-    }
+    { return regions_[region_idx].fence; }
 
     // 获取 region 的跨 submit 信号量（消费方 submit 的 pWaitSemaphores 用）
     [[nodiscard]] VkSemaphore semaphore(std::size_t region_idx) const noexcept
-    {
-        return regions_[region_idx].semaphore;
-    }
+    { return regions_[region_idx].semaphore; }
 
     // 是否使用时间线信号量（false = 走 drain_in_flight 阻塞回退）
     [[nodiscard]] bool timeline() const noexcept { return timeline_; }
 
     // 本 region 最近一次上传的信号 value（消费方 pWaitSemaphoreValues 用）
     [[nodiscard]] std::uint64_t signal_value(std::size_t region_idx) const noexcept
-    {
-        return regions_[region_idx].signal_value;
-    }
+    { return regions_[region_idx].signal_value; }
 
     // 为本次上传分配下一个信号 value（严格递增；必须在 mark_in_flight 前调用）
     [[nodiscard]] std::uint64_t next_signal_value(std::size_t region_idx) noexcept
@@ -342,21 +318,14 @@ public:
     // 获取 region 的专属 command buffer（上传 copy 录制用；acquire 等完
     // fence 后 vkResetCommandBuffer 复用，禁止在 pending 状态释放/重建）
     [[nodiscard]] VkCommandBuffer command_buffer(std::size_t region_idx) const noexcept
-    {
-        return regions_[region_idx].cmd;
-    }
+    { return regions_[region_idx].cmd; }
 
     // region 是否 in flight（已提交、fence 尚未被等待）
     [[nodiscard]] bool in_flight(std::size_t region_idx) const noexcept
-    {
-        return regions_[region_idx].in_flight;
-    }
+    { return regions_[region_idx].in_flight; }
 
     // 标记 region 为正在使用
-    void mark_in_flight(std::size_t region_idx) noexcept
-    {
-        regions_[region_idx].in_flight = true;
-    }
+    void mark_in_flight(std::size_t region_idx) noexcept { regions_[region_idx].in_flight = true; }
 
     // 获取 region 大小
     [[nodiscard]] std::size_t region_size() const noexcept { return region_size_; }

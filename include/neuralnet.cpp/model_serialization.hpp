@@ -67,7 +67,7 @@ namespace nn
 //  仍需能被推理入口直接读（裁决第 3 条的"测试推理"用途），故不做独立格式。
 // ═══════════════════════════════════════════════════════════════════════════
 
-inline constexpr uint32_t MODEL_MAGIC    = 0x4E4E4E4E;  // "NNNN"
+inline constexpr uint32_t MODEL_MAGIC = 0x4E4E4E4E;  // "NNNN"
 // v7（docs/internal/23）：**文件角色**（role 字节：Model=推理 / Checkpoint=训练）
 //   + **参数级 kind**（[kind][precision][rows][cols][aux_len][payload_len][aux][payload]）。
 //   · 角色决定"写哪些参数"：`.nnmodel` 写推理所需全部参数（三值层写打包形态）；
@@ -81,7 +81,7 @@ inline constexpr uint32_t MODEL_MAGIC    = 0x4E4E4E4E;  // "NNNN"
 //   · **整文件校验和 + 尾部完整性标记**：`[sha256 32B]["NNEND" 5B]`（摘要覆盖
 //     其前的全部字节，边写边算：见 `detail::HashingStreamBuf`）；截断/损坏的
 //     文件在读入前即明确报错（`verify_model_integrity`），不再静默载入错误权重。
-inline constexpr uint32_t MODEL_VERSION  = 8;
+inline constexpr uint32_t MODEL_VERSION = 8;
 
 // ── 尾部完整性标记（v8；见上）────────────────────────────────────────────
 inline constexpr std::size_t MODEL_DIGEST_BYTES = 32;          // sha256
@@ -109,26 +109,24 @@ namespace detail
 
 template <typename T>
     requires std::is_trivially_copyable_v<T>
-[[nodiscard]] inline Result<void> write_bytes(std::ostream &ofs, const T &v)
+[[nodiscard]] inline Result<void> write_bytes(std::ostream& ofs, const T& v)
 {
-    if (!nn::write_pod(ofs, v))
-        NN_FAIL("Write error");
+    if (!nn::write_pod(ofs, v)) NN_FAIL("Write error");
     return {};
 }
 
 template <typename T>
     requires std::is_trivially_copyable_v<T>
-[[nodiscard]] inline Result<T> read_bytes(std::ifstream &ifs)
+[[nodiscard]] inline Result<T> read_bytes(std::ifstream& ifs)
 {
     T v{};
     if (!nn::read_pod(ifs, v))
     {
         // 诊断增强：带上失败位置（跨版本格式排查时先看"读到哪断了"）
         const auto pos = ifs.tellg();
-        NN_FAIL("Unexpected end of file（读 " + std::to_string(sizeof(T)) +
-                " 字节失败，流位置 " +
-                (pos < 0 ? std::string("<eof>")
-                         : std::to_string(static_cast<long long>(pos))) + "）");
+        NN_FAIL("Unexpected end of file（读 " + std::to_string(sizeof(T)) + " 字节失败，流位置 " +
+                (pos < 0 ? std::string("<eof>") : std::to_string(static_cast<long long>(pos))) +
+                "）");
     }
     return v;
 }
@@ -138,11 +136,12 @@ template <typename T>
 
 // variadic 字段批量写入：依次写入每个字段，遇错即停
 template <typename... Ts>
-[[nodiscard]] inline Result<void> write_fields(std::ostream &ofs, const Ts &...fields)
+[[nodiscard]] inline Result<void> write_fields(std::ostream& ofs, const Ts&... fields)
 {
     Result<void> result = {};
     bool stop = false;
-    auto write_one = [&](const auto &field) {
+    auto write_one = [&](const auto& field)
+    {
         if (stop) return;
         result = write_bytes(ofs, field);
         if (!result) stop = true;
@@ -157,16 +156,14 @@ namespace detail_read
 {
 // 递归终止：所有字段已读取
 template <typename Tuple>
-[[nodiscard]] inline Result<void> read_fields_rec(
-    std::ifstream & /*ifs*/, Tuple & /*values*/, std::index_sequence<>)
-{
-    return {};
-}
+[[nodiscard]] inline Result<void> read_fields_rec(std::ifstream& /*ifs*/, Tuple& /*values*/,
+                                                  std::index_sequence<>)
+{ return {}; }
 
 // 递归读取第 I 个字段，然后读取剩余字段
 template <typename Tuple, std::size_t I, std::size_t... Rest>
-[[nodiscard]] inline Result<void> read_fields_rec(
-    std::ifstream &ifs, Tuple &values, std::index_sequence<I, Rest...>)
+[[nodiscard]] inline Result<void> read_fields_rec(std::ifstream& ifs, Tuple& values,
+                                                  std::index_sequence<I, Rest...>)
 {
     using T = std::tuple_element_t<I, Tuple>;
     auto r = read_bytes<T>(ifs);
@@ -177,11 +174,11 @@ template <typename Tuple, std::size_t I, std::size_t... Rest>
 }  // namespace detail_read
 
 template <typename... Ts>
-[[nodiscard]] inline Result<std::tuple<Ts...>> read_fields(std::ifstream &ifs)
+[[nodiscard]] inline Result<std::tuple<Ts...>> read_fields(std::ifstream& ifs)
 {
     std::tuple<Ts...> values{};
-    auto result = detail_read::read_fields_rec<std::tuple<Ts...>>(
-        ifs, values, std::index_sequence_for<Ts...>{});
+    auto result = detail_read::read_fields_rec<std::tuple<Ts...>>(ifs, values,
+                                                                  std::index_sequence_for<Ts...>{});
     NN_TRY_CHECK(result);
     return values;
 }
@@ -195,14 +192,15 @@ template <typename... Ts>
 class HashingStreamBuf : public std::streambuf
 {
 public:
-    HashingStreamBuf(std::streambuf &sink, Sha256State &hasher) noexcept
-        : sink_(sink), hasher_(hasher) {}
+    HashingStreamBuf(std::streambuf& sink, Sha256State& hasher) noexcept
+        : sink_(sink), hasher_(hasher)
+    {
+    }
 
 protected:
-    std::streamsize xsputn(const char *s, std::streamsize n) override
+    std::streamsize xsputn(const char* s, std::streamsize n) override
     {
-        if (n > 0)
-            sha256_update(hasher_, std::string_view(s, static_cast<std::size_t>(n)));
+        if (n > 0) sha256_update(hasher_, std::string_view(s, static_cast<std::size_t>(n)));
         return sink_.sputn(s, n);
     }
 
@@ -215,14 +213,14 @@ protected:
     }
 
 private:
-    std::streambuf &sink_;
-    Sha256State &hasher_;
+    std::streambuf& sink_;
+    Sha256State& hasher_;
 };
 
 // ── 矩阵读写（v5：per-tensor precision tag）──────────────────────────────
 
 // v5：写入矩阵时附带 precision tag（1B），tag 值见 precision_tag()
-[[nodiscard]] inline Result<void> write_matrix_v5(std::ostream &ofs, const Matrix &m, Precision p)
+[[nodiscard]] inline Result<void> write_matrix_v5(std::ostream& ofs, const Matrix& m, Precision p)
 {
     // 写入 precision tag（§11.3）
     NN_TRY(r, write_bytes<uint8_t>(ofs, precision_tag(p)));
@@ -230,24 +228,23 @@ private:
     NN_TRY(r2, write_bytes<uint64_t>(ofs, static_cast<uint64_t>(m.rows())));
     NN_TRY(r3, write_bytes<uint64_t>(ofs, static_cast<uint64_t>(m.cols())));
     // 写入数据
-    if (!nn::write_pod_span(ofs, m.span()))
-        NN_FAIL("Write error while writing matrix data");
+    if (!nn::write_pod_span(ofs, m.span())) NN_FAIL("Write error while writing matrix data");
     return {};
 }
 
 // v5：写入 f16 矩阵
-[[nodiscard]] inline Result<void> write_matrix_fp16(std::ostream &ofs, const MatrixT<Precision::F16> &m)
+[[nodiscard]] inline Result<void> write_matrix_fp16(std::ostream& ofs,
+                                                    const MatrixT<Precision::F16>& m)
 {
     NN_TRY(r, write_bytes<uint8_t>(ofs, precision_tag(Precision::F16)));
     NN_TRY(r2, write_bytes<uint64_t>(ofs, static_cast<uint64_t>(m.rows())));
     NN_TRY(r3, write_bytes<uint64_t>(ofs, static_cast<uint64_t>(m.cols())));
-    if (!nn::write_pod_span(ofs, m.span()))
-        NN_FAIL("Write error while writing f16 matrix data");
+    if (!nn::write_pod_span(ofs, m.span())) NN_FAIL("Write error while writing f16 matrix data");
     return {};
 }
 
 // v5：读取矩阵（自动识别 precision tag）
-[[nodiscard]] inline Result<std::pair<Precision, Matrix>> read_matrix_v5(std::ifstream &ifs)
+[[nodiscard]] inline Result<std::pair<Precision, Matrix>> read_matrix_v5(std::ifstream& ifs)
 {
     // 读取 precision tag
     auto tag_r = read_bytes<uint8_t>(ifs);
@@ -275,16 +272,15 @@ private:
         const std::streampos pos = ifs.tellg();
         ifs.seekg(0, std::ios::end);
         const std::streampos end = ifs.tellg();
-        if (pos < 0 || end < pos)
-            NN_FAIL("Cannot determine file size while reading matrix");
+        if (pos < 0 || end < pos) NN_FAIL("Cannot determine file size while reading matrix");
         ifs.seekg(pos);
-        if (!ifs)
-            NN_FAIL("Stream seek failed while reading matrix");
+        if (!ifs) NN_FAIL("Stream seek failed while reading matrix");
         const auto remaining = static_cast<std::uint64_t>(end - pos);
         const std::uint64_t elem_bytes = (p == Precision::F16) ? 2u : 4u;
         const std::uint64_t max_elems = remaining / elem_bytes;
         if (rows != 0 && cols != 0 && static_cast<std::uint64_t>(rows) > max_elems / cols)
-            NN_FAIL("Matrix shape " + std::to_string(rows) + "x" + std::to_string(cols)                 + " exceeds remaining file bytes; file is corrupt or malicious");
+            NN_FAIL("Matrix shape " + std::to_string(rows) + "x" + std::to_string(cols) +
+                    " exceeds remaining file bytes; file is corrupt or malicious");
     }
 
     if (p == Precision::F16)
@@ -309,16 +305,15 @@ private:
 }
 
 // ── v4 兼容：无 precision tag 的矩阵读写 ─────────────────────────────────
-[[nodiscard]] inline Result<void> write_matrix(std::ostream &ofs, const Matrix &m)
+[[nodiscard]] inline Result<void> write_matrix(std::ostream& ofs, const Matrix& m)
 {
     NN_TRY(r, write_bytes<uint64_t>(ofs, static_cast<uint64_t>(m.rows())));
     NN_TRY(r2, write_bytes<uint64_t>(ofs, static_cast<uint64_t>(m.cols())));
-    if (!nn::write_pod_span(ofs, m.span()))
-        NN_FAIL("Write error while writing matrix data");
+    if (!nn::write_pod_span(ofs, m.span())) NN_FAIL("Write error while writing matrix data");
     return {};
 }
 
-[[nodiscard]] inline Result<void> read_matrix(std::ifstream &ifs, Matrix &m)
+[[nodiscard]] inline Result<void> read_matrix(std::ifstream& ifs, Matrix& m)
 {
     auto rows_r = read_bytes<uint64_t>(ifs);
     NN_TRY_CHECK(rows_r);
@@ -329,7 +324,9 @@ private:
 
     if (rows != m.rows() || cols != m.cols())
     {
-        NN_FAIL("Matrix shape mismatch: expected (" + std::to_string(m.rows())             + ", " + std::to_string(m.cols()) + "), got ("             + std::to_string(rows) + ", " + std::to_string(cols) + ")");
+        NN_FAIL("Matrix shape mismatch: expected (" + std::to_string(m.rows()) + ", " +
+                std::to_string(m.cols()) + "), got (" + std::to_string(rows) + ", " +
+                std::to_string(cols) + ")");
     }
 
     if (!nn::read_pod_span(ifs, m.span()))
@@ -339,20 +336,18 @@ private:
 
 // ── ModelSpec ↔ KeyValueRecord（自描述规格头） ─────────────────────────
 
-[[nodiscard]] inline KeyValueRecord spec_to_kv(const ModelSpec &spec)
+[[nodiscard]] inline KeyValueRecord spec_to_kv(const ModelSpec& spec)
 {
     KeyValueRecord kv;
     // type = 字符串类型名（判别符随 ModelSpecBase 多态走；旧文件的数值 type
     // 仅在读侧做向下回落，见 spec_from_kv）。
     kv.set("type", std::string(spec.type_name()));
     // 公共字段（RL-0 多输出）：旧文件缺键 = 单输出模型。
-    if (spec.output_schema)
-        kv.set("output_schema", encode_tensor_schema(*spec.output_schema));
+    if (spec.output_schema) kv.set("output_schema", encode_tensor_schema(*spec.output_schema));
     if (!spec.output_packing.empty())
         kv.set("output_packing", encode_tensor_name_list(spec.output_packing));
     // 类型特有字段：各子类只写自己的键（键名与既有扁平布局一致）。
-    if (spec.arch)
-        spec.arch->write_kv(kv);
+    if (spec.arch) spec.arch->write_kv(kv);
     return kv;
 }
 
@@ -365,7 +360,7 @@ private:
 //   1. spec_to_kv 中写入；
 //   2. 此处追加一行（引入版本 + 缺失默认值）。
 // ══════════════════════════════════════════════════════════════════════
-inline void apply_spec_version_defaults(KeyValueRecord &kv, uint32_t version)
+inline void apply_spec_version_defaults(KeyValueRecord& kv, uint32_t version)
 {
     // norm_type 于 v4 引入；更早版本缺失时默认 LayerNorm。
     // 注：v1/v2/v3 偏移量格式在 read_and_validate_header 已拒绝，此处为语义兜底。
@@ -378,7 +373,7 @@ inline void apply_spec_version_defaults(KeyValueRecord &kv, uint32_t version)
     // if (version < 5 && !kv.has("max_norm")) kv.set("max_norm", 0);
 }
 
-[[nodiscard]] inline Result<ModelSpec> spec_from_kv(const KeyValueRecord &kv)
+[[nodiscard]] inline Result<ModelSpec> spec_from_kv(const KeyValueRecord& kv)
 {
     ModelSpec spec;  // 缺失字段保持各子类默认值（即版本默认值）
 
@@ -400,15 +395,13 @@ inline void apply_spec_version_defaults(KeyValueRecord &kv, uint32_t version)
         if (tnum == 6)
             NN_FAIL("该模型文件为 AttnZip/ZiPT 架构，已整体移除"
                     "（代码保留在 legacy/zipt 分支；恢复前提见 docs/history/history.md）");
-        const char *n = legacy_spec_type_name(tnum);
-        if (!n)
-            NN_FAIL("模型文件规格 type 数值非法（" + std::to_string(tnum) + "）");
+        const char* n = legacy_spec_type_name(tnum);
+        if (!n) NN_FAIL("模型文件规格 type 数值非法（" + std::to_string(tnum) + "）");
         if (std::string(n) == "zipt")
             NN_FAIL("该模型文件为 AttnZip/ZiPT 架构，已整体移除"
                     "（代码保留在 legacy/zipt 分支；恢复前提见 docs/history/history.md）");
         spec.arch = make_spec(n);
-        if (!spec.arch)
-            NN_FAIL("模型文件规格 type 数值无法还原（" + std::to_string(tnum) + "）");
+        if (!spec.arch) NN_FAIL("模型文件规格 type 数值无法还原（" + std::to_string(tnum) + "）");
     }
 
     // ── 公共字段（output_schema / output_packing，RL-0）：缺键 → nullopt/空 ──
@@ -442,27 +435,22 @@ inline void apply_spec_version_defaults(KeyValueRecord &kv, uint32_t version)
     }
 
     // ── 类型特有字段（各子类读自己的键；缺失键保持默认）──────────────────
-    if (spec.arch)
-    {
-        NN_TRY(x, spec.arch->read_kv(kv));
-    }
+    if (spec.arch) { NN_TRY(x, spec.arch->read_kv(kv)); }
 
-    if (!spec.arch)
-        NN_FAIL("模型文件规格缺少有效的 type 字段");
+    if (!spec.arch) NN_FAIL("模型文件规格缺少有效的 type 字段");
     return spec;
 }
 
 // ── 规格头读写：长度前缀 + KeyValueRecord（无偏移量假设） ────────────────
 
-[[nodiscard]] inline Result<void> write_spec_header(std::ostream &ofs, const ModelSpec &spec)
+[[nodiscard]] inline Result<void> write_spec_header(std::ostream& ofs, const ModelSpec& spec)
 {
     auto bytes = spec_to_kv(spec).serialize();
     NN_TRY(r, write_bytes<uint64_t>(ofs, static_cast<uint64_t>(bytes.size())));
     if (!bytes.empty())
     {
         ofs.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
-        if (!ofs)
-            NN_FAIL("Write error while writing spec header");
+        if (!ofs) NN_FAIL("Write error while writing spec header");
     }
     return {};
 }
@@ -472,7 +460,7 @@ inline void apply_spec_version_defaults(KeyValueRecord &kv, uint32_t version)
 // 下连 Result 都回不去）。模型 spec / tokenizer JSON 远小于此值。
 inline constexpr std::size_t kMaxSerializedStringBytes = 64u * 1024u * 1024u;
 
-[[nodiscard]] inline Result<ModelSpec> read_spec_header(std::ifstream &ifs, uint32_t version)
+[[nodiscard]] inline Result<ModelSpec> read_spec_header(std::ifstream& ifs, uint32_t version)
 {
     auto len_r = read_bytes<uint64_t>(ifs);
     NN_TRY_CHECK(len_r);
@@ -483,8 +471,7 @@ inline constexpr std::size_t kMaxSerializedStringBytes = 64u * 1024u * 1024u;
     if (len > 0)
     {
         ifs.read(bytes.data(), static_cast<std::streamsize>(len));
-        if (!ifs)
-            NN_FAIL("Unexpected end while reading spec header");
+        if (!ifs) NN_FAIL("Unexpected end while reading spec header");
     }
     auto kv_r = KeyValueRecord::parse(bytes);
     NN_TRY_CHECK(kv_r);
@@ -495,24 +482,22 @@ inline constexpr std::size_t kMaxSerializedStringBytes = 64u * 1024u * 1024u;
 // ── 训练状态段读取（v8）：长度前缀 + KeyValueRecord → TrainState ─────────
 // `state_len == 0` = 无该段（Model 角色，或断点由未接线路径写出）⇒ 默认值，
 // 续训路径按"冷启动语义"处理。
-[[nodiscard]] inline Result<std::unique_ptr<TrainState>> read_train_state_section(
-    std::ifstream &ifs, std::uint64_t state_len)
+[[nodiscard]] inline Result<std::unique_ptr<TrainState>>
+read_train_state_section(std::ifstream& ifs, std::uint64_t state_len)
 {
-    if (state_len == 0)
-        return std::unique_ptr<TrainState>(std::make_unique<TextTrainState>());
+    if (state_len == 0) return std::unique_ptr<TrainState>(std::make_unique<TextTrainState>());
     if (state_len > kMaxSerializedStringBytes)
         NN_FAIL("训练状态段长度越界（超过 64 MiB），文件可能损坏或恶意");
     std::string bytes(static_cast<std::size_t>(state_len), '\0');
     ifs.read(bytes.data(), static_cast<std::streamsize>(bytes.size()));
-    if (!ifs)
-        NN_FAIL("Unexpected end while reading train state section");
+    if (!ifs) NN_FAIL("Unexpected end while reading train state section");
     NN_TRY(kv, KeyValueRecord::parse(bytes));
     return train_state_from_kv(*kv);
 }
 
 // ── 文件头读写 ──────────────────────────────────────────────────────
 
-[[nodiscard]] inline Result<void> write_header(std::ostream &ofs, ModelRole role)
+[[nodiscard]] inline Result<void> write_header(std::ostream& ofs, ModelRole role)
 {
     NN_TRY(r, write_bytes<uint32_t>(ofs, MODEL_MAGIC));
     NN_TRY(r2, write_bytes<uint32_t>(ofs, MODEL_VERSION));
@@ -523,37 +508,35 @@ inline constexpr std::size_t kMaxSerializedStringBytes = 64u * 1024u * 1024u;
 
 // 返回读到的 version，同时校验 magic number、格式版本和精度
 // 仅接受自描述格式 v4+；v1/v2/v3 偏移量定长格式在此处拒绝。
-[[nodiscard]] inline Result<uint32_t> read_and_validate_header(
-    std::ifstream &ifs, ModelRole* role_out = nullptr)
+[[nodiscard]] inline Result<uint32_t> read_and_validate_header(std::ifstream& ifs,
+                                                               ModelRole* role_out = nullptr)
 {
     auto magic_r = read_bytes<uint32_t>(ifs);
     NN_TRY_CHECK(magic_r);
     if (*magic_r != MODEL_MAGIC)
-        NN_FAIL("Invalid model file: bad magic number (0x"
-                           + std::to_string(*magic_r) + ")");
+        NN_FAIL("Invalid model file: bad magic number (0x" + std::to_string(*magic_r) + ")");
     auto version_r = read_bytes<uint32_t>(ifs);
     NN_TRY_CHECK(version_r);
     const auto version = *version_r;
     if (version < 4)
-        NN_FAIL("模型文件为旧格式 (v" + std::to_string(version)
-                           + ")，已不再支持；请用当前版本重新训练/保存。");
+        NN_FAIL("模型文件为旧格式 (v" + std::to_string(version) +
+                ")，已不再支持；请用当前版本重新训练/保存。");
     if (version > MODEL_VERSION)
-        NN_FAIL("模型文件版本过新 (v" + std::to_string(version)
-                           + " > v" + std::to_string(MODEL_VERSION) + ")，请升级程序。");
+        NN_FAIL("模型文件版本过新 (v" + std::to_string(version) + " > v" +
+                std::to_string(MODEL_VERSION) + ")，请升级程序。");
     auto pt_result = read_bytes<uint8_t>(ifs);
-    if (!pt_result)
-        NN_FAIL("Unexpected end: missing precision tag");
+    if (!pt_result) NN_FAIL("Unexpected end: missing precision tag");
     uint8_t precision_tag = *pt_result;
     if (precision_tag != PRECISION_TAG)
-        NN_FAIL("Precision mismatch: file uses " + std::string(precision_tag == 0 ? "f32" : "f64")             + ", but build uses " + std::string(PRECISION_TAG == 0 ? "f32" : "f64"));
+        NN_FAIL("Precision mismatch: file uses " + std::string(precision_tag == 0 ? "f32" : "f64") +
+                ", but build uses " + std::string(PRECISION_TAG == 0 ? "f32" : "f64"));
 
     // ── v7：文件角色字节（v5/v6 无该字段 → 一律按 Model 处理，零破坏）──────
     ModelRole role = ModelRole::Model;
     if (version >= 7)
     {
         auto role_r = read_bytes<uint8_t>(ifs);
-        if (!role_r)
-            NN_FAIL("Unexpected end: missing file role byte (v7)");
+        if (!role_r) NN_FAIL("Unexpected end: missing file role byte (v7)");
         if (*role_r > static_cast<uint8_t>(ModelRole::Checkpoint))
             NN_FAIL("模型文件 role 字段非法（" + std::to_string(*role_r) + "）");
         role = static_cast<ModelRole>(*role_r);
@@ -566,19 +549,18 @@ inline constexpr std::size_t kMaxSerializedStringBytes = 64u * 1024u * 1024u;
 // v5 及以下 = JSON 字符串；v6 起 = .nnvocab 文件镜像字节。
 // 本层只搬字节，解释权在调用方（load_tokenizer_from_model_blob）。
 
-[[nodiscard]] inline Result<void> write_tokenizer(std::ostream &ofs, const std::string &data)
+[[nodiscard]] inline Result<void> write_tokenizer(std::ostream& ofs, const std::string& data)
 {
     NN_TRY(r, write_bytes<uint64_t>(ofs, static_cast<uint64_t>(data.size())));
     if (!data.empty())
     {
         ofs.write(data.data(), static_cast<std::streamsize>(data.size()));
-        if (!ofs)
-            NN_FAIL("Write error while writing tokenizer");
+        if (!ofs) NN_FAIL("Write error while writing tokenizer");
     }
     return {};
 }
 
-[[nodiscard]] inline Result<std::string> read_tokenizer(std::ifstream &ifs)
+[[nodiscard]] inline Result<std::string> read_tokenizer(std::ifstream& ifs)
 {
     auto len_r = read_bytes<uint64_t>(ifs);
     NN_TRY_CHECK(len_r);
@@ -589,8 +571,7 @@ inline constexpr std::size_t kMaxSerializedStringBytes = 64u * 1024u * 1024u;
 
     std::string data(len, '\0');
     ifs.read(data.data(), static_cast<std::streamsize>(len));
-    if (!ifs)
-        NN_FAIL("Unexpected end while reading tokenizer data");
+    if (!ifs) NN_FAIL("Unexpected end while reading tokenizer data");
     return data;
 }
 
@@ -607,8 +588,8 @@ inline constexpr std::size_t kMaxSerializedStringBytes = 64u * 1024u * 1024u;
 static_assert(sizeof(Scalar) == 4, "v7 打包载荷按 f32 字承载（Scalar 必须是 float）");
 
 // 单行：2-bit 容器字 -> 盘上 payload（2-bit / base-3）
-inline void encode_packed_row(bool base3, const std::uint32_t *words, std::size_t k,
-                              std::uint8_t *out) noexcept
+inline void encode_packed_row(bool base3, const std::uint32_t* words, std::size_t k,
+                              std::uint8_t* out) noexcept
 {
     if (base3)
     {
@@ -619,8 +600,8 @@ inline void encode_packed_row(bool base3, const std::uint32_t *words, std::size_
 }
 
 // 单行：盘上 payload -> 2-bit 容器字（运行期一律 2-bit）
-inline void decode_packed_row(bool base3, const std::uint8_t *in, std::size_t k,
-                              std::uint32_t *words) noexcept
+inline void decode_packed_row(bool base3, const std::uint8_t* in, std::size_t k,
+                              std::uint32_t* words) noexcept
 {
     if (base3)
     {
@@ -642,14 +623,13 @@ struct ParamBlob
 
 // 未信任长度防御：条目字节数不得超过文件剩余长度
 // （与 read_matrix_v5 同一威胁模型：先校验再分配/跳过）
-[[nodiscard]] inline Result<void> ensure_blob_fits_(
-    std::ifstream &ifs, std::uint64_t aux_len, std::uint64_t payload_len)
+[[nodiscard]] inline Result<void> ensure_blob_fits_(std::ifstream& ifs, std::uint64_t aux_len,
+                                                    std::uint64_t payload_len)
 {
     const std::streampos pos = ifs.tellg();
     ifs.seekg(0, std::ios::end);
     const std::streampos end = ifs.tellg();
-    if (pos < 0 || end < pos)
-        NN_FAIL("Cannot determine file size while reading param entry");
+    if (pos < 0 || end < pos) NN_FAIL("Cannot determine file size while reading param entry");
     ifs.seekg(pos);
     const auto remain = static_cast<std::uint64_t>(end - pos);
     if (aux_len > remain || payload_len > remain - aux_len)
@@ -657,7 +637,7 @@ struct ParamBlob
     return {};
 }
 
-[[nodiscard]] inline Result<void> write_param_blob(std::ostream &ofs, const ParamBlob &b)
+[[nodiscard]] inline Result<void> write_param_blob(std::ostream& ofs, const ParamBlob& b)
 {
     NN_TRY(r0, write_bytes<uint8_t>(ofs, static_cast<uint8_t>(b.kind)));
     NN_TRY(r1, write_bytes<uint8_t>(ofs, precision_tag(b.precision)));
@@ -667,20 +647,20 @@ struct ParamBlob
     NN_TRY(r5, write_bytes<uint64_t>(ofs, static_cast<uint64_t>(b.payload.size())));
     if (!b.aux.empty())
     {
-        ofs.write(reinterpret_cast<const char *>(b.aux.data()),
+        ofs.write(reinterpret_cast<const char*>(b.aux.data()),
                   static_cast<std::streamsize>(b.aux.size()));
         if (!ofs) NN_FAIL("Write error while writing param aux");
     }
     if (!b.payload.empty())
     {
-        ofs.write(reinterpret_cast<const char *>(b.payload.data()),
+        ofs.write(reinterpret_cast<const char*>(b.payload.data()),
                   static_cast<std::streamsize>(b.payload.size()));
         if (!ofs) NN_FAIL("Write error while writing param payload");
     }
     return {};
 }
 
-[[nodiscard]] inline Result<ParamBlob> read_param_blob(std::ifstream &ifs)
+[[nodiscard]] inline Result<ParamBlob> read_param_blob(std::ifstream& ifs)
 {
     auto k_r = read_bytes<uint8_t>(ifs);
     NN_TRY_CHECK(k_r);
@@ -706,13 +686,12 @@ struct ParamBlob
     b.payload.resize(static_cast<std::size_t>(*plen_r));
     if (!b.aux.empty())
     {
-        ifs.read(reinterpret_cast<char *>(b.aux.data()),
-                 static_cast<std::streamsize>(b.aux.size()));
+        ifs.read(reinterpret_cast<char*>(b.aux.data()), static_cast<std::streamsize>(b.aux.size()));
         if (!ifs) NN_FAIL("Unexpected end while reading param aux");
     }
     if (!b.payload.empty())
     {
-        ifs.read(reinterpret_cast<char *>(b.payload.data()),
+        ifs.read(reinterpret_cast<char*>(b.payload.data()),
                  static_cast<std::streamsize>(b.payload.size()));
         if (!ifs) NN_FAIL("Unexpected end while reading param payload");
     }
@@ -722,7 +701,7 @@ struct ParamBlob
 // ── 跳过参数条目（只读条目头，载荷 seek 过去）────────────────────────────
 // 读训练状态段（在参数之前）与读参数（状态段在前）时各需跳过对方；把载荷
 // 读进内存再丢掉在大模型上是纯浪费（一条 embedding 就几百 MB）。
-[[nodiscard]] inline Result<void> skip_param_blob(std::ifstream &ifs)
+[[nodiscard]] inline Result<void> skip_param_blob(std::ifstream& ifs)
 {
     auto k_r = read_bytes<uint8_t>(ifs);
     NN_TRY_CHECK(k_r);
@@ -738,196 +717,187 @@ struct ParamBlob
     NN_TRY_CHECK(ensure_blob_fits_(ifs, *alen_r, *plen_r));
     const auto jump = static_cast<std::streamoff>(*alen_r + *plen_r);
     ifs.seekg(jump, std::ios::cur);
-    if (!ifs)
-        NN_FAIL("参数条目跳过失败（文件可能损坏或截断）");
+    if (!ifs) NN_FAIL("参数条目跳过失败（文件可能损坏或截断）");
     return {};
 }
 
 } // namespace detail
 
 // ── ParamEntry ⇄ ParamBlob（宿主字节编解码；base-3 只在这里出现）─────────
-[[nodiscard]] inline Result<detail::ParamBlob> param_entry_to_blob(
-    ComputeEngine &engine, const ParamEntry &e, ModelRole role)
+[[nodiscard]] inline Result<detail::ParamBlob>
+param_entry_to_blob(ComputeEngine& engine, const ParamEntry& e, ModelRole role)
 {
     detail::ParamBlob b;
     b.rows = e.rows;
     b.cols = e.cols;
     switch (e.kind)
     {
-        case ParamKind::Dense:
-        case ParamKind::TernaryLatent:
+    case ParamKind::Dense:
+    case ParamKind::TernaryLatent:
+    {
+        b.kind = e.kind;
+        b.precision = e.precision;
+        auto m32 = engine.to_matrix(e.payload, Precision::F32);
+        NN_TRY_CHECK(m32);
+        if (m32->rows() != e.rows || m32->cols() != e.cols)
+            NN_FAIL("序列化：参数张量形状与条目不一致");
+        if (e.precision == Precision::F16)
         {
-            b.kind = e.kind;
-            b.precision = e.precision;
-            auto m32 = engine.to_matrix(e.payload, Precision::F32);
-            NN_TRY_CHECK(m32);
-            if (m32->rows() != e.rows || m32->cols() != e.cols)
-                NN_FAIL("序列化：参数张量形状与条目不一致");
-            if (e.precision == Precision::F16)
-            {
-                MatrixT<Precision::F16> m16(e.rows, e.cols);
-                const auto s = m32->span();
-                auto d = m16.span();
-                for (std::size_t i = 0; i < s.size(); ++i) d[i] = s[i];
-                const auto bytes = std::span<const std::uint8_t>(
-                    reinterpret_cast<const std::uint8_t *>(m16.span().data()),
-                    m16.span().size() * sizeof(std::uint16_t));
-                b.payload.assign(bytes.begin(), bytes.end());
-            }
-            else
-            {
-                const auto bytes = std::span<const std::uint8_t>(
-                    reinterpret_cast<const std::uint8_t *>(m32->span().data()),
-                    m32->span().size() * sizeof(Scalar));
-                b.payload.assign(bytes.begin(), bytes.end());
-            }
-            return b;
+            MatrixT<Precision::F16> m16(e.rows, e.cols);
+            const auto s = m32->span();
+            auto d = m16.span();
+            for (std::size_t i = 0; i < s.size(); ++i)
+                d[i] = s[i];
+            const auto bytes = std::span<const std::uint8_t>(
+                reinterpret_cast<const std::uint8_t*>(m16.span().data()),
+                m16.span().size() * sizeof(std::uint16_t));
+            b.payload.assign(bytes.begin(), bytes.end());
         }
-        case ParamKind::TernaryPacked2:
+        else
         {
-            auto cont = engine.to_matrix(e.payload, Precision::F32);
-            NN_TRY_CHECK(cont);
-            auto tau = engine.to_matrix(e.aux, Precision::F32);
-            NN_TRY_CHECK(tau);
-            const std::size_t k = e.cols;
-            const std::size_t rows = e.rows;
-            const std::size_t wpr = nn::trit_pack::words_per_row(k);
-            if (cont->rows() != rows || cont->cols() != wpr)
-                NN_FAIL("序列化：打包容器形状与条目不一致");
-            if (tau->rows() != rows || tau->cols() != 1)
-                NN_FAIL("序列化：tau 形状与条目不一致");
-            const auto tsp = tau->span();
-            b.aux.resize(tsp.size() * sizeof(Scalar));
-            std::memcpy(b.aux.data(), tsp.data(), b.aux.size());
-            // 推理角色默认落盘为 base-3（1.6 bpw）；断点角色不会走到这里
-            const bool base3 = (role == ModelRole::Model);
-            b.kind = base3 ? ParamKind::TernaryPacked3 : ParamKind::TernaryPacked2;
-            b.precision = Precision::F32;
-            const std::size_t per_row = base3
-                ? nn::trit_pack::base3_bytes_per_row(k)
-                : nn::trit_pack::bytes_per_row(k);
-            b.payload.resize(rows * per_row);
-            const auto cs = cont->span();
-            std::vector<std::uint32_t> words(wpr);
-            for (std::size_t r = 0; r < rows; ++r)
-            {
-                for (std::size_t i = 0; i < wpr; ++i)
-                    words[i] = std::bit_cast<std::uint32_t>(cs[r * wpr + i]);
-                detail::encode_packed_row(base3, words.data(), k,
-                                          b.payload.data() + r * per_row);
-            }
-            return b;
+            const auto bytes = std::span<const std::uint8_t>(
+                reinterpret_cast<const std::uint8_t*>(m32->span().data()),
+                m32->span().size() * sizeof(Scalar));
+            b.payload.assign(bytes.begin(), bytes.end());
         }
-        default:
-            NN_FAIL(std::string("序列化：不支持的参数形态（kind=") +
-                    param_kind_name(e.kind) + "）");
+        return b;
+    }
+    case ParamKind::TernaryPacked2:
+    {
+        auto cont = engine.to_matrix(e.payload, Precision::F32);
+        NN_TRY_CHECK(cont);
+        auto tau = engine.to_matrix(e.aux, Precision::F32);
+        NN_TRY_CHECK(tau);
+        const std::size_t k = e.cols;
+        const std::size_t rows = e.rows;
+        const std::size_t wpr = nn::trit_pack::words_per_row(k);
+        if (cont->rows() != rows || cont->cols() != wpr)
+            NN_FAIL("序列化：打包容器形状与条目不一致");
+        if (tau->rows() != rows || tau->cols() != 1) NN_FAIL("序列化：tau 形状与条目不一致");
+        const auto tsp = tau->span();
+        b.aux.resize(tsp.size() * sizeof(Scalar));
+        std::memcpy(b.aux.data(), tsp.data(), b.aux.size());
+        // 推理角色默认落盘为 base-3（1.6 bpw）；断点角色不会走到这里
+        const bool base3 = (role == ModelRole::Model);
+        b.kind = base3 ? ParamKind::TernaryPacked3 : ParamKind::TernaryPacked2;
+        b.precision = Precision::F32;
+        const std::size_t per_row =
+            base3 ? nn::trit_pack::base3_bytes_per_row(k) : nn::trit_pack::bytes_per_row(k);
+        b.payload.resize(rows * per_row);
+        const auto cs = cont->span();
+        std::vector<std::uint32_t> words(wpr);
+        for (std::size_t r = 0; r < rows; ++r)
+        {
+            for (std::size_t i = 0; i < wpr; ++i)
+                words[i] = std::bit_cast<std::uint32_t>(cs[r * wpr + i]);
+            detail::encode_packed_row(base3, words.data(), k, b.payload.data() + r * per_row);
+        }
+        return b;
+    }
+    default:
+        NN_FAIL(std::string("序列化：不支持的参数形态（kind=") + param_kind_name(e.kind) + "）");
     }
 }
 
-[[nodiscard]] inline Result<ParamEntry> param_blob_to_entry(
-    ComputeEngine &engine, const detail::ParamBlob &b,
-    WeightLoadIntent intent = WeightLoadIntent::Inference)
+[[nodiscard]] inline Result<ParamEntry>
+param_blob_to_entry(ComputeEngine& engine, const detail::ParamBlob& b,
+                    WeightLoadIntent intent = WeightLoadIntent::Inference)
 {
     ParamEntry e;
     e.rows = static_cast<std::size_t>(b.rows);
     e.cols = static_cast<std::size_t>(b.cols);
     switch (b.kind)
     {
-        case ParamKind::Dense:
-        case ParamKind::TernaryLatent:
+    case ParamKind::Dense:
+    case ParamKind::TernaryLatent:
+    {
+        Matrix m(e.rows, e.cols);
+        if (b.precision == Precision::F16)
         {
-            Matrix m(e.rows, e.cols);
-            if (b.precision == Precision::F16)
-            {
-                MatrixT<Precision::F16> m16(e.rows, e.cols);
-                if (b.payload.size() != m16.span().size() * sizeof(std::uint16_t))
-                    NN_FAIL("序列化：f16 载荷长度与形状不一致");
-                std::memcpy(m16.span().data(), b.payload.data(), b.payload.size());
-                const auto s = m16.span();
-                auto d = m.span();
-                for (std::size_t i = 0; i < s.size(); ++i)
-                    d[i] = static_cast<Scalar>(s[i]);
-            }
-            else
-            {
-                if (b.payload.size() != m.size() * sizeof(Scalar))
-                    NN_FAIL("序列化：载荷长度与形状不一致");
-                std::memcpy(m.span().data(), b.payload.data(), b.payload.size());
-            }
-            // 载荷恒物化为 f32 张量（f16 升位精确无损）→ import_into_ 负责回写
-            auto t = engine.from_matrix(m, Precision::F32);
-            NN_TRY_CHECK(t);
-            e.kind = b.kind;
-            e.precision = b.precision;
-            e.payload = std::move(*t);
-            return e;
+            MatrixT<Precision::F16> m16(e.rows, e.cols);
+            if (b.payload.size() != m16.span().size() * sizeof(std::uint16_t))
+                NN_FAIL("序列化：f16 载荷长度与形状不一致");
+            std::memcpy(m16.span().data(), b.payload.data(), b.payload.size());
+            const auto s = m16.span();
+            auto d = m.span();
+            for (std::size_t i = 0; i < s.size(); ++i)
+                d[i] = static_cast<Scalar>(s[i]);
         }
-        case ParamKind::TernaryPacked2:
-        case ParamKind::TernaryPacked3:
+        else
         {
-            const std::size_t k = static_cast<std::size_t>(b.cols);
-            const std::size_t rows = static_cast<std::size_t>(b.rows);
-            const std::size_t wpr = nn::trit_pack::words_per_row(k);
-            const bool base3 = (b.kind == ParamKind::TernaryPacked3);
-            const std::size_t per_row = base3
-                ? nn::trit_pack::base3_bytes_per_row(k)
-                : nn::trit_pack::bytes_per_row(k);
-            if (b.payload.size() != rows * per_row)
-                NN_FAIL("序列化：打包载荷长度与形状不一致");
-            Matrix tm(rows, 1);
-            if (b.aux.size() != tm.size() * sizeof(Scalar))
-                NN_FAIL("序列化：tau（aux）长度与形状不一致");
-            std::memcpy(tm.span().data(), b.aux.data(), b.aux.size());
-            // ── P1-7：Trainable ⇒ 反量化成 f32 latent（warm start / QAT 续训）──
-            // 载荷 → latent 的转换在**宿主侧**（L3 是宿主字节/Matrix 的唯一落点；
-            // L2 层不得碰 Matrix）。τ 随条目一起交给层（aux）：层按文件 τ 重建
-            // 打包派生物，故首次 forward 的 wq/τ 与文件里的模型逐位一致。
-            // 公式与两条不变量的依据见 ternary_pack.hpp 的 `latent_row_scale`。
-            if (intent == WeightLoadIntent::Trainable)
-            {
-                Matrix lat(rows, k);
-                std::vector<std::uint32_t> words(wpr);
-                const auto ts = tm.span();
-                auto ls = lat.span();
-                for (std::size_t r = 0; r < rows; ++r)
-                {
-                    detail::decode_packed_row(base3, b.payload.data() + r * per_row,
-                                              k, words.data());
-                    nn::trit_pack::dequant_row(words.data(), k, ts[r],
-                                               ls.data() + r * k);
-                }
-                auto lt = engine.from_matrix(lat, Precision::F32);
-                NN_TRY_CHECK(lt);
-                auto tt = engine.from_matrix(tm, Precision::F32);
-                NN_TRY_CHECK(tt);
-                e.kind = ParamKind::TernaryLatent;
-                e.precision = Precision::F32;
-                e.payload = std::move(*lt);
-                e.aux = std::move(*tt);
-                return e;
-            }
-            Matrix cont(rows, wpr);
+            if (b.payload.size() != m.size() * sizeof(Scalar))
+                NN_FAIL("序列化：载荷长度与形状不一致");
+            std::memcpy(m.span().data(), b.payload.data(), b.payload.size());
+        }
+        // 载荷恒物化为 f32 张量（f16 升位精确无损）→ import_into_ 负责回写
+        auto t = engine.from_matrix(m, Precision::F32);
+        NN_TRY_CHECK(t);
+        e.kind = b.kind;
+        e.precision = b.precision;
+        e.payload = std::move(*t);
+        return e;
+    }
+    case ParamKind::TernaryPacked2:
+    case ParamKind::TernaryPacked3:
+    {
+        const std::size_t k = static_cast<std::size_t>(b.cols);
+        const std::size_t rows = static_cast<std::size_t>(b.rows);
+        const std::size_t wpr = nn::trit_pack::words_per_row(k);
+        const bool base3 = (b.kind == ParamKind::TernaryPacked3);
+        const std::size_t per_row =
+            base3 ? nn::trit_pack::base3_bytes_per_row(k) : nn::trit_pack::bytes_per_row(k);
+        if (b.payload.size() != rows * per_row) NN_FAIL("序列化：打包载荷长度与形状不一致");
+        Matrix tm(rows, 1);
+        if (b.aux.size() != tm.size() * sizeof(Scalar))
+            NN_FAIL("序列化：tau（aux）长度与形状不一致");
+        std::memcpy(tm.span().data(), b.aux.data(), b.aux.size());
+        // ── P1-7：Trainable ⇒ 反量化成 f32 latent（warm start / QAT 续训）──
+        // 载荷 → latent 的转换在**宿主侧**（L3 是宿主字节/Matrix 的唯一落点；
+        // L2 层不得碰 Matrix）。τ 随条目一起交给层（aux）：层按文件 τ 重建
+        // 打包派生物，故首次 forward 的 wq/τ 与文件里的模型逐位一致。
+        // 公式与两条不变量的依据见 ternary_pack.hpp 的 `latent_row_scale`。
+        if (intent == WeightLoadIntent::Trainable)
+        {
+            Matrix lat(rows, k);
             std::vector<std::uint32_t> words(wpr);
-            auto cs = cont.span();
+            const auto ts = tm.span();
+            auto ls = lat.span();
             for (std::size_t r = 0; r < rows; ++r)
             {
-                detail::decode_packed_row(base3, b.payload.data() + r * per_row, k,
-                                          words.data());
-                for (std::size_t i = 0; i < wpr; ++i)
-                    cs[r * wpr + i] = std::bit_cast<Scalar>(words[i]);
+                detail::decode_packed_row(base3, b.payload.data() + r * per_row, k, words.data());
+                nn::trit_pack::dequant_row(words.data(), k, ts[r], ls.data() + r * k);
             }
-            auto ct = engine.from_matrix(cont, Precision::F32);
-            NN_TRY_CHECK(ct);
-            e.kind = ParamKind::TernaryPacked2;   // 运行期形态：内核只认 2-bit 容器
-            e.payload = std::move(*ct);
+            auto lt = engine.from_matrix(lat, Precision::F32);
+            NN_TRY_CHECK(lt);
             auto tt = engine.from_matrix(tm, Precision::F32);
             NN_TRY_CHECK(tt);
+            e.kind = ParamKind::TernaryLatent;
+            e.precision = Precision::F32;
+            e.payload = std::move(*lt);
             e.aux = std::move(*tt);
             return e;
         }
-        default:
-            NN_FAIL(std::string("序列化：文件里是不支持的参数形态（kind=") +
-                    param_kind_name(b.kind) + "）");
+        Matrix cont(rows, wpr);
+        std::vector<std::uint32_t> words(wpr);
+        auto cs = cont.span();
+        for (std::size_t r = 0; r < rows; ++r)
+        {
+            detail::decode_packed_row(base3, b.payload.data() + r * per_row, k, words.data());
+            for (std::size_t i = 0; i < wpr; ++i)
+                cs[r * wpr + i] = std::bit_cast<Scalar>(words[i]);
+        }
+        auto ct = engine.from_matrix(cont, Precision::F32);
+        NN_TRY_CHECK(ct);
+        e.kind = ParamKind::TernaryPacked2;   // 运行期形态：内核只认 2-bit 容器
+        e.payload = std::move(*ct);
+        auto tt = engine.from_matrix(tm, Precision::F32);
+        NN_TRY_CHECK(tt);
+        e.aux = std::move(*tt);
+        return e;
+    }
+    default:
+        NN_FAIL(std::string("序列化：文件里是不支持的参数形态（kind=") + param_kind_name(b.kind) +
+                "）");
     }
 }
 
@@ -947,31 +917,29 @@ struct ParamBlob
 // 截断/损坏的文件在解析参数之前就明确报错（旧缺陷 C5：静默载入错误权重）。
 // 成本 = 一次顺序读（分块哈希，不把文件读进内存）；调用方是
 // load_model / load_train_state，`peek_*` 只读头部故不校验。
-[[nodiscard]] inline Result<void> verify_model_integrity(const std::string &filename)
+[[nodiscard]] inline Result<void> verify_model_integrity(const std::string& filename)
 {
     std::ifstream ifs(filename, std::ios::binary);
-    if (!ifs)
-        NN_FAIL("Cannot open file for reading: " + filename);
+    if (!ifs) NN_FAIL("Cannot open file for reading: " + filename);
     ifs.seekg(0, std::ios::end);
     const std::streampos end = ifs.tellg();
-    if (end < 0)
-        NN_FAIL("Cannot determine file size: " + filename);
+    if (end < 0) NN_FAIL("Cannot determine file size: " + filename);
     const auto total = static_cast<std::uint64_t>(end);
     if (total < MODEL_TAIL_BYTES)
         NN_FAIL("模型文件过小（" + std::to_string(total) + " 字节 < 尾部标记 " +
-                std::to_string(MODEL_TAIL_BYTES) + " 字节）：文件被截断或不是模型文件: " + filename);
+                std::to_string(MODEL_TAIL_BYTES) +
+                " 字节）：文件被截断或不是模型文件: " + filename);
     ifs.seekg(static_cast<std::streamoff>(total - MODEL_TAIL_BYTES), std::ios::beg);
-    if (!ifs)
-        NN_FAIL("Seek failed while verifying: " + filename);
+    if (!ifs) NN_FAIL("Seek failed while verifying: " + filename);
     std::array<std::uint8_t, MODEL_TAIL_BYTES> tail{};
-    ifs.read(reinterpret_cast<char *>(tail.data()),
-             static_cast<std::streamsize>(MODEL_TAIL_BYTES));
+    ifs.read(reinterpret_cast<char*>(tail.data()), static_cast<std::streamsize>(MODEL_TAIL_BYTES));
     if (ifs.gcount() != static_cast<std::streamsize>(MODEL_TAIL_BYTES))
         NN_FAIL("尾部完整性标记读取失败（文件被截断）: " + filename);
-    if (std::string_view(reinterpret_cast<const char *>(tail.data()) + MODEL_DIGEST_BYTES,
+    if (std::string_view(reinterpret_cast<const char*>(tail.data()) + MODEL_DIGEST_BYTES,
                          MODEL_TAIL_MAGIC.size()) != MODEL_TAIL_MAGIC)
         NN_FAIL("模型文件缺少尾部完整性标记（\"NNEND\"）：文件被截断、损坏，"
-                "或是旧版本（v7 及以下）文件: " + filename);
+                "或是旧版本（v7 及以下）文件: " +
+                filename);
 
     std::array<std::uint8_t, MODEL_DIGEST_BYTES> stored{};
     std::memcpy(stored.data(), tail.data(), MODEL_DIGEST_BYTES);
@@ -992,16 +960,18 @@ struct ParamBlob
 // （`Optimizer::save_state` 的产出顺序即载入时的期望顺序）。
 struct CheckpointState
 {
-    const TrainState *state = nullptr;          // 状态本体（空 = 写 0 长度段）
+    const TrainState* state = nullptr;          // 状态本体（空 = 写 0 长度段）
     std::span<const Tensor> optimizer_blobs{};  // 优化器状态张量（Dense 形态落盘）
 };
 
 // ── 保存模型（v8：文件角色 + 参数级 kind + 训练状态段 + 尾部校验和）──────
 // role 决定"写哪些参数"：Model = 推理模型（三值层写打包形态，默认 base-3 载荷）；
 // Checkpoint = 训练断点（三值层写 f32 latent）+ 可选训练状态段。
-[[nodiscard]] inline Result<void> save_model(const std::string &filename,
-    Model &model, const ModelSpec &spec, const std::string &tokenizer_data = {},
-    ModelRole role = ModelRole::Model, const CheckpointState &ckpt = {})
+[[nodiscard]] inline Result<void> save_model(const std::string& filename, Model& model,
+                                             const ModelSpec& spec,
+                                             const std::string& tokenizer_data = {},
+                                             ModelRole role = ModelRole::Model,
+                                             const CheckpointState& ckpt = {})
 {
     if (ckpt.state != nullptr && role != ModelRole::Checkpoint)
         NN_FAIL("训练状态段只能写入 Checkpoint 角色（.nnckpt）：推理模型（.nnmodel）"
@@ -1010,8 +980,7 @@ struct CheckpointState
         NN_FAIL("优化器状态张量必须与训练状态一同写入（CheckpointState::state 为空）");
 
     std::ofstream ofs(filename, std::ios::binary);
-    if (!ofs)
-        NN_FAIL("Cannot open file for writing: " + filename);
+    if (!ofs) NN_FAIL("Cannot open file for writing: " + filename);
 
     // v8 整文件校验和：所有内容字节经哈希流写入；摘要与尾部标记最后**不经**该流
     detail::Sha256State hasher;
@@ -1037,17 +1006,15 @@ struct CheckpointState
         if (state_len > 0)
         {
             os.write(state_bytes.data(), static_cast<std::streamsize>(state_bytes.size()));
-            if (!os)
-                NN_FAIL("Write error while writing train state to: " + filename);
+            if (!os) NN_FAIL("Write error while writing train state to: " + filename);
         }
     }
     auto& engine = model.engine();
 
     // 优化器状态张量（Dense 条目；形状/精度随张量自描述，载入方自行校验）
-    for (const Tensor &t : ckpt.optimizer_blobs)
+    for (const Tensor& t : ckpt.optimizer_blobs)
     {
-        if (!t.valid())
-            NN_FAIL("优化器状态张量非法（未绑定存储）");
+        if (!t.valid()) NN_FAIL("优化器状态张量非法（未绑定存储）");
         ParamEntry e;
         e.kind = ParamKind::Dense;
         e.precision = t.precision();
@@ -1061,7 +1028,7 @@ struct CheckpointState
     // 逐层逐参数（索引 = 本层参数扁平顺序；`Model::parameters()` 即各层的级联）
     for (std::size_t li = 0; li < model.num_layers(); ++li)
     {
-        Layer &L = model.layer_at(li);
+        Layer& L = model.layer_at(li);
         const std::size_t n = L.param_count();
         for (std::size_t i = 0; i < n; ++i)
         {
@@ -1087,39 +1054,34 @@ struct CheckpointState
 
     // tokenizer 数据（长度前缀，0 = 未嵌入；v5=JSON / v6=.nnvocab，按版本分派）
     NN_TRY(r4, detail::write_tokenizer(os, tokenizer_data));
-    if (!os)
-        NN_FAIL("Write error while saving model to: " + filename);
+    if (!os) NN_FAIL("Write error while saving model to: " + filename);
 
     // ── 尾部（v8）：整文件校验和 + 完整性标记 ─────────────────────────────
     // 注意：摘要与标记本身**不算进**校验和 ⇒ 直接写 ofs（绕过哈希流）。
     const auto digest = detail::sha256_finalize(hasher);
-    ofs.write(reinterpret_cast<const char *>(digest.data()),
+    ofs.write(reinterpret_cast<const char*>(digest.data()),
               static_cast<std::streamsize>(digest.size()));
-    ofs.write(MODEL_TAIL_MAGIC.data(),
-              static_cast<std::streamsize>(MODEL_TAIL_MAGIC.size()));
-    if (!ofs)
-        NN_FAIL("Write error while writing file tail to: " + filename);
+    ofs.write(MODEL_TAIL_MAGIC.data(), static_cast<std::streamsize>(MODEL_TAIL_MAGIC.size()));
+    if (!ofs) NN_FAIL("Write error while writing file tail to: " + filename);
     return {};
 }
 
 // ── 读取模型规格（只读头部，不读参数/tokenizer） ──────────────────────────
-[[nodiscard]] inline Result<ModelSpec> peek_model_spec(const std::string &filename)
+[[nodiscard]] inline Result<ModelSpec> peek_model_spec(const std::string& filename)
 {
     std::ifstream ifs(filename, std::ios::binary);
-    if (!ifs)
-        NN_FAIL("Cannot open file for reading: " + filename);
+    if (!ifs) NN_FAIL("Cannot open file for reading: " + filename);
     auto version_r = detail::read_and_validate_header(ifs);
     NN_TRY_CHECK(version_r);
     return detail::read_spec_header(ifs, *version_r);
 }
 
 // ── 只读文件角色（v7；v5/v6 无该字段 → Model）────────────────────────────
-[[nodiscard]] inline Result<ModelRole> peek_model_role(const std::string &filename,
-                                                       uint32_t *version_out = nullptr)
+[[nodiscard]] inline Result<ModelRole> peek_model_role(const std::string& filename,
+                                                       uint32_t* version_out = nullptr)
 {
     std::ifstream ifs(filename, std::ios::binary);
-    if (!ifs)
-        NN_FAIL("Cannot open file for reading: " + filename);
+    if (!ifs) NN_FAIL("Cannot open file for reading: " + filename);
     ModelRole role = ModelRole::Model;
     auto v = detail::read_and_validate_header(ifs, &role);
     NN_TRY_CHECK(v);
@@ -1131,24 +1093,22 @@ struct CheckpointState
 // 供续训路径在建模型**之前**取精度 profile 与计数器、供 CLI/GUI 显示断点状态。
 // 没有该段（role=Model，或 v7 及以下 / 未接线的断点）→ 明确报错，调用方据此
 // 回落"冷启动语义"（docs/internal/18 §4.2 P1-2）。
-[[nodiscard]] inline Result<std::unique_ptr<TrainState>> peek_train_state(
-    const std::string &filename)
+[[nodiscard]] inline Result<std::unique_ptr<TrainState>>
+peek_train_state(const std::string& filename)
 {
     std::ifstream ifs(filename, std::ios::binary);
-    if (!ifs)
-        NN_FAIL("Cannot open file for reading: " + filename);
+    if (!ifs) NN_FAIL("Cannot open file for reading: " + filename);
     auto version_r = detail::read_and_validate_header(ifs);
     NN_TRY_CHECK(version_r);
     if (*version_r < 8)
-        NN_FAIL("训练状态段自 v8 起才有：" + filename + " 是 v" +
-                std::to_string(*version_r) + "（按冷启动语义处理）");
+        NN_FAIL("训练状态段自 v8 起才有：" + filename + " 是 v" + std::to_string(*version_r) +
+                "（按冷启动语义处理）");
     auto spec_r = detail::read_spec_header(ifs, *version_r);
     NN_TRY_CHECK(spec_r);
     auto len_r = detail::read_bytes<uint64_t>(ifs);
     NN_TRY_CHECK(len_r);
     if (*len_r == 0)
-        NN_FAIL("文件没有训练状态段（推理模型 .nnmodel，或该断点由旧版本写出）: " +
-                filename);
+        NN_FAIL("文件没有训练状态段（推理模型 .nnmodel，或该断点由旧版本写出）: " + filename);
     NN_TRY(state, detail::read_train_state_section(ifs, *len_r));
     return *std::move(state);
 }
@@ -1163,25 +1123,23 @@ struct LoadedTrainState
     std::vector<Precision> optimizer_blob_precisions;
 };
 
-[[nodiscard]] inline Result<LoadedTrainState> load_train_state(
-    ComputeEngine &engine, const std::string &filename)
+[[nodiscard]] inline Result<LoadedTrainState> load_train_state(ComputeEngine& engine,
+                                                               const std::string& filename)
 {
     std::ifstream ifs(filename, std::ios::binary);
-    if (!ifs)
-        NN_FAIL("Cannot open file for reading: " + filename);
+    if (!ifs) NN_FAIL("Cannot open file for reading: " + filename);
     auto version_r = detail::read_and_validate_header(ifs);
     NN_TRY_CHECK(version_r);
     if (*version_r < 8)
-        NN_FAIL("训练状态段自 v8 起才有：" + filename + " 是 v" +
-                std::to_string(*version_r) + "（按冷启动语义处理）");
+        NN_FAIL("训练状态段自 v8 起才有：" + filename + " 是 v" + std::to_string(*version_r) +
+                "（按冷启动语义处理）");
     NN_TRY_CHECK(verify_model_integrity(filename));
     auto spec_r = detail::read_spec_header(ifs, *version_r);
     NN_TRY_CHECK(spec_r);
     auto len_r = detail::read_bytes<uint64_t>(ifs);
     NN_TRY_CHECK(len_r);
     if (*len_r == 0)
-        NN_FAIL("文件没有训练状态段（推理模型 .nnmodel，或该断点由旧版本写出）: " +
-                filename);
+        NN_FAIL("文件没有训练状态段（推理模型 .nnmodel，或该断点由旧版本写出）: " + filename);
 
     LoadedTrainState out;
     NN_TRY(st, detail::read_train_state_section(ifs, *len_r));
@@ -1210,15 +1168,12 @@ struct LoadedTrainState
 // intent（P1-7）：三值层的**打包载荷**是"进部署只读态"还是"反量化成可训练
 //    latent"——推理侧默认 `Inference`（0.25 B/权重）；训练侧的 warm start /
 //    QAT 续训传 `Trainable`（`.nnckpt` 的 TernaryLatent 载荷两种意图同结果）。
-[[nodiscard]] inline Result<std::string> load_model(const std::string &filename, Model &model,
-                                                   uint32_t *version_out = nullptr,
-                                                   ModelRole *role_out = nullptr,
-                                                   WeightLoadIntent intent =
-                                                       WeightLoadIntent::Inference)
+[[nodiscard]] inline Result<std::string>
+load_model(const std::string& filename, Model& model, uint32_t* version_out = nullptr,
+           ModelRole* role_out = nullptr, WeightLoadIntent intent = WeightLoadIntent::Inference)
 {
     std::ifstream ifs(filename, std::ios::binary);
-    if (!ifs)
-        NN_FAIL("Cannot open file for reading: " + filename);
+    if (!ifs) NN_FAIL("Cannot open file for reading: " + filename);
     ModelRole role = ModelRole::Model;
     auto version_r = detail::read_and_validate_header(ifs, &role);
     NN_TRY_CHECK(version_r);
@@ -1227,8 +1182,7 @@ struct LoadedTrainState
     if (role_out) *role_out = role;
 
     // v8：整文件校验和（截断/损坏在读参数之前明确报错）
-    if (version >= 8)
-        NN_TRY_CHECK(verify_model_integrity(filename));
+    if (version >= 8) NN_TRY_CHECK(verify_model_integrity(filename));
 
     // 读取并校验规格头
     auto spec_r = detail::read_spec_header(ifs, version);
@@ -1237,7 +1191,10 @@ struct LoadedTrainState
     {
         if (!spec_matches(*stored, *spec_r))
         {
-            NN_FAIL("Model architecture mismatch while loading '" + filename + "': "                 "model expects " + spec_summary(*stored) +                 " but file contains " + spec_summary(*spec_r));
+            NN_FAIL("Model architecture mismatch while loading '" + filename +
+                    "': "
+                    "model expects " +
+                    spec_summary(*stored) + " but file contains " + spec_summary(*spec_r));
         }
     }
 
@@ -1260,7 +1217,7 @@ struct LoadedTrainState
         // ── v7：参数级 kind（由拥有该参数的那个层决定形态）─────────────
         for (std::size_t li = 0; li < model.num_layers(); ++li)
         {
-            Layer &L = model.layer_at(li);
+            Layer& L = model.layer_at(li);
             const std::size_t n = L.param_count();
             for (std::size_t i = 0; i < n; ++i)
             {
@@ -1346,20 +1303,17 @@ struct LoadedTrainState
         tokenizer_data = std::move(*tok_r);
     }
 
-    if (!ifs)
-        NN_FAIL("Read error while loading model from: " + filename);
+    if (!ifs) NN_FAIL("Read error while loading model from: " + filename);
     return tokenizer_data;
 }
 
 // ── 统一入口（v5/v6/v7 同一 magic，自动按版本分流）───────────────────────
-[[nodiscard]] inline Result<ModelSpec> peek_any_model_spec(const std::string &filename)
-{
-    return peek_model_spec(filename);
-}
+[[nodiscard]] inline Result<ModelSpec> peek_any_model_spec(const std::string& filename)
+{ return peek_model_spec(filename); }
 
-[[nodiscard]] inline Result<void> load_any_model(const std::string &filename, Model &model,
-                                                 std::string *tokenizer_out = nullptr,
-                                                 ModelRole *role_out = nullptr)
+[[nodiscard]] inline Result<void> load_any_model(const std::string& filename, Model& model,
+                                                 std::string* tokenizer_out = nullptr,
+                                                 ModelRole* role_out = nullptr)
 {
     auto tok_r = load_model(filename, model, nullptr, role_out);
     NN_TRY_CHECK(tok_r);

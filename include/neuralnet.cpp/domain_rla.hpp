@@ -22,32 +22,32 @@
 #include <neuralnet.cpp/precision.hpp>
 #include "domain_gpt.hpp"  // GPT_VOCAB_SIZE 等共享默认超参
 
-namespace nn {
+namespace nn
+{
 
 // ── RAPT 配置结构体 ─────────────────────────────────────────────────────
-struct RAPTConfig {
+struct RAPTConfig
+{
     std::size_t vocab_size = GPT_VOCAB_SIZE;
-    std::size_t d_model    = GPT_D_MODEL;
-    std::size_t seq_len    = GPT_SEQ_LEN;
-    std::size_t num_heads  = GPT_NUM_HEADS;
-    std::size_t d_ff       = GPT_D_FF;
+    std::size_t d_model = GPT_D_MODEL;
+    std::size_t seq_len = GPT_SEQ_LEN;
+    std::size_t num_heads = GPT_NUM_HEADS;
+    std::size_t d_ff = GPT_D_FF;
     std::size_t num_layers = GPT_NUM_LAYERS;
-    PosEncodingType pos_enc   = PosEncodingType::RoPE;   // RLA 约束：RoPE（或 ALiBi）
+    PosEncodingType pos_enc = PosEncodingType::RoPE;   // RLA 约束：RoPE（或 ALiBi）
     ActivationType activation = ActivationType::GeLU;
-    NormType norm_type        = NormType::LayerNorm;
+    NormType norm_type = NormType::LayerNorm;
     bool causal = true;                                  // RAPT 是 causal LM
     PrecisionProfile precision;  // 模型级精度配置（§9.1，默认全 F32）
 };
 
 // ── 构建 RAPT 模型（推荐使用） ─────────────────────────────────────────
-[[nodiscard]] inline Result<Model> build_rapt_model(
-    ComputeEngine& engine, const RAPTConfig& cfg)
+[[nodiscard]] inline Result<Model> build_rapt_model(ComputeEngine& engine, const RAPTConfig& cfg)
 {
-    if (cfg.d_model == 0 || cfg.num_heads == 0 || cfg.seq_len == 0 ||
-        cfg.vocab_size == 0 || cfg.d_ff == 0 || cfg.num_layers == 0)
+    if (cfg.d_model == 0 || cfg.num_heads == 0 || cfg.seq_len == 0 || cfg.vocab_size == 0 ||
+        cfg.d_ff == 0 || cfg.num_layers == 0)
         NN_FAIL("RAPT model parameters must be positive");
-    if (cfg.d_model % cfg.num_heads != 0)
-        NN_FAIL("RAPT d_model must be divisible by num_heads");
+    if (cfg.d_model % cfg.num_heads != 0) NN_FAIL("RAPT d_model must be divisible by num_heads");
     // RLA 强约束：RoPE 需偶数 d_k（旋转块）；v1 只支持 RoPE
     if (cfg.pos_enc != PosEncodingType::RoPE)
         NN_FAIL("RAPT v1 requires pos_enc == RoPE (RLA constraint)");
@@ -55,57 +55,49 @@ struct RAPTConfig {
         NN_FAIL("RAPT requires even d_k (RoPE) — d_model/num_heads must be even");
     Model model(engine);
     {
-        auto r = model.add<RAPTModel>(
-            cfg.vocab_size, cfg.d_model, cfg.seq_len,
-            cfg.num_heads, cfg.d_ff, cfg.num_layers,
-            cfg.pos_enc, cfg.activation, cfg.norm_type, cfg.causal, cfg.precision);
+        auto r = model.add<RAPTModel>(cfg.vocab_size, cfg.d_model, cfg.seq_len, cfg.num_heads,
+                                      cfg.d_ff, cfg.num_layers, cfg.pos_enc, cfg.activation,
+                                      cfg.norm_type, cfg.causal, cfg.precision);
         NN_TRY_CHECK(r);
     }
     return model;
 }
 
 // ── 从 ModelSpec 构建 RAPT 模型 ─────────────────────────────────────────
-[[nodiscard]] inline Result<Model> build_rapt_model_from_spec(
-    ComputeEngine& engine, const ModelSpec& spec,
-    PrecisionProfile precision = PrecisionProfile{})
+[[nodiscard]] inline Result<Model>
+build_rapt_model_from_spec(ComputeEngine& engine, const ModelSpec& spec,
+                           PrecisionProfile precision = PrecisionProfile{})
 {
-    const auto *r = spec.as<RaptSpec>();
-    if (r == nullptr)
-        NN_FAIL("Invalid ModelSpec type for RAPT: expected RAPT");
-    auto model = build_rapt_model(engine, RAPTConfig{
-        r->vocab_size, r->d_model, r->seq_len,
-        r->num_heads, r->d_ff, r->num_layers,
-        r->pos_encoding, r->activation, r->norm_type, /*causal=*/true, precision});
-    if (model)
-        model->set_spec(spec);
+    const auto* r = spec.as<RaptSpec>();
+    if (r == nullptr) NN_FAIL("Invalid ModelSpec type for RAPT: expected RAPT");
+    auto model =
+        build_rapt_model(engine, RAPTConfig{r->vocab_size, r->d_model, r->seq_len, r->num_heads,
+                                            r->d_ff, r->num_layers, r->pos_encoding, r->activation,
+                                            r->norm_type, /*causal=*/true, precision});
+    if (model) model->set_spec(spec);
     return model;
 }
 
 // ── 构造 RAPT ModelSpec ─────────────────────────────────────────────────
-[[nodiscard]] inline ModelSpec make_rapt_spec(
-    std::size_t vocab_size,
-    std::size_t d_model,
-    std::size_t seq_len,
-    std::size_t num_heads,
-    std::size_t d_ff,
-    std::size_t num_layers,
-    PosEncodingType pos_encoding = PosEncodingType::RoPE,
-    ActivationType activation = ActivationType::GeLU,
-    NormType norm_type = NormType::LayerNorm)
+[[nodiscard]] inline ModelSpec make_rapt_spec(std::size_t vocab_size, std::size_t d_model,
+                                              std::size_t seq_len, std::size_t num_heads,
+                                              std::size_t d_ff, std::size_t num_layers,
+                                              PosEncodingType pos_encoding = PosEncodingType::RoPE,
+                                              ActivationType activation = ActivationType::GeLU,
+                                              NormType norm_type = NormType::LayerNorm)
 {
     ModelSpec spec;
-    auto &r = spec.emplace<RaptSpec>();
-    r.vocab_size   = vocab_size;
-    r.d_model      = d_model;
-    r.seq_len      = seq_len;
-    r.num_heads    = num_heads;
-    r.d_ff         = d_ff;
-    r.num_layers   = num_layers;
+    auto& r = spec.emplace<RaptSpec>();
+    r.vocab_size = vocab_size;
+    r.d_model = d_model;
+    r.seq_len = seq_len;
+    r.num_heads = num_heads;
+    r.d_ff = d_ff;
+    r.num_layers = num_layers;
     r.pos_encoding = pos_encoding;
-    r.activation   = activation;
-    r.norm_type    = norm_type;
+    r.activation = activation;
+    r.norm_type = norm_type;
     return spec;
 }
 
 } // namespace nn
-

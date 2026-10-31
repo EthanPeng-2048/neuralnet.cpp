@@ -24,21 +24,21 @@
 #include <vector>
 #include "test_common.hpp"
 
-using nn::Scalar;
-using nn::Matrix;
-using nn::Tensor;
-using nn::TensorRef;
+using nn::ActivationType;
 using nn::ComputeEngine;
 using nn::CpuEngine;
-using nn::ActivationType;
 using nn::FeedForward;
+using nn::Matrix;
+using nn::Scalar;
+using nn::Tensor;
+using nn::TensorRef;
 
-namespace {
+namespace
+{
 
 
 // 用当前参数前向，返回 L = Σ y*go
-Scalar eval_loss(ComputeEngine &engine, FeedForward &ff,
-                 const Tensor &x, const Tensor &go)
+Scalar eval_loss(ComputeEngine& engine, FeedForward& ff, const Tensor& x, const Tensor& go)
 {
     auto y = ff.forward(x);
     auto y_m = engine.to_matrix(*y);
@@ -50,15 +50,12 @@ Scalar eval_loss(ComputeEngine &engine, FeedForward &ff,
 // 验证单个张量参数/输入的梯度（逐元素中心差分）
 //   fwd_input: 前向传播使用的输入。参数验证时传固定 x；输入梯度验证时
 //              传被扰动的输入副本（扰动 fwd_input 本身并重算 loss）。
-bool check_grad_tensor(
-    ComputeEngine &engine, FeedForward &ff,
-    const Tensor &fwd_input,
-    const Tensor &go,
-    Tensor &param,               // 被扰动的张量（参数或输入）
-    const Matrix &base,          // 扰动前的值
-    const Matrix &grad_analytical, // backward 得到的梯度
-    const std::string &name,
-    Scalar eps, Scalar tol)
+bool check_grad_tensor(ComputeEngine& engine, FeedForward& ff, const Tensor& fwd_input,
+                       const Tensor& go,
+                       Tensor& param,               // 被扰动的张量（参数或输入）
+                       const Matrix& base,          // 扰动前的值
+                       const Matrix& grad_analytical, // backward 得到的梯度
+                       const std::string& name, Scalar eps, Scalar tol)
 {
     bool ok = true;
     std::size_t bad = 0;
@@ -72,18 +69,30 @@ bool check_grad_tensor(
             Matrix pp = base;
             pp.set_value_unchecked(r, c, orig + eps);
             auto r_p = engine.write(param, pp.span());
-            if (!r_p) { std::cerr << "write(+) failed\n"; return false; }
+            if (!r_p)
+            {
+                std::cerr << "write(+) failed\n";
+                return false;
+            }
             const Scalar lp = eval_loss(engine, ff, fwd_input, go);
 
             Matrix pm = base;
             pm.set_value_unchecked(r, c, orig - eps);
             auto r_m = engine.write(param, pm.span());
-            if (!r_m) { std::cerr << "write(-) failed\n"; return false; }
+            if (!r_m)
+            {
+                std::cerr << "write(-) failed\n";
+                return false;
+            }
             const Scalar lm = eval_loss(engine, ff, fwd_input, go);
 
             // 恢复原值
             auto r_r = engine.write(param, base.span());
-            if (!r_r) { std::cerr << "write(restore) failed\n"; return false; }
+            if (!r_r)
+            {
+                std::cerr << "write(restore) failed\n";
+                return false;
+            }
 
             const Scalar num = (lp - lm) / (Scalar{2} * eps);
             const Scalar ana = grad_analytical.at_unchecked(r, c);
@@ -93,31 +102,28 @@ bool check_grad_tensor(
             {
                 ok = false;
                 if (bad < 10)
-                    std::cout << "  [FAIL] " << name << "(" << r << "," << c
-                              << ") num=" << num << " ana=" << ana << "\n";
+                    std::cout << "  [FAIL] " << name << "(" << r << "," << c << ") num=" << num
+                              << " ana=" << ana << "\n";
                 ++bad;
             }
         }
     }
-    std::cout << "  " << name << ": "
-              << (ok ? "OK" : "FAIL")
-              << "  max_err=" << max_err << "  bad=" << bad << "\n";
+    std::cout << "  " << name << ": " << (ok ? "OK" : "FAIL") << "  max_err=" << max_err
+              << "  bad=" << bad << "\n";
     return ok;
 }
 
 } // namespace
 
-int main(int argc, char *argv[])
+int main(int argc, char* argv[])
 {
     Scalar tol = 2e-2f;
     bool use_gpu = false;
     for (int i = 1; i < argc; ++i)
     {
         std::string a = argv[i];
-        if (a == "--tol" && i + 1 < argc)
-            tol = static_cast<Scalar>(std::atof(argv[++i]));
-        else if (a == "--gpu")
-            use_gpu = true;
+        if (a == "--tol" && i + 1 < argc) tol = static_cast<Scalar>(std::atof(argv[++i]));
+        else if (a == "--gpu") use_gpu = true;
         else if (a == "--help")
         {
             std::cout << "用法: swiglu_gradcheck [--gpu] [--tol <f>]\n";
@@ -130,18 +136,18 @@ int main(int argc, char *argv[])
     auto engine_res = nn::cli::create_engine(ecfg, std::cout);
     NN_EXIT(engine_res, 1, "引擎创建失败: ");
     auto engine = std::move(*engine_res);
-    ComputeEngine &eng = *engine;
+    ComputeEngine& eng = *engine;
 
     // 小规模，加速测试
     const std::size_t d_model = 8;
-    const std::size_t d_ff    = 16;   // SwiGLU 时 fc1 → 2*d_ff=32
-    const std::size_t batch   = 4;
+    const std::size_t d_ff = 16;   // SwiGLU 时 fc1 → 2*d_ff=32
+    const std::size_t batch = 4;
 
     std::cout << "========================================\n";
     std::cout << "  SwiGLU 数值梯度检查 (gradcheck)\n";
     std::cout << "========================================\n";
-    std::cout << "  d_model=" << d_model << " d_ff=" << d_ff
-              << " batch=" << batch << " tol=" << tol << "\n";
+    std::cout << "  d_model=" << d_model << " d_ff=" << d_ff << " batch=" << batch << " tol=" << tol
+              << "\n";
 
     FeedForward ff(d_model, d_ff, ActivationType::SwiGLU);
     NN_EXIT(ff.init(eng), 1, "FeedForward init 失败: ");
@@ -151,8 +157,10 @@ int main(int argc, char *argv[])
 
     Matrix x_m(d_model, batch);
     Matrix go_m(d_model, batch);
-    for (std::size_t i = 0; i < x_m.size(); ++i) x_m.span()[i] = dist(rng);
-    for (std::size_t i = 0; i < go_m.size(); ++i) go_m.span()[i] = dist(rng);
+    for (std::size_t i = 0; i < x_m.size(); ++i)
+        x_m.span()[i] = dist(rng);
+    for (std::size_t i = 0; i < go_m.size(); ++i)
+        go_m.span()[i] = dist(rng);
 
     auto x = eng.from_matrix(x_m);
     NN_EXIT(x, 1, "from_matrix(x) failed\n");
@@ -165,8 +173,8 @@ int main(int argc, char *argv[])
 
     // ── 清零梯度并 backward ──
     auto params = ff.parameters();
-    auto grads  = ff.param_gradients();
-    for (auto &g : grads)
+    auto grads = ff.param_gradients();
+    for (auto& g : grads)
     {
         auto rz = eng.zero(g.get());
         NN_EXIT(rz, 1, "zero failed\n");
@@ -186,8 +194,7 @@ int main(int argc, char *argv[])
         auto g = eng.to_matrix(grads[pi].get());
         NN_EXIT(g, 1, "to_matrix(grad) failed\n");
         std::string name = pi < 4 ? std::string(pnames[pi]) : ("param[" + std::to_string(pi) + "]");
-        all_pass &= check_grad_tensor(
-            eng, ff, *x, *go, params[pi].get(), *p, *g, name, eps, tol);
+        all_pass &= check_grad_tensor(eng, ff, *x, *go, params[pi].get(), *p, *g, name, eps, tol);
     }
 
     // ── 验证输入梯度（扰动输入副本本身，前向用该副本） ──
@@ -196,8 +203,7 @@ int main(int argc, char *argv[])
         NN_EXIT(gxm, 1, "to_matrix(grad_x) failed\n");
         auto xt = eng.clone(*x);   // 可写副本，避免扰动原始输入 Tensor
         NN_EXIT(xt, 1, "clone(x) failed\n");
-        all_pass &= check_grad_tensor(
-            eng, ff, *xt, *go, *xt, x_m, *gxm, "grad_x", eps, tol);
+        all_pass &= check_grad_tensor(eng, ff, *xt, *go, *xt, x_m, *gxm, "grad_x", eps, tol);
     }
 
     std::cout << "----------------------------------------\n";

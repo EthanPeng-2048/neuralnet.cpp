@@ -23,11 +23,12 @@ using nn::Matrix;
 using nn::Precision;
 using nn::Scalar;
 
-namespace {
+namespace
+{
 
 // f16 网格：给定 f32 值与相邻 f16 网格点，打印“掉了几个 ULP”
-void report(const char* label, const std::vector<Scalar>& before,
-            const std::vector<Scalar>& after, int steps)
+void report(const char* label, const std::vector<Scalar>& before, const std::vector<Scalar>& after,
+            int steps)
 {
     std::printf("  [%s] %d 步：\n", label, steps);
     for (std::size_t i = 0; i < before.size(); ++i)
@@ -39,16 +40,18 @@ void report(const char* label, const std::vector<Scalar>& before,
             continue;
         }
         // ULP 位移 = |1/p - 1/a| 不便；直接用 half 网格步长推：按 f16 尾数
-        auto ulp = [](Scalar v) -> Scalar {
+        auto ulp = [](Scalar v) -> Scalar
+        {
             v = std::fabs(v);
             if (v == 0) return std::numeric_limits<Scalar>::min();
-            int e; std::frexp(v, &e);           // v = f * 2^e, 0.5<=f<1
+            int e;
+            std::frexp(v, &e);           // v = f * 2^e, 0.5<=f<1
             return std::ldexp(1.0f, e - 11);    // f16 尾数 10 bit + 符号位对齐
         };
         const Scalar u = ulp(b);
         const Scalar steps_down = (b - a) / u;  // 正 = 掉网格
-        std::printf("    p0=%-12.7g → %-12.7g  Δ/ULP=%-8.3f  相对=%-10.4g\n",
-                    b, a, steps_down, (a - b) / b);
+        std::printf("    p0=%-12.7g → %-12.7g  Δ/ULP=%-8.3f  相对=%-10.4g\n", b, a, steps_down,
+                    (a - b) / b);
     }
 }
 
@@ -69,24 +72,31 @@ void probe_decay(nn::ComputeEngine& eng, const char* label, Precision P)
 
     Matrix m(1, 6);
     const Scalar init[6] = {1.0f, 0.5f, 0.077f, -0.077f, 0.036f, 2.0f};
-    for (std::size_t i = 0; i < 6; ++i) m.span()[i] = init[i];
+    for (std::size_t i = 0; i < 6; ++i)
+        m.span()[i] = init[i];
 
     auto p_r = eng.from_matrix(m, P);
-    if (!p_r) { std::printf("  [%s] from_matrix 失败\n", label); return; }
+    if (!p_r)
+    {
+        std::printf("  [%s] from_matrix 失败\n", label);
+        return;
+    }
     auto p = std::move(*p_r);
 
     const auto before = download(eng, p);
     for (int s = 0; s < steps; ++s)
     {
-        auto r = nn::dsl::compute_into(eng,
-            nn::dsl::leaf(p) * nn::dsl::rparam(factor), p);
-        if (!r) { std::printf("  [%s] decay compute_into 失败: %s\n",
-                              label, r.error().message.c_str()); return; }
+        auto r = nn::dsl::compute_into(eng, nn::dsl::leaf(p) * nn::dsl::rparam(factor), p);
+        if (!r)
+        {
+            std::printf("  [%s] decay compute_into 失败: %s\n", label, r.error().message.c_str());
+            return;
+        }
     }
     const auto after = download(eng, p);
 
-    std::printf("[decay] %s target=%s factor=%.7f（应为“不变”：|Δ| 远小于 1 ULP）\n",
-                label, P == Precision::F16 ? "f16" : "f32", factor);
+    std::printf("[decay] %s target=%s factor=%.7f（应为“不变”：|Δ| 远小于 1 ULP）\n", label,
+                P == Precision::F16 ? "f16" : "f32", factor);
     report("decay", before, after, steps);
 }
 
@@ -98,10 +108,15 @@ void probe_add(nn::ComputeEngine& eng, const char* label, Precision P)
 
     Matrix m(1, 6);
     const Scalar init[6] = {1.0f, 0.5f, 0.077f, -0.077f, 0.036f, 2.0f};
-    for (std::size_t i = 0; i < 6; ++i) m.span()[i] = init[i];
+    for (std::size_t i = 0; i < 6; ++i)
+        m.span()[i] = init[i];
 
     auto p_r = eng.from_matrix(m, P);
-    if (!p_r) { std::printf("  [%s] from_matrix 失败\n", label); return; }
+    if (!p_r)
+    {
+        std::printf("  [%s] from_matrix 失败\n", label);
+        return;
+    }
     auto p = std::move(*p_r);
 
     const auto before = download(eng, p);
@@ -110,18 +125,25 @@ void probe_add(nn::ComputeEngine& eng, const char* label, Precision P)
         Matrix dm(1, 6);
         // 交替 ±d：偶数步 +d，奇数步 -d（模拟 Adam 双向更新）
         const Scalar sign = (s % 2 == 0) ? d : -d;
-        for (std::size_t i = 0; i < 6; ++i) dm.span()[i] = sign;
+        for (std::size_t i = 0; i < 6; ++i)
+            dm.span()[i] = sign;
         auto d_r = eng.from_matrix(dm, P);
-        if (!d_r) { std::printf("  [%s] delta from_matrix 失败\n", label); return; }
-        auto r = nn::dsl::compute_into(eng,
-            nn::dsl::leaf(p) + nn::dsl::leaf(*d_r), p);
-        if (!r) { std::printf("  [%s] add compute_into 失败: %s\n",
-                              label, r.error().message.c_str()); return; }
+        if (!d_r)
+        {
+            std::printf("  [%s] delta from_matrix 失败\n", label);
+            return;
+        }
+        auto r = nn::dsl::compute_into(eng, nn::dsl::leaf(p) + nn::dsl::leaf(*d_r), p);
+        if (!r)
+        {
+            std::printf("  [%s] add compute_into 失败: %s\n", label, r.error().message.c_str());
+            return;
+        }
     }
     const auto after = download(eng, p);
 
-    std::printf("[p+delta] %s target=%s（±%.0e 交替：应为小幅随机游走、无系统性收缩）\n",
-                label, P == Precision::F16 ? "f16" : "f32", d);
+    std::printf("[p+delta] %s target=%s（±%.0e 交替：应为小幅随机游走、无系统性收缩）\n", label,
+                P == Precision::F16 ? "f16" : "f32", d);
     report("add", before, after, steps);
 }
 
@@ -143,10 +165,13 @@ int main(int argc, char* argv[])
     for (int i = 1; i < argc; ++i)
     {
         std::string arg = argv[i];
-        if (auto dev = nn::cli::parse_gpu_option(argc, argv, i, true))
-            gpu_device = *dev;
+        if (auto dev = nn::cli::parse_gpu_option(argc, argv, i, true)) gpu_device = *dev;
         else if (arg == "--gpu") gpu_device.clear();
-        else { std::fprintf(stderr, "未知参数: %s\n", arg.c_str()); return 2; }
+        else
+        {
+            std::fprintf(stderr, "未知参数: %s\n", arg.c_str());
+            return 2;
+        }
     }
 
     std::printf("decay_probe：f16 权重衰减乘法 / 加法写回的舍入行为\n");
@@ -160,7 +185,7 @@ int main(int argc, char* argv[])
 #ifdef NN_HAS_VULKAN
     {
         auto backend_owner = nn::GpuBackend::shared();
-    nn::GpuBackend& backend = *backend_owner;
+        nn::GpuBackend& backend = *backend_owner;
         auto init_r = backend.initialize(gpu_device);
         if (!init_r)
         {
@@ -173,7 +198,8 @@ int main(int argc, char* argv[])
         run_all(adapter, "gpu");
     }
 #else
-    (void)argc; (void)argv;
+    (void)argc;
+    (void)argv;
     std::printf("[SKIP] 需要 Vulkan SDK。\n");
     return 77;
 #endif

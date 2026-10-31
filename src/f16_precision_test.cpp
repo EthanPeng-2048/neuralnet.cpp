@@ -26,16 +26,18 @@ namespace
 int g_failures = 0;
 
 
-#define CHECK_NEAR(a, b, tol, msg) \
-    do { \
-        const double va = static_cast<double>(a), vb = static_cast<double>(b); \
-        const double tol_ = (tol); \
-        const double err = std::fabs(va - vb); \
-        if (err > tol_ * (1.0 + std::fabs(vb))) { \
-            std::fprintf(stderr, "  FAIL %s:%d: %s (%.6g vs %.6g, err=%.3g)\n", \
-                         g_label, __LINE__, (msg), va, vb, err); \
-            ++g_failures; \
-        } \
+#define CHECK_NEAR(a, b, tol, msg)                                                                 \
+    do                                                                                             \
+    {                                                                                              \
+        const double va = static_cast<double>(a), vb = static_cast<double>(b);                     \
+        const double tol_ = (tol);                                                                 \
+        const double err = std::fabs(va - vb);                                                     \
+        if (err > tol_ * (1.0 + std::fabs(vb)))                                                    \
+        {                                                                                          \
+            std::fprintf(stderr, "  FAIL %s:%d: %s (%.6g vs %.6g, err=%.3g)\n", g_label, __LINE__, \
+                         (msg), va, vb, err);                                                      \
+            ++g_failures;                                                                          \
+        }                                                                                          \
     } while (0)
 
 const char* g_label = "?";
@@ -55,13 +57,14 @@ bool env_flag(const char* name)
 #endif
 }
 
-nn::Matrix make_rand(std::size_t rows, std::size_t cols, unsigned seed,
-                     float lo = -1.0f, float hi = 1.0f)
+nn::Matrix make_rand(std::size_t rows, std::size_t cols, unsigned seed, float lo = -1.0f,
+                     float hi = 1.0f)
 {
     nn::Matrix m(rows, cols);
     std::mt19937 rng(seed);
     std::uniform_real_distribution<float> d(lo, hi);
-    for (auto& v : m.span()) v = d(rng);
+    for (auto& v : m.span())
+        v = d(rng);
     return m;
 }
 
@@ -71,8 +74,7 @@ nn::Matrix read_f32(nn::ComputeEngine& eng, const nn::Tensor& t)
     auto r = eng.to_matrix(t, nn::Precision::F32);
     if (!r)
     {
-        std::fprintf(stderr, "  FAIL %s: to_matrix 失败: %s\n", g_label,
-                     r.error().message.c_str());
+        std::fprintf(stderr, "  FAIL %s: to_matrix 失败: %s\n", g_label, r.error().message.c_str());
         ++g_failures;
         return nn::Matrix(1, 1);
     }
@@ -108,7 +110,11 @@ void test_f32_zero_regression(nn::ComputeEngine& raw, nn::ComputeEngine& eng)
         bool identical = (mr.rows() == mg.rows() && mr.cols() == mg.cols());
         if (identical)
             for (std::size_t i = 0; i < mr.size(); ++i)
-                if (mr.span()[i] != mg.span()[i]) { identical = false; break; }
+                if (mr.span()[i] != mg.span()[i])
+                {
+                    identical = false;
+                    break;
+                }
         CHECK(identical, "f32 全 f32 配置逐字节一致（G5 零回归）");
         CHECK(gots[k]->precision() == nn::Precision::F32, "全 f32 输出精度");
     }
@@ -124,12 +130,10 @@ void test_f32_zero_regression_dsl(nn::ComputeEngine& raw, nn::ComputeEngine& eng
     CHECK(ta && tb, "from_matrix");
     if (!ta || !tb) return;
 
-    auto ref = nn::dsl::compute(raw,
-        nn::dsl::exp(nn::dsl::leaf(*ta) * nn::dsl::rparam(0.25f))
-        + nn::dsl::leaf(*tb), 16, 8);
-    auto got = nn::dsl::compute(eng,
-        nn::dsl::exp(nn::dsl::leaf(*ta) * nn::dsl::rparam(0.25f))
-        + nn::dsl::leaf(*tb), 16, 8);
+    auto ref = nn::dsl::compute(
+        raw, nn::dsl::exp(nn::dsl::leaf(*ta) * nn::dsl::rparam(0.25f)) + nn::dsl::leaf(*tb), 16, 8);
+    auto got = nn::dsl::compute(
+        eng, nn::dsl::exp(nn::dsl::leaf(*ta) * nn::dsl::rparam(0.25f)) + nn::dsl::leaf(*tb), 16, 8);
     CHECK(ref && got, "dsl::compute");
     if (!ref || !got) return;
 
@@ -139,7 +143,11 @@ void test_f32_zero_regression_dsl(nn::ComputeEngine& raw, nn::ComputeEngine& eng
     bool identical = (mr.rows() == mg.rows() && mr.cols() == mg.cols());
     if (identical)
         for (std::size_t i = 0; i < mr.size(); ++i)
-            if (mr.span()[i] != mg.span()[i]) { identical = false; break; }
+            if (mr.span()[i] != mg.span()[i])
+            {
+                identical = false;
+                break;
+            }
     CHECK(identical, "f32 DSL 逐字节一致（G5 零回归）");
 }
 
@@ -160,14 +168,14 @@ void test_f16_dsl(nn::ComputeEngine& raw, nn::ComputeEngine& eng)
     auto tb32 = eng.cast(*tb16, nn::Precision::F32);
     CHECK(ta32 && tb32, "cast f16→f32");
     if (!ta32 || !tb32) return;
-    auto ref = nn::dsl::compute(raw,
-        nn::dsl::exp(nn::dsl::leaf(*ta32) * nn::dsl::rparam(0.25f))
-        + nn::dsl::leaf(*tb32), 24, 10);
+    auto ref = nn::dsl::compute(
+        raw, nn::dsl::exp(nn::dsl::leaf(*ta32) * nn::dsl::rparam(0.25f)) + nn::dsl::leaf(*tb32), 24,
+        10);
     CHECK(ref.has_value(), "f32 参考");
 
-    auto got = nn::dsl::compute(eng,
-        nn::dsl::exp(nn::dsl::leaf(*ta16) * nn::dsl::rparam(0.25f))
-        + nn::dsl::leaf(*tb16), 24, 10, nn::Precision::F16);
+    auto got = nn::dsl::compute(
+        eng, nn::dsl::exp(nn::dsl::leaf(*ta16) * nn::dsl::rparam(0.25f)) + nn::dsl::leaf(*tb16), 24,
+        10, nn::Precision::F16);
     CHECK(got.has_value(), "f16 dsl::compute");
     if (!ref || !got) return;
 
@@ -176,12 +184,11 @@ void test_f16_dsl(nn::ComputeEngine& raw, nn::ComputeEngine& eng)
     const nn::Matrix mr = read_f32(raw, *ref);
     double max_err = 0.0;
     for (std::size_t i = 0; i < mr.size(); ++i)
-        max_err = std::max(max_err, std::fabs(static_cast<double>(mg.span()[i])
-                                            - static_cast<double>(mr.span()[i])));
+        max_err = std::max(max_err, std::fabs(static_cast<double>(mg.span()[i]) -
+                                              static_cast<double>(mr.span()[i])));
     // f16 相对精度 2^-10 ≈ 1e-3，逐算子舍入累积 → 5e-3 容差
     CHECK(max_err < 5e-3, "f16 DSL 与 f32 参考在容差内");
-    if (max_err >= 5e-3)
-        std::fprintf(stderr, "    max_err=%.3g\n", max_err);
+    if (max_err >= 5e-3) std::fprintf(stderr, "    max_err=%.3g\n", max_err);
 }
 
 // ── 3. in-place：存储精度不可变 + 对象身份保持（§8.3）────────────────────
@@ -205,9 +212,13 @@ void test_f16_inplace(nn::ComputeEngine& raw, nn::ComputeEngine& eng)
     bool ok = true;
     for (std::size_t i = 0; i < a.size(); ++i)
     {
-        const float expect = static_cast<float>(
-            static_cast<nn::f16>(static_cast<nn::f16>(a.span()[i]) + static_cast<nn::f16>(b.span()[i])));
-        if (std::fabs(out.span()[i] - expect) > 2e-3f) { ok = false; break; }
+        const float expect = static_cast<float>(static_cast<nn::f16>(
+            static_cast<nn::f16>(a.span()[i]) + static_cast<nn::f16>(b.span()[i])));
+        if (std::fabs(out.span()[i] - expect) > 2e-3f)
+        {
+            ok = false;
+            break;
+        }
     }
     CHECK(ok, "f16 in-place 结果正确且别名可见");
 
@@ -222,7 +233,11 @@ void test_f16_inplace(nn::ComputeEngine& raw, nn::ComputeEngine& eng)
     const nn::Matrix z = read_f32(raw, *ta);
     bool all_zero = true;
     for (std::size_t i = 0; i < z.size(); ++i)
-        if (z.span()[i] != 0.0f) { all_zero = false; break; }
+        if (z.span()[i] != 0.0f)
+        {
+            all_zero = false;
+            break;
+        }
     CHECK(all_zero, "f16 zero 写零");
 }
 
@@ -246,7 +261,8 @@ void test_f16_move(nn::ComputeEngine& raw, nn::ComputeEngine& eng)
         bool ok = true;
         for (std::size_t r = 0; r < 3; ++r)
             for (std::size_t c = 0; c < 4; ++c)
-                if (std::fabs(ms.at(r, c) - static_cast<float>(static_cast<nn::f16>(a.at(r + 2, c)))) > 1e-3f)
+                if (std::fabs(ms.at(r, c) -
+                              static_cast<float>(static_cast<nn::f16>(a.at(r + 2, c)))) > 1e-3f)
                     ok = false;
         CHECK(ok, "slice_rows 数值正确");
     }
@@ -259,16 +275,18 @@ void test_f16_move(nn::ComputeEngine& raw, nn::ComputeEngine& eng)
         CHECK(ri.has_value(), "insert_rows(f16)");
         CHECK(dst->precision() == nn::Precision::F16, "insert_rows 后 dst 精度不变");
         const nn::Matrix md = read_f32(raw, *dst);
-        CHECK_NEAR(md.at(3, 1), static_cast<float>(static_cast<nn::f16>(a.at(3, 1))),
-                   1e-3, "insert_rows 数值");
+        CHECK_NEAR(md.at(3, 1), static_cast<float>(static_cast<nn::f16>(a.at(3, 1))), 1e-3,
+                   "insert_rows 数值");
     }
 
     // gather_rows（表 f16、索引 f32）
     nn::Matrix tbl = make_rand(6, 3, 8);
     auto tt = eng.from_matrix(tbl, nn::Precision::F16);
     nn::Matrix idxm(4, 1);
-    idxm.set_value(0, 0, 3); idxm.set_value(1, 0, 0);
-    idxm.set_value(2, 0, 5); idxm.set_value(3, 0, 1);
+    idxm.set_value(0, 0, 3);
+    idxm.set_value(1, 0, 0);
+    idxm.set_value(2, 0, 5);
+    idxm.set_value(3, 0, 1);
     auto idx = raw.from_matrix(idxm);
     if (tt && idx)
     {
@@ -277,8 +295,8 @@ void test_f16_move(nn::ComputeEngine& raw, nn::ComputeEngine& eng)
         if (g)
         {
             const nn::Matrix mg = read_f32(raw, *g);
-            CHECK_NEAR(mg.at(2, 2), static_cast<float>(static_cast<nn::f16>(tbl.at(5, 2))),
-                       1e-3, "gather_rows 数值");
+            CHECK_NEAR(mg.at(2, 2), static_cast<float>(static_cast<nn::f16>(tbl.at(5, 2))), 1e-3,
+                       "gather_rows 数值");
         }
     }
 
@@ -331,8 +349,8 @@ void test_f16_reduce_matmul(nn::ComputeEngine& raw, nn::ComputeEngine& eng)
             const nn::Matrix mr = read_f32(raw, *ref);
             double max_err = 0.0;
             for (std::size_t i = 0; i < mr.size(); ++i)
-                max_err = std::max(max_err,
-                    std::fabs(static_cast<double>(mg.span()[i]) - static_cast<double>(mr.span()[i])));
+                max_err = std::max(max_err, std::fabs(static_cast<double>(mg.span()[i]) -
+                                                      static_cast<double>(mr.span()[i])));
             CHECK(max_err < 5e-3, "f16 matmul 与 f32 参考在容差内");
             if (max_err >= 5e-3) std::fprintf(stderr, "    matmul max_err=%.3g\n", max_err);
         }
@@ -346,12 +364,13 @@ void test_f16_end_to_end(nn::ComputeEngine& raw, nn::ComputeEngine& eng)
 {
     const std::size_t D = 8, N = 32;
     nn::Matrix x = make_rand(D, N, 21);
-    nn::Matrix w_true(D, 1, nn::Scalar{0.5f});   // 0.5 在 f16 中可精确表示
+    nn::Matrix w_true(D, 1, nn::Scalar{0.5f}); // 0.5 在 f16 中可精确表示
     nn::Matrix y(N, 1);
     for (std::size_t i = 0; i < N; ++i)
     {
         float s = 0.0f;
-        for (std::size_t d = 0; d < D; ++d) s += x.at(d, i) * w_true.at(d, 0);
+        for (std::size_t d = 0; d < D; ++d)
+            s += x.at(d, i) * w_true.at(d, 0);
         y.set_value(i, 0, s);
     }
 
@@ -372,34 +391,62 @@ void test_f16_end_to_end(nn::ComputeEngine& raw, nn::ComputeEngine& eng)
     for (int step = 0; step < 40; ++step)
     {
         auto pred = eng.matmul(*tx, *tw, true, false, nn::Precision::F16);
-        if (!pred) { CHECK(false, "matmul forward"); return; }
-        auto diff = nn::dsl::compute(eng,
-            nn::dsl::leaf(*pred) - nn::dsl::leaf(*ty), N, 1, nn::Precision::F16);
-        if (!diff) { CHECK(false, "diff"); return; }
+        if (!pred)
+        {
+            CHECK(false, "matmul forward");
+            return;
+        }
+        auto diff = nn::dsl::compute(eng, nn::dsl::leaf(*pred) - nn::dsl::leaf(*ty), N, 1,
+                                     nn::Precision::F16);
+        if (!diff)
+        {
+            CHECK(false, "diff");
+            return;
+        }
 
         // loss（f32 参考读数，仅用于断言收敛）
-        auto sq = nn::dsl::compute(eng,
-            nn::dsl::leaf(*diff) * nn::dsl::leaf(*diff), N, 1, nn::Precision::F32);
-        if (!sq) { CHECK(false, "sq"); return; }
+        auto sq = nn::dsl::compute(eng, nn::dsl::leaf(*diff) * nn::dsl::leaf(*diff), N, 1,
+                                   nn::Precision::F32);
+        if (!sq)
+        {
+            CHECK(false, "sq");
+            return;
+        }
         auto loss_sum = eng.col_reduce_sum(*sq, nn::Precision::F32);
-        if (!loss_sum) { CHECK(false, "loss reduce"); return; }
+        if (!loss_sum)
+        {
+            CHECK(false, "loss reduce");
+            return;
+        }
         const nn::Matrix lm = read_f32(raw, *loss_sum);
         const float loss = lm.span()[0] / static_cast<float>(N);
         if (step == 0) first_loss = loss;
         last_loss = loss;
 
         // grad_w = 2/N * x · diff
-        auto gdiff = nn::dsl::compute(eng,
-            nn::dsl::leaf(*diff) * nn::dsl::rparam(2.0f / static_cast<float>(N)),
-            N, 1, nn::Precision::F16);
-        if (!gdiff) { CHECK(false, "gdiff"); return; }
+        auto gdiff = nn::dsl::compute(
+            eng, nn::dsl::leaf(*diff) * nn::dsl::rparam(2.0f / static_cast<float>(N)), N, 1,
+            nn::Precision::F16);
+        if (!gdiff)
+        {
+            CHECK(false, "gdiff");
+            return;
+        }
         auto grad = eng.matmul(*tx, *gdiff, false, false, nn::Precision::F16);
-        if (!grad) { CHECK(false, "grad matmul"); return; }
+        if (!grad)
+        {
+            CHECK(false, "grad matmul");
+            return;
+        }
 
         // w -= lr*grad（f16 存储就地更新；先抬 f32 再落回）
-        auto upd = nn::dsl::compute_into(eng,
-            nn::dsl::leaf(*tw) - nn::dsl::leaf(*grad) * nn::dsl::rparam(lr), *tw);
-        if (!upd) { CHECK(false, "参数更新"); return; }
+        auto upd = nn::dsl::compute_into(
+            eng, nn::dsl::leaf(*tw) - nn::dsl::leaf(*grad) * nn::dsl::rparam(lr), *tw);
+        if (!upd)
+        {
+            CHECK(false, "参数更新");
+            return;
+        }
         CHECK(tw->precision() == nn::Precision::F16, "训练后权重仍为 f16");
     }
     CHECK(last_loss < first_loss * 0.5f, "全 f16 训练 loss 显著下降");
@@ -412,11 +459,11 @@ struct TrainResult
     bool ok = false;
     float first = 0.0f;
     float last = 0.0f;
-    std::vector<float> losses;   // 每步 loss（f32/f16 轨迹对拍用）
+    std::vector<float> losses; // 每步 loss（f32/f16 轨迹对拍用）
 };
 
-TrainResult train_tiny_gpt(nn::ComputeEngine& eng, const nn::PrecisionProfile& prof,
-                           int steps, float lr, bool verbose)
+TrainResult train_tiny_gpt(nn::ComputeEngine& eng, const nn::PrecisionProfile& prof, int steps,
+                           float lr, bool verbose)
 {
     TrainResult out;
     nn::GptConfig cfg{};
@@ -429,7 +476,11 @@ TrainResult train_tiny_gpt(nn::ComputeEngine& eng, const nn::PrecisionProfile& p
     cfg.precision = prof;
 
     auto mr = nn::build_gpt_model(eng, cfg);
-    if (!mr) { CHECK(false, "build_gpt_model"); return out; }
+    if (!mr)
+    {
+        CHECK(false, "build_gpt_model");
+        return out;
+    }
     nn::Model& model = *mr;
 
     // 确定初值：把全部参数覆盖为固定伪随机值。Linear 的初值来自
@@ -441,7 +492,8 @@ TrainResult train_tiny_gpt(nn::ComputeEngine& eng, const nn::PrecisionProfile& p
         for (auto& p : model.parameters())
         {
             nn::Matrix m(p.get().rows(), p.get().cols());
-            for (auto& v : m.span()) v = nd(rng);
+            for (auto& v : m.span())
+                v = nd(rng);
             if (auto r = eng.copy_from(p.get(), m); !r)
             {
                 CHECK(false, "copy_from(固定初值)");
@@ -450,9 +502,13 @@ TrainResult train_tiny_gpt(nn::ComputeEngine& eng, const nn::PrecisionProfile& p
         }
     }
 
-    auto opt = nn::create_optimizer("adamw", eng, model.parameters(),
-                                    model.param_gradients(), lr, 0.0f, prof);
-    if (!opt) { CHECK(false, "create_optimizer"); return out; }
+    auto opt = nn::create_optimizer("adamw", eng, model.parameters(), model.param_gradients(), lr,
+                                    0.0f, prof);
+    if (!opt)
+    {
+        CHECK(false, "create_optimizer");
+        return out;
+    }
 
     const std::size_t batch = 2;
     const std::size_t total = batch * cfg.seq_len;
@@ -464,7 +520,11 @@ TrainResult train_tiny_gpt(nn::ComputeEngine& eng, const nn::PrecisionProfile& p
         tgt.set_value(i % cfg.vocab_size, i, 1.0f);
     auto xt = eng.from_matrix(x);
     auto tt = eng.from_matrix(tgt);
-    if (!xt || !tt) { CHECK(false, "from_matrix"); return out; }
+    if (!xt || !tt)
+    {
+        CHECK(false, "from_matrix");
+        return out;
+    }
 
     nn::CrossEntropyLoss ce;
     ce.set_precision_profile(prof);
@@ -480,34 +540,60 @@ TrainResult train_tiny_gpt(nn::ComputeEngine& eng, const nn::PrecisionProfile& p
             if (!std::isfinite(v))
             {
                 std::fprintf(stderr, "      [%s] step %d 首个非有限值: %s @%s 前 4 值 %.4g %.4g\n",
-                             g_label, g_step, tag, t.shape_str().c_str(),
-                             m->span()[0], m->span()[1]);
+                             g_label, g_step, tag, t.shape_str().c_str(), m->span()[0],
+                             m->span()[1]);
                 return;
             }
     };
 
     // 固定初值后先扫一遍参数：确认 NaN 不是初始化引入的
     if (verbose)
-        for (auto& p : model.parameters()) scan("init-param", p.get());
+        for (auto& p : model.parameters())
+            scan("init-param", p.get());
 
     for (int s = 0; s < steps; ++s)
     {
         g_step = s;
-        if (auto r = model.zero_grad(); !r) { CHECK(false, "zero_grad"); return out; }
+        if (auto r = model.zero_grad(); !r)
+        {
+            CHECK(false, "zero_grad");
+            return out;
+        }
         auto logits = model.forward(*xt);
-        if (!logits) { CHECK(false, "model.forward"); return out; }
+        if (!logits)
+        {
+            CHECK(false, "model.forward");
+            return out;
+        }
         scan("forward/logits", *logits);
         auto loss = ce.forward(eng, *logits, *tt);
-        if (!loss) { CHECK(false, "ce.forward"); return out; }
+        if (!loss)
+        {
+            CHECK(false, "ce.forward");
+            return out;
+        }
         auto grad = ce.backward();
-        if (!grad) { CHECK(false, "ce.backward"); return out; }
+        if (!grad)
+        {
+            CHECK(false, "ce.backward");
+            return out;
+        }
         scan("ce/backward", *grad);
         auto bwd = model.backward(*grad);
-        if (!bwd) { CHECK(false, "model.backward"); return out; }
+        if (!bwd)
+        {
+            CHECK(false, "model.backward");
+            return out;
+        }
         scan("model/backward-out", *bwd);
         if (verbose && s < 3)
-            for (auto& p : model.param_gradients()) scan("param-grad", p.get());
-        if (auto r = opt->step(); !r) { CHECK(false, "optimizer.step"); return out; }
+            for (auto& p : model.param_gradients())
+                scan("param-grad", p.get());
+        if (auto r = opt->step(); !r)
+        {
+            CHECK(false, "optimizer.step");
+            return out;
+        }
         if (s == 0) out.first = *loss;
         out.last = *loss;
         out.losses.push_back(*loss);
@@ -530,8 +616,7 @@ TrainResult train_tiny_gpt(nn::ComputeEngine& eng, const nn::PrecisionProfile& p
                     }
                     if (bad || mx > 1e4)
                         std::fprintf(stderr, "      参数异常: %s max=%.3g%s\n",
-                                     p.get().shape_str().c_str(), mx,
-                                     bad ? " (NaN/Inf)" : "");
+                                     p.get().shape_str().c_str(), mx, bad ? " (NaN/Inf)" : "");
                 }
                 break;
             }
@@ -554,8 +639,7 @@ void test_f16_model_e2e(nn::ComputeEngine& raw, nn::ComputeEngine& eng)
     // 对照：原生引擎 + 全 f32 profile（现状路径）
     const auto r32 = train_tiny_gpt(raw, nn::profile_f32(), STEPS, LR, false);
     CHECK(r32.ok, "profile_f32 训练完成");
-    if (r32.ok)
-        CHECK(r32.losses.back() <= r32.losses.front(), "profile_f32（原生引擎）loss 不增");
+    if (r32.ok) CHECK(r32.losses.back() <= r32.losses.front(), "profile_f32（原生引擎）loss 不增");
 
     // profile_f16：param + compute f16（CLI --f16 语义）
     // NN_F16_DEBUG=1 → 逐 step loss + 逐阶段非有限值扫描（定位 CPU f16 发散用）
@@ -568,10 +652,10 @@ void test_f16_model_e2e(nn::ComputeEngine& raw, nn::ComputeEngine& eng)
     {
         // 硬失败判据：f16 训练 loss 必须全程有限（轨迹与 f32 对齐是本测试
         // 前提）——出现非有限值即发散，直接失败，不做任何容忍分支。
-        std::fprintf(stderr, "  FAIL %s: f16 训练出现非有限 loss（回归！）"
-                             " 轨迹: %.4f → %.4f\n",
-                     g_label, r16.losses.empty() ? 0.0 : r16.losses.front(),
-                     r16.losses.back());
+        std::fprintf(stderr,
+                     "  FAIL %s: f16 训练出现非有限 loss（回归！）"
+                     " 轨迹: %.4f → %.4f\n",
+                     g_label, r16.losses.empty() ? 0.0 : r16.losses.front(), r16.losses.back());
         ++g_failures;
         return;
     }
@@ -586,16 +670,19 @@ void test_f16_model_e2e(nn::ComputeEngine& raw, nn::ComputeEngine& eng)
         max_rel = std::max(max_rel, rel);
     }
     CHECK(max_rel < 0.10, "f16 训练轨迹与 f32 逐 step 一致（<10%）");
-    if (max_rel >= 0.10)
-        std::fprintf(stderr, "    轨迹最大相对偏差 %.3f\n", max_rel);
-    std::fprintf(stderr, "    [%s] f32 %.4f → %.4f ; f16 %.4f → %.4f (max_rel=%.4f)\n",
-                 g_label, r32.losses.front(), r32.losses.back(),
-                 r16.losses.front(), r16.losses.back(), max_rel);
+    if (max_rel >= 0.10) std::fprintf(stderr, "    轨迹最大相对偏差 %.3f\n", max_rel);
+    std::fprintf(stderr, "    [%s] f32 %.4f → %.4f ; f16 %.4f → %.4f (max_rel=%.4f)\n", g_label,
+                 r32.losses.front(), r32.losses.back(), r16.losses.front(), r16.losses.back(),
+                 max_rel);
     // 参数精度必须由 profile 驱动：profile_f16 下全部参数 f16、f32 下全 f32
     {
         nn::GptConfig cfg{};
-        cfg.vocab_size = 32; cfg.d_model = 16; cfg.seq_len = 4;
-        cfg.num_heads = 2; cfg.d_ff = 32; cfg.num_layers = 2;
+        cfg.vocab_size = 32;
+        cfg.d_model = 16;
+        cfg.seq_len = 4;
+        cfg.num_heads = 2;
+        cfg.d_ff = 32;
+        cfg.num_layers = 2;
         cfg.precision = nn::profile_f16();
         auto m16 = nn::build_gpt_model(eng, cfg);
         CHECK(m16.has_value(), "build_gpt_model(profile_f16)");
@@ -641,15 +728,20 @@ void test_f16_model_e2e(nn::ComputeEngine& raw, nn::ComputeEngine& eng)
 void run_profile_matrix(nn::ComputeEngine& eng, bool verbose)
 {
     using P = nn::Precision;
-    struct Case { const char* name; nn::PrecisionProfile prof; bool healthy; };
+    struct Case
+    {
+        const char* name;
+        nn::PrecisionProfile prof;
+        bool healthy;
+    };
     const Case cases[] = {
-        {"f32",         nn::profile_f32(),                 true},
-        {"param=f16",   {P::F16, P::F32, P::F32, P::F32},  true},
-        {"compute=f16", {P::F32, P::F16, P::F32, P::F32},  true},
-        {"stable=f16",  {P::F32, P::F32, P::F16, P::F32},  true},
-        {"opt=f16",     {P::F32, P::F32, P::F32, P::F16},  false},
-        {"all=f16",     nn::profile_all_f16(),             false},
-        {"f16(CLI)",    nn::profile_f16(),                 true},
+        {"f32", nn::profile_f32(), true},
+        {"param=f16", {P::F16, P::F32, P::F32, P::F32}, true},
+        {"compute=f16", {P::F32, P::F16, P::F32, P::F32}, true},
+        {"stable=f16", {P::F32, P::F32, P::F16, P::F32}, true},
+        {"opt=f16", {P::F32, P::F32, P::F32, P::F16}, false},
+        {"all=f16", nn::profile_all_f16(), false},
+        {"f16(CLI)", nn::profile_f16(), true},
     };
     const char* saved = g_label;
     for (const auto& c : cases)
@@ -692,15 +784,14 @@ void test_full_f16_training(nn::ComputeEngine& eng)
     const char* saved = g_label;
     g_label = "fullf16";
     nn::PrecisionProfile full = nn::profile_f16();
-    full.stable    = nn::Precision::F16;
+    full.stable = nn::Precision::F16;
     full.optimizer = nn::Precision::F16;
     const TrainResult r = train_tiny_gpt(eng, full, /*steps=*/20, /*lr=*/3e-3f,
                                          /*verbose=*/false);
     CHECK(!r.losses.empty(), "full-f16：训练未产出 loss");
     for (const float l : r.losses)
         CHECK(std::isfinite(l), "full-f16：loss 必须有限（NaN/inf = optimizer=f16 退化）");
-    if (r.losses.size() >= 2)
-        CHECK(r.losses.back() < r.losses.front(), "full-f16：loss 应下降");
+    if (r.losses.size() >= 2) CHECK(r.losses.back() < r.losses.front(), "full-f16：loss 应下降");
     g_label = saved;
 }
 
@@ -713,8 +804,8 @@ void test_full_f16_training(nn::ComputeEngine& eng)
 // 只让**求和**越过 65504 —— 从而把「输出溢出」与「元素级溢出」区分开。
 void test_ce_loss_stable_f16_no_overflow(nn::ComputeEngine& eng)
 {
-    constexpr std::size_t C = 100;      // 词表：lse ≈ ln(100) ≈ 4.6
-    constexpr std::size_t N = 20000;    // token：Σ ≈ -4.6·20000 ≈ -92000 > 65504
+    constexpr std::size_t C = 100; // 词表：lse ≈ ln(100) ≈ 4.6
+    constexpr std::size_t N = 20000; // token：Σ ≈ -4.6·20000 ≈ -92000 > 65504
     nn::Matrix logits(C, N);
     std::mt19937 rng(777);
     std::uniform_real_distribution<float> dist(-2.0f, 2.0f);
@@ -736,14 +827,14 @@ void test_ce_loss_stable_f16_no_overflow(nn::ComputeEngine& eng)
     if (!ref) return;
 
     nn::CrossEntropyLoss ce16;
-    ce16.set_precision_profile({nn::Precision::F32, nn::Precision::F32,
-                                nn::Precision::F16, nn::Precision::F32});
+    ce16.set_precision_profile(
+        {nn::Precision::F32, nn::Precision::F32, nn::Precision::F16, nn::Precision::F32});
     auto got = ce16.forward_sparse(eng, *t, labels, {}, C);
     CHECK(got.has_value(), "ce-f16-overflow: stable=f16 forward_sparse");
     if (!got) return;
 
-    std::fprintf(stderr, "    [%s] ce loss: f32 %.4f ; stable=f16 %.4f\n",
-                 g_label, static_cast<double>(*ref), static_cast<double>(*got));
+    std::fprintf(stderr, "    [%s] ce loss: f32 %.4f ; stable=f16 %.4f\n", g_label,
+                 static_cast<double>(*ref), static_cast<double>(*got));
     CHECK(std::isfinite(static_cast<double>(*got)),
           "stable=f16 的 loss 必须有限（(1,1) 归约输出不得落 f16 溢出为 ±inf）");
     CHECK(std::fabs(static_cast<double>(*got) - static_cast<double>(*ref)) <=
@@ -789,7 +880,7 @@ int main()
     {
         auto cpu_owner = nn::CpuEngine::create();
         nn::CpuEngine& cpu = *cpu_owner;
-        nn::ComputeEngine& adapter = cpu;   // P-1：原 PrecisionEngine 已下沉
+        nn::ComputeEngine& adapter = cpu; // P-1：原 PrecisionEngine 已下沉
         run_suite("cpu", cpu, adapter, /*allow_arbitrary_expr=*/true);
         if (env_flag("NN_F16_DEBUG"))
         {
@@ -802,12 +893,12 @@ int main()
     // GPU（可选；设备不可用则跳过 GPU 部分而不是失败）
     {
         auto backend_owner = nn::GpuBackend::shared();
-    nn::GpuBackend& backend = *backend_owner;
+        nn::GpuBackend& backend = *backend_owner;
         if (backend.initialize())
         {
             auto gpu_owner = nn::GpuEngine::create(backend);
             nn::GpuEngine& gpu = *gpu_owner;
-            nn::ComputeEngine& adapter = gpu;   // P-1：原 PrecisionEngine 已下沉
+            nn::ComputeEngine& adapter = gpu; // P-1：原 PrecisionEngine 已下沉
             run_suite("gpu", gpu, adapter, /*allow_arbitrary_expr=*/false);
         }
         else

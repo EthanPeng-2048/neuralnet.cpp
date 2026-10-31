@@ -17,13 +17,14 @@
 #include <string>
 #include "test_common.hpp"
 
-using nn::Scalar;
-using nn::Matrix;
-using nn::Tensor;
 using nn::ComputeEngine;
+using nn::Matrix;
+using nn::Scalar;
 using nn::Softmax;
+using nn::Tensor;
 
-namespace {
+namespace
+{
 
 
 Scalar eval_loss(ComputeEngine& engine, Softmax& sm, const Tensor& x, const Tensor& go)
@@ -35,8 +36,7 @@ Scalar eval_loss(ComputeEngine& engine, Softmax& sm, const Tensor& x, const Tens
 }
 
 
-bool check_input_grad(ComputeEngine& engine, Softmax& sm,
-                      const Tensor& go, const Tensor& grad_x,
+bool check_input_grad(ComputeEngine& engine, Softmax& sm, const Tensor& go, const Tensor& grad_x,
                       const Matrix& x_m, Scalar eps, Scalar tol)
 {
     bool ok = true;
@@ -63,13 +63,13 @@ bool check_input_grad(ComputeEngine& engine, Softmax& sm,
             {
                 ok = false;
                 if (bad < 8)
-                    std::cout << "  [FAIL] (" << r << "," << c << ") num=" << num
-                              << " ana=" << ana << " err=" << err << "\n";
+                    std::cout << "  [FAIL] (" << r << "," << c << ") num=" << num << " ana=" << ana
+                              << " err=" << err << "\n";
                 ++bad;
             }
         }
-    std::cout << "  grad_x: " << (ok ? "OK" : "FAIL")
-              << "  max_err=" << max_err << "  bad=" << bad << "\n";
+    std::cout << "  grad_x: " << (ok ? "OK" : "FAIL") << "  max_err=" << max_err << "  bad=" << bad
+              << "\n";
     return ok;
 }
 
@@ -85,8 +85,10 @@ int main(int argc, char* argv[])
     {
         std::string a = argv[i];
         if (a == "--tol" && i + 1 < argc) tol = static_cast<Scalar>(std::atof(argv[++i]));
-        else if (a == "--rows" && i + 1 < argc) rows = static_cast<std::size_t>(std::atoi(argv[++i]));
-        else if (a == "--cols" && i + 1 < argc) cols = static_cast<std::size_t>(std::atoi(argv[++i]));
+        else if (a == "--rows" && i + 1 < argc)
+            rows = static_cast<std::size_t>(std::atoi(argv[++i]));
+        else if (a == "--cols" && i + 1 < argc)
+            cols = static_cast<std::size_t>(std::atoi(argv[++i]));
         else if (a == "--gpu") use_gpu = true;
         else if (a == "--help")
         {
@@ -113,8 +115,10 @@ int main(int argc, char* argv[])
     std::uniform_real_distribution<Scalar> dist(-2, 2);
     Matrix x_m(rows, cols);
     Matrix go_m(rows, cols);
-    for (std::size_t i = 0; i < x_m.size(); ++i) x_m.span()[i] = dist(rng);
-    for (std::size_t i = 0; i < go_m.size(); ++i) go_m.span()[i] = dist(rng);
+    for (std::size_t i = 0; i < x_m.size(); ++i)
+        x_m.span()[i] = dist(rng);
+    for (std::size_t i = 0; i < go_m.size(); ++i)
+        go_m.span()[i] = dist(rng);
 
     auto x = eng.from_matrix(x_m);
     auto go = eng.from_matrix(go_m);

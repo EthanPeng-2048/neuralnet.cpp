@@ -51,8 +51,10 @@ struct Fixture
         params.push_back(engine.create_tensor(3, 1, nn::Precision::F32, nn::InitSpec::zero()));
         grads.push_back(engine.create_tensor(4, 3, nn::Precision::F32, nn::InitSpec::zero()));
         grads.push_back(engine.create_tensor(3, 1, nn::Precision::F32, nn::InitSpec::zero()));
-        for (auto& p : params) pref.push_back(std::ref(p));
-        for (auto& g : grads) gref.push_back(std::ref(g));
+        for (auto& p : params)
+            pref.push_back(std::ref(p));
+        for (auto& g : grads)
+            gref.push_back(std::ref(g));
         set_params_from_seed(/*seed=*/1);
         set_grads(0);
     }
@@ -65,8 +67,8 @@ struct Fixture
             nn::Matrix m(params[pi].rows(), params[pi].cols());
             auto s = m.span();
             for (std::size_t k = 0; k < s.size(); ++k)
-                s[k] = 0.05f * static_cast<float>((static_cast<int>(k) * 7 + seed * 3) % 11 - 5)
-                     + 0.001f * static_cast<float>(pi);
+                s[k] = 0.05f * static_cast<float>((static_cast<int>(k) * 7 + seed * 3) % 11 - 5) +
+                       0.001f * static_cast<float>(pi);
             NN_ASSERT_ALWAYS(engine.copy_from(params[pi], m), "upload params");
         }
     }
@@ -90,7 +92,8 @@ struct Fixture
     [[nodiscard]] std::vector<nn::Matrix> snapshot()
     {
         std::vector<nn::Matrix> out;
-        for (const auto& p : params) out.push_back(download(engine, p));
+        for (const auto& p : params)
+            out.push_back(download(engine, p));
         return out;
     }
 
@@ -102,8 +105,7 @@ struct Fixture
     }
 };
 
-[[nodiscard]] bool same_params(const std::vector<nn::Matrix>& a,
-                               const std::vector<nn::Matrix>& b)
+[[nodiscard]] bool same_params(const std::vector<nn::Matrix>& a, const std::vector<nn::Matrix>& b)
 {
     if (a.size() != b.size()) return false;
     for (std::size_t i = 0; i < a.size(); ++i)
@@ -120,8 +122,8 @@ struct Fixture
 [[nodiscard]] std::unique_ptr<nn::Optimizer> make(Fixture& fx, const std::string& name)
 {
     return nn::create_optimizer(name, fx.engine, fx.pref, fx.gref,
-                                /*lr=*/0.01f, /*weight_decay=*/0.01f,
-                                nn::PrecisionProfile{}, 0.9f, 0.999f);
+                                /*lr=*/0.01f, /*weight_decay=*/0.01f, nn::PrecisionProfile{}, 0.9f,
+                                0.999f);
 }
 
 // 表里声明的"逻辑状态缓冲数" → 期望的张量数（每参数）
@@ -145,7 +147,8 @@ void test_state_presence()
         CHECK(opt != nullptr, ("create_optimizer: " + std::string(meta.name)).c_str());
         if (!opt) continue;
 
-        for (std::size_t s = 0; s < 3; ++s) fx.step(*opt, s);
+        for (std::size_t s = 0; s < 3; ++s)
+            fx.step(*opt, s);
 
         std::vector<nn::Tensor> state;
         auto sr = opt->save_state(state);
@@ -153,15 +156,16 @@ void test_state_presence()
         const std::size_t want = expected_tensors_per_param(meta.name) * kParams;
         CHECK(state.size() == want,
               ("状态张量数 = " + std::to_string(want) + "（" + std::string(meta.name) +
-               "），实际 " + std::to_string(state.size())).c_str());
+               "），实际 " + std::to_string(state.size()))
+                  .c_str());
         if (meta.state_bufs == 0 && meta.name != "adamwquant")
             CHECK(state.empty(), "无状态优化器（sgd）导出的状态为空");
         else if (state.empty())
             CHECK(false, "有状态优化器不得导出空状态（新优化器必须实现 save_state）");
 
         // 步计数器：Adam 家族非零；无状态优化器恒 0
-        const bool adam_family = meta.name == "adam" || meta.name == "adamw" ||
-                                 meta.name == "adamwquant";
+        const bool adam_family =
+            meta.name == "adam" || meta.name == "adamw" || meta.name == "adamwquant";
         CHECK(opt->state_step() == (adam_family ? 3u : 0u),
               ("state_step: " + std::string(meta.name)).c_str());
 
@@ -173,7 +177,11 @@ void test_state_presence()
             {
                 const auto m = download(fx.engine, state[i]);
                 for (float v : m.span())
-                    if (v != 0.0f) { nonzero = true; break; }
+                    if (v != 0.0f)
+                    {
+                        nonzero = true;
+                        break;
+                    }
             }
             CHECK(nonzero, ("重启后状态非零（" + std::string(meta.name) + "）").c_str());
         }
@@ -195,8 +203,13 @@ void test_resume_continuity()
         Fixture a;
         a.build();
         auto opt_a = make(a, name);
-        if (!opt_a) { CHECK(false, "create_optimizer (A)"); continue; }
-        for (std::size_t s = 0; s < kTotal; ++s) a.step(*opt_a, s);
+        if (!opt_a)
+        {
+            CHECK(false, "create_optimizer (A)");
+            continue;
+        }
+        for (std::size_t s = 0; s < kTotal; ++s)
+            a.step(*opt_a, s);
         const auto params_a = a.snapshot();
 
         // B：跑到中途 → 存状态 → 新建优化器（模拟进程重启）→ 载入续跑
@@ -204,8 +217,13 @@ void test_resume_continuity()
         b.build();
         b.set_params_from_seed(1);   // 与 A 同一初值
         auto opt_b = make(b, name);
-        if (!opt_b) { CHECK(false, "create_optimizer (B)"); continue; }
-        for (std::size_t s = 0; s < kSplit; ++s) b.step(*opt_b, s);
+        if (!opt_b)
+        {
+            CHECK(false, "create_optimizer (B)");
+            continue;
+        }
+        for (std::size_t s = 0; s < kSplit; ++s)
+            b.step(*opt_b, s);
         std::vector<nn::Tensor> saved;
         auto sr = opt_b->save_state(saved);
         CHECK(sr.has_value(), ("save_state（中断点）: " + name).c_str());
@@ -213,11 +231,16 @@ void test_resume_continuity()
 
         opt_b.reset();                       // "进程死了"：优化器连同状态一起消失
         auto opt_b2 = make(b, name);         // 重启后重新构造（状态为零初始化）
-        if (!opt_b2) { CHECK(false, "create_optimizer (B2)"); continue; }
+        if (!opt_b2)
+        {
+            CHECK(false, "create_optimizer (B2)");
+            continue;
+        }
         opt_b2->set_state_step(saved_step);
         auto lr2 = opt_b2->load_state(saved);
         CHECK(lr2.has_value(), ("load_state（重启）: " + name).c_str());
-        for (std::size_t s = kSplit; s < kTotal; ++s) b.step(*opt_b2, s);
+        for (std::size_t s = kSplit; s < kTotal; ++s)
+            b.step(*opt_b2, s);
         CHECK(same_params(params_a, b.snapshot()),
               ("重启续跑与直跑参数逐位一致（" + name + "）").c_str());
 
@@ -228,12 +251,22 @@ void test_resume_continuity()
         c.build();
         c.set_params_from_seed(1);
         auto opt_c = make(c, name);
-        if (!opt_c) { CHECK(false, "create_optimizer (C)"); continue; }
-        for (std::size_t s = 0; s < kSplit; ++s) c.step(*opt_c, s);
+        if (!opt_c)
+        {
+            CHECK(false, "create_optimizer (C)");
+            continue;
+        }
+        for (std::size_t s = 0; s < kSplit; ++s)
+            c.step(*opt_c, s);
         opt_c.reset();
         auto opt_c2 = make(c, name);         // 不载入状态、不恢复 t
-        if (!opt_c2) { CHECK(false, "create_optimizer (C2)"); continue; }
-        for (std::size_t s = kSplit; s < kTotal; ++s) c.step(*opt_c2, s);
+        if (!opt_c2)
+        {
+            CHECK(false, "create_optimizer (C2)");
+            continue;
+        }
+        for (std::size_t s = kSplit; s < kTotal; ++s)
+            c.step(*opt_c2, s);
         if (stateful)
             CHECK(!same_params(params_a, c.snapshot()),
                   ("冷启动续跑与直跑不同（负例具判别力：" + name + "）").c_str());
@@ -250,8 +283,13 @@ void test_state_mismatch()
     Fixture fx;
     fx.build();
     auto opt = make(fx, "adam");
-    if (!opt) { CHECK(false, "create_optimizer"); return; }
-    for (std::size_t s = 0; s < 2; ++s) fx.step(*opt, s);
+    if (!opt)
+    {
+        CHECK(false, "create_optimizer");
+        return;
+    }
+    for (std::size_t s = 0; s < 2; ++s)
+        fx.step(*opt, s);
     std::vector<nn::Tensor> state;
     NN_ASSERT_ALWAYS(opt->save_state(state), "save_state");
 
@@ -266,8 +304,7 @@ void test_state_mismatch()
     CHECK(!bad_shape.has_value(), "状态张量形状不符 → 报错");
     // sgd 无状态：给非空状态 → 报错
     auto sgd = make(fx, "sgd");
-    if (sgd)
-        CHECK(!sgd->load_state(state).has_value(), "无状态优化器收到状态 → 报错");
+    if (sgd) CHECK(!sgd->load_state(state).has_value(), "无状态优化器收到状态 → 报错");
 }
 } // namespace
 

@@ -19,11 +19,11 @@
 
 int g_fail = 0;
 
-namespace {
+namespace
+{
 
 // 逐位比对（容差 1e-4；两侧同引擎同精度）
-void compare(nn::ComputeEngine& e, const nn::Tensor& got, const nn::Tensor& ref,
-             const char* msg)
+void compare(nn::ComputeEngine& e, const nn::Tensor& got, const nn::Tensor& ref, const char* msg)
 {
     CHECK(got.rows() == ref.rows() && got.cols() == ref.cols(), msg);
     if (got.rows() != ref.rows() || got.cols() != ref.cols()) return;
@@ -89,10 +89,10 @@ void test_mha_consistency()
     CHECK(gpair.has_value(), "[1] backward_pair");
     if (!gmha || !gpair) return;
     // grad_query + grad_memory == MHA 的 grad_input（同一投影拆分的两半）
-    CHECK(gpair->grad_query.rows() == d_model &&
-          gpair->grad_query.cols() == batch * seq, "[1] grad_query 形状");
-    CHECK(gpair->grad_memory.rows() == d_model &&
-          gpair->grad_memory.cols() == batch * seq, "[1] grad_memory 形状");
+    CHECK(gpair->grad_query.rows() == d_model && gpair->grad_query.cols() == batch * seq,
+          "[1] grad_query 形状");
+    CHECK(gpair->grad_memory.rows() == d_model && gpair->grad_memory.cols() == batch * seq,
+          "[1] grad_memory 形状");
     auto gsum = download(*engine2, gpair->grad_query);
     auto gmem = download(*engine2, gpair->grad_memory);
     auto gs = gsum.span();
@@ -104,7 +104,8 @@ void test_mha_consistency()
         if (std::fabs(gs[i] + gms[i] - rs[i]) > 1e-4f)
         {
             std::printf("[FAIL] [1] grad_query+grad_memory == MHA grad_input: "
-                        "idx=%zu got=%g ref=%g\n", i, gs[i] + gms[i], rs[i]);
+                        "idx=%zu got=%g ref=%g\n",
+                        i, gs[i] + gms[i], rs[i]);
             ++g_fail;
             break;
         }
@@ -127,7 +128,8 @@ void test_rectangular()
           "[2] 输出形状 (d_model, batch*seq_q)");
     const auto om = download(*engine, *out);
     bool finite = true;
-    for (auto v : om.span()) if (!std::isfinite(v)) finite = false;
+    for (auto v : om.span())
+        if (!std::isfinite(v)) finite = false;
     CHECK(finite, "[2] 输出有限");
 
     auto grad = make_tensor(*engine, d_model, batch * seq_q, 0.02f, 0.01f);
@@ -136,11 +138,12 @@ void test_rectangular()
     if (!g) return;
     CHECK(g->grad_query.rows() == d_model && g->grad_query.cols() == batch * seq_q,
           "[2] grad_query 形状");
-    CHECK(g->grad_memory.rows() == d_model &&
-          g->grad_memory.cols() == batch * seq_kv, "[2] grad_memory 形状");
+    CHECK(g->grad_memory.rows() == d_model && g->grad_memory.cols() == batch * seq_kv,
+          "[2] grad_memory 形状");
     const auto grm = download(*engine, g->grad_memory);
     finite = true;
-    for (auto v : grm.span()) if (!std::isfinite(v)) finite = false;
+    for (auto v : grm.span())
+        if (!std::isfinite(v)) finite = false;
     CHECK(finite, "[2] grad_memory 有限");
 }
 
@@ -197,8 +200,7 @@ void test_gradcheck()
             auto pm = download(*engine, p.get());
             auto sp = pm.span();
             for (std::size_t i = 0; i < sp.size(); ++i, ++k)
-                sp[i] = 0.05f * std::sin(0.7f * static_cast<nn::Scalar>(
-                    (k * 17) % 23 + 1));
+                sp[i] = 0.05f * std::sin(0.7f * static_cast<nn::Scalar>((k * 17) % 23 + 1));
             auto cp = engine->copy_from(p.get(), pm);
             CHECK(cp.has_value(), "[5] 权重回写");
         }
@@ -210,20 +212,26 @@ void test_gradcheck()
     for (std::size_t i = 0; i < y_n; ++i)
         W[i] = 0.01f * static_cast<nn::Scalar>(i % 7 + 1);
 
-    auto eval = [&]() -> nn::Scalar {
+    auto eval = [&]() -> nn::Scalar
+    {
         auto y = xattn.forward_pair(q, m);
         NN_ASSERT_ALWAYS(y, "gradcheck eval: forward_pair failed");
         auto ym = download(*engine, *y);
         const auto sp = ym.span();
         nn::Scalar loss = 0;
-        for (std::size_t i = 0; i < sp.size(); ++i) loss += sp[i] * W[i];
+        for (std::size_t i = 0; i < sp.size(); ++i)
+            loss += sp[i] * W[i];
         return loss;
     };
 
     // 解析梯度：go 第 i 列 = W 第 i 列 → backward_pair 的两路梯度即
     // d<Y,W>/dq 与 d<Y,W>/dm（W 由 go 的列主序承载）
     nn::Matrix go_m(d_model, batch * seq_q);
-    { auto sp = go_m.span(); for (std::size_t i = 0; i < y_n; ++i) sp[i] = W[i]; }
+    {
+        auto sp = go_m.span();
+        for (std::size_t i = 0; i < y_n; ++i)
+            sp[i] = W[i];
+    }
     auto go = upload(*engine, go_m);
     (void)eval();   // backward_pair 需要 forward_pair 的缓存
     auto g = xattn.backward_pair(go);
@@ -237,7 +245,8 @@ void test_gradcheck()
     auto ga_m = download(*engine, g->grad_memory);
 
     // in-place 扰动辅助：改 t 的第 idx 个标量（经 copy_from 写回）
-    auto perturb = [&](nn::Tensor& t, std::size_t idx, nn::Scalar v) {
+    auto perturb = [&](nn::Tensor& t, std::size_t idx, nn::Scalar v)
+    {
         auto tm = download(*engine, t);
         tm.span()[idx] = v;
         auto cp = engine->copy_from(t, tm);
@@ -265,8 +274,7 @@ void test_gradcheck()
         const nn::Scalar ana = ga_q.span()[idx];
         if (std::fabs(num - ana) > tol)
         {
-            std::printf("[FAIL] [5] grad_query idx=%zu num=%g ana=%g\n",
-                        idx, num, ana);
+            std::printf("[FAIL] [5] grad_query idx=%zu num=%g ana=%g\n", idx, num, ana);
             ++bad_q;
         }
     }
@@ -286,8 +294,7 @@ void test_gradcheck()
         const nn::Scalar ana = ga_m.span()[idx];
         if (std::fabs(num - ana) > tol)
         {
-            std::printf("[FAIL] [5] grad_memory idx=%zu num=%g ana=%g\n",
-                        idx, num, ana);
+            std::printf("[FAIL] [5] grad_memory idx=%zu num=%g ana=%g\n", idx, num, ana);
             ++bad_m;
         }
     }

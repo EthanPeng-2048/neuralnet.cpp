@@ -2178,6 +2178,21 @@ GPU 后端 / GPU 引擎头文件「历史状态类注释」摘录。整改原则
 - 验收：`.clang-format` 能被 clang-format 23 解析（`--style=file` 退出码 0）；`.gitattributes`
   落地后 `git status` 无重规范化噪声（工作树本来就全 LF）。
 
+## 全仓 clang-format 基线化（2026-10-31）
+
+- 类型：演进记录（**推翻**上文 2026-10-11「整仓 clang-format 重排被否决」的结论）
+- 内容：`5854b98` 对全仓 187 个 `*.cpp` / `*.hpp` / `*.inc` 跑 `clang-format -i`（配置即
+  `.clang-format`，未改任何取值），净改动约 1.9 万行；随后 5 个子仓各自同配置格式化并打
+  tag（base `v1.0.2`、dataset `v1.0.1`、kvrecord `v1.1.1`、threadpool `v1.0.1`、
+  tokenizer `v1.0.1`），门面 `c94f315` bump 指针。
+- 为什么推翻旧结论：旧结论的前提是「存量手工排版是风格基线，整仓重排会制造 41% 的行级
+  噪声」；维护者决定把噪声**一次性付清**，此后新改动不再需要与两种写法共存，`git clang-format`
+  的增量格式化也不再产生大 diff。
+- 代价（已知，不再重复申诉）：`git blame` 在该提交处断代，历史行归属需 `-w --follow` 或
+  `git blame <5854b98^> -- path` 回看；`src/` 测试与 4 个 `compute_vk_backend_*.inc` 同批被重排。
+- 验收：Release 全量 ctest **73 注册 → 72 pass + 1 skip + 0 fail**（skip = `scan_bitwise_test`，
+  Windows 平台口径），证明格式化未改语义（宏续行、字符串拼接、4 个 `.inc` 表均编译通过）。
+
 ---
 
 # AGENTS.md

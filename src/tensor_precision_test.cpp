@@ -85,8 +85,7 @@ void test_f16_cpu_tensor(nn::ComputeEngine& eng)
     // 经 F16 槽位下载（降 cast 再升位）语义：仍是精确往返
     auto back16_r = eng.to_matrix(t, nn::Precision::F16);
     CHECK(static_cast<bool>(back16_r), "to_matrix P=F16 succeeds");
-    if (back16_r)
-        CHECK(back16_r->at(0, 0) == 1.5f, "f16 data[0,0] via P=F16 download");
+    if (back16_r) CHECK(back16_r->at(0, 0) == 1.5f, "f16 data[0,0] via P=F16 download");
 
     std::printf(" done\n");
 }
@@ -143,15 +142,15 @@ void test_create_tensor_factory(nn::ComputeEngine& eng)
     {
         auto r = eng.try_create_tensor(2, 2, P);
         CHECK(!r, "try_create_tensor 拒绝非存储精度");
-        if (!r)
-            CHECK(!r.error().message.empty(), "拒绝原因非空（结构化错误）");
+        if (!r) CHECK(!r.error().message.empty(), "拒绝原因非空（结构化错误）");
     }
     // ② 形状溢出 → 拒绝（rows*cols 超过 size_t），而不是回绕后按错误元素数分配
     auto ovf = eng.try_create_tensor(std::numeric_limits<std::size_t>::max() / 2 + 1, 4);
     CHECK(!ovf, "try_create_tensor 拒绝形状溢出");
     // ③ 正常请求仍返回可用张量（Result 成功路径）
     auto ok_r = eng.try_create_tensor(2, 3, nn::Precision::F32);
-    CHECK(static_cast<bool>(ok_r) && ok_r->valid() && ok_r->rows() == 2, "try_create_tensor 成功路径");
+    CHECK(static_cast<bool>(ok_r) && ok_r->valid() && ok_r->rows() == 2,
+          "try_create_tensor 成功路径");
     // ④ InitSpec 重载同协议
     auto z_r = eng.try_create_tensor(2, 3, nn::Precision::F32, nn::InitSpec::zero());
     CHECK(static_cast<bool>(z_r) && z_r->valid(), "try_create_tensor(InitSpec) 成功路径");
@@ -225,8 +224,7 @@ void test_f16_data_roundtrip(nn::ComputeEngine& eng)
     bool exact = true;
     for (std::size_t r = 0; r < 2 && exact; ++r)
         for (std::size_t c = 0; c < 2; ++c)
-            if (back.at(r, c) != static_cast<float>(m.at(r, c)))
-                exact = false;
+            if (back.at(r, c) != static_cast<float>(m.at(r, c))) exact = false;
     CHECK(exact, "f16 roundtrip bit-exact via f32 download");
 
     std::printf(" done\n");

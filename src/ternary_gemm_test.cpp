@@ -53,13 +53,12 @@ void test_layout()
     CHECK(bytes_per_row(512) == 128, "K=512 → 128 B/行 = 0.25 B/权重");
 
     // 位序：第 j 个权重的码在 (word >> 2j) & 3
-    const float w[16] = {1.0f, -1.0f, 0.0f, 0.4f,  -0.4f, 1.0f, -1.0f, 0.0f,
-                         0.9f, -0.9f, 0.1f, -0.1f, 0.6f, -0.6f, 0.0f, 0.0f};
+    const float w[16] = {1.0f, -1.0f, 0.0f, 0.4f,  -0.4f, 1.0f,  -1.0f, 0.0f,
+                         0.9f, -0.9f, 0.1f, -0.1f, 0.6f,  -0.6f, 0.0f,  0.0f};
     std::uint32_t word[1] = {0};
     pack_row(w, 16, /*tau=*/1.0f, word);
     // τ=1 → 阈值 0.5：1.0 → +1(码3)、-1.0 → -1(码1)、|w|≤0.5 → 0(码2)
-    const std::uint32_t expect_codes[16] = {3, 1, 2, 2, 2, 3, 1, 2,
-                                            3, 1, 2, 2, 3, 1, 2, 2};
+    const std::uint32_t expect_codes[16] = {3, 1, 2, 2, 2, 3, 1, 2, 3, 1, 2, 2, 3, 1, 2, 2};
     bool bits_ok = true;
     for (std::uint32_t j = 0; j < 16; ++j)
         if (((word[0] >> (2 * j)) & 3u) != expect_codes[j]) bits_ok = false;
@@ -76,9 +75,8 @@ void test_layout()
     CHECK(roundtrip, "解码往返（尾部位 = 码 2，不是未定义码 0）");
 
     // ── base-3（部署编码，P2）：5 digit/字节，digit = 码 - 1 ─────────────
-    CHECK(kBase3PerByte == 5 && base3_bytes_per_row(128) == 26 &&
-              base3_bytes_per_row(5) == 1 && base3_bytes_per_row(6) == 2 &&
-              base3_bytes_per_row(17) == 4,
+    CHECK(kBase3PerByte == 5 && base3_bytes_per_row(128) == 26 && base3_bytes_per_row(5) == 1 &&
+              base3_bytes_per_row(6) == 2 && base3_bytes_per_row(17) == 4,
           "base-3 尺寸账：ceil(K/5)（128 → 26 B = 1.625 bpw）");
     {
         // 覆盖三种码 + 长度非 5 倍数的尾部：base3 → 2-bit 容器必须与直接打包逐位一致
@@ -96,8 +94,7 @@ void test_layout()
             for (std::size_t i = 0; i < wpr * nn::trit_pack::kPerWord; ++i)
             {
                 const std::uint32_t code = (i < K) ? w[i] : 2u;
-                ref[i / nn::trit_pack::kPerWord] |=
-                    code << (2 * (i % nn::trit_pack::kPerWord));
+                ref[i / nn::trit_pack::kPerWord] |= code << (2 * (i % nn::trit_pack::kPerWord));
             }
             // 容器 → base-3 → 容器（部署落盘/读盘的宿主侧往返，不涉浮点）
             nn::trit_pack::pack_row_base3(ref.data(), K, b3.data());
@@ -105,8 +102,8 @@ void test_layout()
             if (back != ref) b3_ok = false;
             // 单点解码（参考读法）与真值一致
             for (std::size_t i = 0; i < K; ++i)
-                if (nn::trit_pack::at_base3(b3.data(), i) !=
-                    nn::trit_pack::value_of(w[i])) b3_ok = false;
+                if (nn::trit_pack::at_base3(b3.data(), i) != nn::trit_pack::value_of(w[i]))
+                    b3_ok = false;
             // 尾部字必须是"码 2 = 三值 0"
             for (std::size_t i = K; i < wpr * nn::trit_pack::kPerWord; ++i)
                 if (nn::trit_pack::at(back.data(), i) != 0.0f) b3_ok = false;
@@ -117,9 +114,8 @@ void test_layout()
 
 // ── 工具：宿主参考 GEMM（入参是**三值**（已量化），乘逐行 τ；transA=0/1）──
 // GEMM 消费的是量化后的三值权重 —— 参考必须用 trit 而不是原始 latent。
-void ref_gemm(const std::vector<float>& trit, const std::vector<float>& tau,
-              std::size_t rows, std::size_t k, const nn::Matrix& B, bool transA,
-              nn::Matrix& out)
+void ref_gemm(const std::vector<float>& trit, const std::vector<float>& tau, std::size_t rows,
+              std::size_t k, const nn::Matrix& B, bool transA, nn::Matrix& out)
 {
     if (!transA)
     {
@@ -183,12 +179,15 @@ void test_primitives(nn::ComputeEngine& eng, const char* tag)
     for (std::size_t r = 0; r < ROWS; ++r)
     {
         double s = 0.0;
-        for (std::size_t c = 0; c < K; ++c) s += std::fabs(static_cast<double>(W.at(r, c)));
+        for (std::size_t c = 0; c < K; ++c)
+            s += std::fabs(static_cast<double>(W.at(r, c)));
         tau[r] = static_cast<float>(s / static_cast<double>(K));
-        for (std::size_t c = 0; c < K; ++c) w_flat[r * K + c] = W.at(r, c);
+        for (std::size_t c = 0; c < K; ++c)
+            w_flat[r * K + c] = W.at(r, c);
     }
     nn::Matrix tau_m(ROWS, 1);
-    for (std::size_t r = 0; r < ROWS; ++r) tau_m.set_value(r, 0, tau[r]);
+    for (std::size_t r = 0; r < ROWS; ++r)
+        tau_m.set_value(r, 0, tau[r]);
     nn::Tensor tau_t = upload(eng, tau_m);
 
     // 三值（宿主，作为后续参考与"逐位一致"的基准）
@@ -203,8 +202,7 @@ void test_primitives(nn::ComputeEngine& eng, const char* tag)
     if (!packed_r.has_value()) return;
     nn::Tensor packed = std::move(*packed_r);
     const std::size_t words = nn::trit_pack::words_per_row(K);
-    CHECK(packed.rows() == ROWS && packed.cols() == words,
-          "打包容器形状 (rows, ceil(K/16))");
+    CHECK(packed.rows() == ROWS && packed.cols() == words, "打包容器形状 (rows, ceil(K/16))");
     {
         const nn::Matrix pm = download(eng, packed);
         bool same = true;
@@ -246,7 +244,8 @@ void test_primitives(nn::ComputeEngine& eng, const char* tag)
             // 与"f16 稠密缓冲路径"（matmul(wq,·)·τ）等价
             nn::Matrix wq_m(ROWS, K);
             for (std::size_t r = 0; r < ROWS; ++r)
-                for (std::size_t c = 0; c < K; ++c) wq_m.set_value(r, c, trit[r * K + c]);
+                for (std::size_t c = 0; c < K; ++c)
+                    wq_m.set_value(r, c, trit[r * K + c]);
             nn::Tensor wq_t = upload(eng, wq_m, nn::Precision::F16);
             auto dense = eng.matmul(wq_t, Xt, false, false, nn::Precision::F32);
             CHECK(dense.has_value(), "稠密 wq matmul 成功");
@@ -256,9 +255,9 @@ void test_primitives(nn::ComputeEngine& eng, const char* tag)
                 double dmax = 0.0;
                 for (std::size_t r = 0; r < ROWS; ++r)
                     for (std::size_t n = 0; n < N; ++n)
-                        dmax = std::max(dmax,
-                            std::fabs(static_cast<double>(d.at(r, n)) * static_cast<double>(tau[r]) -
-                                      static_cast<double>(ref.at(r, n))));
+                        dmax = std::max(dmax, std::fabs(static_cast<double>(d.at(r, n)) *
+                                                            static_cast<double>(tau[r]) -
+                                                        static_cast<double>(ref.at(r, n))));
                 CHECK(dmax < 1e-5, "f16 稠密路径（P1）同一口径（三值逐位一致）");
             }
         }
@@ -275,9 +274,11 @@ void test_primitives(nn::ComputeEngine& eng, const char* tag)
                 a_flat[k * M + m] = 0.19f * static_cast<float>((k * 5 + m * 3) % 7) - 0.5f;
         nn::Matrix A(K, M);
         for (std::size_t k = 0; k < K; ++k)
-            for (std::size_t m = 0; m < M; ++m) A.set_value(k, m, a_flat[k * M + m]);
+            for (std::size_t m = 0; m < M; ++m)
+                A.set_value(k, m, a_flat[k * M + m]);
         nn::Matrix tau_k_m(K, 1);
-        for (std::size_t k = 0; k < K; ++k) tau_k_m.set_value(k, 0, tau_k[k]);
+        for (std::size_t k = 0; k < K; ++k)
+            tau_k_m.set_value(k, 0, tau_k[k]);
         nn::Tensor At = upload(eng, A);
         nn::Tensor tau_kt = upload(eng, tau_k_m);
         auto pk2_r = eng.trit_pack(At, tau_kt);
@@ -332,7 +333,8 @@ void test_bitlinear_paths(nn::ComputeEngine& eng, const char* tag)
     nn::PrecisionProfile prof;
     prof.param = nn::Precision::T1_58;
 
-    auto make = [&](bool packed) {
+    auto make = [&](bool packed)
+    {
         auto bl = std::make_unique<nn::BitLinear>(IN, OUT);
         bl->set_precision_profile(prof);
         auto r = bl->init(eng);
@@ -364,7 +366,8 @@ void test_bitlinear_paths(nn::ComputeEngine& eng, const char* tag)
     }
 
     // 反向：dX 与 dW 两路对比（同一上游梯度）
-    auto make_grad = [&] {
+    auto make_grad = [&]
+    {
         nn::Matrix G(OUT, B);
         for (std::size_t o = 0; o < OUT; ++o)
             for (std::size_t c = 0; c < B; ++c)
@@ -405,8 +408,8 @@ void test_bitlinear_paths(nn::ComputeEngine& eng, const char* tag)
 //   2. **尾块**：M/N 非 64 倍数、K 非 16 倍数（trit 越界必须判 0 = 三值 0）。
 //   3. **单列**：N=1（自回归解码形态；列块大面积空转，网格与守卫都必须对）。
 // 覆盖 transA=0/1 × f32/f16 存储四种组合。
-void check_gemm_shape(nn::ComputeEngine& eng, std::size_t M, std::size_t K,
-                      std::size_t N, bool transA, bool f16_mode)
+void check_gemm_shape(nn::ComputeEngine& eng, std::size_t M, std::size_t K, std::size_t N,
+                      bool transA, bool f16_mode)
 {
     const std::size_t sr = transA ? K : M;   // A 的存储行数
     const std::size_t al = transA ? M : K;   // A 的存储行长（= 一行三值个数）
@@ -417,24 +420,27 @@ void check_gemm_shape(nn::ComputeEngine& eng, std::size_t M, std::size_t K,
             a_flat[r * al + c] = 0.17f * static_cast<float>((r * 7 + c * 3) % 13) - 0.9f;
     nn::Matrix A_lat(sr, al);
     for (std::size_t r = 0; r < sr; ++r)
-        for (std::size_t c = 0; c < al; ++c) A_lat.set_value(r, c, a_flat[r * al + c]);
+        for (std::size_t c = 0; c < al; ++c)
+            A_lat.set_value(r, c, a_flat[r * al + c]);
 
     // τ = 逐存储行 absmean（宿主；DSL 那条归约由 t1_58_test 覆盖）
     std::vector<float> tau(sr, 0.0f);
     for (std::size_t r = 0; r < sr; ++r)
     {
         double s = 0.0;
-        for (std::size_t c = 0; c < al; ++c) s += std::fabs(a_flat[r * al + c]);
+        for (std::size_t c = 0; c < al; ++c)
+            s += std::fabs(a_flat[r * al + c]);
         tau[r] = static_cast<float>(s / static_cast<double>(al));
     }
     nn::Matrix tau_m(sr, 1);
-    for (std::size_t r = 0; r < sr; ++r) tau_m.set_value(r, 0, tau[r]);
+    for (std::size_t r = 0; r < sr; ++r)
+        tau_m.set_value(r, 0, tau[r]);
 
     std::vector<float> trit(sr * al, 0.0f);
     for (std::size_t r = 0; r < sr; ++r)
         for (std::size_t c = 0; c < al; ++c)
-            trit[r * al + c] = nn::trit_pack::value_of(
-                nn::trit_pack::code_of(a_flat[r * al + c], tau[r]));
+            trit[r * al + c] =
+                nn::trit_pack::value_of(nn::trit_pack::code_of(a_flat[r * al + c], tau[r]));
 
     // B (K,N)：f16 存储时宿主参考必须用**同一批** f16 舍入值，否则容差里混进
     // "输入表示差"（既会把真实错误判成噪声、也会把噪声判成错误）。
@@ -463,8 +469,8 @@ void check_gemm_shape(nn::ComputeEngine& eng, std::size_t M, std::size_t K,
     CHECK(packed_r.has_value(), "跨形状：trit_pack 成功");
     if (!packed_r.has_value()) return;
 
-    auto got_r = transA ? eng.matmul_q_t(*packed_r, tau_t, Bt, M, P)
-                        : eng.matmul_q(*packed_r, tau_t, Bt, P);
+    auto got_r =
+        transA ? eng.matmul_q_t(*packed_r, tau_t, Bt, M, P) : eng.matmul_q(*packed_r, tau_t, Bt, P);
     CHECK(got_r.has_value(), "跨形状：matmul_q(_t) 成功");
     if (!got_r.has_value()) return;
     CHECK(got_r->rows() == M && got_r->cols() == N, "跨形状：输出形状 (M,N)");
@@ -481,8 +487,8 @@ void check_gemm_shape(nn::ComputeEngine& eng, std::size_t M, std::size_t K,
     // 容差按**全局幅度**定标：三值点积可正负相消，逐元素相对判据在近零点爆炸
     const double scale = std::max(1.0, rmax);
     const double tol = f16_mode ? 4e-3 : 1e-4;
-    std::printf("    M=%-5zu K=%-5zu N=%-4zu transA=%u %-3s max_err=%.3e\n",
-                M, K, N, transA ? 1u : 0u, f16_mode ? "f16" : "f32", emax);
+    std::printf("    M=%-5zu K=%-5zu N=%-4zu transA=%u %-3s max_err=%.3e\n", M, K, N,
+                transA ? 1u : 0u, f16_mode ? "f16" : "f32", emax);
     CHECK(emax <= tol * scale, "跨形状：matmul_q(_t) = 宿主参考");
 }
 
@@ -494,7 +500,8 @@ void test_shapes(nn::ComputeEngine& eng, const char* tag, bool gpu)
         std::puts("    （引擎无打包能力 → 跳过）");
         return;
     }
-    struct Sh { std::size_t M, K, N; };
+    struct Sh
+    { std::size_t M, K, N; };
     const Sh base[] = {
         {64, 16, 64},    // 单块方形（旧极小形状 = 掩盖轴向缺陷的那一类）
         {128, 32, 64},   // 行 2 块 / 列 1 块
@@ -529,8 +536,8 @@ void test_shapes(nn::ComputeEngine& eng, const char* tag, bool gpu)
 // [5] 用的是 OUT=9/IN=24/B=4（两向都只有 1 块）→ 天然测不出分块/网格缺陷。
 // 这里把形状撑过块边界，并**同时覆盖 f32 与 f16 compute**（后者才是训练路径：
 // 2B4T 形状的 GPT 训练发散正发生在 f16 compute 的打包内核上）。
-void check_bitlinear_shape(nn::ComputeEngine& eng, std::size_t IN, std::size_t OUT,
-                           std::size_t B, const nn::PrecisionProfile& prof)
+void check_bitlinear_shape(nn::ComputeEngine& eng, std::size_t IN, std::size_t OUT, std::size_t B,
+                           const nn::PrecisionProfile& prof)
 {
     nn::Matrix W(OUT, IN);
     for (std::size_t o = 0; o < OUT; ++o)
@@ -543,7 +550,8 @@ void check_bitlinear_shape(nn::ComputeEngine& eng, std::size_t IN, std::size_t O
 
     const nn::Precision P =
         (prof.compute == nn::Precision::F16) ? nn::Precision::F16 : nn::Precision::F32;
-    auto make = [&](bool packed) {
+    auto make = [&](bool packed)
+    {
         auto bl = std::make_unique<nn::BitLinear>(IN, OUT);
         bl->set_precision_profile(prof);
         auto r = bl->init(eng);
@@ -563,7 +571,8 @@ void check_bitlinear_shape(nn::ComputeEngine& eng, std::size_t IN, std::size_t O
     CHECK(y_pk.has_value() && y_dn.has_value(), "两条路径 forward 都成功");
     if (!y_pk.has_value() || !y_dn.has_value()) return;
 
-    auto cmp = [&](const nn::Tensor& a, const nn::Tensor& b, const char* what) {
+    auto cmp = [&](const nn::Tensor& a, const nn::Tensor& b, const char* what)
+    {
         const nn::Matrix am = download(eng, a), bm = download(eng, b);
         const auto pa = am.span();
         const auto pb = bm.span();
@@ -575,8 +584,7 @@ void check_bitlinear_shape(nn::ComputeEngine& eng, std::size_t IN, std::size_t O
         }
         const double scale = std::max(1.0, rmax);
         const double tol = (P == nn::Precision::F16) ? 4e-3 : 1e-5;
-        std::printf("    [%s] IN=%-4zu OUT=%-4zu B=%-4zu max_err=%.3e\n",
-                    what, IN, OUT, B, emax);
+        std::printf("    [%s] IN=%-4zu OUT=%-4zu B=%-4zu max_err=%.3e\n", what, IN, OUT, B, emax);
         CHECK(emax <= tol * scale, "BitLinear 跨形状：打包 = 稠密");
     };
     cmp(*y_pk, *y_dn, "fwd");
@@ -605,7 +613,8 @@ void test_bitlinear_shapes(nn::ComputeEngine& eng, const char* tag)
     p32.param = nn::Precision::T1_58;
     const nn::PrecisionProfile profs[2] = {p32, nn::profile_t1_58()};
     const char* ptags[2] = {"t1_58/f32", "t1_58/f16"};
-    struct Sh { std::size_t IN, OUT, B; };
+    struct Sh
+    { std::size_t IN, OUT, B; };
     const Sh shapes[] = {
         {70, 150, 100},   // 两向都多块 + 尾块
         {256, 64, 9},     // 窄 N 刚过分派门（9 > 8 → 分块内核）+ K 整块
@@ -659,7 +668,8 @@ void test_dequant()
         for (const std::vector<float>& w : rows)
         {
             double acc = 0.0;
-            for (float v : w) acc += std::fabs(static_cast<double>(v));
+            for (float v : w)
+                acc += std::fabs(static_cast<double>(v));
             const float tau = static_cast<float>(acc / static_cast<double>(K));
             std::vector<std::uint32_t> words(wpr, 0u);
             pack_row(w.data(), K, tau, words.data());
@@ -676,7 +686,8 @@ void test_dequant()
             if (again != words) repack_ok = false;
             // ③ 逐行 absmean(L) == τ（浮点链只有 ±1 ulp；这里给 2e-6 相对带）
             double l1 = 0.0;
-            for (float v : lat) l1 += std::fabs(static_cast<double>(v));
+            for (float v : lat)
+                l1 += std::fabs(static_cast<double>(v));
             const double mean = l1 / static_cast<double>(K);
             const double rel = std::fabs(mean - static_cast<double>(tau)) /
                                std::max(1e-30, std::fabs(static_cast<double>(tau)));
@@ -728,7 +739,6 @@ int main(int argc, char* argv[])
         test_bitlinear_shapes(eng, "CPU");
     }
 
-    if (g_failures == 0)
-        std::puts("ternary_gemm_test: 全部通过");
+    if (g_failures == 0) std::puts("ternary_gemm_test: 全部通过");
     return g_failures == 0 ? 0 : 1;
 }

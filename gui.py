@@ -66,9 +66,13 @@ _OPTIMIZER_RE = re.compile(r"优化器:([a-z0-9_/]+)")
 
 def cli_help_text(exe_name: str) -> str:
     """跑一次 CLI 的 --help 取帮助文本；未构建 / 超时 / 异常 → 空串。"""
-    exe = BUILD_DIR / (exe_name + (".exe" if os.name == "nt" else ""))
+    name = exe_name + (".exe" if os.name == "nt" else "")
+    exe = BUILD_DIR / name
     if not exe.exists():
-        return ""
+        # preset 构建（CMakePresets.json）把产物放在 build/<preset>/ 下
+        exe = next((p / name for p in sorted(BUILD_DIR.glob("*")) if (p / name).exists()), None)
+        if exe is None:
+            return ""
     try:
         proc = subprocess.run([str(exe), "--help"], capture_output=True,
                               text=True, errors="replace", timeout=15)

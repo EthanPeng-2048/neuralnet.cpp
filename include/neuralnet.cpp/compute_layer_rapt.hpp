@@ -66,12 +66,12 @@ private:
     Tensor Kp_cache_;        // (BH*d_k, seq) ReLU(RoPE(K))
     Tensor V_re_cache_;      // (BH*d_k, seq) V（不 ReLU、不 RoPE）
     std::size_t batch_cache_ = 0;
-    std::size_t seq_cache_   = 0;
+    std::size_t seq_cache_ = 0;
 
     // z-scan 缓存：V_ones / e_0 用于计算 z = Σk'（RLA-2 分母）
     Tensor V_ones_cache_;    // (BH*dk, seq) 全1矩阵
     Tensor e_0_cache_;       // (BH*dk, seq) 每头首行=1、其余=0（单位向量）
-    std::size_t ones_BH_  = 0;
+    std::size_t ones_BH_ = 0;
     std::size_t ones_seq_ = 0;
 
     // RMSNorm 缓存（RLA-2：投影后 RMSNorm → RoPE → ReLU）
@@ -86,8 +86,7 @@ private:
 
     // 由 doc_ids_ 构建文档边界向量（size = batch*seq）：boundary[b*seq+t]=1
     // 表示位置 t 是文档起点（t==0 或与前一位置文档不同）。
-    [[nodiscard]] std::vector<uint8_t> build_boundary_(
-        std::size_t batch, std::size_t seq) const
+    [[nodiscard]] std::vector<uint8_t> build_boundary_(std::size_t batch, std::size_t seq) const
     {
         std::vector<uint8_t> boundary;
         if (!has_doc_ids_) return boundary;
@@ -113,29 +112,26 @@ private:
     // 确保 V_ones / e_0 缓存与当前 BH·dk × seq 尺寸匹配。
     // 返回 Result：分配/upload 失败（常见为显存不足）时传播真实错误，
     // 避免后续 scan/outer_col 对空张量报 "import: invalid tensor" 掩盖根因。
-    [[nodiscard]] Result<void> ensure_ones_(
-        ComputeEngine& engine, std::size_t BH, std::size_t dk, std::size_t seq)
+    [[nodiscard]] Result<void> ensure_ones_(ComputeEngine& engine, std::size_t BH, std::size_t dk,
+                                            std::size_t seq)
     {
         // 两个缓存都有效且尺寸匹配才命中（避免半初始化：V_ones 有效但 e_0 缺失）。
-        if (ones_BH_ == BH && ones_seq_ == seq &&
-            V_ones_cache_.valid() && e_0_cache_.valid())
+        if (ones_BH_ == BH && ones_seq_ == seq && V_ones_cache_.valid() && e_0_cache_.valid())
             return {};
         const std::size_t rows = BH * dk;
         // V_ones：全1（声明式常数初始化，M2 InitSpec）
-        V_ones_cache_ = engine.create_tensor(rows, seq, Precision::F32,
-                                             InitSpec::constant(Scalar{1}));
-        if (!V_ones_cache_.valid())
-            NN_FAIL("ensure_ones_: V_ones 分配失败");
+        V_ones_cache_ =
+            engine.create_tensor(rows, seq, Precision::F32, InitSpec::constant(Scalar{1}));
+        if (!V_ones_cache_.valid()) NN_FAIL("ensure_ones_: V_ones 分配失败");
         // e_0：每头首行=1，其余=0（用于 suffix(scale·q) 的外积构造）
         std::vector<Scalar> e0(rows * seq, Scalar{0});   // 宿主桥（17 §3 D11）
         for (std::size_t bh = 0; bh < BH; ++bh)
             for (std::size_t t = 0; t < seq; ++t)
                 e0[(bh * dk) * seq + t] = Scalar{1};
-        auto e0t = detail::upload_span(engine, rows, seq, Precision::F32,
-                                       std::span(e0));
+        auto e0t = detail::upload_span(engine, rows, seq, Precision::F32, std::span(e0));
         NN_TRY_CHECK(e0t);
         e_0_cache_ = std::move(*e0t);
-        ones_BH_  = BH;
+        ones_BH_ = BH;
         ones_seq_ = seq;
         return {};
     }
@@ -143,9 +139,9 @@ private:
     // ── 逐头 RMSNorm 前向（RLA-2：投影后 RMSNorm → RoPE → ReLU） ────
     // 对 (BH*dk, seq) 张量的每个 dk 块独立归一化：y = x / sqrt(mean(x²) + eps)
     // 无学习参数（固定增益=1），符合极简原则。
-    [[nodiscard]] Result<Tensor> rms_norm_forward_(
-        ComputeEngine& engine, const Tensor& input,
-        std::size_t BH, std::size_t dk, std::size_t seq, Tensor* rms_inv_out)
+    [[nodiscard]] Result<Tensor> rms_norm_forward_(ComputeEngine& engine, const Tensor& input,
+                                                   std::size_t BH, std::size_t dk, std::size_t seq,
+                                                   Tensor* rms_inv_out)
     {
         const Scalar inv_dk = Scalar{1} / static_cast<Scalar>(dk);
         const Scalar eps = Scalar{1e-5};
@@ -187,11 +183,11 @@ private:
             // 必须分两步：归约融合 shader 尚不支持"归约后仍有逐元素后处理"
             // 的形态（GPU 侧会静默错值，见 GpuEngine::eval_expr_reduce 的显式
             // 拒绝）；1/dk、eps 由 RParam 承载 → 值不进 expr_spec_key。
-            auto s = dsl::compute_reduce(engine,
-                dsl::col_reduce_sum(dsl::leaf(*x) * dsl::leaf(*x)), dk, seq, p_.compute);
+            auto s = dsl::compute_reduce(engine, dsl::col_reduce_sum(dsl::leaf(*x) * dsl::leaf(*x)),
+                                         dk, seq, p_.compute);
             NN_TRY_CHECK(s);
-            auto ri = dsl::compute(engine,
-                dsl::rsqrt(dsl::leaf(*s) * dsl::rparam(inv_dk) + dsl::rparam(eps)),
+            auto ri = dsl::compute(
+                engine, dsl::rsqrt(dsl::leaf(*s) * dsl::rparam(inv_dk) + dsl::rparam(eps)),
                 s->rows(), s->cols(), p_.compute);
             NN_TRY_CHECK(ri);
             if (rms_inv_out)
@@ -206,8 +202,8 @@ private:
                     NN_TRY(ins_ri, engine.insert_rows(rms_out, bh, *ri));
                 }
             }
-            auto n = dsl::compute(engine,
-                dsl::leaf(*x) * dsl::col_broadcast(*ri), dk, seq, p_.compute);
+            auto n =
+                dsl::compute(engine, dsl::leaf(*x) * dsl::col_broadcast(*ri), dk, seq, p_.compute);
             NN_TRY_CHECK(n);
             NN_TRY(ins, engine.insert_rows(output, bh * dk, *n));
         }
@@ -218,10 +214,9 @@ private:
     // ── 逐头 RMSNorm 反向 ───────────────────────────────────────────
     // dL/dx = (1/rms) · (g - y · (g·y)/dk)
     // 其中 y = normed（缓存），rms = 1/rms_inv（缓存）。
-    [[nodiscard]] Result<Tensor> rms_norm_backward_(
-        ComputeEngine& engine, const Tensor& grad,
-        const Tensor& normed, const Tensor& rms_inv,
-        std::size_t BH, std::size_t dk, std::size_t seq)
+    [[nodiscard]] Result<Tensor> rms_norm_backward_(ComputeEngine& engine, const Tensor& grad,
+                                                    const Tensor& normed, const Tensor& rms_inv,
+                                                    std::size_t BH, std::size_t dk, std::size_t seq)
     {
         const Scalar inv_dk = Scalar{1} / static_cast<Scalar>(dk);
         // RV-02：分配失败原因直接上抛（同前向：精度与内部 DSL 一致，P2-3）
@@ -234,18 +229,17 @@ private:
             NN_TRY(ri, engine.slice_rows(rms_inv, bh, 1));
             // m = (1/dk) · col_reduce_sum(gy * y)  → (1, seq)
             // 归约与后处理分两步（原因同上：归约融合 shader 不支持归约后后处理）
-            auto m_raw = dsl::compute_reduce(engine,
-                dsl::col_reduce_sum(dsl::leaf(*gy) * dsl::leaf(*y)), dk, seq, p_.compute);
+            auto m_raw = dsl::compute_reduce(
+                engine, dsl::col_reduce_sum(dsl::leaf(*gy) * dsl::leaf(*y)), dk, seq, p_.compute);
             NN_TRY_CHECK(m_raw);
-            auto m = dsl::compute(engine,
-                dsl::leaf(*m_raw) * dsl::rparam(inv_dk),
-                m_raw->rows(), m_raw->cols(), p_.compute);
+            auto m = dsl::compute(engine, dsl::leaf(*m_raw) * dsl::rparam(inv_dk), m_raw->rows(),
+                                  m_raw->cols(), p_.compute);
             NN_TRY_CHECK(m);
             // grad_x = (gy − m·y) · rms_inv：三式合一，单次遍历、无中间张量
             auto gx = dsl::compute(engine,
-                (dsl::leaf(*gy) - dsl::col_broadcast(*m) * dsl::leaf(*y))
-                    * dsl::col_broadcast(*ri),
-                dk, seq, p_.compute);
+                                   (dsl::leaf(*gy) - dsl::col_broadcast(*m) * dsl::leaf(*y)) *
+                                       dsl::col_broadcast(*ri),
+                                   dk, seq, p_.compute);
             NN_TRY_CHECK(gx);
             NN_TRY(ins, engine.insert_rows(output, bh * dk, *gx));
         }
@@ -253,15 +247,11 @@ private:
     }
 
 public:
-    ReLULinearAttention(std::size_t d_model, std::size_t num_heads,
-                        std::size_t seq_len = 0,
-                        bool causal = true,
-                        PosEncodingType pos_enc = PosEncodingType::RoPE)
-        : d_model_(d_model), num_heads_(num_heads),
-          d_k_(d_model / num_heads),
-          seq_len_(seq_len), causal_(causal),
-          w_q_(d_model, d_model), w_k_(d_model, d_model),
-          w_v_(d_model, d_model), w_o_(d_model, d_model)
+    ReLULinearAttention(std::size_t d_model, std::size_t num_heads, std::size_t seq_len = 0,
+                        bool causal = true, PosEncodingType pos_enc = PosEncodingType::RoPE)
+        : d_model_(d_model), num_heads_(num_heads), d_k_(d_model / num_heads), seq_len_(seq_len),
+          causal_(causal), w_q_(d_model, d_model), w_k_(d_model, d_model), w_v_(d_model, d_model),
+          w_o_(d_model, d_model)
     {
         // RV-01：整除不成立 → d_k_ 错值（除零/越界索引）在后续热路径静默发生
         NN_ASSERT_ALWAYS(d_model % num_heads == 0,
@@ -340,26 +330,30 @@ public:
         Q_rms_inv_cache_ = Tensor{};
         K_rms_inv_cache_ = Tensor{};
         batch_cache_ = 0;
-        seq_cache_   = 0;
-        w_q_.clear_cache(); w_k_.clear_cache();
-        w_v_.clear_cache(); w_o_.clear_cache();
+        seq_cache_ = 0;
+        w_q_.clear_cache();
+        w_k_.clear_cache();
+        w_v_.clear_cache();
+        w_o_.clear_cache();
     }
 
     // 文档感知：记录每位置文档 id（batch-major），forward/backward 据此
     // 在文档边界重置运行态（每个 token 只聚合本文档内前缀）。
     void set_doc_ids(std::span<const std::size_t> ids) override
     {
-        if (ids.empty()) { doc_ids_.clear(); has_doc_ids_ = false; return; }
+        if (ids.empty())
+        {
+            doc_ids_.clear();
+            has_doc_ids_ = false;
+            return;
+        }
         doc_ids_.assign(ids.begin(), ids.end());
         has_doc_ids_ = true;
     }
 
     // 绝对位置偏移（滑动窗生成用）：转发给位置编码策略（RoPE 生效，其余 no-op），
     // 使重计算式生成的位置从真实起点算起而非每次从 0 重置。
-    void set_position_offset(std::size_t off)
-    {
-        pos_->set_position_offset(off);
-    }
+    void set_position_offset(std::size_t off) { pos_->set_position_offset(off); }
 
     std::vector<TensorRef> activation_cache() override
     {
@@ -373,10 +367,14 @@ public:
         if (K_normed_cache_.valid()) r.emplace_back(K_normed_cache_);
         if (Q_rms_inv_cache_.valid()) r.emplace_back(Q_rms_inv_cache_);
         if (K_rms_inv_cache_.valid()) r.emplace_back(K_rms_inv_cache_);
-        auto wq = w_q_.activation_cache(); r.insert(r.end(), wq.begin(), wq.end());
-        auto wk = w_k_.activation_cache(); r.insert(r.end(), wk.begin(), wk.end());
-        auto wv = w_v_.activation_cache(); r.insert(r.end(), wv.begin(), wv.end());
-        auto wo = w_o_.activation_cache(); r.insert(r.end(), wo.begin(), wo.end());
+        auto wq = w_q_.activation_cache();
+        r.insert(r.end(), wq.begin(), wq.end());
+        auto wk = w_k_.activation_cache();
+        r.insert(r.end(), wk.begin(), wk.end());
+        auto wv = w_v_.activation_cache();
+        r.insert(r.end(), wv.begin(), wv.end());
+        auto wo = w_o_.activation_cache();
+        r.insert(r.end(), wo.begin(), wo.end());
         return r;
     }
 
@@ -388,12 +386,10 @@ public:
     //
     // 实现：两次 scan_prefix_outer（主扫描 + z-scan），z-scan 用 V=ones 获得 z。
     // ══════════════════════════════════════════════════════════════════════
-    [[nodiscard]] Result<Tensor> forward(
-        const Tensor& input) override
+    [[nodiscard]] Result<Tensor> forward(const Tensor& input) override
     {
         ComputeEngine& engine = engine_ref();
-        if (input.rows() != d_model_)
-            NN_FAIL("ReLULinearAttention forward: input shape mismatch");
+        if (input.rows() != d_model_) NN_FAIL("ReLULinearAttention forward: input shape mismatch");
         const std::size_t total = input.cols();
         const std::size_t seq = (seq_len_ > 0) ? seq_len_ : total;
         const std::size_t batch = (seq_len_ > 0) ? (total / seq_len_) : 1;
@@ -445,11 +441,11 @@ public:
             NN_TRY(qr, pos_->apply_qk(engine, Q, seq, false));
             NN_TRY(kr, pos_->apply_qk(engine, K, seq, false));
         }
-        auto Qp = dsl::compute(engine,
-            dsl::max(dsl::leaf(Q), Scalar{0}), Q.rows(), Q.cols(), p_.compute);
+        auto Qp =
+            dsl::compute(engine, dsl::max(dsl::leaf(Q), Scalar{0}), Q.rows(), Q.cols(), p_.compute);
         NN_TRY_CHECK(Qp);
-        auto Kp = dsl::compute(engine,
-            dsl::max(dsl::leaf(K), Scalar{0}), K.rows(), K.cols(), p_.compute);
+        auto Kp =
+            dsl::compute(engine, dsl::max(dsl::leaf(K), Scalar{0}), K.rows(), K.cols(), p_.compute);
         NN_TRY_CHECK(Kp);
 
         // O(L·d_k²) 运行态前缀和扫描（消除 O(L²) 得分矩阵物化）。
@@ -463,8 +459,7 @@ public:
             std::vector<Scalar> bm(batch * seq, Scalar{0});   // 宿主桥（17 §3 D11）
             for (std::size_t i = 0; i < boundary.size(); ++i)
                 bm[i] = static_cast<Scalar>(boundary[i]);
-            auto bt = detail::upload_span(engine, 1, batch * seq, Precision::F32,
-                                          std::span(bm));
+            auto bt = detail::upload_span(engine, 1, batch * seq, Precision::F32, std::span(bm));
             NN_TRY_CHECK(bt);
             boundary_t = std::move(*bt);
             has_bnd = true;
@@ -478,9 +473,8 @@ public:
         const Tensor& dummy = *dummy_r;
 
         // 主扫描：读出 [0) B·P = num = B·q'（RLA-2 分子）
-        auto Sc = engine.scan_prefix_outer(*Kp, V, *Qp, V, dummy, dummy, false,
-                                           d_k_, num_heads_, causal_,
-                                           boundary_t, has_bnd);
+        auto Sc = engine.scan_prefix_outer(*Kp, V, *Qp, V, dummy, dummy, false, d_k_, num_heads_,
+                                           causal_, boundary_t, has_bnd);
         NN_TRY_CHECK(Sc);
         NN_TRY(BP_r, engine.slice_rows(*Sc, 0, BHdk));
 
@@ -488,17 +482,14 @@ public:
         //   [0) B·P = q'·z（标量，头内逐行重复）
         //   [2) B^T·R = dk·z（向量，backward 用）
         NN_TRY(ones_r, ensure_ones_(engine, BH, d_k_, seq));
-        auto Z_sc = engine.scan_prefix_outer(*Kp, V_ones_cache_, *Qp, V_ones_cache_,
-                                             dummy, dummy, false,
-                                             d_k_, num_heads_, causal_,
-                                             boundary_t, has_bnd);
+        auto Z_sc = engine.scan_prefix_outer(*Kp, V_ones_cache_, *Qp, V_ones_cache_, dummy, dummy,
+                                             false, d_k_, num_heads_, causal_, boundary_t, has_bnd);
         NN_TRY_CHECK(Z_sc);
         NN_TRY(u_r, engine.slice_rows(*Z_sc, 0, BHdk));
 
         // den = q'·z + ε；out = num / den（逐元素链融合为单 kernel：num/(u+ε)）
-        auto div_r = dsl::compute(engine,
-            dsl::leaf(*BP_r) / (dsl::leaf(*u_r) + Scalar{1e-4}),
-            (*BP_r).rows(), (*BP_r).cols(), p_.compute);
+        auto div_r = dsl::compute(engine, dsl::leaf(*BP_r) / (dsl::leaf(*u_r) + Scalar{1e-4}),
+                                  (*BP_r).rows(), (*BP_r).cols(), p_.compute);
         NN_TRY_CHECK(div_r);
         Tensor out_t = std::move(*div_r);
 
@@ -521,7 +512,7 @@ public:
             V_re_cache_ = std::move(V);
         }
         batch_cache_ = batch;
-        seq_cache_   = seq;
+        seq_cache_ = seq;
 
         return w_o_.forward(concat);
     }
@@ -542,19 +533,18 @@ public:
     //   dB = outer(gnum, q),  S_B = suffix(dB)
     //   gV = S_B·k,  gK = S_B^T·v + suffix(scale·q)
     // ══════════════════════════════════════════════════════════════════════
-    [[nodiscard]] Result<Tensor> backward(
-        const Tensor& grad_output) override
+    [[nodiscard]] Result<Tensor> backward(const Tensor& grad_output) override
     {
         ComputeEngine& engine = engine_ref();
         // 缓存前置校验：checkpoint 模式（尚未 forward_recompute）或 offload
         // （尚未 import）下缓存为空，backward 必须立刻返回明确错误——否则空
         // 张量会流进 matmul 报出无关错误，甚至静默算出垃圾梯度。
-        if (seq_cache_ == 0 || batch_cache_ == 0 ||
-            !Qp_cache_.valid() || !Kp_cache_.valid() || !V_re_cache_.valid() ||
-            !Q_normed_cache_.valid() || !K_normed_cache_.valid() ||
+        if (seq_cache_ == 0 || batch_cache_ == 0 || !Qp_cache_.valid() || !Kp_cache_.valid() ||
+            !V_re_cache_.valid() || !Q_normed_cache_.valid() || !K_normed_cache_.valid() ||
             !Q_rms_inv_cache_.valid() || !K_rms_inv_cache_.valid())
         {
-            NN_FAIL("ReLULinearAttention::backward: forward 缓存缺失"                 "（checkpoint 模式需先 forward_recompute）");
+            NN_FAIL("ReLULinearAttention::backward: forward 缓存缺失"
+                    "（checkpoint 模式需先 forward_recompute）");
         }
         const std::size_t seq = seq_cache_;
         const std::size_t batch = batch_cache_;
@@ -582,8 +572,7 @@ public:
             std::vector<Scalar> bm(batch * seq, Scalar{0});   // 宿主桥（17 §3 D11）
             for (std::size_t i = 0; i < boundary.size(); ++i)
                 bm[i] = static_cast<Scalar>(boundary[i]);
-            auto bt = detail::upload_span(engine, 1, batch * seq, Precision::F32,
-                                          std::span(bm));
+            auto bt = detail::upload_span(engine, 1, batch * seq, Precision::F32, std::span(bm));
             NN_TRY_CHECK(bt);
             boundary_t = std::move(*bt);
             has_bnd = true;
@@ -598,25 +587,22 @@ public:
 
         // ── z-scan：获取 z 和 q·z（backward 需要 z 向量） ────────────
         NN_TRY(ones_r, ensure_ones_(engine, BH, d_k_, seq));
-        auto Z_sc = engine.scan_prefix_outer(Kp_cache_, V_ones_cache_, Qp_cache_, V_ones_cache_,
-                                             dummy, dummy, false,
-                                             d_k_, num_heads_, causal_,
-                                             boundary_t, has_bnd);
+        auto Z_sc =
+            engine.scan_prefix_outer(Kp_cache_, V_ones_cache_, Qp_cache_, V_ones_cache_, dummy,
+                                     dummy, false, d_k_, num_heads_, causal_, boundary_t, has_bnd);
         NN_TRY_CHECK(Z_sc);
         auto u_r = engine.slice_rows(*Z_sc, 0, BHdk);         // q·z（标量重复 dk 次）
         NN_TRY_CHECK(u_r);
         auto z2_r = engine.slice_rows(*Z_sc, 2 * BHdk, BHdk); // dk·z（向量）
         NN_TRY_CHECK(z2_r);
-        auto z_inv_r = dsl::compute(engine,
-            dsl::leaf(*z2_r) * dsl::rparam(Scalar{1} / static_cast<Scalar>(d_k_)),
+        auto z_inv_r = dsl::compute(
+            engine, dsl::leaf(*z2_r) * dsl::rparam(Scalar{1} / static_cast<Scalar>(d_k_)),
             z2_r->rows(), z2_r->cols(), p_.compute);
         NN_TRY_CHECK(z_inv_r); // z = [2)/dk
 
         // ── pass 1：主扫描，读出 B^T·g 和 r = g·(B·q) ────────────
-        auto Sc = engine.scan_prefix_outer(Kp_cache_, V_re_cache_, Qp_cache_, gcr,
-                                           dummy, dummy, false,
-                                           d_k_, num_heads_, causal_,
-                                           boundary_t, has_bnd);
+        auto Sc = engine.scan_prefix_outer(Kp_cache_, V_re_cache_, Qp_cache_, gcr, dummy, dummy,
+                                           false, d_k_, num_heads_, causal_, boundary_t, has_bnd);
         NN_TRY_CHECK(Sc);
         auto BTR_r = engine.slice_rows(*Sc, 2 * BHdk, BHdk);  // B^T·g
         NN_TRY_CHECK(BTR_r);
@@ -628,21 +614,20 @@ public:
         //   scale = -r/(u+ε)²        （分母修正系数，用于 gQ/gK）
         //   gQt  = B^T·g/(u+ε) + scale·z   （gQ 完整表达式）
         const std::size_t cRows = (*u_r).rows(), cCols = (*u_r).cols();
-        auto gnum_r = dsl::compute(engine,
-            dsl::leaf(gcr) / (dsl::leaf(*u_r) + Scalar{1e-4}),
-            cRows, cCols, p_.compute);
+        auto gnum_r = dsl::compute(engine, dsl::leaf(gcr) / (dsl::leaf(*u_r) + Scalar{1e-4}), cRows,
+                                   cCols, p_.compute);
         NN_TRY_CHECK(gnum_r);
         auto scale_r = dsl::compute(engine,
-            dsl::neg(dsl::leaf(*r_r))
-                / ((dsl::leaf(*u_r) + Scalar{1e-4}) * (dsl::leaf(*u_r) + Scalar{1e-4})),
-            cRows, cCols, p_.compute);
+                                    dsl::neg(dsl::leaf(*r_r)) / ((dsl::leaf(*u_r) + Scalar{1e-4}) *
+                                                                 (dsl::leaf(*u_r) + Scalar{1e-4})),
+                                    cRows, cCols, p_.compute);
         NN_TRY_CHECK(scale_r); // -r/den²（标量重复 dk 次）
 
         // ── gQ = B^T·gnum + scale·z（全链融合为单 kernel） ─────────────
         auto gQt_r = dsl::compute(engine,
-            dsl::leaf(*BTR_r) / (dsl::leaf(*u_r) + Scalar{1e-4})
-                + dsl::leaf(*scale_r) * dsl::leaf(*z_inv_r),
-            cRows, cCols, p_.compute);
+                                  dsl::leaf(*BTR_r) / (dsl::leaf(*u_r) + Scalar{1e-4}) +
+                                      dsl::leaf(*scale_r) * dsl::leaf(*z_inv_r),
+                                  cRows, cCols, p_.compute);
         NN_TRY_CHECK(gQt_r);
         Tensor gQt = std::move(*gQt_r);
 
@@ -654,9 +639,8 @@ public:
         if (causal_)
         {
             // 因果：S_B = suffix(dB)，gV = S_B·k，gK_B = S_B^T·v
-            auto SBc_r = engine.scan_suffix_outer(*dB_r, Kp_cache_, V_re_cache_,
-                                                  d_k_, num_heads_, true,
-                                                  boundary_t, has_bnd);
+            auto SBc_r = engine.scan_suffix_outer(*dB_r, Kp_cache_, V_re_cache_, d_k_, num_heads_,
+                                                  true, boundary_t, has_bnd);
             NN_TRY_CHECK(SBc_r);
             NN_TRY(gv_r, engine.slice_rows(*SBc_r, 0, BHdk));
             gVt = std::move(*gv_r);
@@ -664,14 +648,12 @@ public:
 
             // suffix(scale·q)：D = outer(q, e_0, scale)，suffix(D)·e_0
             NN_TRY(D_zq_r, engine.outer_col(Qp_cache_, e_0_cache_, *scale_r, d_k_, true));
-            auto SZ_r = engine.scan_suffix_outer(*D_zq_r, e_0_cache_, e_0_cache_,
-                                                 d_k_, num_heads_, true,
-                                                 boundary_t, has_bnd);
+            auto SZ_r = engine.scan_suffix_outer(*D_zq_r, e_0_cache_, e_0_cache_, d_k_, num_heads_,
+                                                 true, boundary_t, has_bnd);
             NN_TRY_CHECK(SZ_r);
             NN_TRY(suffix_sq_r, engine.slice_rows(*SZ_r, 0, BHdk));
-            auto gk_r = dsl::compute(engine,
-                dsl::leaf(*gK_B_r) + dsl::leaf(*suffix_sq_r),
-                gK_B_r->rows(), gK_B_r->cols(), p_.compute);
+            auto gk_r = dsl::compute(engine, dsl::leaf(*gK_B_r) + dsl::leaf(*suffix_sq_r),
+                                     gK_B_r->rows(), gK_B_r->cols(), p_.compute);
             NN_TRY_CHECK(gk_r);
             gKt = std::move(*gk_r);
         }
@@ -679,22 +661,19 @@ public:
         {
             // 双向：A/B 为全集常数 → dB 在所有位置广播相同值
             // 归约步用 dsl::compute_reduce
-            auto dB_sum_r = dsl::compute_reduce(engine,
-                dsl::row_reduce_sum(dsl::leaf(*dB_r)),
-                dB_r->rows(), dB_r->cols(), p_.compute);
+            auto dB_sum_r = dsl::compute_reduce(engine, dsl::row_reduce_sum(dsl::leaf(*dB_r)),
+                                                dB_r->rows(), dB_r->cols(), p_.compute);
             NN_TRY_CHECK(dB_sum_r);
             // Bb = row_broadcast(dB_sum)：单条表达式一次 dispatch 完成，
             // 不物化中间张量。
             // 注：IR 规定"输出 = 最后一条指令的 dst"，故**单视图表达式不合法**
             // （指令表为空会被 validate_expr_spec 拒绝）。这里与一个**运行时 0**
             // （RParam，编译期无法被常量折叠掉）相加，使表达式合法且语义不变。
-            auto Bb_r = dsl::compute(engine,
-                dsl::row_broadcast(*dB_sum_r) + dsl::rparam(Scalar{0}),
-                BHdk * d_k_, seq, p_.compute);
+            auto Bb_r = dsl::compute(engine, dsl::row_broadcast(*dB_sum_r) + dsl::rparam(Scalar{0}),
+                                     BHdk * d_k_, seq, p_.compute);
             NN_TRY_CHECK(Bb_r);
-            auto SBc_r = engine.scan_suffix_outer(*Bb_r, Kp_cache_, V_re_cache_,
-                                                  d_k_, num_heads_, false,
-                                                  dummy, false);
+            auto SBc_r = engine.scan_suffix_outer(*Bb_r, Kp_cache_, V_re_cache_, d_k_, num_heads_,
+                                                  false, dummy, false);
             NN_TRY_CHECK(SBc_r);
             NN_TRY(gv_r, engine.slice_rows(*SBc_r, 0, BHdk));
             gVt = std::move(*gv_r);
@@ -702,28 +681,25 @@ public:
 
             // 双向 gK 的常数项：Σ_t scale_t · q_t（逐元素链与行归约融合为单次
             // dispatch，不物化 scale_q 中间张量）
-            auto tsq_r = dsl::compute_reduce(engine,
-                dsl::row_reduce_sum(dsl::leaf(*scale_r) * dsl::leaf(Qp_cache_)),
-                BHdk, seq, p_.compute);
+            auto tsq_r = dsl::compute_reduce(
+                engine, dsl::row_reduce_sum(dsl::leaf(*scale_r) * dsl::leaf(Qp_cache_)), BHdk, seq,
+                p_.compute);
             NN_TRY_CHECK(tsq_r);
             // gk = gK_B + row_broadcast(tsq)：单条表达式一次 dispatch 完成
             // （不物化中间张量）
-            auto gk_r = dsl::compute(engine,
-                dsl::leaf(*gK_B_r) + dsl::row_broadcast(*tsq_r),
-                gK_B_r->rows(), gK_B_r->cols(), p_.compute);
+            auto gk_r = dsl::compute(engine, dsl::leaf(*gK_B_r) + dsl::row_broadcast(*tsq_r),
+                                     gK_B_r->rows(), gK_B_r->cols(), p_.compute);
             NN_TRY_CHECK(gk_r);
             gKt = std::move(*gk_r);
         }
 
         // ── ReLU 反向：(x>0) ? g : 0 ───────────────────────────────
-        auto gq_relu = dsl::compute(engine,
-            dsl::select(dsl::leaf(Qp_cache_) > Scalar{0},
-                        dsl::leaf(gQt), Scalar{0}),
+        auto gq_relu = dsl::compute(
+            engine, dsl::select(dsl::leaf(Qp_cache_) > Scalar{0}, dsl::leaf(gQt), Scalar{0}),
             gQt.rows(), gQt.cols(), p_.compute);
         NN_TRY_CHECK(gq_relu);
-        auto gk_relu = dsl::compute(engine,
-            dsl::select(dsl::leaf(Kp_cache_) > Scalar{0},
-                        dsl::leaf(gKt), Scalar{0}),
+        auto gk_relu = dsl::compute(
+            engine, dsl::select(dsl::leaf(Kp_cache_) > Scalar{0}, dsl::leaf(gKt), Scalar{0}),
             gKt.rows(), gKt.cols(), p_.compute);
         NN_TRY_CHECK(gk_relu);
 
@@ -736,12 +712,12 @@ public:
         // ── RLA-2 RMSNorm 反向（RoPE 反向之后、rearrange 之前） ──────
         {
             const std::size_t BHrms = batch * num_heads_;
-            auto gq_rn = rms_norm_backward_(engine, *gq_relu, Q_normed_cache_,
-                                            Q_rms_inv_cache_, BHrms, d_k_, seq);
+            auto gq_rn = rms_norm_backward_(engine, *gq_relu, Q_normed_cache_, Q_rms_inv_cache_,
+                                            BHrms, d_k_, seq);
             NN_TRY_CHECK(gq_rn);
             gq_relu = std::move(*gq_rn);
-            auto gk_rn = rms_norm_backward_(engine, *gk_relu, K_normed_cache_,
-                                            K_rms_inv_cache_, BHrms, d_k_, seq);
+            auto gk_rn = rms_norm_backward_(engine, *gk_relu, K_normed_cache_, K_rms_inv_cache_,
+                                            BHrms, d_k_, seq);
             NN_TRY_CHECK(gk_rn);
             gk_relu = std::move(*gk_rn);
         }
@@ -768,8 +744,8 @@ public:
         NN_TRY(giv, w_v_.backward(gv_r));
         // grad_input = gq + gk + gv：三路累加**原地**融合为单趟（目标传递，
         // 不额外分配）；求和按 (gq + gk) + gv 的固定顺序结合，跨 run 确定
-        auto acc = dsl::compute_into(engine,
-            dsl::leaf(*giq) + dsl::leaf(*gik) + dsl::leaf(*giv), *giq);
+        auto acc =
+            dsl::compute_into(engine, dsl::leaf(*giq) + dsl::leaf(*gik) + dsl::leaf(*giv), *giq);
         NN_TRY_CHECK(acc);
         return giq;
     }
@@ -779,9 +755,8 @@ public:
     //   B += k' ⊗ v,  z += k'
     //   num = B·q',  den = q'·z + ε,  out = num / den
     // 每步 O(d_k²)，与序列长度无关。
-    [[nodiscard]] Result<Tensor> forward_step(
-        ComputeEngine& engine, const Tensor& input,
-        Tensor& B_state, Tensor& z_state, std::size_t pos)
+    [[nodiscard]] Result<Tensor> forward_step(ComputeEngine& engine, const Tensor& input,
+                                              Tensor& B_state, Tensor& z_state, std::size_t pos)
     {
         auto q_res = w_q_.forward(input);   // (d_model, 1) = (H*dk, 1)
         NN_TRY_CHECK(q_res);
@@ -800,33 +775,35 @@ public:
             NN_TRY(qr, pos_->apply_qk_step(engine, Q, pos, false));
             NN_TRY(kr, pos_->apply_qk_step(engine, K, pos, false));
         }
-        auto Qp = dsl::compute(engine,
-            dsl::max(dsl::leaf(Q), Scalar{0}), Q.rows(), Q.cols(), p_.compute);
+        auto Qp =
+            dsl::compute(engine, dsl::max(dsl::leaf(Q), Scalar{0}), Q.rows(), Q.cols(), p_.compute);
         NN_TRY_CHECK(Qp);
-        auto Kp = dsl::compute(engine,
-            dsl::max(dsl::leaf(K), Scalar{0}), K.rows(), K.cols(), p_.compute);
+        auto Kp =
+            dsl::compute(engine, dsl::max(dsl::leaf(K), Scalar{0}), K.rows(), K.cols(), p_.compute);
         NN_TRY_CHECK(Kp);
         const std::size_t H = num_heads_;
         const std::size_t dk = d_k_;
 
         // 更新运行态：B += k' ⊗ v，z += k'（原地累加，dsl::compute_into）
         // dsl::matmul(batch)：纯 {0,1} 结构（attention backward 已登记同 key）
-        auto B_add_r = dsl::compute(engine,        // v·k'^T → (H*dk, dk)
-            dsl::matmul(V, *Kp, false, true, H),
-            V.rows(), Kp->rows() / H, p_.compute);
+        auto B_add_r =
+            dsl::compute(engine,        // v·k'^T → (H*dk, dk)
+                         dsl::matmul(V, *Kp, false, true, H), V.rows(), Kp->rows() / H, p_.compute);
         NN_TRY_CHECK(B_add_r);
-        { auto r = dsl::compute_into(engine,
-              dsl::leaf(B_state) + dsl::leaf(*B_add_r), B_state);
-          NN_TRY_CHECK(r); }
-        { auto r = dsl::compute_into(engine,               // z += k'（(H*dk, 1)）
-              dsl::leaf(z_state) + dsl::leaf(*Kp), z_state);
-          NN_TRY_CHECK(r); }
+        {
+            auto r = dsl::compute_into(engine, dsl::leaf(B_state) + dsl::leaf(*B_add_r), B_state);
+            NN_TRY_CHECK(r);
+        }
+        {
+            auto r = dsl::compute_into(engine,               // z += k'（(H*dk, 1)）
+                                       dsl::leaf(z_state) + dsl::leaf(*Kp), z_state);
+            NN_TRY_CHECK(r);
+        }
 
         // num = B·q'：batched_matmul(B_state, Qp, H) → (H*dk, 1)
         // dsl::matmul(batch)：纯 {0,0} 结构（scan 手工登记同 key）
-        auto num_r = dsl::compute(engine,
-            dsl::matmul(B_state, *Qp, false, false, H),
-            B_state.rows(), Qp->cols(), p_.compute);
+        auto num_r = dsl::compute(engine, dsl::matmul(B_state, *Qp, false, false, H),
+                                  B_state.rows(), Qp->cols(), p_.compute);
         NN_TRY_CHECK(num_r);
 
         // den = q'·z：逐头标量点积（通过宿主桥在 CPU 上计算，17 §3 D11；
@@ -844,16 +821,14 @@ public:
             for (std::size_t j = 0; j < dk; ++j)
                 den_full[h * dk + j] = dot;
         }
-        auto den_t = detail::upload_span(engine, H * dk, 1, Precision::F32,
-                                         std::span(den_full));
+        auto den_t = detail::upload_span(engine, H * dk, 1, Precision::F32, std::span(den_full));
         NN_TRY_CHECK(den_t);
 
         // out = num / (den + ε)：与 forward 的除法（:491）**逐 token 同构**——
         // 同一个 AOT 键由 scan_exprs 的 ReLULinearAttention dry-run 覆盖，
         // GPU 闭合世界可命中。
-        auto out_r = dsl::compute(engine,
-            dsl::leaf(*num_r) / (dsl::leaf(*den_t) + Scalar{1e-4}),
-            (*num_r).rows(), (*num_r).cols(), p_.compute);
+        auto out_r = dsl::compute(engine, dsl::leaf(*num_r) / (dsl::leaf(*den_t) + Scalar{1e-4}),
+                                  (*num_r).rows(), (*num_r).cols(), p_.compute);
         NN_TRY_CHECK(out_r);
         return w_o_.forward(*out_r);
     }
@@ -872,16 +847,13 @@ private:
     ActivationOffloader offloader_;   // L1-offload（与 GPTBlock 共用实现）
 
 public:
-    RAPTBlock(std::size_t d_model, std::size_t num_heads, std::size_t d_ff,
-              std::size_t seq_len, PosEncodingType pos_enc,
-              ActivationType activation = ActivationType::GeLU,
-              NormType norm_type = NormType::LayerNorm,
-              bool causal = true,
+    RAPTBlock(std::size_t d_model, std::size_t num_heads, std::size_t d_ff, std::size_t seq_len,
+              PosEncodingType pos_enc, ActivationType activation = ActivationType::GeLU,
+              NormType norm_type = NormType::LayerNorm, bool causal = true,
               PrecisionProfile precision = PrecisionProfile{})
         : norm1_(make_norm_layer(d_model, norm_type)),
           attn_(d_model, num_heads, seq_len, causal, pos_enc),
-          norm2_(make_norm_layer(d_model, norm_type)),
-          ff_(d_model, d_ff, activation)
+          norm2_(make_norm_layer(d_model, norm_type)), ff_(d_model, d_ff, activation)
     {
         // D7：将精度配置注入所有子层（§9.2）—— override 内已逐子层下传
         set_precision_profile(precision);
@@ -913,17 +885,13 @@ public:
 
     std::vector<TensorRef> parameters() override
     {
-        return collect_refs(norm1_->parameters(),
-                            attn_.parameters(),
-                            norm2_->parameters(),
+        return collect_refs(norm1_->parameters(), attn_.parameters(), norm2_->parameters(),
                             ff_.parameters());
     }
     std::vector<TensorRef> param_gradients() override
     {
-        return collect_refs(norm1_->param_gradients(),
-                            attn_.param_gradients(),
-                            norm2_->param_gradients(),
-                            ff_.param_gradients());
+        return collect_refs(norm1_->param_gradients(), attn_.param_gradients(),
+                            norm2_->param_gradients(), ff_.param_gradients());
     }
 
     void set_checkpoint_mode(bool enabled) override
@@ -937,8 +905,10 @@ public:
 
     void clear_cache() override
     {
-        norm1_->clear_cache(); attn_.clear_cache();
-        norm2_->clear_cache(); ff_.clear_cache();
+        norm1_->clear_cache();
+        attn_.clear_cache();
+        norm2_->clear_cache();
+        ff_.clear_cache();
     }
 
     // RAPTBlock 与 GPTBlock 一样是"重计算单元"。
@@ -947,8 +917,7 @@ public:
     // 重计算：必须走**虚函数** set_checkpoint_mode 关闭本块+子层的 checkpoint
     // 模式（基类默认实现只改本块的标志位，子层仍处于 checkpoint 模式 →
     // forward 不会重建子层缓存 → backward 要么报错、要么误用上一 step 的陈旧缓存）。
-    [[nodiscard]] Result<Tensor> forward_recompute(
-        const Tensor& saved_input) override
+    [[nodiscard]] Result<Tensor> forward_recompute(const Tensor& saved_input) override
     {
         set_checkpoint_mode(false);
         auto r = forward(saved_input);
@@ -961,17 +930,11 @@ public:
     void set_offload_enabled(bool enabled) { offloader_.set_enabled(enabled); }
     [[nodiscard]] bool offload_enabled() const noexcept { return offloader_.enabled(); }
     [[nodiscard]] Result<void> export_activations(ComputeEngine& engine)
-    {
-        return offloader_.export_activations(engine, activation_cache());
-    }
+    { return offloader_.export_activations(engine, activation_cache()); }
     [[nodiscard]] Result<void> import_activations(ComputeEngine& engine)
-    {
-        return offloader_.import_activations(engine);
-    }
+    { return offloader_.import_activations(engine); }
     [[nodiscard]] std::size_t offload_slab_bytes() const noexcept
-    {
-        return offloader_.slab_bytes();
-    }
+    { return offloader_.slab_bytes(); }
 
     // 新一轮 forward 入口：上一轮导出未被 backward 消费（推理/评估）时作废
     void discard_offloaded_activations() noexcept { offloader_.discard(); }
@@ -979,73 +942,60 @@ public:
     std::vector<TensorRef> activation_cache() override
     {
         std::vector<TensorRef> r;
-        auto a = attn_.activation_cache(); r.insert(r.end(), a.begin(), a.end());
-        auto n1 = norm1_->activation_cache(); r.insert(r.end(), n1.begin(), n1.end());
-        auto n2 = norm2_->activation_cache(); r.insert(r.end(), n2.begin(), n2.end());
-        auto f = ff_.activation_cache(); r.insert(r.end(), f.begin(), f.end());
+        auto a = attn_.activation_cache();
+        r.insert(r.end(), a.begin(), a.end());
+        auto n1 = norm1_->activation_cache();
+        r.insert(r.end(), n1.begin(), n1.end());
+        auto n2 = norm2_->activation_cache();
+        r.insert(r.end(), n2.begin(), n2.end());
+        auto f = ff_.activation_cache();
+        r.insert(r.end(), f.begin(), f.end());
         return r;
     }
 
     // 文档感知：转发给内部 RLA-2 注意力（文档边界处重置运行态）
-    void set_doc_ids(std::span<const std::size_t> ids) override
-    {
-        attn_.set_doc_ids(ids);
-    }
+    void set_doc_ids(std::span<const std::size_t> ids) override { attn_.set_doc_ids(ids); }
 
     // 绝对位置偏移：转发给内部 RLA-2 注意力（滑动窗生成时 RoPE 用绝对位置）
-    void set_position_offset(std::size_t off)
-    {
-        attn_.set_position_offset(off);
-    }
+    void set_position_offset(std::size_t off) { attn_.set_position_offset(off); }
 
-    [[nodiscard]] Result<Tensor> forward(
-        const Tensor& input) override
+    [[nodiscard]] Result<Tensor> forward(const Tensor& input) override
     {
         ComputeEngine& engine = engine_ref();
         // 两个残差分支（与 GPTBlock/TransformerEncoderLayer 同骨架）。
         // P2-3：残差相加的精度实参改为 `p_.compute`（此前硬编码 F32）——
         // 与 GPTBlock / TransformerEncoderLayer 同口径；默认 profile 的
         // compute = F32 → 逐位不变，`--f16` 下残差走 f16 存储。
-        auto r1 = prenorm_residual_forward_(engine, input, *norm1_, attn_,
-                                            p_.compute);
+        auto r1 = prenorm_residual_forward_(engine, input, *norm1_, attn_, p_.compute);
         NN_TRY_CHECK(r1);
-        return prenorm_residual_forward_(engine, *r1, *norm2_, ff_,
-                                         p_.compute);
+        return prenorm_residual_forward_(engine, *r1, *norm2_, ff_, p_.compute);
     }
 
-    [[nodiscard]] Result<Tensor> backward(
-        const Tensor& grad_output) override
+    [[nodiscard]] Result<Tensor> backward(const Tensor& grad_output) override
     {
         ComputeEngine& engine = engine_ref();
         // activation offload：从 host 恢复激活再反向（替代重计算）
-        if (offloader_.offloaded())
-        {
-            NN_TRY(im, offloader_.import_activations(engine));
-        }
+        if (offloader_.offloaded()) { NN_TRY(im, offloader_.import_activations(engine)); }
         // 两处残差分流 + 子层反向（与 GPTBlock / TransformerEncoderLayer 同一骨架）。
         // P2-3：精度实参改为 `p_.compute`（同前向；默认 profile 逐位不变）。
-        return prenorm_residual_backward_(engine, grad_output,
-                                          *norm1_, attn_, *norm2_, ff_,
+        return prenorm_residual_backward_(engine, grad_output, *norm1_, attn_, *norm2_, ff_,
                                           p_.compute);
     }
 
     // 增量推理：单 token → norm1 → RLA-2 运行态注意力 → 残差 → norm2 → FFN → 残差
     // B_state/z_state: RLA-2 运行态 KV cache（见 ReLULinearAttention::forward_step）
-    [[nodiscard]] Result<Tensor> forward_step(
-        ComputeEngine& engine, const Tensor& input,
-        Tensor& B_state, Tensor& z_state, std::size_t pos)
+    [[nodiscard]] Result<Tensor> forward_step(ComputeEngine& engine, const Tensor& input,
+                                              Tensor& B_state, Tensor& z_state, std::size_t pos)
     {
         NN_TRY(n1, norm1_->forward(input));
         NN_TRY(a, attn_.forward_step(engine, *n1, B_state, z_state, pos));
-        auto r1 = dsl::compute(engine,
-            dsl::leaf(input) + dsl::leaf(*a),
-            input.rows(), input.cols(), p_.compute);
+        auto r1 = dsl::compute(engine, dsl::leaf(input) + dsl::leaf(*a), input.rows(), input.cols(),
+                               p_.compute);
         NN_TRY_CHECK(r1);
         NN_TRY(n2, norm2_->forward(*r1));
         NN_TRY(f, ff_.forward(*n2));
-        return dsl::compute(engine,
-            dsl::leaf(*r1) + dsl::leaf(*f),
-            r1->rows(), r1->cols(), p_.compute);
+        return dsl::compute(engine, dsl::leaf(*r1) + dsl::leaf(*f), r1->rows(), r1->cols(),
+                            p_.compute);
     }
 };
 
@@ -1092,13 +1042,10 @@ public:
               std::size_t num_heads, std::size_t d_ff, std::size_t num_layers,
               PosEncodingType pos_enc = PosEncodingType::RoPE,
               ActivationType activation = ActivationType::GeLU,
-              NormType norm_type = NormType::LayerNorm,
-              bool causal = true,
+              NormType norm_type = NormType::LayerNorm, bool causal = true,
               PrecisionProfile precision = PrecisionProfile{})
-        : vocab_size_(vocab_size), d_model_(d_model), seq_len_(seq_len),
-          num_heads_(num_heads),
-          ln_f_(make_norm_layer(d_model, norm_type)),
-          lm_head_(d_model, vocab_size)
+        : vocab_size_(vocab_size), d_model_(d_model), seq_len_(seq_len), num_heads_(num_heads),
+          ln_f_(make_norm_layer(d_model, norm_type)), lm_head_(d_model, vocab_size)
     {
         // D7：将精度配置注入自身和所有子层（§9.2）
         set_precision_profile(precision);
@@ -1113,8 +1060,8 @@ public:
         blocks_.reserve(num_layers);
         for (std::size_t i = 0; i < num_layers; ++i)
         {
-            blocks_.emplace_back(d_model, num_heads, d_ff, seq_len, pos_enc,
-                                 activation, norm_type, causal, precision);
+            blocks_.emplace_back(d_model, num_heads, d_ff, seq_len, pos_enc, activation, norm_type,
+                                 causal, precision);
         }
         pos_encoder_->set_precision_profile(precision);
     }
@@ -1127,7 +1074,8 @@ public:
         Layer::set_precision_profile(profile);
         if (ln_f_) ln_f_->set_precision_profile(profile);
         lm_head_.set_precision_profile(profile);
-        for (auto& b : blocks_) b.set_precision_profile(profile);
+        for (auto& b : blocks_)
+            b.set_precision_profile(profile);
         if (pos_encoder_) pos_encoder_->set_precision_profile(profile);
     }
 
@@ -1137,49 +1085,39 @@ public:
         constexpr Scalar emb_init_std = 0.02;
         token_emb_ = engine.create_tensor(vocab_size_, d_model_, p_.param,
                                           InitSpec::normal(0, emb_init_std, kInitSeed));
-        if (!token_emb_.valid())
-            NN_FAIL("RAPTModel: token_emb 初始化失败");
-        grad_token_emb_ = engine.create_tensor(vocab_size_, d_model_, p_.param,
-                                               InitSpec::zero());
-        if (!grad_token_emb_.valid())
-            NN_FAIL("RAPTModel: token_emb 梯度缓冲初始化失败");
-        if (pos_encoder_)
-        {
-            NN_TRY(r, pos_encoder_->init(engine));
-        }
+        if (!token_emb_.valid()) NN_FAIL("RAPTModel: token_emb 初始化失败");
+        grad_token_emb_ = engine.create_tensor(vocab_size_, d_model_, p_.param, InitSpec::zero());
+        if (!grad_token_emb_.valid()) NN_FAIL("RAPTModel: token_emb 梯度缓冲初始化失败");
+        if (pos_encoder_) { NN_TRY(r, pos_encoder_->init(engine)); }
         for (auto& b : blocks_)
         {
             NN_TRY(r, b.init(engine));
         }
-        if (ln_f_)
+        if (ln_f_) { NN_TRY(r, ln_f_->init(engine)); }
         {
-            NN_TRY(r, ln_f_->init(engine));
+            NN_TRY(r, lm_head_.init(engine));
         }
-        { NN_TRY(r, lm_head_.init(engine)); }
         return {};
     }
 
     std::vector<TensorRef> parameters() override
     {
-        return collect_refs(token_emb_,
-                            pos_encoder_->parameters(),
+        return collect_refs(token_emb_, pos_encoder_->parameters(),
                             collect_block_refs_(blocks_, &RAPTBlock::parameters),
-                            ln_f_->parameters(),
-                            lm_head_.parameters());
+                            ln_f_->parameters(), lm_head_.parameters());
     }
     std::vector<TensorRef> param_gradients() override
     {
-        return collect_refs(grad_token_emb_,
-                            pos_encoder_->param_gradients(),
+        return collect_refs(grad_token_emb_, pos_encoder_->param_gradients(),
                             collect_block_refs_(blocks_, &RAPTBlock::param_gradients),
-                            ln_f_->param_gradients(),
-                            lm_head_.param_gradients());
+                            ln_f_->param_gradients(), lm_head_.param_gradients());
     }
 
     void set_checkpoint_mode(bool enabled) override
     {
         Layer::set_checkpoint_mode(enabled);
-        for (auto& b : blocks_) b.set_checkpoint_mode(enabled);
+        for (auto& b : blocks_)
+            b.set_checkpoint_mode(enabled);
         ln_f_->set_checkpoint_mode(enabled);
         lm_head_.set_checkpoint_mode(enabled);
     }
@@ -1191,7 +1129,8 @@ public:
     // 同样保留），清理会让梯度写不回词嵌入表。
     void clear_cache() override
     {
-        for (auto& b : blocks_) b.clear_cache();
+        for (auto& b : blocks_)
+            b.clear_cache();
         ln_f_->clear_cache();
         lm_head_.clear_cache();
         checkpoint_inputs_.clear();
@@ -1200,14 +1139,19 @@ public:
     // 文档感知：记录 doc_ids，forward 时下发给各块（文档边界处重置 RLA-2 运行态）
     void set_doc_ids(std::span<const std::size_t> ids) override
     {
-        if (ids.empty()) { doc_ids_.clear(); return; }
+        if (ids.empty())
+        {
+            doc_ids_.clear();
+            return;
+        }
         doc_ids_.assign(ids.begin(), ids.end());
     }
 
     // 绝对位置偏移：下发给各块（滑动窗生成时 RoPE 用绝对位置，非 0..seq-1 重置）
     void set_position_offset(std::size_t off)
     {
-        for (auto& b : blocks_) b.set_position_offset(off);
+        for (auto& b : blocks_)
+            b.set_position_offset(off);
     }
 
     // ── batch 录制粒度（防 TDR）：每 N 个块提交一次，0 = 不启用 ──
@@ -1222,7 +1166,8 @@ public:
     void set_activation_offload(bool enabled) override
     {
         activation_offload_ = enabled;
-        for (auto& b : blocks_) b.set_offload_enabled(enabled);
+        for (auto& b : blocks_)
+            b.set_offload_enabled(enabled);
     }
     [[nodiscard]] bool activation_offload() const noexcept { return activation_offload_; }
 
@@ -1230,19 +1175,20 @@ public:
     [[nodiscard]] std::size_t offload_ram_bytes() override
     {
         std::size_t total = 0;
-        for (auto& b : blocks_) total += b.offload_slab_bytes();
+        for (auto& b : blocks_)
+            total += b.offload_slab_bytes();
         return total;
     }
 
-    [[nodiscard]] Result<Tensor> forward(
-        const Tensor& input) override
+    [[nodiscard]] Result<Tensor> forward(const Tensor& input) override
     {
         ComputeEngine& engine = engine_ref();
         // 新一轮 forward：上一轮 offload 的激活若未被 backward 消费（推理/评估
         // 路径），其 slab 数据已作废——入口统一丢弃，保证 export 状态机从
         // Idle 开始。
         if (activation_offload_)
-            for (auto& b : blocks_) b.discard_offloaded_activations();
+            for (auto& b : blocks_)
+                b.discard_offloaded_activations();
         const std::size_t seq = input.rows();
         const std::size_t batch = input.cols();
         batch_size_ = batch;
@@ -1286,8 +1232,7 @@ public:
                 NN_TRY(ex, b.export_activations(engine));
             }
             // 按间隔 flush，将大录制拆成多个小提交（防 TDR）
-            if (flush_interval_ > 0 && (bi + 1) % flush_interval_ == 0
-                && bi + 1 < blocks_.size())
+            if (flush_interval_ > 0 && (bi + 1) % flush_interval_ == 0 && bi + 1 < blocks_.size())
             {
                 NN_TRY(fr, engine.flush_batch());
             }
@@ -1296,8 +1241,7 @@ public:
         return lm_head_.forward(*ln);
     }
 
-    [[nodiscard]] Result<Tensor> backward(
-        const Tensor& grad_output) override
+    [[nodiscard]] Result<Tensor> backward(const Tensor& grad_output) override
     {
         ComputeEngine& engine = engine_ref();
         const std::size_t seq = seq_len_;
@@ -1323,11 +1267,11 @@ public:
             }
             auto br = blocks_[idx].backward(grad_x);
             if (!br)
-                NN_FAIL("RAPTModel::backward: block " + std::to_string(idx) + " failed: "                     + br.error().message);
+                NN_FAIL("RAPTModel::backward: block " + std::to_string(idx) +
+                        " failed: " + br.error().message);
             grad_x = std::move(*br);
             // 重算/恢复出来的激活用后即释放，避免跨块累积（否则抵消省显存收益）
-            if (checkpoint_every_ > 0 || activation_offload_)
-                blocks_[idx].clear_cache();
+            if (checkpoint_every_ > 0 || activation_offload_) blocks_[idx].clear_cache();
             if (flush_interval_ > 0 && (bi + 1) % flush_interval_ == 0 && bi + 1 < n)
             {
                 NN_TRY(fr, engine.flush_batch());
@@ -1339,10 +1283,8 @@ public:
         NN_TRY(pr, pos_encoder_->backward(engine, *grad_T, batch, seq));
         NN_TRY(sr, engine.scatter_add_rows(grad_token_emb_, stored_tokens_tensor_, *grad_T));
 
-        Tensor grad_input = engine.create_tensor(seq, batch, Precision::F32,
-                                                 InitSpec::zero());
-        if (!grad_input.valid())
-            NN_FAIL("RAPT token_emb backward: 梯度张量分配失败");
+        Tensor grad_input = engine.create_tensor(seq, batch, Precision::F32, InitSpec::zero());
+        if (!grad_input.valid()) NN_FAIL("RAPT token_emb backward: 梯度张量分配失败");
         return grad_input;
     }
 
@@ -1356,27 +1298,28 @@ public:
              std::size_t eos_token_id = static_cast<std::size_t>(-1),
              std::size_t min_new_tokens = 0)
     {
-        if (prompt.empty())
-            NN_FAIL("RAPT generate: empty prompt");
+        if (prompt.empty()) NN_FAIL("RAPT generate: empty prompt");
         const std::size_t dk = d_model_ / num_heads_;
         // RLA-2 每块两个运行态：B_state (d_model, d_k) + z_state (d_model, 1)
         std::vector<Tensor> statesB, statesZ;
         for (std::size_t i = 0; i < blocks_.size(); ++i)
         {
             statesB.emplace_back(engine.create_tensor(d_model_, dk));
-            { NN_TRY(r, engine.zero(statesB.back())); }
+            {
+                NN_TRY(r, engine.zero(statesB.back()));
+            }
             statesZ.emplace_back(engine.create_tensor(d_model_, 1));
-            { NN_TRY(r, engine.zero(statesZ.back())); }
+            {
+                NN_TRY(r, engine.zero(statesZ.back()));
+            }
         }
 
         // 处理单个 token：embed → 各块 forward_step → LN → LM head → 返回 logits 列
-        auto step_one = [&](std::size_t tok, std::size_t pos)
-            -> Result<std::vector<Scalar>>
+        auto step_one = [&](std::size_t tok, std::size_t pos) -> Result<std::vector<Scalar>>
         {
             std::vector<Scalar> idx_v(1);              // 宿主桥（17 §3 D11）
             idx_v[0] = static_cast<Scalar>(tok);
-            auto idx_t = detail::upload_span(engine, 1, 1, Precision::F32,
-                                             std::span(idx_v));
+            auto idx_t = detail::upload_span(engine, 1, 1, Precision::F32, std::span(idx_v));
             NN_TRY_CHECK(idx_t);
             auto emb = engine.gather_rows(token_emb_, *idx_t);   // (1, d_model)
             NN_TRY_CHECK(emb);

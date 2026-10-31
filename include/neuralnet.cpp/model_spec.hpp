@@ -37,27 +37,27 @@ namespace nn
 // ── 位置编码类型 ─────────────────────────────────────────────────────────
 enum class PosEncodingType : uint32_t
 {
-    Learned    = 0,  // 可学习位置嵌入（GPT 默认）
+    Learned = 0,  // 可学习位置嵌入（GPT 默认）
     Sinusoidal = 1,  // 正弦波固定位置编码
-    ALiBi      = 2,  // 线性偏置注意力（无位置嵌入）
-    RoPE       = 3,  // 旋转位置编码（在注意力 Q/K 上施加，无位置嵌入）
+    ALiBi = 2,  // 线性偏置注意力（无位置嵌入）
+    RoPE = 3,  // 旋转位置编码（在注意力 Q/K 上施加，无位置嵌入）
 };
 
 // ── FFN 激活类型 ─────────────────────────────────────────────────────────
 enum class ActivationType : uint32_t
 {
-    GeLU   = 0,  // QuickGeLU（GPT-2 风格，默认）
+    GeLU = 0,  // QuickGeLU（GPT-2 风格，默认）
     SwiGLU = 1,  // SwiGLU（LLaMA/Mistral 风格，每参数效率更高）
     // 门控平方 ReLU（BitNet b1.58 2B4T 的 `hidden_act = "relu2"`）：
     //   out = relu²(gate(x)) ⊙ up(x) —— 与 SwiGLU 同接线，只换逐元素函数。
-    ReLU2  = 2,
+    ReLU2 = 2,
 };
 
 // ── 归一化层类型 ─────────────────────────────────────────────────────────
 enum class NormType : uint32_t
 {
     LayerNorm = 0,  // LayerNorm（GPT-2 风格；MLP/ViT 默认）
-    RMSNorm   = 1,  // RMSNorm（LLaMA/Mistral 风格，更快更稳）
+    RMSNorm = 1,  // RMSNorm（LLaMA/Mistral 风格，更快更稳）
     BatchNorm = 2,  // BatchNorm（沿 batch 维归一化，CNN 默认）
 };
 
@@ -77,10 +77,10 @@ enum class NormType : uint32_t
 //   Final = ViT：编码器末端 final norm（全局平均池化之前，原版 ViT 的 ln_f）
 enum class NormPlace : uint32_t
 {
-    None  = 0,
-    Conv  = 1,
-    Head  = 2,
-    Both  = 3,
+    None = 0,
+    Conv = 1,
+    Head = 2,
+    Both = 3,
     Final = 4,
 };
 
@@ -89,11 +89,16 @@ enum class NormPlace : uint32_t
 {
     switch (p)
     {
-    case NormPlace::Conv:  return "conv";
-    case NormPlace::Head:  return "head";
-    case NormPlace::Both:  return "both";
-    case NormPlace::Final: return "final";
-    default:               return "none";
+    case NormPlace::Conv:
+        return "conv";
+    case NormPlace::Head:
+        return "head";
+    case NormPlace::Both:
+        return "both";
+    case NormPlace::Final:
+        return "final";
+    default:
+        return "none";
     }
 }
 
@@ -106,32 +111,30 @@ enum class NormPlace : uint32_t
 // 参数条数/顺序不变 → 无需升 MODEL_VERSION，与 norm_place 的缺键处理同款。
 enum class WeightQuant : uint32_t
 {
-    None  = 0,
+    None = 0,
     T1_58 = 1,
 };
 
 // WeightQuant → CLI/日志/序列化用短名（唯一命名口径；与 Precision::T1_58 同词法）
 [[nodiscard]] inline const char* weight_quant_name(WeightQuant q) noexcept
-{
-    return q == WeightQuant::T1_58 ? "t1_58" : "none";
-}
+{ return q == WeightQuant::T1_58 ? "t1_58" : "none"; }
 
 // ── 旧文件数值 type（仅作向下回落识别；规格判别符 = ModelSpecBase::type_name）──
 // 规格对象不再持有本枚举：新文件的 `type` 键写**类型名字符串**（如 "GPT"），
 // 读到数值（旧文件）时经 `legacy_spec_type_name` 还原为类型名再构造对应子类。
 enum class ModelType : uint32_t
 {
-    Unknown     = 0,
-    MLP         = 1,
+    Unknown = 0,
+    MLP = 1,
     Transformer = 2,
-    GPT         = 3,
-    ALiBi_GPT   = 4,  // 使用 ALiBi 的 GPT 模型（向后兼容）
-    CNN         = 5,  // 卷积神经网络（LeNet 风格，MNIST）
+    GPT = 3,
+    ALiBi_GPT = 4,  // 使用 ALiBi 的 GPT 模型（向后兼容）
+    CNN = 5,  // 卷积神经网络（LeNet 风格，MNIST）
     // 6 = AttnZip / ZiPT —— **已整体移除**（代码保留在 `legacy/zipt`
     //     分支，恢复前提见 docs/history/history.md「ZiPT 移除」条）。此枚举值仅作占位：
     //     加载旧模型文件（type=6）时据此给出明确错误，而不是含糊的 "Unknown"。
     Reserved_ZiPT = 6,
-    RAPT        = 7,  // ReLU 激活线性注意力（ReLU-Linear Attention，causal LM）
+    RAPT = 7,  // ReLU 激活线性注意力（ReLU-Linear Attention，causal LM）
 };
 
 // 前置声明（`summary` 需要读外壳的公共字段）
@@ -203,10 +206,10 @@ public:
     [[nodiscard]] bool arch_compatible(const ModelSpecBase& o) const override
     {
         const auto* p = dynamic_cast<const TransformerSpec*>(&o);
-        return p && d_model == p->d_model && num_heads == p->num_heads &&
-               d_ff == p->d_ff && num_layers == p->num_layers &&
-               patch_size == p->patch_size && norm_type == p->norm_type &&
-               norm_place == p->norm_place && weight_quant == p->weight_quant;
+        return p && d_model == p->d_model && num_heads == p->num_heads && d_ff == p->d_ff &&
+               num_layers == p->num_layers && patch_size == p->patch_size &&
+               norm_type == p->norm_type && norm_place == p->norm_place &&
+               weight_quant == p->weight_quant;
     }
     [[nodiscard]] std::string summary(const ModelSpec& shell) const override;
     void write_kv(KeyValueRecord& kv) const override;
@@ -243,14 +246,12 @@ public:
         const auto* p = dynamic_cast<const GptSpec*>(&o);
         // ALiBi_GPT 与 GPT 同族，统一由 GPTModel 承载，用 pos_encoding 区分
         // Learned/Sinusoidal/ALiBi/RoPE —— 同为 GptSpec 即同族。
-        return p && vocab_size == p->vocab_size && d_model == p->d_model &&
-               seq_len == p->seq_len && num_heads == p->num_heads &&
-               d_ff == p->d_ff && num_layers == p->num_layers &&
+        return p && vocab_size == p->vocab_size && d_model == p->d_model && seq_len == p->seq_len &&
+               num_heads == p->num_heads && d_ff == p->d_ff && num_layers == p->num_layers &&
                pos_encoding == p->pos_encoding && activation == p->activation &&
                norm_type == p->norm_type && subln == p->subln &&
                n_head_kv_or_heads() == p->n_head_kv_or_heads() &&
-               tie_embeddings == p->tie_embeddings &&
-               weight_quant == p->weight_quant;
+               tie_embeddings == p->tie_embeddings && weight_quant == p->weight_quant;
     }
     [[nodiscard]] std::string summary(const ModelSpec& shell) const override;
     void write_kv(KeyValueRecord& kv) const override;
@@ -283,12 +284,12 @@ public:
     [[nodiscard]] bool arch_compatible(const ModelSpecBase& o) const override
     {
         const auto* p = dynamic_cast<const CnnSpec*>(&o);
-        return p && cnn_in_channels == p->cnn_in_channels &&
-               cnn_in_size == p->cnn_in_size && cnn_pool == p->cnn_pool &&
-               cnn_channels == p->cnn_channels && cnn_kernels == p->cnn_kernels &&
-               cnn_strides == p->cnn_strides && cnn_paddings == p->cnn_paddings &&
-               layer_dims == p->layer_dims && norm_type == p->norm_type &&
-               norm_place == p->norm_place && weight_quant == p->weight_quant;
+        return p && cnn_in_channels == p->cnn_in_channels && cnn_in_size == p->cnn_in_size &&
+               cnn_pool == p->cnn_pool && cnn_channels == p->cnn_channels &&
+               cnn_kernels == p->cnn_kernels && cnn_strides == p->cnn_strides &&
+               cnn_paddings == p->cnn_paddings && layer_dims == p->layer_dims &&
+               norm_type == p->norm_type && norm_place == p->norm_place &&
+               weight_quant == p->weight_quant;
     }
     [[nodiscard]] std::string summary(const ModelSpec& shell) const override;
     void write_kv(KeyValueRecord& kv) const override;
@@ -317,9 +318,8 @@ public:
     [[nodiscard]] bool arch_compatible(const ModelSpecBase& o) const override
     {
         const auto* p = dynamic_cast<const RaptSpec*>(&o);
-        return p && vocab_size == p->vocab_size && d_model == p->d_model &&
-               seq_len == p->seq_len && num_heads == p->num_heads &&
-               d_ff == p->d_ff && num_layers == p->num_layers &&
+        return p && vocab_size == p->vocab_size && d_model == p->d_model && seq_len == p->seq_len &&
+               num_heads == p->num_heads && d_ff == p->d_ff && num_layers == p->num_layers &&
                pos_encoding == p->pos_encoding && activation == p->activation &&
                norm_type == p->norm_type && weight_quant == p->weight_quant;
     }
@@ -344,7 +344,9 @@ struct ModelSpec
     explicit ModelSpec(std::unique_ptr<ModelSpecBase> a) : arch(std::move(a)) {}
     ModelSpec(const ModelSpec& o)
         : output_schema(o.output_schema), output_packing(o.output_packing),
-          arch(o.arch ? o.arch->clone() : nullptr) {}
+          arch(o.arch ? o.arch->clone() : nullptr)
+    {
+    }
     ModelSpec& operator=(const ModelSpec& o)
     {
         if (this != &o)
@@ -359,8 +361,7 @@ struct ModelSpec
     ModelSpec& operator=(ModelSpec&&) noexcept = default;
 
     // 就地构造类型化规格，返回引用便于逐字段填充
-    template <class T>
-    T& emplace()
+    template <class T> T& emplace()
     {
         auto p = std::make_unique<T>();
         T& ref = *p;
@@ -372,16 +373,13 @@ struct ModelSpec
     { return arch ? arch->type_name() : "Unknown"; }
     [[nodiscard]] bool has_arch() const noexcept { return arch != nullptr; }
 
-    template <class T>
-    [[nodiscard]] T* as() noexcept { return dynamic_cast<T*>(arch.get()); }
-    template <class T>
-    [[nodiscard]] const T* as() const noexcept
+    template <class T> [[nodiscard]] T* as() noexcept { return dynamic_cast<T*>(arch.get()); }
+    template <class T> [[nodiscard]] const T* as() const noexcept
     { return dynamic_cast<const T*>(arch.get()); }
 
     // ── 判别（调用点兼容层；实现 = 类型化 dynamic_cast）────────────────
     [[nodiscard]] bool is_mlp() const noexcept { return as<MlpSpec>() != nullptr; }
-    [[nodiscard]] bool is_transformer() const noexcept
-    { return as<TransformerSpec>() != nullptr; }
+    [[nodiscard]] bool is_transformer() const noexcept { return as<TransformerSpec>() != nullptr; }
     [[nodiscard]] bool is_gpt() const noexcept { return as<GptSpec>() != nullptr; }
     [[nodiscard]] bool is_alibi_gpt() const noexcept
     {
@@ -395,12 +393,9 @@ struct ModelSpec
 // ── 架构一致性校验（公共字段 + arch_compatible；语义见子类注释）────────────
 [[nodiscard]] inline bool spec_matches(const ModelSpec& a, const ModelSpec& b)
 {
-    if (a.output_schema.has_value() != b.output_schema.has_value())
-        return false;
-    if (a.output_schema.has_value() && *a.output_schema != *b.output_schema)
-        return false;
-    if (a.output_packing != b.output_packing)
-        return false;
+    if (a.output_schema.has_value() != b.output_schema.has_value()) return false;
+    if (a.output_schema.has_value() && *a.output_schema != *b.output_schema) return false;
+    if (a.output_packing != b.output_packing) return false;
     if (!a.arch || !b.arch)
         return false;   // 任一侧无类型化规格（Unknown）⇒ 不匹配（与旧 default 一致）
     return a.arch->arch_compatible(*b.arch);
@@ -435,15 +430,24 @@ struct ModelSpec
 {
     switch (v)
     {
-    case 0: return nullptr;      // Unknown：不构造 arch
-    case 1: return "MLP";
-    case 2: return "Transformer";
-    case 3: return "GPT";
-    case 4: return "GPT";        // ALiBi_GPT：同族，pos_encoding 从字段还原
-    case 5: return "CNN";
-    case 6: return "zipt";       // 哨兵：ZiPT 已移除（序列化层显式报错）
-    case 7: return "RAPT";
-    default: return nullptr;
+    case 0:
+        return nullptr;      // Unknown：不构造 arch
+    case 1:
+        return "MLP";
+    case 2:
+        return "Transformer";
+    case 3:
+        return "GPT";
+    case 4:
+        return "GPT";        // ALiBi_GPT：同族，pos_encoding 从字段还原
+    case 5:
+        return "CNN";
+    case 6:
+        return "zipt";       // 哨兵：ZiPT 已移除（序列化层显式报错）
+    case 7:
+        return "RAPT";
+    default:
+        return nullptr;
     }
 }
 
@@ -461,8 +465,7 @@ public:
         return reg;
     }
 
-    void register_type(std::string name, Factory f)
-    { types_[std::move(name)] = std::move(f); }
+    void register_type(std::string name, Factory f) { types_[std::move(name)] = std::move(f); }
 
     [[nodiscard]] std::unique_ptr<ModelSpecBase> make(const std::string& name) const
     {
@@ -486,8 +489,7 @@ private:
 {
     // 旧扁平布局的默认分支口径：layers 恒 0（MLP 用 layer_dims 表达深度）
     std::string out = std::string("MLP(layers=0");
-    if (shell.output_schema)
-        out += ",outputs=" + std::to_string(shell.output_schema->size());
+    if (shell.output_schema) out += ",outputs=" + std::to_string(shell.output_schema->size());
     if (weight_quant != WeightQuant::None)
         out += ",wq=" + std::string(weight_quant_name(weight_quant));
     return out + ")";
@@ -496,8 +498,7 @@ private:
 [[nodiscard]] inline std::string TransformerSpec::summary(const ModelSpec& shell) const
 {
     std::string out = std::string("Transformer(layers=") + std::to_string(num_layers);
-    if (shell.output_schema)
-        out += ",outputs=" + std::to_string(shell.output_schema->size());
+    if (shell.output_schema) out += ",outputs=" + std::to_string(shell.output_schema->size());
     if (weight_quant != WeightQuant::None)
         out += ",wq=" + std::string(weight_quant_name(weight_quant));
     return out + ")";
@@ -506,21 +507,17 @@ private:
 [[nodiscard]] inline std::string GptSpec::summary(const ModelSpec&) const
 {
     return std::string("GPT(vocab=") + std::to_string(vocab_size) +
-           ",d_model=" + std::to_string(d_model) +
-           ",seq_len=" + std::to_string(seq_len) +
-           ",heads=" + std::to_string(num_heads) +
-           ",d_ff=" + std::to_string(d_ff) +
-           ",layers=" + std::to_string(num_layers) +
-           (subln ? ",subln=1" : "") +
-           (n_head_kv_or_heads() != num_heads
-                ? ",kv_heads=" + std::to_string(n_head_kv_or_heads()) : "") +
+           ",d_model=" + std::to_string(d_model) + ",seq_len=" + std::to_string(seq_len) +
+           ",heads=" + std::to_string(num_heads) + ",d_ff=" + std::to_string(d_ff) +
+           ",layers=" + std::to_string(num_layers) + (subln ? ",subln=1" : "") +
+           (n_head_kv_or_heads() != num_heads ? ",kv_heads=" + std::to_string(n_head_kv_or_heads())
+                                              : "") +
            (tie_embeddings ? ",tied=1" : "") + ")";
 }
 
 [[nodiscard]] inline std::string CnnSpec::summary(const ModelSpec&) const
 {
-    std::string c = std::to_string(cnn_in_channels) + "x" +
-                    std::to_string(cnn_in_size) + "->";
+    std::string c = std::to_string(cnn_in_channels) + "x" + std::to_string(cnn_in_size) + "->";
     for (std::size_t i = 0; i < cnn_channels.size(); ++i)
     {
         if (i) c += "-";
@@ -532,10 +529,8 @@ private:
 [[nodiscard]] inline std::string RaptSpec::summary(const ModelSpec&) const
 {
     return std::string("RAPT(vocab=") + std::to_string(vocab_size) +
-           ",d_model=" + std::to_string(d_model) +
-           ",seq_len=" + std::to_string(seq_len) +
-           ",heads=" + std::to_string(num_heads) +
-           ",d_ff=" + std::to_string(d_ff) +
+           ",d_model=" + std::to_string(d_model) + ",seq_len=" + std::to_string(seq_len) +
+           ",heads=" + std::to_string(num_heads) + ",d_ff=" + std::to_string(d_ff) +
            ",layers=" + std::to_string(num_layers) +
            ",pos_enc=" + std::to_string(static_cast<unsigned>(pos_encoding)) + ")";
 }
@@ -545,7 +540,8 @@ inline void MlpSpec::write_kv(KeyValueRecord& kv) const
 {
     std::vector<std::uint64_t> dims;
     dims.reserve(layer_dims.size());
-    for (auto d : layer_dims) dims.push_back(static_cast<std::uint64_t>(d));
+    for (auto d : layer_dims)
+        dims.push_back(static_cast<std::uint64_t>(d));
     kv.set("layer_dims", dims);
     kv.set("norm_type", static_cast<std::uint64_t>(norm_type));
     kv.set("weight_quant", static_cast<std::uint64_t>(weight_quant));
@@ -585,10 +581,12 @@ inline void CnnSpec::write_kv(KeyValueRecord& kv) const
     kv.set("cnn_in_channels", static_cast<std::uint64_t>(cnn_in_channels));
     kv.set("cnn_in_size", static_cast<std::uint64_t>(cnn_in_size));
     kv.set("cnn_pool", static_cast<std::uint64_t>(cnn_pool));
-    auto arr = [](const std::vector<std::size_t>& v) {
+    auto arr = [](const std::vector<std::size_t>& v)
+    {
         std::vector<std::uint64_t> out;
         out.reserve(v.size());
-        for (auto x : v) out.push_back(static_cast<std::uint64_t>(x));
+        for (auto x : v)
+            out.push_back(static_cast<std::uint64_t>(x));
         return out;
     };
     kv.set("cnn_channels", arr(cnn_channels));
@@ -628,15 +626,15 @@ inline void get_size(const KeyValueRecord& kv, const char* key, std::size_t& out
     std::uint64_t v = 0;
     if (kv.get(key, v)) out = static_cast<std::size_t>(v);
 }
-inline void get_dims(const KeyValueRecord& kv, const char* key,
-                     std::vector<std::size_t>& out)
+inline void get_dims(const KeyValueRecord& kv, const char* key, std::vector<std::size_t>& out)
 {
     std::vector<std::uint64_t> v;
     if (kv.get(key, v))
     {
         out.clear();
         out.reserve(v.size());
-        for (auto x : v) out.push_back(static_cast<std::size_t>(x));
+        for (auto x : v)
+            out.push_back(static_cast<std::size_t>(x));
     }
 }
 } // namespace spec_kv_detail

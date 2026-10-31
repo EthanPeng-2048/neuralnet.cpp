@@ -21,7 +21,7 @@
 using nn::Scalar;
 
 // ==================== 帮助信息 ====================
-void print_usage(const char *prog)
+void print_usage(const char* prog)
 {
     nn::cli::Help help(std::cout, prog, "BPE 分词器训练程序");
 
@@ -31,7 +31,11 @@ void print_usage(const char *prog)
     help.item("<text-file>", "训练文本文件路径 (UTF-8 编码)");
 
     help.section("选项");
-    help.opt("--tokenizer <type>", "分词器类型: bpe/charbpe (默认: bpe)\nbpe: 字节级 BBPE，兼容性最好，任意字节均可编码；\n但中文按 3 字节切分，小模型难学到词义\ncharbpe: 字符级 BPE，每个汉字为 1 个基础 token，\nBPE 学会合并常见词组；中文场景推荐使用");
+    help.opt(
+        "--tokenizer <type>",
+        "分词器类型: bpe/charbpe (默认: bpe)\nbpe: 字节级 "
+        "BBPE，兼容性最好，任意字节均可编码；\n但中文按 3 字节切分，小模型难学到词义\ncharbpe: "
+        "字符级 BPE，每个汉字为 1 个基础 token，\nBPE 学会合并常见词组；中文场景推荐使用");
     help.opt("--output <path>", "词表输出路径 (默认: bpe_vocab.nnvocab)");
     help.opt("--vocab-size <n>", "目标词表大小 (默认: 5000；最小 258 = 256 字节 + BOS/EOS)");
     help.opt("--min-freq <n>", "最小合并频率 (默认: 2)");
@@ -50,7 +54,7 @@ struct Config
     std::uint32_t threads = 0;   // 预分词并行: 0=自动, 1=顺序, >1=指定
 };
 
-Config parse_args(int argc, char *argv[])
+Config parse_args(int argc, char* argv[])
 {
     Config cfg;
     for (int i = 1; i < argc; ++i)
@@ -66,17 +70,19 @@ Config parse_args(int argc, char *argv[])
             cfg.tokenizer_type = argv[++i];
             if (cfg.tokenizer_type != "bpe" && cfg.tokenizer_type != "charbpe")
             {
-                std::cerr << "未知分词器类型: " << cfg.tokenizer_type
-                          << "，可选: bpe, charbpe\n";
+                std::cerr << "未知分词器类型: " << cfg.tokenizer_type << "，可选: bpe, charbpe\n";
                 std::exit(1);
             }
         }
-        else if (arg == "--output" && i + 1 < argc)
-            cfg.output_path = argv[++i];
+        else if (arg == "--output" && i + 1 < argc) cfg.output_path = argv[++i];
         else if (arg == "--vocab-size" && i + 1 < argc)
         {
             auto v = nn::parse_number<std::size_t>(argv[++i]);
-            if (!v) { std::cerr << "无效 --vocab-size: " << v.error().message << "\n"; std::exit(1); }
+            if (!v)
+            {
+                std::cerr << "无效 --vocab-size: " << v.error().message << "\n";
+                std::exit(1);
+            }
             if (*v < 258)
             {
                 // BPE 词表 = 256 字节 + BOS/EOS；更小值会在
@@ -89,17 +95,24 @@ Config parse_args(int argc, char *argv[])
         else if (arg == "--min-freq" && i + 1 < argc)
         {
             auto v = nn::parse_number<std::uint32_t>(argv[++i]);
-            if (!v) { std::cerr << "无效 --min-freq: " << v.error().message << "\n"; std::exit(1); }
+            if (!v)
+            {
+                std::cerr << "无效 --min-freq: " << v.error().message << "\n";
+                std::exit(1);
+            }
             cfg.min_freq = *v;
         }
         else if (arg == "--threads" && i + 1 < argc)
         {
             auto v = nn::parse_number<std::uint32_t>(argv[++i]);
-            if (!v) { std::cerr << "无效 --threads: " << v.error().message << "\n"; std::exit(1); }
+            if (!v)
+            {
+                std::cerr << "无效 --threads: " << v.error().message << "\n";
+                std::exit(1);
+            }
             cfg.threads = *v;
         }
-        else if (!arg.starts_with("--"))
-            cfg.text_path = arg;
+        else if (!arg.starts_with("--")) cfg.text_path = arg;
         else
         {
             std::cerr << "未知参数: " << arg << "\n使用 --help 查看用法\n";
@@ -115,7 +128,7 @@ Config parse_args(int argc, char *argv[])
 }
 
 // ==================== 主函数 ====================
-int main(int argc, char *argv[])
+int main(int argc, char* argv[])
 {
     Config cfg = parse_args(argc, argv);
 
@@ -146,13 +159,11 @@ int main(int argc, char *argv[])
 
     // ── 训练 ──────────────────────────────────────────────────
     std::cout << "========================================\n";
-    std::cout << "  " << (cfg.tokenizer_type == "charbpe" ? "CharBPE" : "BPE")
-              << " 分词器训练\n";
+    std::cout << "  " << (cfg.tokenizer_type == "charbpe" ? "CharBPE" : "BPE") << " 分词器训练\n";
     std::cout << "========================================\n";
     std::cout << "  目标词表: " << cfg.vocab_size << "\n";
     std::cout << "  最小频率: " << cfg.min_freq << "\n";
-    std::cout << "  预分词线程: " << cfg.threads
-              << (cfg.threads == 0 ? " (自动)" : "") << "\n";
+    std::cout << "  预分词线程: " << cfg.threads << (cfg.threads == 0 ? " (自动)" : "") << "\n";
     std::cout << "========================================\n" << std::endl;
 
     // 根据分词器类型调用对应训练接口（BPE 和 CharBPE 接口签名一致）
@@ -187,8 +198,8 @@ int main(int argc, char *argv[])
     auto t_end = std::chrono::steady_clock::now();
     Scalar train_sec = std::chrono::duration<Scalar>(t_end - t_start).count();
 
-    std::cout << "\n训练完成! 耗时: " << std::fixed << std::setprecision(1)
-              << train_sec << "s" << std::endl;
+    std::cout << "\n训练完成! 耗时: " << std::fixed << std::setprecision(1) << train_sec << "s"
+              << std::endl;
     std::cout << "词表大小: " << tokenizer->vocab_size() << std::endl;
 
     // ── 保存词表 ─────────────────────────────────────────────
@@ -205,9 +216,8 @@ int main(int argc, char *argv[])
             sample = nl == std::string::npos ? text : text.substr(0, nl);
         }
         auto ids = tokenizer->encode(sample);
-        std::cout << "\n示例编码 (" << sample.size() << " 字节 → "
-                  << ids.size() << " tokens, 压缩率 "
-                  << std::fixed << std::setprecision(2)
+        std::cout << "\n示例编码 (" << sample.size() << " 字节 → " << ids.size()
+                  << " tokens, 压缩率 " << std::fixed << std::setprecision(2)
                   << static_cast<double>(sample.size()) / std::max<std::size_t>(ids.size(), 1)
                   << " bytes/token):\n";
         std::cout << "  原文: \"" << sample << "\"\n";

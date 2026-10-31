@@ -32,8 +32,19 @@ using nn::Scalar;
 namespace
 {
 
-enum class Rule { AbsMean, AbsMax };
-enum class Gran { Tensor, Row, Blk256, Blk128, Blk64 };
+enum class Rule
+{
+    AbsMean,
+    AbsMax
+};
+enum class Gran
+{
+    Tensor,
+    Row,
+    Blk256,
+    Blk128,
+    Blk64
+};
 
 constexpr std::size_t kOutCols = 4;   // 输出误差用的随机 x 列数
 constexpr int kNumRules = 2;
@@ -43,11 +54,16 @@ const char* gran_name(Gran g)
 {
     switch (g)
     {
-        case Gran::Tensor: return "tensor";
-        case Gran::Row:    return "row";
-        case Gran::Blk256: return "blk256";
-        case Gran::Blk128: return "blk128";
-        case Gran::Blk64:  return "blk64";
+    case Gran::Tensor:
+        return "tensor";
+    case Gran::Row:
+        return "row";
+    case Gran::Blk256:
+        return "blk256";
+    case Gran::Blk128:
+        return "blk128";
+    case Gran::Blk64:
+        return "blk64";
     }
     return "?";
 }
@@ -56,10 +72,14 @@ std::size_t gran_block(Gran g)
 {
     switch (g)
     {
-        case Gran::Blk256: return 256;
-        case Gran::Blk128: return 128;
-        case Gran::Blk64:  return 64;
-        default:           return 0;
+    case Gran::Blk256:
+        return 256;
+    case Gran::Blk128:
+        return 128;
+    case Gran::Blk64:
+        return 64;
+    default:
+        return 0;
     }
 }
 
@@ -90,8 +110,9 @@ Raw evaluate(const Matrix& m, const std::vector<Scalar>& x, Rule rule, Gran gran
     const auto w = m.span();
     const std::size_t n = w.size();
     const std::size_t cols = m.cols();
-    const std::size_t block = (gran == Gran::Row) ? cols
-                            : (gran == Gran::Tensor) ? n : gran_block(gran);
+    const std::size_t block = (gran == Gran::Row)      ? cols
+                              : (gran == Gran::Tensor) ? n
+                                                       : gran_block(gran);
 
     std::vector<Scalar> wq(n, Scalar{0});
     Raw r;
@@ -103,7 +124,8 @@ Raw evaluate(const Matrix& m, const std::vector<Scalar>& x, Rule rule, Gran gran
         if (rule == Rule::AbsMean)
         {
             double s = 0.0;
-            for (std::size_t i = begin; i < end; ++i) s += std::fabs(static_cast<double>(w[i]));
+            for (std::size_t i = begin; i < end; ++i)
+                s += std::fabs(static_cast<double>(w[i]));
             tau = s / static_cast<double>(end - begin);
         }
         else
@@ -133,7 +155,7 @@ Raw evaluate(const Matrix& m, const std::vector<Scalar>& x, Rule rule, Gran gran
             for (std::size_t c = 0; c < cols; ++c)
             {
                 const double xv = static_cast<double>(x[c * kOutCols + j]);
-                y  += static_cast<double>(w[rr * cols + c]) * xv;
+                y += static_cast<double>(w[rr * cols + c]) * xv;
                 yh += static_cast<double>(wq[rr * cols + c]) * xv;
             }
             const double d = yh - y;
@@ -144,13 +166,12 @@ Raw evaluate(const Matrix& m, const std::vector<Scalar>& x, Rule rule, Gran gran
     return r;
 }
 
-constexpr Gran kGrans[kNumGrans] = {Gran::Tensor, Gran::Row, Gran::Blk256, Gran::Blk128, Gran::Blk64};
+constexpr Gran kGrans[kNumGrans] = {Gran::Tensor, Gran::Row, Gran::Blk256, Gran::Blk128,
+                                    Gran::Blk64};
 constexpr Rule kRules[kNumRules] = {Rule::AbsMean, Rule::AbsMax};
 
 inline double pct(double num, double den)
-{
-    return den > 0.0 ? 100.0 * std::sqrt(num / den) : 0.0;
-}
+{ return den > 0.0 ? 100.0 * std::sqrt(num / den) : 0.0; }
 
 // 三值分布的信息熵（bit/权重）：把"多少权重存活"翻译成"实际携带多少信息"
 inline double entropy_bits(const Raw& r)
@@ -184,33 +205,50 @@ int main(int argc, char** argv)
 
         nn::CpuEngine eng;
         auto spec_r = nn::peek_model_spec(path);
-        if (!spec_r) { std::printf("peek 失败: %s\n", spec_r.error().message.c_str()); continue; }
+        if (!spec_r)
+        {
+            std::printf("peek 失败: %s\n", spec_r.error().message.c_str());
+            continue;
+        }
         const nn::ModelSpec& spec = *spec_r;
         std::printf("spec: type=%u d_model=%zu d_ff=%zu layers=%zu vocab=%zu layer_dims=%zu\n",
-                    static_cast<unsigned>(spec.type), spec.d_model, spec.d_ff,
-                    spec.num_layers, spec.vocab_size, spec.layer_dims.size());
+                    static_cast<unsigned>(spec.type), spec.d_model, spec.d_ff, spec.num_layers,
+                    spec.vocab_size, spec.layer_dims.size());
 
         nn::Result<nn::Model> built = (spec.is_gpt() || spec.is_alibi_gpt())
-            ? nn::build_gpt_model_from_spec(eng, spec)
-            : nn::build_mnist_model_from_spec(eng, spec);
-        if (!built) { std::printf("build 失败: %s\n", built.error().message.c_str()); continue; }
+                                          ? nn::build_gpt_model_from_spec(eng, spec)
+                                          : nn::build_mnist_model_from_spec(eng, spec);
+        if (!built)
+        {
+            std::printf("build 失败: %s\n", built.error().message.c_str());
+            continue;
+        }
         nn::Model model = std::move(*built);
 
         auto loaded = nn::load_model(path, model);
-        if (!loaded) { std::printf("load 失败: %s\n", loaded.error().message.c_str()); continue; }
+        if (!loaded)
+        {
+            std::printf("load 失败: %s\n", loaded.error().message.c_str());
+            continue;
+        }
 
         auto params = model.parameters();
 
         Raw agg[kNumRules][kNumGrans];
         std::size_t total_w = 0, n_mat = 0, n_skip = 0;
 
-        std::printf("\n%-4s %-13s %-11s %-10s %-9s  [absmean@row]  [absmax@row]  [absmean@256] [absmax@256]\n",
+        std::printf("\n%-4s %-13s %-11s %-10s %-9s  [absmean@row]  [absmax@row]  [absmean@256] "
+                    "[absmax@256]\n",
                     "#", "shape", "mean|w|", "max|w|", "max/mean");
 
         for (std::size_t pi = 0; pi < params.size(); ++pi)
         {
             const nn::Tensor& t = params[pi].get();
-            if (t.cols() < 2) { ++n_skip; continue; }   // 跳过 bias（(out,1)）
+            if (t.cols() < 2)
+            {
+                ++n_skip;
+                continue;
+            }   // 跳过 bias（(out,1)）
             auto mr = eng.to_matrix(t, Precision::F32);
             if (!mr) continue;
             const Matrix& m = *mr;
@@ -218,7 +256,8 @@ int main(int argc, char** argv)
             std::mt19937 rng(20261010u + static_cast<unsigned>(pi));
             std::normal_distribution<float> nd(0.f, 1.f);
             std::vector<Scalar> x(m.cols() * kOutCols);
-            for (auto& v : x) v = nd(rng);
+            for (auto& v : x)
+                v = nd(rng);
 
             double s = 0.0, mx = 0.0;
             for (auto wv : m.span())
@@ -234,7 +273,7 @@ int main(int argc, char** argv)
                 for (int gi = 0; gi < kNumGrans; ++gi)
                 {
                     const Raw r = evaluate(m, x, kRules[ri], kGrans[gi]);
-                    z[ri][gi]  = 100.0 * r.zero / static_cast<double>(m.size());
+                    z[ri][gi] = 100.0 * r.zero / static_cast<double>(m.size());
                     rl[ri][gi] = pct(r.wnum, r.wden);
                     agg[ri][gi].zero += r.zero;
                     agg[ri][gi].pos += r.pos;
@@ -248,29 +287,25 @@ int main(int argc, char** argv)
             total_w += m.size();
             ++n_mat;
 
-            const std::string shape =
-                std::to_string(m.rows()) + "x" + std::to_string(m.cols());
+            const std::string shape = std::to_string(m.rows()) + "x" + std::to_string(m.cols());
             std::printf("%-4zu %-13s %-11.5f %-10.5f %-9.2f  "
                         "%5.1f%%/%5.1f%%  %5.1f%%/%5.1f%%  %5.1f%%/%5.1f%%  %5.1f%%/%5.1f%%\n",
-                        pi, shape.c_str(), mean, mx, mean > 0.0 ? mx / mean : 0.0,
-                        z[0][1], rl[0][1], z[1][1], rl[1][1],
-                        z[0][2], rl[0][2], z[1][2], rl[1][2]);
+                        pi, shape.c_str(), mean, mx, mean > 0.0 ? mx / mean : 0.0, z[0][1],
+                        rl[0][1], z[1][1], rl[1][1], z[0][2], rl[0][2], z[1][2], rl[1][2]);
         }
 
         std::printf("\n-- 汇总（按元素数加权；矩阵 %zu 个 / 权重 %zu 个，跳过 bias %zu 个）--\n",
                     n_mat, total_w, n_skip);
-        std::printf("%-8s %-30s %-30s\n", "粒度",
-                    "absmean zero%/relerr%/bits", "absmax zero%/relerr%/bits");
+        std::printf("%-8s %-30s %-30s\n", "粒度", "absmean zero%/relerr%/bits",
+                    "absmax zero%/relerr%/bits");
         for (int gi = 0; gi < kNumGrans; ++gi)
         {
             std::printf("%-8s %8.1f%% / %8.1f%% / %5.3f      %8.1f%% / %8.1f%% / %5.3f\n",
                         gran_name(kGrans[gi]),
                         agg[0][gi].zero * 100.0 / static_cast<double>(total_w),
-                        pct(agg[0][gi].wnum, agg[0][gi].wden),
-                        entropy_bits(agg[0][gi]),
+                        pct(agg[0][gi].wnum, agg[0][gi].wden), entropy_bits(agg[0][gi]),
                         agg[1][gi].zero * 100.0 / static_cast<double>(total_w),
-                        pct(agg[1][gi].wnum, agg[1][gi].wden),
-                        entropy_bits(agg[1][gi]));
+                        pct(agg[1][gi].wnum, agg[1][gi].wden), entropy_bits(agg[1][gi]));
         }
 
         std::printf("\n-- 层输出相对误差（%%，全模型加权）--\n");

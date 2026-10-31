@@ -64,15 +64,14 @@ namespace
         // "精度 × activation offload" 组合，否则 rc0 承诺的配置期拒绝会被绕开
         // （残余路径只能到首个 block 才由库层 fail-fast）。这里经 Result 上抛
         // （不用 std::exit），保持三模块不终止进程的不变量。
-        if (auto combo_err = nn::cli::precision_offload_combo_error(cfg))
-            NN_FAIL(*combo_err);
+        if (auto combo_err = nn::cli::precision_offload_combo_error(cfg)) NN_FAIL(*combo_err);
     }
 
     // ── 打开数据集（.nndataset；token 流/掩码/词表都在生成期定好）──────
     std::cout << "加载数据集: " << cfg.text_path << " ..." << std::endl;
     NN_TRY_MSG(ds_r, "打开数据集失败", nn::Dataset::open(cfg.text_path));
-    const nn::Dataset &dataset = *ds_r;
-    const std::string &loss_scope = dataset.info().loss_scope;
+    const nn::Dataset& dataset = *ds_r;
+    const std::string& loss_scope = dataset.info().loss_scope;
 
     // 词表来自数据集配套（内嵌三层 kvrec）；保存模型时原样嵌出（模型 v6）。
     NN_TRY_MSG(tokenizer_r, "加载数据集内嵌词表失败",
@@ -98,15 +97,12 @@ namespace
     {
         NN_TRY_MSG(test_samples_r, "读取测试样本集失败",
                    nn::TextSampleSet::create(dataset, nn::DatasetSubset::Test, window));
-        if (test_samples_r->sample_count() > 0)
-            test_samples = std::move(*test_samples_r);
-        else
-            empty_test_tokens = test_samples_r->token_count();
+        if (test_samples_r->sample_count() > 0) test_samples = std::move(*test_samples_r);
+        else empty_test_tokens = test_samples_r->token_count();
     }
 
     std::cout << "训练子集: " << train_samples.doc_count() << " docs / "
-              << train_samples.token_count() << " tokens  loss_scope=" << loss_scope
-              << "\n";
+              << train_samples.token_count() << " tokens  loss_scope=" << loss_scope << "\n";
     // 文档感知：doc_ids 非空（每 doc = 一篇文档）即启用块对角掩码。
     if (!train_samples.corpus().doc_ids.empty())
         std::cout << "文档感知掩码已启用（每行 = 一篇文档，"
@@ -117,15 +113,15 @@ namespace
     if (loss_scope == "assistant")
     {
         std::size_t asst_tokens = 0;
-        for (unsigned char m : train_samples.corpus().loss_mask) asst_tokens += m;
+        for (unsigned char m : train_samples.corpus().loss_mask)
+            asst_tokens += m;
         std::cout << "assistant loss 掩码已启用（" << asst_tokens << " / "
-                  << train_samples.token_count()
-                  << " tokens 作为预测目标参与 loss）\n";
+                  << train_samples.token_count() << " tokens 作为预测目标参与 loss）\n";
     }
 
-    std::cout << "滑动窗口: seq_len=" << cfg.seq_len
-              << " stride=" << train_samples.stride()
-              << " 样本数=" << train_samples.sample_count() << "\n" << std::endl;
+    std::cout << "滑动窗口: seq_len=" << cfg.seq_len << " stride=" << train_samples.stride()
+              << " 样本数=" << train_samples.sample_count() << "\n"
+              << std::endl;
 
     // 空 test 子集的启动信息（v1.9.0 锚：仍打印"样本数: 0"；评估跳过由
     // TextTrainer 的 nullopt test 语义保证）。
@@ -134,8 +130,8 @@ namespace
         if (loss_scope == "assistant")
             std::cout << "测试集 assistant 掩码: 0 / " << *empty_test_tokens
                       << " tokens 参与评估\n";
-        std::cout << "测试集: " << dataset.info().test_docs << " docs  样本数: 0  tokens: "
-                  << *empty_test_tokens << std::endl;
+        std::cout << "测试集: " << dataset.info().test_docs
+                  << " docs  样本数: 0  tokens: " << *empty_test_tokens << std::endl;
     }
 
     // ── 数据集身份（P1-2 断点门禁的"内容"侧）────────────────────────────
@@ -151,8 +147,7 @@ namespace
     dataset_identity.num_samples = train_samples.sample_count();
     dataset_identity.loss_scope = loss_scope;
     // steps_per_epoch 是**派生量**（样本数 ÷ batch），与训练工厂同一公式。
-    dataset_identity.steps_per_epoch =
-        train_samples.steps_per_epoch(cfg.batch_size);
+    dataset_identity.steps_per_epoch = train_samples.steps_per_epoch(cfg.batch_size);
 
     // ── 数据集身份门禁（硬错、无逃生阀；docs/internal/23 §2.1.1）────────────
     // 数据集变 ⇒ 样本数变 ⇒ steps_per_epoch 变 ⇒ step 级调度的 total_steps、
@@ -160,8 +155,8 @@ namespace
     // 的续训语义。合法出口 = 从 .nnmodel 开新一轮（下面的 warm start 分支）。
     if (adoption.adopted)
     {
-        NN_TRY_CHECK(nn::cli::verify_dataset_identity(
-            adoption.state.dataset, dataset_identity, cfg.resume_path));
+        NN_TRY_CHECK(nn::cli::verify_dataset_identity(adoption.state.dataset, dataset_identity,
+                                                      cfg.resume_path));
     }
 
     // ── 打印配置 ─────────────────────────────────────────────
@@ -174,24 +169,22 @@ namespace
     std::cout << "  Transformer 层数: " << cfg.num_layers << "\n";
     std::cout << "  FFN 维度: " << cfg.d_ff << "\n";
     std::cout << "  序列长度: " << cfg.seq_len << "\n";
-    std::cout << "  模型架构: "
-              << (cfg.model_type == "rapt" ? "RAPT (ReLU 线性注意力)"
-                  : "GPT") << "\n";
+    std::cout << "  模型架构: " << (cfg.model_type == "rapt" ? "RAPT (ReLU 线性注意力)" : "GPT")
+              << "\n";
     if (cfg.model_type == "rapt")
     {
         std::cout << "  位置编码: RoPE（RLA 强制，施加在 ReLU 之前）\n";
     }
     std::cout << "  优化器: " << cfg.optimizer_name << "  学习率: " << cfg.lr << "\n";
     // β1/β2 的消费方 = 表中 beta = true 的优化器（sgd 家族/muon 忽略）
-    if (const auto *om = nn::find_optimizer(cfg.optimizer_name); om != nullptr && om->beta)
+    if (const auto* om = nn::find_optimizer(cfg.optimizer_name); om != nullptr && om->beta)
     {
         // 前面的计时打印固定过 precision(1)，这里恢复足够位数（0.95 才不会印成 0.9）
-        std::cout << std::defaultfloat << std::setprecision(6)
-                  << "  Adam β1/β2: " << cfg.beta1 << " / " << cfg.beta2 << "\n";
+        std::cout << std::defaultfloat << std::setprecision(6) << "  Adam β1/β2: " << cfg.beta1
+                  << " / " << cfg.beta2 << "\n";
     }
     std::cout << "  loss 范围: " << loss_scope << "（生成期定好，随数据集）\n";
-    if (cfg.max_steps > 0)
-        std::cout << "  最大步数: " << cfg.max_steps << "\n";
+    if (cfg.max_steps > 0) std::cout << "  最大步数: " << cfg.max_steps << "\n";
     std::cout << "  轮数: " << cfg.epochs << "  批大小: " << cfg.batch_size << "\n";
     std::cout << "  GPU: " << (cfg.gpu_enabled ? "启用" : "禁用") << "\n";
     std::cout << "  梯度日志: " << (cfg.grad_log ? "启用" : "禁用") << "\n";
@@ -213,10 +206,10 @@ namespace
     // 触发条件 = **真的有 f16 存储**（四个槽里任一为 f16）。不能用
     // `!is_profile_f32()`：`param = t1_58` 时三值并不产生 f16 存储（latent 恒 f32、
     // 只有量化缓冲是 f16），那样会打出误导性的"f16 存储已启用"。
-    const bool f16_storage = (cfg.precision.param == nn::Precision::F16 ||
-                              cfg.precision.compute == nn::Precision::F16 ||
-                              cfg.precision.stable == nn::Precision::F16 ||
-                              cfg.precision.optimizer == nn::Precision::F16);
+    const bool f16_storage =
+        (cfg.precision.param == nn::Precision::F16 || cfg.precision.compute == nn::Precision::F16 ||
+         cfg.precision.stable == nn::Precision::F16 ||
+         cfg.precision.optimizer == nn::Precision::F16);
     if (f16_storage)
     {
         std::cout << "[精度] f16 存储已启用（基类边界 cast + in-kernel f16 变体 + f16 GEMM）\n"
@@ -249,20 +242,17 @@ namespace
                     "见 docs/internal/21-quantized-weights.md §4.8.3。\n"
                     "  · 三值 GPT：改用 --model gpt\n"
                     "  · 三值 MLP：mnist_train --arch mlp --precision-param t1_58");
-        model_build = nn::build_rapt_model(*engine, nn::RAPTConfig{
-            tokenizer->vocab_size(), cfg.d_model, cfg.seq_len,
-            cfg.num_heads, cfg.d_ff, cfg.num_layers,
-            cfg.pos_encoding, cfg.activation, cfg.norm_type,
-            /*causal=*/true, cfg.precision});
+        model_build = nn::build_rapt_model(
+            *engine, nn::RAPTConfig{tokenizer->vocab_size(), cfg.d_model, cfg.seq_len,
+                                    cfg.num_heads, cfg.d_ff, cfg.num_layers, cfg.pos_encoding,
+                                    cfg.activation, cfg.norm_type,
+                                    /*causal=*/true, cfg.precision});
     }
     else
     {
         model_build = nn::build_gpt_model(
-            *engine,
-            tokenizer->vocab_size(), cfg.d_model, cfg.seq_len,
-            cfg.num_heads, cfg.d_ff, cfg.num_layers,
-            cfg.pos_encoding, cfg.activation, cfg.norm_type,
-            cfg.precision);
+            *engine, tokenizer->vocab_size(), cfg.d_model, cfg.seq_len, cfg.num_heads, cfg.d_ff,
+            cfg.num_layers, cfg.pos_encoding, cfg.activation, cfg.norm_type, cfg.precision);
     }
     NN_TRY_MSG(model_build_r, "构建模型失败", std::move(model_build));
     auto model = std::move(*model_build_r);
@@ -319,9 +309,11 @@ namespace
         else
         {
             model.set_activation_offload(true);
-            std::cout << "activation offload 已启用: 每块激活搬 host-visible，backward 拷回（不重算）\n";
+            std::cout
+                << "activation offload 已启用: 每块激活搬 host-visible，backward 拷回（不重算）\n";
             if (cfg.checkpoint_every > 0)
-                std::cout << "  （混合模式）与 checkpoint 共存：checkpoint 块重算，其余块 offload\n";
+                std::cout
+                    << "  （混合模式）与 checkpoint 共存：checkpoint 块重算，其余块 offload\n";
             std::cout << "  offload slab 在首次 forward 时按激活形状分配（RAM ≈ 激活实际体积）\n";
         }
     }
@@ -329,22 +321,20 @@ namespace
     // ── 构建规格（用于保存） ─────────────────────────────────
     nn::ModelSpec spec;
     if (cfg.model_type == "rapt")
-        spec = nn::make_rapt_spec(
-            tokenizer->vocab_size(), cfg.d_model, cfg.seq_len,
-            cfg.num_heads, cfg.d_ff, cfg.num_layers,
-            cfg.pos_encoding, cfg.activation, cfg.norm_type);
+        spec = nn::make_rapt_spec(tokenizer->vocab_size(), cfg.d_model, cfg.seq_len, cfg.num_heads,
+                                  cfg.d_ff, cfg.num_layers, cfg.pos_encoding, cfg.activation,
+                                  cfg.norm_type);
     else
-        spec = nn::make_gpt_spec(
-            tokenizer->vocab_size(), cfg.d_model, cfg.seq_len,
-            cfg.num_heads, cfg.d_ff, cfg.num_layers,
-            cfg.pos_encoding, cfg.activation, cfg.norm_type);
+        spec = nn::make_gpt_spec(tokenizer->vocab_size(), cfg.d_model, cfg.seq_len, cfg.num_heads,
+                                 cfg.d_ff, cfg.num_layers, cfg.pos_encoding, cfg.activation,
+                                 cfg.norm_type);
 
     // 三值权重（P1.5，docs 21 §4.7/§4.8.3）：param=t1_58 → 线性层用 BitLinear。
     // 规格是**加载时的权威来源**（缺键 = None → 旧文件零破坏）；--resume 时下面
     // 会用文件里的规格覆盖本行。
-    spec.as<nn::GptSpec>()->weight_quant =
-        (cfg.precision.param == nn::Precision::T1_58) ? nn::WeightQuant::T1_58
-                                                      : nn::WeightQuant::None;
+    spec.as<nn::GptSpec>()->weight_quant = (cfg.precision.param == nn::Precision::T1_58)
+                                               ? nn::WeightQuant::T1_58
+                                               : nn::WeightQuant::None;
 
 
     // ── 断点恢复（--resume / --resume-epoch / --resume-step）──────────────
@@ -382,8 +372,8 @@ namespace
     // 位置必须在优化器构造之后：状态张量按优化器自身的缓冲形状回写。
     if (adoption.adopted)
     {
-        NN_TRY_CHECK(nn::cli::load_optimizer_state(*engine, cfg.resume_path,
-                                                   session.optimizer(), std::cout));
+        NN_TRY_CHECK(nn::cli::load_optimizer_state(*engine, cfg.resume_path, session.optimizer(),
+                                                   std::cout));
     }
 
     // ── 训练工厂：数据集（样本集）直接接入 ───────────────────────────────
@@ -407,8 +397,7 @@ namespace
     if (report.abort_code != 0) return report.abort_code;
 
     // ── step 剖析报告（NN_PROFILE=1 / NN_PROFILE_TRACE 时生效）────────────
-    if (nn::prof::enabled())
-        nn::prof::dump(stderr, report.elapsed_ns);
+    if (nn::prof::enabled()) nn::prof::dump(stderr, report.elapsed_ns);
 
     // ── 保存模型（含规格 + 嵌入 tokenizer） ──────────────────
     // 推理模型（Model 角色）：三值层写打包形态 + τ（不含训练参数）。
@@ -417,8 +406,8 @@ namespace
                nn::cli::save_text_train_model(cfg.save_path, trainer.session().model(), spec,
                                               tokenizer_bytes));
     (void)save_result;
-    std::cout << "\n训练完成! 总耗时: " << std::fixed << std::setprecision(1)
-              << report.seconds << "s"
+    std::cout << "\n训练完成! 总耗时: " << std::fixed << std::setprecision(1) << report.seconds
+              << "s"
               << "  词表已嵌入模型文件" << std::endl;
     // 退出码语义（P1-1）：有断点没写出去 ⇒ 非零退出。推理模型文件已落盘，
     // 但"可续训"这一性质不成立，上层不得把它当成功（文案在 checkpoint 模块）。
@@ -430,15 +419,14 @@ namespace
 // 本函数是唯一的进程出口（`main` 返回退出码）：解析层内部按 CLI 语义
 // exit(0)/exit(1)（--help / 参数错误），其余一切经 `run_text_train` 的 Result
 // 回报后在此统一打印并返回 1。
-int main(int argc, char *argv[])
+int main(int argc, char* argv[])
 {
     nn::cli::TrainConfig cfg = nn::cli::parse_text_train_args(argc, argv);
 
     // ── 危险精度组合启动期告警（仅警告，不拒绝；docs/internal/24 §2.3 F1）────
     // optimizer=f16（含四字段全 f16）只打印一次到 stderr：不改变退出码、不阻断
     // 训练、不静默降级；`--f16` 与合法组合返回空串（静默）。
-    if (const std::string warn = nn::cli::dangerous_precision_warning(cfg.precision);
-        !warn.empty())
+    if (const std::string warn = nn::cli::dangerous_precision_warning(cfg.precision); !warn.empty())
         std::cerr << warn;
 
     auto run = run_text_train(cfg);

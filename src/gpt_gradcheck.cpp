@@ -25,26 +25,30 @@
 #include <string_view>
 #include "test_common.hpp"
 
-using nn::Scalar;
-using nn::Matrix;
-using nn::Tensor;
-using nn::TensorRef;
+using nn::ActivationType;
 using nn::ComputeEngine;
 using nn::GPTModel;
 using nn::Layer;
-using nn::PosEncodingType;
-using nn::ActivationType;
+using nn::Matrix;
 using nn::NormType;
+using nn::PosEncodingType;
+using nn::Scalar;
+using nn::Tensor;
+using nn::TensorRef;
 
-namespace {
+namespace
+{
 
 
 // 用当前参数前向，返回 L = Σ logits*go
-Scalar eval_loss(ComputeEngine& engine, GPTModel& model,
-                 const Tensor& input, const Tensor& go)
+Scalar eval_loss(ComputeEngine& engine, GPTModel& model, const Tensor& input, const Tensor& go)
 {
     auto y = model.forward(input);
-    if (!y) { std::cerr << "  [eval] forward failed: " << y.error().message << "\n"; std::abort(); }
+    if (!y)
+    {
+        std::cerr << "  [eval] forward failed: " << y.error().message << "\n";
+        std::abort();
+    }
     auto y_m = engine.to_matrix(*y);
     auto go_m = engine.to_matrix(go);
     return dot(*y_m, *go_m);
@@ -52,14 +56,10 @@ Scalar eval_loss(ComputeEngine& engine, GPTModel& model,
 
 
 // 验证单个参数张量梯度（逐元素中心差分）
-bool check_grad_tensor(
-    ComputeEngine& engine, GPTModel& model,
-    const Tensor& input, const Tensor& go,
-    Tensor& param,
-    const Matrix& base,
-    const Matrix& grad_analytical,
-    const std::string& name,
-    Scalar eps, Scalar tol)
+bool check_grad_tensor(ComputeEngine& engine, GPTModel& model, const Tensor& input,
+                       const Tensor& go, Tensor& param, const Matrix& base,
+                       const Matrix& grad_analytical, const std::string& name, Scalar eps,
+                       Scalar tol)
 {
     bool ok = true;
     std::size_t bad = 0;
@@ -73,18 +73,30 @@ bool check_grad_tensor(
             Matrix pp = base;
             pp.set_value_unchecked(r, c, orig + eps);
             auto r_p = engine.write(param, pp.span());
-            if (!r_p) { std::cerr << "write(+) failed\n"; return false; }
+            if (!r_p)
+            {
+                std::cerr << "write(+) failed\n";
+                return false;
+            }
             const Scalar lp = eval_loss(engine, model, input, go);
 
             Matrix pm = base;
             pm.set_value_unchecked(r, c, orig - eps);
             auto r_m = engine.write(param, pm.span());
-            if (!r_m) { std::cerr << "write(-) failed\n"; return false; }
+            if (!r_m)
+            {
+                std::cerr << "write(-) failed\n";
+                return false;
+            }
             const Scalar lm = eval_loss(engine, model, input, go);
 
             // 恢复原值
             auto r_r = engine.write(param, base.span());
-            if (!r_r) { std::cerr << "write(restore) failed\n"; return false; }
+            if (!r_r)
+            {
+                std::cerr << "write(restore) failed\n";
+                return false;
+            }
 
             const Scalar num = (lp - lm) / (Scalar{2} * eps);
             const Scalar ana = grad_analytical.at_unchecked(r, c);
@@ -94,16 +106,14 @@ bool check_grad_tensor(
             {
                 ok = false;
                 if (bad < 6)
-                    std::cout << "  [FAIL] " << name << "(" << r << "," << c
-                              << ") num=" << num << " ana=" << ana
-                              << " err=" << err << "\n";
+                    std::cout << "  [FAIL] " << name << "(" << r << "," << c << ") num=" << num
+                              << " ana=" << ana << " err=" << err << "\n";
                 ++bad;
             }
         }
     }
-    std::cout << "  " << name << ": "
-              << (ok ? "OK" : "FAIL")
-              << "  max_err=" << max_err << "  bad=" << bad << "\n";
+    std::cout << "  " << name << ": " << (ok ? "OK" : "FAIL") << "  max_err=" << max_err
+              << "  bad=" << bad << "\n";
     return ok;
 }
 
@@ -119,19 +129,17 @@ int main(int argc, char* argv[])
     for (int i = 1; i < argc; ++i)
     {
         std::string a = argv[i];
-        if (a == "--tol" && i + 1 < argc)
-            tol = static_cast<Scalar>(std::atof(argv[++i]));
+        if (a == "--tol" && i + 1 < argc) tol = static_cast<Scalar>(std::atof(argv[++i]));
         else if (a == "--layers" && i + 1 < argc)
             num_layers = static_cast<std::size_t>(std::atoi(argv[++i]));
         else if (a == "--batch" && i + 1 < argc)
             batch = static_cast<std::size_t>(std::atoi(argv[++i]));
-        else if (a == "--pos-enc" && i + 1 < argc)
-            pos_enc_name = argv[++i];
-        else if (a == "--gpu")
-            use_gpu = true;
+        else if (a == "--pos-enc" && i + 1 < argc) pos_enc_name = argv[++i];
+        else if (a == "--gpu") use_gpu = true;
         else if (a == "--help")
         {
-            std::cout << "用法: gpt_gradcheck [--gpu] [--layers N] [--batch N] [--tol <f>] [--pos-enc learned|sinusoidal|alibi|rope]\n";
+            std::cout << "用法: gpt_gradcheck [--gpu] [--layers N] [--batch N] [--tol <f>] "
+                         "[--pos-enc learned|sinusoidal|alibi|rope]\n";
             return 0;
         }
     }
@@ -159,17 +167,14 @@ int main(int argc, char* argv[])
     std::cout << "========================================\n";
     std::cout << "  GPTModel 整链数值梯度检查 (gradcheck)\n";
     std::cout << "========================================\n";
-    std::cout << "  vocab=" << vocab << " d_model=" << d_model
-              << " seq=" << seq_len << " batch=" << batch
-              << " heads=" << num_heads << " d_ff=" << d_ff
+    std::cout << "  vocab=" << vocab << " d_model=" << d_model << " seq=" << seq_len
+              << " batch=" << batch << " heads=" << num_heads << " d_ff=" << d_ff
               << " layers=" << num_layers << "\n";
     std::cout << "  activation=SwiGLU norm=RMSNorm pos=" << pos_enc_name << "\n";
     std::cout << "  tol=" << tol << "\n";
 
-    GPTModel model(vocab, d_model, seq_len, num_heads, d_ff, num_layers,
-                   pos_enc,
-                   ActivationType::SwiGLU,
-                   NormType::RMSNorm);
+    GPTModel model(vocab, d_model, seq_len, num_heads, d_ff, num_layers, pos_enc,
+                   ActivationType::SwiGLU, NormType::RMSNorm);
     NN_EXIT(model.init(eng), 1, "GPTModel init 失败: ");
 
     std::mt19937_64 rng(123);
@@ -182,7 +187,8 @@ int main(int argc, char* argv[])
 
     // 输出权重 go (vocab, seq*batch)
     Matrix go_m(vocab, seq_len * batch);
-    for (std::size_t i = 0; i < go_m.size(); ++i) go_m.span()[i] = dist(rng);
+    for (std::size_t i = 0; i < go_m.size(); ++i)
+        go_m.span()[i] = dist(rng);
 
     auto x = eng.from_matrix(x_m);
     NN_EXIT(x, 1, "from_matrix(x) failed\n");
@@ -196,11 +202,11 @@ int main(int argc, char* argv[])
 
     // ── 清零梯度并 backward ──
     auto params = model.parameters();
-    auto grads  = model.param_gradients();
+    auto grads = model.param_gradients();
     if (params.size() != grads.size())
     {
-        std::cerr << "params/grads size mismatch: "
-                  << params.size() << " vs " << grads.size() << "\n";
+        std::cerr << "params/grads size mismatch: " << params.size() << " vs " << grads.size()
+                  << "\n";
         return 1;
     }
     for (auto& g : grads)
@@ -224,22 +230,19 @@ int main(int argc, char* argv[])
         NN_EXIT(gm, 1, "to_matrix(grad) failed\n");
         if (pm->rows() != gm->rows() || pm->cols() != gm->cols())
         {
-            std::cerr << "shape mismatch param[" << p << "]: "
-                      << pm->rows() << "x" << pm->cols()
+            std::cerr << "shape mismatch param[" << p << "]: " << pm->rows() << "x" << pm->cols()
                       << " vs grad " << gm->rows() << "x" << gm->cols() << "\n";
             return 1;
         }
         std::string name = "param[" + std::to_string(pi++) + "]";
         // 精简命名：按顺序标注
         static constexpr std::array<std::string_view, 12> tags = {
-            "token_emb", "pos_emb", "blk0.wq", "blk0.wk",
-            "blk0.wv", "blk0.wo", "blk0.norm1.g", "blk0.fc1.w", "blk0.fc1.b",
-            "blk0.fc2.w", "blk0.fc2.b", "blk0.norm2.g"};
+            "token_emb",    "pos_emb",    "blk0.wq",    "blk0.wk",    "blk0.wv",    "blk0.wo",
+            "blk0.norm1.g", "blk0.fc1.w", "blk0.fc1.b", "blk0.fc2.w", "blk0.fc2.b", "blk0.norm2.g"};
         if (pi - 1 < 12)
-            name = std::string("p[") + std::to_string(pi - 1) + "]= "
-                   + std::string(tags[pi - 1]);
-        all_pass &= check_grad_tensor(
-            eng, model, *x, *go, params[p].get(), *pm, *gm, name, eps, tol);
+            name = std::string("p[") + std::to_string(pi - 1) + "]= " + std::string(tags[pi - 1]);
+        all_pass &=
+            check_grad_tensor(eng, model, *x, *go, params[p].get(), *pm, *gm, name, eps, tol);
     }
 
     std::cout << "----------------------------------------\n";
