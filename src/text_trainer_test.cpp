@@ -424,8 +424,8 @@ void test_checkpoint_hook(const std::string& dir)
     CHECK(st.recipe.batch_size == cfg.batch_size && st.recipe.epochs == 2,
           "状态含训练配方（batch/epochs）");
     CHECK(st.recipe.optimizer == "adam", "状态含优化器名");
-    CHECK(st.optimizer_step == trainer_r->session().step_count(),
-          "状态含 Adam 的 t（= 优化器更新次数）");
+    CHECK(st.optimizer_step == trainer_r->session().optimizer().state_step(),
+          "状态含 Adam 的 t（优化器权威 t，issue #42）");
     CHECK(st.stride == cfg.stride, "状态含 stride（文本域扩展）");
 
     // 落盘状态可被 peek/load 读回（与 CLI 断点同一文件格式）

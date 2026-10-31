@@ -543,21 +543,26 @@ public:
         return save_model(path, model_, spec, tokenizer_data, ModelRole::Checkpoint, ckpt);
     }
 
-    // 一站式续训：载入权重（同一 .nnckpt 文件）→ 读训练状态段 → 可选交叉
-    // 校验（`current` = 本次训练的状态快照；配方/数据集身份不一致硬报错，
-    // Relaxed 只查 kind）→ 恢复优化器状态（t 先于/后于张量无序依赖，本入口
-    // 固定先 t 后张量）→ 恢复会话计数器。返回加载出的状态（域读取数据集身份
-    // 等字段用）。
+    // 一站式续训：读训练状态段 → 可选交叉校验（`current` = 本次训练的状态
+    // 快照；配方/数据集身份不一致硬报错，Relaxed 只查 kind）→ **校验通过后**
+    // 载入权重（同一 .nnckpt 文件）→ 恢复优化器状态（t 先于/后于张量无序依赖，
+    // 本入口固定先 t 后张量）→ 会话计数器镜像为优化器权威 t。返回加载出的
+    // 状态（域读取数据集身份等字段用）。
+    //
+    // 顺序即契约（issue #43）：权重载入放在校验之后，Strict 校验失败时模型
+    // 参数保持调用前原样，不存在"半提交"（参数已改写却返回错误）。
     [[nodiscard]] Result<std::unique_ptr<TrainState>>
     resume(const std::string& path, const TrainState* current = nullptr,
            ResumePolicy policy = ResumePolicy::Strict)
     {
-        NN_TRY(lm, load_model(path, model_, nullptr, nullptr, WeightLoadIntent::Trainable));
         NN_TRY(loaded, load_train_state(engine(), path));
         if (current != nullptr) { NN_TRY(vr, verify_resume(*loaded->state, *current, policy)); }
+        NN_TRY(lm, load_model(path, model_, nullptr, nullptr, WeightLoadIntent::Trainable));
         opt_->set_state_step(loaded->state->optimizer_step);
         NN_TRY(ls, opt_->load_state(loaded->optimizer_blobs));
-        state_.optimizer_step = loaded->state->counters.global_step;
+        // 会话镜像 = 优化器权威 t（不是 TrainState.counters.global_step：后者是
+        // "下一步位置"的绝对步号，与 Adam 的偏置修正计数不是同一量——issue #42）。
+        state_.optimizer_step = opt_->state_step();
         if (loaded->state->counters.lr > 0) set_lr(static_cast<Scalar>(loaded->state->counters.lr));
         clear_accumulation_state_();
         return std::move(loaded->state);

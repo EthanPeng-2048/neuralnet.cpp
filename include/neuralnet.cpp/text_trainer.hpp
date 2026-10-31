@@ -404,11 +404,14 @@ private:
     }
 
     // 断点状态的权威装配（计数器 = "下一步的位置"，epoch 边界归一化）。
+    // `optimizer_step` 取优化器权威 t（`state_step()`），**不是**会话镜像
+    // `step_count()`：CLI 续训只恢复优化器、不同步会话计数，用镜像会让
+    // 「续训 → 再存档」把 t 退化为本段步数（issue #42）。
     [[nodiscard]] TextTrainState make_train_state(std::size_t epoch, std::size_t step_done,
                                                   Scalar current_lr) const
     {
         return make_text_train_state(cfg_, identity_, steps_per_epoch_, epoch, step_done,
-                                     current_lr, session_.step_count());
+                                     current_lr, session_.optimizer().state_step());
     }
 
     TrainingSession session_;
