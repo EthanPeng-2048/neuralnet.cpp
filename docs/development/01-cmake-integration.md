@@ -188,6 +188,16 @@ tokenizer_infer,dataset_gen,dataset_convert}`，另有 `layer_bench`（性能）
 **已知构建坑**：链接报 `permission denied`（`build/` 下 exe 正在运行被占用 → 构建中止）
 → 追加 `-- -k 0` 让 ninja 跳过失败目标继续建其余目标（被占用目标仍需关掉进程后重链）。
 
+### IDE（clangd）如何解析 `<neuralnet.cpp/xxx.hpp>`
+
+include 路径全部来自 `target_include_directories`（`include/` + `extern/*/include` +
+`build/generated`），clangd 必须拿到编译数据库才能解析。顶层配置时 CMake 自动
+导出 `build/compile_commands.json`（`CMAKE_EXPORT_COMPILE_COMMANDS`，仅 Ninja/Makefile
+生成器有效）；仓库根的 `.clangd` 已指向 `build/`，clangd 打开任意头/源文件即可。
+用 preset 构建时编译数据库在 `build/<preset名>/`，把 `.clangd` 的
+`CompilationDatabase` 改成对应目录（或传 `--compile-commands-dir`）。
+改完 CMake 后记得重新 configure 一次，让数据库里的 `-I` 与目标保持同步。
+
 ---
 
 ## 8. 编译耗时

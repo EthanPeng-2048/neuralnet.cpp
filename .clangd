@@ -1,0 +1,7 @@
+# clangd 配置：指向 CMake 导出的编译数据库。
+# 前提：配置时带 -DCMAKE_EXPORT_COMPILE_COMMANDS=ON（或用 CMakePresets，
+# 已默认打开），生成 build/compile_commands.json。
+# 若用 preset 构建（binaryDir = build/<preset名>），把下行改成对应目录，
+# 例如 CompilationDatabase: build/dev。
+CompileFlags:
+  CompilationDatabase: build
