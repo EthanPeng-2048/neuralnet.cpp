@@ -47,6 +47,8 @@ EXTERNAL_FLAGS = {
     '--test-dir', '--parallel', '--target-env', '--dtype', '--adam-eps', '--device',
     '--task', '--compress', '--list', '--image', '--list-backends', '--summary', '--include',
     '--preset', '--workflow', '--list-presets', '--output-on-failure',
+    # clangd 自带选项（IDE 集成文档用）：clangd --compile-commands-dir <build>
+    '--compile-commands-dir',
     # git 自带选项（文档命令用）：git clang-format --diff / clone --recurse-submodules / tag --tags
     '--diff', '--recurse-submodules', '--tags',
 }

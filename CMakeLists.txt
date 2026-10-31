@@ -12,6 +12,15 @@ cmake_minimum_required(VERSION 3.30)
 # 它只是元数据——发版时同步到最新 tag，实际版本以 git tag / gh release 为准）
 project(neuralnet.cpp VERSION 1.14.1 LANGUAGES CXX)
 
+# ── IDE / clangd：导出 compile_commands.json（仅顶层工程时）───────────────
+# include 路径（include/ + extern/*/include + build/generated）全部来自
+# target_include_directories，clangd 没有编译数据库就解析不到
+# <neuralnet.cpp/xxx.hpp>。Ninja/Makefile 生成器有效，MSVC/Xcode 忽略；
+# 嵌入消费方是否导出由其顶层工程决定，这里不越权。
+if(PROJECT_IS_TOP_LEVEL)
+    set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+endif()
+
 # ══════════════════════════════════════════════════════════════════════════
 #  作为库被消费（add_subdirectory / FetchContent 嵌入 3rd_party）的门控
 # ══════════════════════════════════════════════════════════════════════════
