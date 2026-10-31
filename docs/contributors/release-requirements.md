@@ -357,3 +357,66 @@ f32 `.nnmodel` warm start 1 step：loss **7.6060**；文件 SHA-256
 - 审查修复：PPO off-policy 负 advantage 梯度、GAE mask 值泄漏、policy batch 形状、
   forward 失败后的具名反向状态、不可信 schema 解码上限、pipeline post-hook 状态提交；
   全部加入对应 RL 用例。
+
+---
+
+## 10. 2026-10-31 `v1.14.0` 发布实跑记录
+
+> 测试对象 = `main` 的发布定档提交。口径：GPU = **NVIDIA CMP 40HX / Vulkan SDK 1.4.350**；
+> Windows 两树用本机 preset（`NN_ENABLE_NATIVE=ON`），WSL 两树 `NN_ENABLE_NATIVE=OFF` + `NN_ENABLE_GPU=OFF`；
+> 构建一律 `-j32`（本机 32 核）。
+
+### 10.1 完整 ctest（Release / Debug）
+
+| 树 | 构建 | 完整 ctest |
+|---|---|---|
+| Windows clang 23.1 + MSVC STL / **Release** / Vulkan | 160/160 步 | **73 注册 → 72 pass + 1 skip + 0 fail**（84.3 s，`ctest -j16`）；skip = `scan_bitwise_test` |
+| Windows clang 23.1 + MSVC STL / **Debug** / Vulkan | 160/160 步 | **73 注册 → 73 pass + 0 skip + 0 fail**（434.6 s，顺序） |
+
+> Debug 必须顺序执行：`-j16` 并行时 `f16_precision_test` 被 GPU 争用拖到 40 min+（单跑 50.6 s 通过）；
+> Release 并行无此现象。v1.13.0 记录的既有失败（`t1_58_test` / `write_epoch_test`）本版全部 Passed。
+
+### 10.2 真实语料端到端训练（40HX）
+
+TinyStories 前 20,000 条 → **20,000 docs / 4,241,421 tokens / 8,208 词 / 66,273 个 seq64 窗口**；
+GPT `d_model=64 / heads=4 / layers=2 / d_ff=128 / seq_len=64`，`--batch-size 8 --accum-steps 2`，20 step：
+
+| 配方 | loss（step 20） | 备注 |
+|---|---|---|
+| f32 | 8.7566 → **7.6110** | 1.2 s，无 NaN/冻结 |
+| `--f16` | 8.7620 → **7.6741** | 0.4 s |
+| `--t1_58` | 8.9024 → **8.1851** | 0.5 s |
+
+- 断点续训：`--save-interval 5` 的 step20 `.nnckpt` → `--resume` 续 3 步，loss
+  **7.6525 → 7.5733 → 7.5231**；日志确认优化器 76 张量、`t=20` 恢复；
+- warm start：f32 `.nnmodel` 续 1 步 loss 7.6361，SHA-256 `19A26875…` → `77968371…`（参数确实移动）。
+
+### 10.3 四组「编译器 × 标准库」
+
+| 配置 | 结果 |
+|---|---|
+| Windows clang 23.1 + **MSVC STL** / Release / Vulkan | 见 §10.1（72 pass + 1 skip） |
+| Windows clang 23.1 + **MSVC STL** / Debug / Vulkan | 见 §10.1（73 pass） |
+| WSL g++ 15.2 + **libstdc++** / Release / CPU-only | 140/140 步；**71 注册 → 59 pass + 12 skip + 0 fail**（11.5 s） |
+| WSL clang 24.0 + **libc++** / Release / CPU-only | 140/140 步；**71 注册 → 59 pass + 12 skip + 0 fail**（10.3 s） |
+
+> `cl.exe + MSVC STL` 一组本机无 MSVC 工具链（`cl.exe` 不在 PATH、VS 未安装），**未在本机复跑**，
+> 沿用 CI 口径，记为已知覆盖缺口。WSL 的 12 个 GPU/offload 用例按 77 skip（无 Vulkan）。
+>
+> 本轮修掉的两个**纯 CPU 构建**真实缺陷（`dev` 提交 `a49311d`）：
+> ① 无 Vulkan 时 `gpu_batch_scope_test` 的 `make_conv_model` 触发 `-Wunused-function -Werror`；
+> ② GCC 15.2 在 `-O3` + PCH 下对 `std::optional/std::unique_ptr` 内联析构报
+> `-Wmaybe-uninitialized` 假阳性（诊断位置均为 `<unknown>`）→ 仅对 GNU 关闭该子告警。
+
+### 10.4 门禁与独立发布审查
+
+- `bench/doc_inventory.ps1`：**PASS**（`L2-VIOLATIONS: 0`、`HANDWRITTEN-RESIDUE: 0`、`TERMINATING-CALLS: 0`）；
+- `bench/audit_dangling.ps1`：exit 0；`bench/gui_cli_audit.py`：**PASS，可行动 0**
+  （修复了 preset 构建产物定位：`build/<preset>/`）；
+- 独立只读审查（`v1.13.0..dev`）：**P0 无**；格式化提交按 token 流比对 182 个 C++ 文件 **0 语义差异**；
+  `8406b39` 的 `NN_TRY/NN_FAIL` 改写与宏展开逐字等价；
+- **P1（2，记入 release note §5 已知限制）**：
+  ① 二次续训的 Adam `t` 退化（`make_train_state` 用 `session_.step_count()` 写 `optimizer_step`）；
+  ② `TrainingSession::resume` 先覆盖权重后 `verify_resume`（错误路径半提交）；
+- **P2（4）**：步进驱动 `max_steps==0` 空跑成功返回、`save_checkpoint` 覆盖 `global_step` 的口径分歧、
+  `InferenceScope::error()` 可解引用空 optional、`5854b98` 夹带 `extern/base` 指针且提交说明与实际不符。
