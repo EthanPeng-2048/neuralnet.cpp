@@ -28,6 +28,7 @@ int g_fail = 0;
         }                                                                                 \
     } while (0)
 
+#ifdef NN_HAS_VULKAN
 namespace
 {
 
@@ -42,6 +43,7 @@ nn::Result<nn::Model> make_conv_model(nn::ComputeEngine& eng)
 }
 
 } // namespace
+#endif // NN_HAS_VULKAN
 
 int main()
 {
