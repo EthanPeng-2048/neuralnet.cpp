@@ -111,6 +111,14 @@ if(MSVC)
     add_link_options(/STACK:8388608)
 else()
     add_compile_options(-fno-exceptions -Wall -Wextra -Wpedantic -Werror)
+    # GCC 15.2 在 -O3 + PCH 下对 std::optional / std::unique_ptr 的**内联析构**
+    # 报 -Wmaybe-uninitialized 假阳性（诊断里的内存位置全是 <unknown>；实测
+    # src/layer_lifetime_test.cpp 的 `unique_ptr<nn::Model>` 析构路径，成员已由
+    # make_unique/默认初始化，无真实未初始化读取）。Clang 不产生该告警，因此
+    # 只对 GNU 关闭此子告警；-Wuninitialized 保持开启。
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        add_compile_options(-Wno-maybe-uninitialized)
+    endif()
 endif()
 
 # Windows 上的 clang++（GNU-like 驱动）不是 CMake 的 MSVC 分支，但链接仍走
