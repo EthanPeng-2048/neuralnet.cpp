@@ -49,8 +49,7 @@ void test_state_bytes(nn::ComputeEngine& eng, const char* tag)
     const std::size_t q_state = q.state_bytes();
     const std::size_t a_state = elems * 4u * 2u;             // m/v 各 f32
     std::printf("    AdamWQuant 状态 = %zu B（%.2f B/权重）; f32 AdamW = %zu B（8.00 B/权重）\n",
-                q_state, static_cast<double>(q_state) / static_cast<double>(elems),
-                a_state);
+                q_state, static_cast<double>(q_state) / static_cast<double>(elems), a_state);
     CHECK(q_state < a_state, "量化状态比 f32 状态小");
     // 上界：2 B/权重（f16 m）+ 2 B/权重（f16 v）+ 尺度（4 B/行 × 2 个）
     const std::size_t expect_max = elems * 4u + 64u * 4u * 2u;
@@ -111,24 +110,22 @@ void test_scales(nn::ComputeEngine& eng, const char* tag)
     CHECK(row1_nonzero, "小量级行的状态未被下溢吃掉（动态尺度生效）");
     // 尺度的量级应随行的梯度量级走（行 0 比行 1 大约 1e3 倍）
     CHECK(sm.at(0, 0) > 100.0f * sm.at(1, 0), "行尺度随梯度量级（行0 ≫ 行1）");
-    std::printf("    scale_m: row0=%.3g row1=%.3g（比值 %.0f）\n",
-                static_cast<double>(sm.at(0, 0)), static_cast<double>(sm.at(1, 0)),
-                static_cast<double>(sm.at(0, 0) / sm.at(1, 0)));
+    std::printf("    scale_m: row0=%.3g row1=%.3g（比值 %.0f）\n", static_cast<double>(sm.at(0, 0)),
+                static_cast<double>(sm.at(1, 0)), static_cast<double>(sm.at(0, 0) / sm.at(1, 0)));
 }
 
 // ── [3][4] 端到端：与 f32 AdamW 同量级收敛 + 参数移动 ────────────────────
-bool train_mlp(nn::ComputeEngine& eng, const char* opt_name, int steps,
-               nn::Scalar& loss_out, std::vector<nn::Scalar>& w_before_out,
-               std::vector<nn::Scalar>& w_after_out)
+bool train_mlp(nn::ComputeEngine& eng, const char* opt_name, int steps, nn::Scalar& loss_out,
+               std::vector<nn::Scalar>& w_before_out, std::vector<nn::Scalar>& w_after_out)
 {
     nn::PrecisionProfile prof;   // 默认 f32
-    nn::Result<nn::Model> m_r = nn::build_mnist_mlp_model(
-        eng, nn::MNIST_LAYER_DIMS, nn::NormType::LayerNorm, prof);
+    nn::Result<nn::Model> m_r =
+        nn::build_mnist_mlp_model(eng, nn::MNIST_LAYER_DIMS, nn::NormType::LayerNorm, prof);
     if (!m_r) return false;
     nn::Model& model = *m_r;
 
-    auto os = nn::create_optimizer(opt_name, eng, model.parameters(),
-                                   model.param_gradients(), 0.02f, 0.0f, prof);
+    auto os = nn::create_optimizer(opt_name, eng, model.parameters(), model.param_gradients(),
+                                   0.02f, 0.0f, prof);
     if (!os) return false;
     std::unique_ptr<nn::Optimizer> opt = std::move(os);
 
@@ -157,12 +154,21 @@ bool train_mlp(nn::ComputeEngine& eng, const char* opt_name, int steps,
     {
         if (auto r = model.zero_grad(); !r) return false;
         auto pred = model.forward(Xt);
-        if (!pred) { std::printf("    forward 失败: %s\n", pred.error().message.c_str()); return false; }
+        if (!pred)
+        {
+            std::printf("    forward 失败: %s\n", pred.error().message.c_str());
+            return false;
+        }
         std::vector<std::size_t> labels(B);
-        for (std::size_t b = 0; b < B; ++b) labels[b] = b % C;
+        for (std::size_t b = 0; b < B; ++b)
+            labels[b] = b % C;
         std::vector<nn::Scalar> mask(B, 1.0f);
         auto ls = loss.forward_sparse(eng, *pred, labels, mask, C);
-        if (!ls) { std::printf("    loss 失败: %s\n", ls.error().message.c_str()); return false; }
+        if (!ls)
+        {
+            std::printf("    loss 失败: %s\n", ls.error().message.c_str());
+            return false;
+        }
         last = *ls;
         if (!std::isfinite(last)) return false;
         auto gl = loss.backward();
@@ -188,8 +194,8 @@ void test_convergence(nn::ComputeEngine& eng, const char* tag)
     CHECK(ok_a, "f32 AdamW 训练跑通");
     CHECK(ok_q, "AdamWQuant 训练跑通");
     if (!ok_a || !ok_q) return;
-    std::printf("    最终 loss: AdamW=%.6f  AdamWQuant=%.6f\n",
-                static_cast<double>(loss_adam), static_cast<double>(loss_quant));
+    std::printf("    最终 loss: AdamW=%.6f  AdamWQuant=%.6f\n", static_cast<double>(loss_adam),
+                static_cast<double>(loss_quant));
     CHECK(std::isfinite(loss_quant), "AdamWQuant 的 loss 有限");
     // 收敛量级：能显著下降，且与 f32 AdamW 同量级（不要求逐位：状态量化必然有差）
     CHECK(loss_quant < 0.5f, "AdamWQuant 收敛到小 loss");
@@ -200,12 +206,16 @@ void test_convergence(nn::ComputeEngine& eng, const char* tag)
     for (std::size_t i = 0; i < wa_q.size(); ++i)
         moved += std::fabs(static_cast<double>(wa_q[i]) - static_cast<double>(wb_q[i]));
     CHECK(moved > 1e-3, "AdamWQuant 下参数确实移动（非静默冻结）");
-    std::printf("    首层权重 L1 位移: AdamW=%.4f  AdamWQuant=%.4f\n", [&] {
-        double s = 0.0;
-        for (std::size_t i = 0; i < wa_a.size(); ++i)
-            s += std::fabs(static_cast<double>(wa_a[i]) - static_cast<double>(wb_a[i]));
-        return s;
-    }(), moved);
+    std::printf(
+        "    首层权重 L1 位移: AdamW=%.4f  AdamWQuant=%.4f\n",
+        [&]
+        {
+            double s = 0.0;
+            for (std::size_t i = 0; i < wa_a.size(); ++i)
+                s += std::fabs(static_cast<double>(wa_a[i]) - static_cast<double>(wb_a[i]));
+            return s;
+        }(),
+        moved);
 }
 
 // ── [5] 首步零梯度不产生 NaN ──────────────────────────────────────────────
@@ -257,7 +267,6 @@ int main(int argc, char* argv[])
         test_convergence(eng, "CPU");
     }
 
-    if (g_failures == 0)
-        std::puts("adam_quant_test: 全部通过");
+    if (g_failures == 0) std::puts("adam_quant_test: 全部通过");
     return g_failures == 0 ? 0 : 1;
 }

@@ -58,20 +58,22 @@ std::filesystem::path scratch_dir()
 }
 
 [[nodiscard]] nn::ModelSpec tiny_spec()
-{
-    return nn::make_gpt_spec(VOCAB, D_MODEL, SEQ_LEN, HEADS, D_FF, LAYERS);
-}
+{ return nn::make_gpt_spec(VOCAB, D_MODEL, SEQ_LEN, HEADS, D_FF, LAYERS); }
 
 // 按参数顺序拍参数快照（宿主侧 f32；用于"参数确实移动"的断言）
-[[nodiscard]] std::vector<nn::Scalar> params_snapshot(nn::ComputeEngine& eng,
-                                                      nn::Model& m)
+[[nodiscard]] std::vector<nn::Scalar> params_snapshot(nn::ComputeEngine& eng, nn::Model& m)
 {
     std::vector<nn::Scalar> out;
     for (auto& t : m.parameters())
     {
         auto mat = eng.to_matrix(t.get());
-        if (!mat) { out.push_back(-1e30f); continue; }
-        for (auto v : mat->span()) out.push_back(v);
+        if (!mat)
+        {
+            out.push_back(-1e30f);
+            continue;
+        }
+        for (auto v : mat->span())
+            out.push_back(v);
     }
     return out;
 }
@@ -123,8 +125,7 @@ void test_role_gate_and_roundtrip(const std::filesystem::path& dir)
 
     const std::string model_file = (dir / "gate.nnmodel").string();
     const std::string ckpt_file = (dir / "gate.nnckpt").string();
-    NN_ASSERT_ALWAYS(nn::cli::save_text_train_model(model_file, original, spec,
-                                                    kTokenizerBytes),
+    NN_ASSERT_ALWAYS(nn::cli::save_text_train_model(model_file, original, spec, kTokenizerBytes),
                      "text_train_modules_test: 写推理模型失败");
     nn::cli::TextTrainCheckpointLog log;
     nn::TextTrainState ckpt_state;   // P1-2：断点带训练状态段（本用例不挂优化器状态张量）
@@ -167,13 +168,14 @@ void test_role_gate_and_roundtrip(const std::filesystem::path& dir)
 
         // 解析层登记（不看值：给了 --lr 且值与断点相同也登记）
         {
-            std::vector<std::string> args{"text_train", "/tmp/ds.nndataset", "--lr", "0.001",
-                                          "--epochs", "3", "--save", "/tmp/m.nnmodel"};
+            std::vector<std::string> args{"text_train", "/tmp/ds.nndataset", "--lr",
+                                          "0.001",      "--epochs",          "3",
+                                          "--save",     "/tmp/m.nnmodel"};
             std::vector<char*> argv;
             argv.reserve(args.size());
-            for (std::string& a : args) argv.push_back(a.data());
-            auto cfg_p = nn::cli::parse_text_train_args(static_cast<int>(argv.size()),
-                                                        argv.data());
+            for (std::string& a : args)
+                argv.push_back(a.data());
+            auto cfg_p = nn::cli::parse_text_train_args(static_cast<int>(argv.size()), argv.data());
             CHECK(cfg_p.explicit_train_flags.size() == 2 &&
                       cfg_p.explicit_train_flags[0] == "--lr" &&
                       cfg_p.explicit_train_flags[1] == "--epochs",
@@ -218,15 +220,15 @@ void test_role_gate_and_roundtrip(const std::filesystem::path& dir)
         legacy_state.dataset.steps_per_epoch = 5;
         const std::string legacy_ckpt = (dir / "legacy.nnckpt").string();
         nn::cli::TextTrainCheckpointLog legacy_log;
-        legacy_log.save(legacy_ckpt, original, spec, kTokenizerBytes, legacy_state,
-                        no_blobs, std::cerr);
+        legacy_log.save(legacy_ckpt, original, spec, kTokenizerBytes, legacy_state, no_blobs,
+                        std::cerr);
         nn::cli::TrainConfig legacy_cfg;
         legacy_cfg.resume_path = legacy_ckpt;
         legacy_cfg.load_existing = true;
         std::ostringstream legacy_out, legacy_err;
         auto legacy_r = nn::cli::adopt_resume_state(legacy_cfg, legacy_out, legacy_err);
-        CHECK(legacy_r && legacy_cfg.batch_size == 4 &&
-                  legacy_cfg.accum_steps == 2 && legacy_cfg.start_step == 1,
+        CHECK(legacy_r && legacy_cfg.batch_size == 4 && legacy_cfg.accum_steps == 2 &&
+                  legacy_cfg.start_step == 1,
               "旧 micro-batch 断点 → global=4 / accum=2 / update step=1");
         if (legacy_r)
             CHECK(legacy_r->state.recipe.batch_size_is_global &&
@@ -275,8 +277,7 @@ void test_role_gate_and_roundtrip(const std::filesystem::path& dir)
     }
     CHECK(out.str().find("已加载模型: " + ckpt_file) != std::string::npos,
           "恢复成功应打印已加载模型路径");
-    CHECK(params_identical(eng, original, restored),
-          "恢复后的参数应与保存前逐位一致");
+    CHECK(params_identical(eng, original, restored), "恢复后的参数应与保存前逐位一致");
 
     // 角色语义变更后（2026-10-16 裁定）的反例形态：dense `.nnmodel` ⇒ **warm start**
     // 走通整条恢复流程（SFT 入口）；三值 `.nnmodel` 见下面的 P1-7 反量化块。
@@ -289,9 +290,7 @@ void test_role_gate_and_roundtrip(const std::filesystem::path& dir)
     auto warm = nn::cli::resume_text_train(eng, warm_cfg, m2, spec_out2, out2, err2);
     CHECK(warm.has_value(), "dense 推理模型应能走通恢复流程（warm start）");
     CHECK(err2.str().empty(), "warm start 不应在 stderr 上留痕（错误才经 Result/stderr）");
-    if (warm)
-        CHECK(params_identical(eng, original, m2),
-              "warm start 载入的参数应与写出前逐位一致");
+    if (warm) CHECK(params_identical(eng, original, m2), "warm start 载入的参数应与写出前逐位一致");
 
     // ── P1-7：三值（T1_58）`.nnmodel` 的续训入口（打包 → latent 反量化）──────
     // 三值推理文件的载荷是打包形态（没有 latent，部署态 `backward()` 会报错）。
@@ -307,8 +306,7 @@ void test_role_gate_and_roundtrip(const std::filesystem::path& dir)
         nn::Model src = std::move(*src_r);
 
         const std::string t_file = (dir / "ternary.nnmodel").string();
-        NN_ASSERT_ALWAYS(nn::cli::save_text_train_model(t_file, src, t_spec,
-                                                       kTokenizerBytes),
+        NN_ASSERT_ALWAYS(nn::cli::save_text_train_model(t_file, src, t_spec, kTokenizerBytes),
                          "text_train_modules_test: 写三值推理模型失败");
         {
             auto role = nn::peek_model_role(t_file);
@@ -329,8 +327,7 @@ void test_role_gate_and_roundtrip(const std::filesystem::path& dir)
         nn::ModelSpec t_spec_out;
         nn::Model t_model;
         std::ostringstream t_out, t_err;
-        auto t_res =
-            nn::cli::resume_text_train(eng, t_cfg, t_model, t_spec_out, t_out, t_err);
+        auto t_res = nn::cli::resume_text_train(eng, t_cfg, t_model, t_spec_out, t_out, t_err);
         CHECK(t_res.has_value(), "三值 .nnmodel 应能按 warm start 载入（P1-7：不再被拒）");
         if (t_res.has_value())
         {
@@ -370,8 +367,7 @@ void test_role_gate_and_roundtrip(const std::filesystem::path& dir)
             nn::ModelSpec d_spec_out;
             nn::Model d_model;
             std::ostringstream d_out, d_err;
-            auto d_res = nn::cli::resume_text_train(eng, d_cfg, d_model, d_spec_out, d_out,
-                                                    d_err);
+            auto d_res = nn::cli::resume_text_train(eng, d_cfg, d_model, d_spec_out, d_out, d_err);
             CHECK(d_res.has_value(), "不给精度旗标也应能载入三值 warm start（规格定 BitLinear）");
             if (d_res.has_value())
             {
@@ -384,7 +380,7 @@ void test_role_gate_and_roundtrip(const std::filesystem::path& dir)
 
         // 8 步 Adam：backward 可跑（不是只读部署态）、参数确实移动（P1-7 验收）
         auto opt = nn::create_optimizer("adam", eng, t_model.parameters(),
-                                       t_model.param_gradients(), 1e-2f, 0.0f, t1);
+                                        t_model.param_gradients(), 1e-2f, 0.0f, t1);
         NN_ASSERT_ALWAYS(opt != nullptr, "text_train_modules_test: 建三值优化器失败");
         const std::vector<nn::Scalar> before = params_snapshot(eng, t_model);
 
@@ -400,16 +396,35 @@ void test_role_gate_and_roundtrip(const std::filesystem::path& dir)
         {
             steps_ok = t_model.zero_grad().has_value();
             auto logits = t_model.forward(x_t);
-            if (!logits) { steps_ok = false; break; }
+            if (!logits)
+            {
+                steps_ok = false;
+                break;
+            }
             auto loss = ce.forward(eng, *logits, tgt_t);
-            if (!loss) { steps_ok = false; break; }
+            if (!loss)
+            {
+                steps_ok = false;
+                break;
+            }
             auto grad = ce.backward();
-            if (!grad) { steps_ok = false; break; }
-            if (!t_model.backward(*grad)) { steps_ok = false; break; }
-            if (!opt->step()) { steps_ok = false; break; }
+            if (!grad)
+            {
+                steps_ok = false;
+                break;
+            }
+            if (!t_model.backward(*grad))
+            {
+                steps_ok = false;
+                break;
+            }
+            if (!opt->step())
+            {
+                steps_ok = false;
+                break;
+            }
         }
-        CHECK(steps_ok,
-              "三值 warm start 后 8 步 Adam（forward/loss/backward/step）全部成功");
+        CHECK(steps_ok, "三值 warm start 后 8 步 Adam（forward/loss/backward/step）全部成功");
         const std::vector<nn::Scalar> after = params_snapshot(eng, t_model);
         std::size_t moved = 0, total = 0;
         for (std::size_t i = 0; i < before.size() && i < after.size(); ++i)
@@ -447,12 +462,10 @@ void test_ckpt_accounting(const std::filesystem::path& dir)
     std::ostringstream err_code;
     CHECK(nn::cli::text_train_ckpt_exit_code(log.failures(), err_code) == 1,
           "有断点写失败时收尾退出码必须为 1");
-    CHECK(err_code.str().find("退出码 1") != std::string::npos,
-          "收尾错误行应说明退出码");
+    CHECK(err_code.str().find("退出码 1") != std::string::npos, "收尾错误行应说明退出码");
 
     // 成功路径：不增计数、退出码 0、不打印
-    log.save((dir / "ok.nnckpt").string(), model, spec, kTokenizerBytes, ckpt_state,
-             no_blobs, err);
+    log.save((dir / "ok.nnckpt").string(), model, spec, kTokenizerBytes, ckpt_state, no_blobs, err);
     CHECK(log.failures() == 1, "成功保存不应增加失败计数");
     std::ostringstream err_ok;
     CHECK(nn::cli::text_train_ckpt_exit_code(0, err_ok) == 0, "无失败时退出码必须为 0");
@@ -469,9 +482,8 @@ void test_train_state_wiring(const std::filesystem::path& dir)
     NN_ASSERT_ALWAYS(built, "test_train_state_wiring: 构建小 GPT 失败");
     nn::Model model = std::move(*built);
 
-    auto opt = nn::create_optimizer("adam", eng, model.parameters(),
-                                    model.param_gradients(), 1e-3f, 0.0f,
-                                    nn::PrecisionProfile{}, 0.9f, 0.999f);
+    auto opt = nn::create_optimizer("adam", eng, model.parameters(), model.param_gradients(), 1e-3f,
+                                    0.0f, nn::PrecisionProfile{}, 0.9f, 0.999f);
     NN_ASSERT_ALWAYS(opt != nullptr, "test_train_state_wiring: 建优化器失败");
     NN_ASSERT_ALWAYS(opt->step(), "test_train_state_wiring: 一步失败");
 
@@ -496,10 +508,9 @@ void test_train_state_wiring(const std::filesystem::path& dir)
     nn::cli::TextTrainCheckpointLog log;
     // P2b：状态装配唯一实现 = nn::make_text_train_state（TextTrainer 内部同一函数）
     const nn::TextTrainState state = nn::make_text_train_state(
-        cfg, id, /*steps_per_epoch=*/2, /*epoch=*/1, /*step_done=*/2, 1e-3,
-        opt->state_step());
-    nn::cli::save_ckpt_with_state(path.string(), model, spec, kTokenizerBytes, state, *opt,
-                                  log, err);
+        cfg, id, /*steps_per_epoch=*/2, /*epoch=*/1, /*step_done=*/2, 1e-3, opt->state_step());
+    nn::cli::save_ckpt_with_state(path.string(), model, spec, kTokenizerBytes, state, *opt, log,
+                                  err);
     CHECK(log.failures() == 0 && err.str().empty(), "带状态的断点应一次写成功");
 
     auto st = nn::peek_train_state(path.string());
@@ -527,24 +538,22 @@ void test_train_state_wiring(const std::filesystem::path& dir)
             // 数据集身份门禁走的就是断点里的这份身份
             nn::DatasetIdentity changed = id;
             changed.num_samples = 5;
-            CHECK(!nn::cli::verify_dataset_identity(ts->dataset, changed, path.string())
-                      .has_value(),
-                  "断点记录的身份 vs 变化的网格 ⇒ 硬报错（接线一致）");
+            CHECK(
+                !nn::cli::verify_dataset_identity(ts->dataset, changed, path.string()).has_value(),
+                "断点记录的身份 vs 变化的网格 ⇒ 硬报错（接线一致）");
         }
     }
 
     // 重启：新优化器（状态零初始化）→ 载入断点状态 → t 与张量恢复
-    auto opt2 = nn::create_optimizer("adam", eng, model.parameters(),
-                                     model.param_gradients(), 1e-3f, 0.0f,
-                                     nn::PrecisionProfile{}, 0.9f, 0.999f);
+    auto opt2 = nn::create_optimizer("adam", eng, model.parameters(), model.param_gradients(),
+                                     1e-3f, 0.0f, nn::PrecisionProfile{}, 0.9f, 0.999f);
     NN_ASSERT_ALWAYS(opt2 != nullptr, "test_train_state_wiring: 重建优化器失败");
     CHECK(opt2->state_step() == 0, "新优化器的步计数器从 0 起（前置条件）");
     std::ostringstream out2;
     auto lr = nn::cli::load_optimizer_state(eng, path.string(), *opt2, out2);
     CHECK(lr.has_value(), "load_optimizer_state 应成功");
     CHECK(opt2->state_step() == 1, "载入后 Adam 的 t 恢复（偏置修正计数不丢）");
-    CHECK(out2.str().find("已恢复优化器状态") != std::string::npos,
-          "载入成功应打印一行进度");
+    CHECK(out2.str().find("已恢复优化器状态") != std::string::npos, "载入成功应打印一行进度");
 }
 
 // ── [5] 推理模型角色（text_infer 侧前提）───────────────────────────────

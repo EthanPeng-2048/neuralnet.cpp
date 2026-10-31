@@ -42,14 +42,16 @@ int g_failures = 0;
 std::size_t count_params(const std::vector<nn::TensorRef>& ps)
 {
     std::size_t n = 0;
-    for (const auto& p : ps) n += p.get().rows() * p.get().cols();
+    for (const auto& p : ps)
+        n += p.get().rows() * p.get().cols();
     return n;
 }
 
 double max_abs(const nn::Matrix& m)
 {
     double r = 0.0;
-    for (auto v : m.span()) r = std::max(r, std::fabs(static_cast<double>(v)));
+    for (auto v : m.span())
+        r = std::max(r, std::fabs(static_cast<double>(v)));
     return r;
 }
 
@@ -75,26 +77,26 @@ void test_subln_param_count()
     const auto P = nn::PosEncodingType::Learned;
     const auto A = nn::ActivationType::SwiGLU;
 
-    auto build = [&](nn::NormType nt, bool subln) {
-        auto m = std::make_unique<nn::GPTModel>(
-            V, D, S, H, FF, L, P, A, nt, nn::PrecisionProfile{}, subln);
+    auto build = [&](nn::NormType nt, bool subln)
+    {
+        auto m = std::make_unique<nn::GPTModel>(V, D, S, H, FF, L, P, A, nt, nn::PrecisionProfile{},
+                                                subln);
         NN_EXIT(m->init(eng), 1, "GPTModel init 失败: ");
         return m;
     };
 
     auto off = build(nn::NormType::RMSNorm, false);
-    auto on  = build(nn::NormType::RMSNorm, true);
+    auto on = build(nn::NormType::RMSNorm, true);
     const std::size_t n_off = count_params(off->parameters());
-    const std::size_t n_on  = count_params(on->parameters());
-    std::printf("    RMSNorm: off=%zu on=%zu Δ=%zu（期望 %zu）\n",
-                n_off, n_on, n_on - n_off, L * (D + FF));
+    const std::size_t n_on = count_params(on->parameters());
+    std::printf("    RMSNorm: off=%zu on=%zu Δ=%zu（期望 %zu）\n", n_off, n_on, n_on - n_off,
+                L * (D + FF));
     CHECK(n_on == n_off + L * (D + FF), "RMSNorm 下 SubLN 增量 = layers×(d_model+d_ff)");
 
     // LayerNorm（gamma + beta 两个张量）→ 增量翻倍：证明类型跟随 norm_type
     auto off_ln = build(nn::NormType::LayerNorm, false);
-    auto on_ln  = build(nn::NormType::LayerNorm, true);
-    const std::size_t d_ln = count_params(on_ln->parameters()) -
-                             count_params(off_ln->parameters());
+    auto on_ln = build(nn::NormType::LayerNorm, true);
+    const std::size_t d_ln = count_params(on_ln->parameters()) - count_params(off_ln->parameters());
     std::printf("    LayerNorm: Δ=%zu（期望 %zu）\n", d_ln, L * 2 * (D + FF));
     CHECK(d_ln == L * 2 * (D + FF), "LayerNorm 下 SubLN 增量 = layers×2×(d_model+d_ff)");
 
@@ -115,8 +117,7 @@ void test_subln_grad_wiring()
 
     // FeedForward：参数序 = [fc1.w, fc1.b, fc2.w, fc2.b, sub_norm.gamma]
     {
-        nn::FeedForward ff(D, FF, nn::ActivationType::GeLU, /*subln=*/true,
-                           nn::NormType::RMSNorm);
+        nn::FeedForward ff(D, FF, nn::ActivationType::GeLU, /*subln=*/true, nn::NormType::RMSNorm);
         NN_EXIT(ff.init(eng), 1, "FeedForward init 失败: ");
         auto ps = ff.parameters();
         CHECK(ps.size() == 5, "FF 参数条数 = 5（含 sub_norm.gamma）");
@@ -139,9 +140,8 @@ void test_subln_grad_wiring()
 
     // CausalSelfAttention：参数序 = [w_q, w_k, w_v, w_o, attn_sub_norm.gamma]
     {
-        nn::CausalSelfAttention at(D, H, /*max_len=*/8, /*seq_len=*/S,
-                                   nn::PosEncodingType::RoPE, /*subln=*/true,
-                                   nn::NormType::RMSNorm);
+        nn::CausalSelfAttention at(D, H, /*max_len=*/8, /*seq_len=*/S, nn::PosEncodingType::RoPE,
+                                   /*subln=*/true, nn::NormType::RMSNorm);
         NN_EXIT(at.init(eng), 1, "CausalSelfAttention init 失败: ");
         auto ps = at.parameters();
         // 参数序 = [w_q.w, w_q.b, w_k.w, w_k.b, w_v.w, w_v.b, w_o.w, w_o.b,
@@ -177,8 +177,7 @@ void test_subln_changes_forward()
 
     nn::FeedForward off(D, FF, nn::ActivationType::GeLU, /*subln=*/false);
     NN_EXIT(off.init(eng), 1, "FeedForward(off) init 失败: ");
-    nn::FeedForward on(D, FF, nn::ActivationType::GeLU, /*subln=*/true,
-                       nn::NormType::RMSNorm);
+    nn::FeedForward on(D, FF, nn::ActivationType::GeLU, /*subln=*/true, nn::NormType::RMSNorm);
     NN_EXIT(on.init(eng), 1, "FeedForward(on) init 失败: ");
 
     auto po = off.parameters();   // 4 张
@@ -203,7 +202,8 @@ void test_subln_changes_forward()
     // 反向消融：把 on 的 sub_norm.gamma 改成 0 → 中间激活整片归零 → fc2 偏置存活
     {
         nn::Matrix zero(FF, 1);
-        for (auto& v : zero.span()) v = 0.0f;
+        for (auto& v : zero.span())
+            v = 0.0f;
         NN_EXIT(eng.copy_from(pn[4].get(), zero), 1, "清零 sub_norm.gamma 失败: ");
         auto y0 = on.forward(x);
         NN_EXIT(y0, 1, "forward(gamma=0) 失败: ");
@@ -223,19 +223,24 @@ void test_subln_spec_roundtrip()
     nn::CpuEngine& eng = *eng_owner;
 
     nn::GptConfig cfg;
-    cfg.vocab_size = V; cfg.d_model = D; cfg.seq_len = S;
-    cfg.num_heads = H;  cfg.d_ff = FF;   cfg.num_layers = L;
+    cfg.vocab_size = V;
+    cfg.d_model = D;
+    cfg.seq_len = S;
+    cfg.num_heads = H;
+    cfg.d_ff = FF;
+    cfg.num_layers = L;
     cfg.pos_enc = nn::PosEncodingType::Learned;
     cfg.activation = nn::ActivationType::SwiGLU;
     cfg.norm_type = nn::NormType::RMSNorm;
     cfg.subln = true;
 
-    const nn::ModelSpec spec = nn::make_gpt_spec(
-        V, D, S, H, FF, L, cfg.pos_enc, cfg.activation, cfg.norm_type, cfg.subln);
+    const nn::ModelSpec spec =
+        nn::make_gpt_spec(V, D, S, H, FF, L, cfg.pos_enc, cfg.activation, cfg.norm_type, cfg.subln);
     CHECK(spec.as<nn::GptSpec>()->subln, "make_gpt_spec 记录 subln");
 
     nn::Matrix x_m(S, B);
-    for (std::size_t i = 0; i < x_m.size(); ++i) x_m.span()[i] = static_cast<float>(i % V);
+    for (std::size_t i = 0; i < x_m.size(); ++i)
+        x_m.span()[i] = static_cast<float>(i % V);
 
     nn::Matrix y_ref;
     {
@@ -274,7 +279,8 @@ void test_subln_spec_roundtrip()
 void test_subln_spec_matches()
 {
     std::puts("[5] spec_matches：subln 不同 → 不一致");
-    const auto base = [](bool subln) {
+    const auto base = [](bool subln)
+    {
         return nn::make_gpt_spec(64, 32, 8, 4, 64, 2, nn::PosEncodingType::Learned,
                                  nn::ActivationType::SwiGLU, nn::NormType::RMSNorm, subln);
     };
@@ -285,8 +291,8 @@ void test_subln_spec_matches()
 
 // ── S2/GQA 辅助：把 (n_kv·d_k, C) 的 KV 权重按**块映射**复制成 (n_head·d_k, C) ──
 // 与实现同一约定：MHA 的第 h 头 = GQA 的第 (h / n_rep) 头。
-nn::Matrix repeat_kv_rows(const nn::Matrix& src, std::size_t d_k,
-                          std::size_t n_head, std::size_t n_kv)
+nn::Matrix repeat_kv_rows(const nn::Matrix& src, std::size_t d_k, std::size_t n_head,
+                          std::size_t n_kv)
 {
     const std::size_t n_rep = n_head / n_kv;
     nn::Matrix out(n_head * d_k, src.cols());
@@ -324,8 +330,8 @@ void test_gqa_mha_equivalence(nn::ComputeEngine& eng, const char* tag)
     }
     double wdiff = 0.0;
     for (std::size_t i = 0; i < pm.size(); ++i)
-        wdiff = std::max(wdiff, max_abs_diff(download(eng, pm[i].get()),
-                                             download(eng, pg[i].get())));
+        wdiff =
+            std::max(wdiff, max_abs_diff(download(eng, pm[i].get()), download(eng, pg[i].get())));
     CHECK(wdiff == 0.0, "显式拷贝后两层权重逐位相同");
 
     auto x = make_tensor(eng, D, S * B, 0.15f, 0.02f);
@@ -371,9 +377,8 @@ void test_gqa_head_mapping(nn::ComputeEngine& eng, const char* tag)
     CHECK(pg.size() == 8 && pm.size() == 8, "参数条数 8");
     if (pg.size() != 8 || pm.size() != 8) return;
     for (std::size_t i = 0; i < 8; ++i)
-        std::printf("      param[%zu] gqa=%zux%zu mha=%zux%zu\n", i,
-                    pg[i].get().rows(), pg[i].get().cols(),
-                    pm[i].get().rows(), pm[i].get().cols());
+        std::printf("      param[%zu] gqa=%zux%zu mha=%zux%zu\n", i, pg[i].get().rows(),
+                    pg[i].get().cols(), pm[i].get().rows(), pm[i].get().cols());
 
     // Q/O 直接拷；K/V（w 与 b）按块映射复制行
     for (std::size_t i : {std::size_t{0}, std::size_t{1}, std::size_t{6}, std::size_t{7}})
@@ -381,8 +386,7 @@ void test_gqa_head_mapping(nn::ComputeEngine& eng, const char* tag)
     for (std::size_t i : {std::size_t{2}, std::size_t{3}, std::size_t{4}, std::size_t{5}})
     {
         const nn::Matrix Wg = download(eng, pg[i].get());
-        NN_EXIT(eng.copy_from(pm[i].get(), repeat_kv_rows(Wg, d_k, H, n_kv)),
-                1, "拷贝 K/V 失败: ");
+        NN_EXIT(eng.copy_from(pm[i].get(), repeat_kv_rows(Wg, d_k, H, n_kv)), 1, "拷贝 K/V 失败: ");
     }
 
     auto x = make_tensor(eng, D, S * B, 0.15f, 0.02f);
@@ -408,7 +412,8 @@ void test_gqa_head_mapping(nn::ComputeEngine& eng, const char* tag)
     {
         const nn::Matrix gg = download(eng, gqa.param_gradients()[i].get());
         const nn::Matrix gm_full = download(eng, mha.param_gradients()[i].get());
-        const nn::Matrix gm_fold = [&] {
+        const nn::Matrix gm_fold = [&]
+        {
             nn::Matrix o(gg.rows(), gg.cols());
             const std::size_t n_rep = H / n_kv;
             for (std::size_t r = 0; r < gg.rows(); ++r)
@@ -429,13 +434,12 @@ void test_gqa_head_mapping(nn::ComputeEngine& eng, const char* tag)
 void test_gqa_spec()
 {
     std::puts("[9] GQA 规格往返 + spec_matches");
-    const auto mk = [](std::size_t n_kv) {
+    const auto mk = [](std::size_t n_kv)
+    {
         return nn::make_gpt_spec(64, 32, 8, 4, 64, 2, nn::PosEncodingType::Learned,
-                                 nn::ActivationType::SwiGLU, nn::NormType::RMSNorm,
-                                 false, n_kv);
+                                 nn::ActivationType::SwiGLU, nn::NormType::RMSNorm, false, n_kv);
     };
-    CHECK(!mk(0).as<nn::GptSpec>()->n_head_kv &&
-              mk(0).as<nn::GptSpec>()->n_head_kv_or_heads() == 4,
+    CHECK(!mk(0).as<nn::GptSpec>()->n_head_kv && mk(0).as<nn::GptSpec>()->n_head_kv_or_heads() == 4,
           "0 = num_heads（旧语义）");
     CHECK(nn::spec_matches(mk(0), mk(4)), "0 与显式 num_heads 语义等价");
     CHECK(!nn::spec_matches(mk(2), mk(4)), "n_head_kv 不同 → 不匹配");
@@ -446,19 +450,23 @@ void test_gqa_spec()
     auto eng_owner = nn::CpuEngine::create();
     nn::CpuEngine& eng = *eng_owner;
     nn::GptConfig cfg;
-    cfg.vocab_size = V; cfg.d_model = D; cfg.seq_len = S;
-    cfg.num_heads = H;  cfg.d_ff = FF;   cfg.num_layers = L;
+    cfg.vocab_size = V;
+    cfg.d_model = D;
+    cfg.seq_len = S;
+    cfg.num_heads = H;
+    cfg.d_ff = FF;
+    cfg.num_layers = L;
     cfg.pos_enc = nn::PosEncodingType::Learned;
     cfg.activation = nn::ActivationType::SwiGLU;
     cfg.norm_type = nn::NormType::RMSNorm;
     cfg.subln = true;
     cfg.n_head_kv = 2;
-    const nn::ModelSpec spec = nn::make_gpt_spec(
-        V, D, S, H, FF, L, cfg.pos_enc, cfg.activation, cfg.norm_type,
-        cfg.subln, cfg.n_head_kv);
+    const nn::ModelSpec spec = nn::make_gpt_spec(V, D, S, H, FF, L, cfg.pos_enc, cfg.activation,
+                                                 cfg.norm_type, cfg.subln, cfg.n_head_kv);
 
     nn::Matrix x_m(S, B);
-    for (std::size_t i = 0; i < x_m.size(); ++i) x_m.span()[i] = static_cast<float>(i % V);
+    for (std::size_t i = 0; i < x_m.size(); ++i)
+        x_m.span()[i] = static_cast<float>(i % V);
 
     nn::Matrix y_ref;
     {
@@ -473,7 +481,11 @@ void test_gqa_spec()
         auto peeked = nn::peek_model_spec(file);
         CHECK(peeked.has_value() && peeked->as<nn::GptSpec>()->n_head_kv == 2,
               "规格记住 n_head_kv=2");
-        if (!peeked.has_value()) { std::remove(file.c_str()); return; }
+        if (!peeked.has_value())
+        {
+            std::remove(file.c_str());
+            return;
+        }
         auto m2 = nn::build_gpt_model_from_spec(eng, *peeked);
         NN_EXIT(m2, 1, "build_gpt_model_from_spec(GQA) 失败: ");
         NN_EXIT(nn::load_model(file, *m2), 1, "load_model 失败: ");
@@ -494,21 +506,22 @@ void test_tied_embedding()
     nn::CpuEngine& eng = *eng_owner;
     const std::size_t V = 64, D = 32, S = 8, H = 4, FF = 64, L = 2, B = 2, N = S * B;
 
-    auto mk = [&](bool tie) {
-        auto m = std::make_unique<nn::GPTModel>(
-            V, D, S, H, FF, L, nn::PosEncodingType::Learned,
-            nn::ActivationType::SwiGLU, nn::NormType::RMSNorm,
-            nn::PrecisionProfile{}, /*subln=*/false, /*n_head_kv=*/0, /*tie=*/tie);
+    auto mk = [&](bool tie)
+    {
+        auto m = std::make_unique<nn::GPTModel>(V, D, S, H, FF, L, nn::PosEncodingType::Learned,
+                                                nn::ActivationType::SwiGLU, nn::NormType::RMSNorm,
+                                                nn::PrecisionProfile{}, /*subln=*/false,
+                                                /*n_head_kv=*/0, /*tie=*/tie);
         NN_EXIT(m->init(eng), 1, "GPTModel init 失败: ");
         return m;
     };
 
     auto off = mk(false);
-    auto on  = mk(true);
+    auto on = mk(true);
     const std::size_t n_off = count_params(off->parameters());
-    const std::size_t n_on  = count_params(on->parameters());
-    std::printf("    off=%zu on=%zu Δ=%zu（期望 %zu = V*D + V）\n",
-                n_off, n_on, n_off - n_on, V * D + V);
+    const std::size_t n_on = count_params(on->parameters());
+    std::printf("    off=%zu on=%zu Δ=%zu（期望 %zu = V*D + V）\n", n_off, n_on, n_off - n_on,
+                V * D + V);
     CHECK(n_off - n_on == V * D + V, "tied 少 head 的 (w,b) 两张");
 
     auto po = on->parameters();
@@ -522,11 +535,12 @@ void test_tied_embedding()
         const nn::Matrix w = download(eng, po[i].get());
         NN_EXIT(eng.copy_from(pf[i].get(), w), 1, "拷贝参数失败: ");
     }
-    NN_EXIT(eng.copy_from(pf[po.size()].get(), download(eng, po[0].get())),
-            1, "head.w ← token_emb 失败: ");
+    NN_EXIT(eng.copy_from(pf[po.size()].get(), download(eng, po[0].get())), 1,
+            "head.w ← token_emb 失败: ");
     {
         nn::Matrix zb(V, 1);
-        for (auto& v : zb.span()) v = 0.0f;
+        for (auto& v : zb.span())
+            v = 0.0f;
         NN_EXIT(eng.copy_from(pf[po.size() + 1].get(), zb), 1, "head.b ← 0 失败: ");
     }
 
@@ -570,10 +584,10 @@ void test_tied_embedding()
 void test_tied_spec()
 {
     std::puts("[11] tied embedding 规格往返 + spec_matches");
-    const auto mk = [](bool tie) {
+    const auto mk = [](bool tie)
+    {
         return nn::make_gpt_spec(64, 32, 8, 4, 64, 2, nn::PosEncodingType::Learned,
-                                 nn::ActivationType::SwiGLU, nn::NormType::RMSNorm,
-                                 true, 2, tie);
+                                 nn::ActivationType::SwiGLU, nn::NormType::RMSNorm, true, 2, tie);
     };
     CHECK(!mk(false).as<nn::GptSpec>()->tie_embeddings, "缺省 = false（旧文件语义）");
     CHECK(!nn::spec_matches(mk(false), mk(true)), "tie 不同 → 不匹配");
@@ -584,20 +598,25 @@ void test_tied_spec()
     auto eng_owner = nn::CpuEngine::create();
     nn::CpuEngine& eng = *eng_owner;
     nn::GptConfig cfg;
-    cfg.vocab_size = V; cfg.d_model = D; cfg.seq_len = S;
-    cfg.num_heads = H;  cfg.d_ff = FF;   cfg.num_layers = L;
+    cfg.vocab_size = V;
+    cfg.d_model = D;
+    cfg.seq_len = S;
+    cfg.num_heads = H;
+    cfg.d_ff = FF;
+    cfg.num_layers = L;
     cfg.pos_enc = nn::PosEncodingType::Learned;
     cfg.activation = nn::ActivationType::SwiGLU;
     cfg.norm_type = nn::NormType::RMSNorm;
     cfg.subln = true;
     cfg.n_head_kv = 2;
     cfg.tie_embeddings = true;
-    const nn::ModelSpec spec = nn::make_gpt_spec(
-        V, D, S, H, FF, L, cfg.pos_enc, cfg.activation, cfg.norm_type,
-        cfg.subln, cfg.n_head_kv, cfg.tie_embeddings);
+    const nn::ModelSpec spec =
+        nn::make_gpt_spec(V, D, S, H, FF, L, cfg.pos_enc, cfg.activation, cfg.norm_type, cfg.subln,
+                          cfg.n_head_kv, cfg.tie_embeddings);
 
     nn::Matrix x_m(S, B);
-    for (std::size_t i = 0; i < x_m.size(); ++i) x_m.span()[i] = static_cast<float>(i % V);
+    for (std::size_t i = 0; i < x_m.size(); ++i)
+        x_m.span()[i] = static_cast<float>(i % V);
 
     nn::Matrix y_ref;
     {
@@ -612,7 +631,11 @@ void test_tied_spec()
         auto peeked = nn::peek_model_spec(file);
         CHECK(peeked.has_value() && peeked->as<nn::GptSpec>()->tie_embeddings,
               "规格记住 tie_embeddings");
-        if (!peeked.has_value()) { std::remove(file.c_str()); return; }
+        if (!peeked.has_value())
+        {
+            std::remove(file.c_str());
+            return;
+        }
         auto m2 = nn::build_gpt_model_from_spec(eng, *peeked);
         NN_EXIT(m2, 1, "build_gpt_model_from_spec(tied) 失败: ");
         NN_EXIT(nn::load_model(file, *m2), 1, "load_model 失败: ");
@@ -654,8 +677,7 @@ void test_relu2_activation()
             const double g = x.at(r, c);
             const double u = x.at(FF + r, c);
             const double relu = g > 0.0 ? g : 0.0;
-            fmax = std::max(fmax, std::fabs(static_cast<double>(ym.at(r, c))
-                                            - relu * relu * u));
+            fmax = std::max(fmax, std::fabs(static_cast<double>(ym.at(r, c)) - relu * relu * u));
         }
     std::printf("    forward vs 宿主 relu²(gate)·up 最大差 = %.6g\n", fmax);
     CHECK(fmax < 1e-6, "前向 = relu²(gate)·up");
@@ -675,8 +697,8 @@ void test_relu2_activation()
             const double g = x.at(o, c);
             const double u = x.at(FF + o, c);
             const double relu = g > 0.0 ? g : 0.0;
-            const double expect = (r < FF) ? go.at(o, c) * u * 2.0 * relu
-                                           : go.at(o, c) * relu * relu;
+            const double expect =
+                (r < FF) ? go.at(o, c) * u * 2.0 * relu : go.at(o, c) * relu * relu;
             bmax = std::max(bmax, std::fabs(static_cast<double>(gim.at(r, c)) - expect));
         }
     std::printf("    backward vs 宿主解析式 最大差 = %.6g\n", bmax);
@@ -692,8 +714,12 @@ void test_relu2_gpt()
     const std::size_t V = 48, D = 32, S = 8, H = 4, FF = 64, L = 2, B = 2, N = S * B;
 
     nn::GptConfig cfg;
-    cfg.vocab_size = V; cfg.d_model = D; cfg.seq_len = S;
-    cfg.num_heads = H;  cfg.d_ff = FF;   cfg.num_layers = L;
+    cfg.vocab_size = V;
+    cfg.d_model = D;
+    cfg.seq_len = S;
+    cfg.num_heads = H;
+    cfg.d_ff = FF;
+    cfg.num_layers = L;
     cfg.pos_enc = nn::PosEncodingType::RoPE;
     cfg.activation = nn::ActivationType::ReLU2;
     cfg.norm_type = nn::NormType::RMSNorm;
@@ -702,7 +728,8 @@ void test_relu2_gpt()
     cfg.tie_embeddings = true;   // = 2B4T 的完整结构组合
 
     nn::Matrix x_m(S, B);
-    for (std::size_t i = 0; i < x_m.size(); ++i) x_m.span()[i] = static_cast<float>(i % V);
+    for (std::size_t i = 0; i < x_m.size(); ++i)
+        x_m.span()[i] = static_cast<float>(i % V);
 
     auto m = nn::build_gpt_model(eng, cfg);
     NN_EXIT(m, 1, "build_gpt_model(relu2) 失败: ");
@@ -711,7 +738,8 @@ void test_relu2_gpt()
     const nn::Matrix ym = download(eng, *y);
     CHECK(ym.rows() == V && ym.cols() == N, "logits 形状");
     double mx = 0.0;
-    for (auto v : ym.span()) mx = std::max(mx, std::fabs(static_cast<double>(v)));
+    for (auto v : ym.span())
+        mx = std::max(mx, std::fabs(static_cast<double>(v)));
     CHECK(std::isfinite(mx) && mx > 0.0, "logits 有限且非全零");
 
     auto g = make_tensor(eng, V, N, 0.01f, 0.0002f);
@@ -719,9 +747,9 @@ void test_relu2_gpt()
     NN_EXIT(bi, 1, "relu2 GPT backward 失败: ");
 
     // 规格：activation 进 spec_matches
-    const nn::ModelSpec spec = nn::make_gpt_spec(
-        V, D, S, H, FF, L, cfg.pos_enc, cfg.activation, cfg.norm_type,
-        cfg.subln, cfg.n_head_kv, cfg.tie_embeddings);
+    const nn::ModelSpec spec =
+        nn::make_gpt_spec(V, D, S, H, FF, L, cfg.pos_enc, cfg.activation, cfg.norm_type, cfg.subln,
+                          cfg.n_head_kv, cfg.tie_embeddings);
     auto other = spec;
     other.as<nn::GptSpec>()->activation = nn::ActivationType::SwiGLU;
     CHECK(!nn::spec_matches(spec, other), "activation 不同 → 不匹配");
@@ -736,19 +764,21 @@ bool test_training(nn::ComputeEngine& eng, const char* tag)
     const std::size_t N = S * B;
     std::printf("[6] SubLN 端到端小训练（%s，L2 on logits）\n", tag);
 
-    nn::GPTModel model(V, D, S, H, FF, L, nn::PosEncodingType::Learned,
-                       nn::ActivationType::SwiGLU, nn::NormType::RMSNorm,
-                       nn::PrecisionProfile{}, /*subln=*/true);
+    nn::GPTModel model(V, D, S, H, FF, L, nn::PosEncodingType::Learned, nn::ActivationType::SwiGLU,
+                       nn::NormType::RMSNorm, nn::PrecisionProfile{}, /*subln=*/true);
     if (auto r = model.init(eng); !r)
     {
         std::printf("    init 失败: %s\n", r.error().message.c_str());
         return false;
     }
 
-    auto opt_r = nn::create_optimizer("adamw", eng, model.parameters(),
-                                      model.param_gradients(),
+    auto opt_r = nn::create_optimizer("adamw", eng, model.parameters(), model.param_gradients(),
                                       nn::Scalar{5e-3}, nn::Scalar{0.0});
-    if (!opt_r) { std::printf("    create_optimizer 失败\n"); return false; }
+    if (!opt_r)
+    {
+        std::printf("    create_optimizer 失败\n");
+        return false;
+    }
     nn::Optimizer& opt = *opt_r;
 
     // 固定输入 token ids（seq, batch）与固定目标 logits
@@ -759,7 +789,8 @@ bool test_training(nn::ComputeEngine& eng, const char* tag)
     {
         std::mt19937 rng(11);
         std::uniform_real_distribution<float> d(-1.0f, 1.0f);
-        for (auto& v : tgt.span()) v = d(rng);
+        for (auto& v : tgt.span())
+            v = d(rng);
     }
     const nn::Tensor x = upload(eng, x_m);
 
@@ -773,15 +804,18 @@ bool test_training(nn::ComputeEngine& eng, const char* tag)
             return false;
         }
         auto y = model.forward(x);
-        if (!y) { std::printf("    forward 失败: %s\n", y.error().message.c_str()); return false; }
+        if (!y)
+        {
+            std::printf("    forward 失败: %s\n", y.error().message.c_str());
+            return false;
+        }
         const nn::Matrix ym = download(eng, *y);
 
         nn::Matrix g(V, N);
         double loss = 0.0;
         for (std::size_t i = 0; i < V * N; ++i)
         {
-            const double d = static_cast<double>(ym.span()[i]) -
-                             static_cast<double>(tgt.span()[i]);
+            const double d = static_cast<double>(ym.span()[i]) - static_cast<double>(tgt.span()[i]);
             loss += d * d;
             g.span()[i] = static_cast<float>(2.0 * d / static_cast<double>(V * N));
         }
@@ -815,8 +849,8 @@ struct BitnetData
     std::vector<std::size_t> labels;  // batch-major：i = b*seq + t
 };
 
-[[nodiscard]] BitnetData make_bitnet_data(std::size_t V, std::size_t S,
-                                          std::size_t B, unsigned seed)
+[[nodiscard]] BitnetData make_bitnet_data(std::size_t V, std::size_t S, std::size_t B,
+                                          unsigned seed)
 {
     BitnetData d;
     d.x = nn::Matrix(S, B);
@@ -829,8 +863,7 @@ struct BitnetData
     for (std::size_t b = 0; b < B; ++b)
         for (std::size_t t = 0; t < S; ++t)
         {
-            const std::size_t cur =
-                static_cast<std::size_t>(d.x.span()[t * B + b]);
+            const std::size_t cur = static_cast<std::size_t>(d.x.span()[t * B + b]);
             d.labels[b * S + t] = (cur + 1) % V;
         }
     return d;
@@ -851,11 +884,11 @@ void test_gpt_ternary_wiring()
     nn::PrecisionProfile t1 = f32p;
     t1.param = nn::Precision::T1_58;
 
-    const auto build = [&](const nn::PrecisionProfile& pp) {
-        return nn::build_gpt_model(eng, V, D, S, H, FF, L,
-                                   nn::PosEncodingType::RoPE,
-                                   nn::ActivationType::ReLU2, nn::NormType::RMSNorm,
-                                   pp, /*subln=*/true, /*n_head_kv=*/KV,
+    const auto build = [&](const nn::PrecisionProfile& pp)
+    {
+        return nn::build_gpt_model(eng, V, D, S, H, FF, L, nn::PosEncodingType::RoPE,
+                                   nn::ActivationType::ReLU2, nn::NormType::RMSNorm, pp,
+                                   /*subln=*/true, /*n_head_kv=*/KV,
                                    /*tie_embeddings=*/false);
     };
     auto base = build(f32p);
@@ -864,8 +897,7 @@ void test_gpt_ternary_wiring()
           "三值 GPT 构建+init 成功（4 投影/fc1/fc2/LM head 均 BitLinear）");
     if (!base.has_value() || !tern.has_value())
     {
-        if (!tern.has_value())
-            std::printf("    init 失败: %s\n", tern.error().message.c_str());
+        if (!tern.has_value()) std::printf("    init 失败: %s\n", tern.error().message.c_str());
         return;
     }
 
@@ -873,10 +905,10 @@ void test_gpt_ternary_wiring()
     const auto& pt = tern->parameters();
     bool same = (pb.size() == pt.size());
     for (std::size_t i = 0; same && i < pb.size(); ++i)
-        same = (pb[i].get().rows() == pt[i].get().rows() &&
-                pb[i].get().cols() == pt[i].get().cols());
-    std::printf("    参数：%zu 张量 / %zu 标量（f32 基线 %zu / %zu）\n",
-                pt.size(), count_params(pt), pb.size(), count_params(pb));
+        same =
+            (pb[i].get().rows() == pt[i].get().rows() && pb[i].get().cols() == pt[i].get().cols());
+    std::printf("    参数：%zu 张量 / %zu 标量（f32 基线 %zu / %zu）\n", pt.size(),
+                count_params(pt), pb.size(), count_params(pb));
     CHECK(same, "逐张量形状与 f32 基线一致（BitLinear latent 恒 f32）");
     CHECK(count_params(pb) == count_params(pt), "参数量一致");
 
@@ -888,8 +920,7 @@ void test_gpt_ternary_wiring()
     NN_EXIT(tern->zero_grad(), 1, "zero_grad 失败: ");
     auto logits = tern->forward(xt);
     NN_EXIT(logits, 1, "三值 GPT forward 失败: ");
-    auto loss = ce.forward_sparse(eng, *logits,
-                                  std::span<const std::size_t>(data.labels),
+    auto loss = ce.forward_sparse(eng, *logits, std::span<const std::size_t>(data.labels),
                                   std::span<const nn::Scalar>{}, V);
     NN_EXIT(loss, 1, "sparse CE 失败: ");
     CHECK(std::isfinite(*loss), "三值 GPT 前向 loss 有限");
@@ -918,19 +949,16 @@ double test_bitnet_training(nn::ComputeEngine& eng, const char* tag)
 {
     const std::size_t V = 32, D = 32, S = 8, H = 4, KV = 2, FF = 64, L = 2, B = 4;
     constexpr int STEPS = 200;
-    std::printf("[15] 真实 BitNet（2B4T 形状）端到端训练（%s，CE + AdamW，%d 步）\n",
-                tag, STEPS);
+    std::printf("[15] 真实 BitNet（2B4T 形状）端到端训练（%s，CE + AdamW，%d 步）\n", tag, STEPS);
 
     const BitnetData data = make_bitnet_data(V, S, B, 7u);
     const nn::Tensor xt = upload(eng, data.x);
     const nn::PrecisionProfile f32p;
 
-    const auto train_one = [&](const nn::PrecisionProfile& pp, bool tie,
-                               const char* name) -> double {
-        auto m_r = nn::build_gpt_model(eng, V, D, S, H, FF, L,
-                                       nn::PosEncodingType::RoPE,
-                                       nn::ActivationType::ReLU2,
-                                       nn::NormType::RMSNorm, pp,
+    const auto train_one = [&](const nn::PrecisionProfile& pp, bool tie, const char* name) -> double
+    {
+        auto m_r = nn::build_gpt_model(eng, V, D, S, H, FF, L, nn::PosEncodingType::RoPE,
+                                       nn::ActivationType::ReLU2, nn::NormType::RMSNorm, pp,
                                        /*subln=*/true, /*n_head_kv=*/KV, tie);
         if (!m_r.has_value())
         {
@@ -939,10 +967,13 @@ double test_bitnet_training(nn::ComputeEngine& eng, const char* tag)
             return -1.0;
         }
         nn::Model& model = *m_r;
-        auto opt = nn::create_optimizer("adamw", eng, model.parameters(),
-                                        model.param_gradients(),
+        auto opt = nn::create_optimizer("adamw", eng, model.parameters(), model.param_gradients(),
                                         nn::Scalar{3e-3}, nn::Scalar{0.0f}, pp);
-        if (!opt) { CHECK(false, "优化器创建成功"); return -1.0; }
+        if (!opt)
+        {
+            CHECK(false, "优化器创建成功");
+            return -1.0;
+        }
         nn::CrossEntropyLoss ce;
         ce.set_precision_profile(pp);
 
@@ -950,22 +981,49 @@ double test_bitnet_training(nn::ComputeEngine& eng, const char* tag)
         for (int step = 0; step < STEPS; ++step)
         {
             auto zg = model.zero_grad();
-            if (!zg) { std::printf("    [%s] zero_grad: %s\n", name, zg.error().message.c_str()); return -1.0; }
+            if (!zg)
+            {
+                std::printf("    [%s] zero_grad: %s\n", name, zg.error().message.c_str());
+                return -1.0;
+            }
             auto logits = model.forward(xt);
-            if (!logits) { std::printf("    [%s] forward: %s\n", name, logits.error().message.c_str()); return -1.0; }
-            auto loss = ce.forward_sparse(eng, *logits,
-                                          std::span<const std::size_t>(data.labels),
+            if (!logits)
+            {
+                std::printf("    [%s] forward: %s\n", name, logits.error().message.c_str());
+                return -1.0;
+            }
+            auto loss = ce.forward_sparse(eng, *logits, std::span<const std::size_t>(data.labels),
                                           std::span<const nn::Scalar>{}, V);
-            if (!loss) { std::printf("    [%s] loss: %s\n", name, loss.error().message.c_str()); return -1.0; }
-            if (!std::isfinite(*loss)) { CHECK(false, "loss 有限"); return -1.0; }
+            if (!loss)
+            {
+                std::printf("    [%s] loss: %s\n", name, loss.error().message.c_str());
+                return -1.0;
+            }
+            if (!std::isfinite(*loss))
+            {
+                CHECK(false, "loss 有限");
+                return -1.0;
+            }
             if (step == 0) first = *loss;
             last = *loss;
             auto grad = ce.backward();
-            if (!grad) { std::printf("    [%s] ce.backward 失败\n", name); return -1.0; }
+            if (!grad)
+            {
+                std::printf("    [%s] ce.backward 失败\n", name);
+                return -1.0;
+            }
             auto bw = model.backward(*grad);
-            if (!bw) { std::printf("    [%s] backward: %s\n", name, bw.error().message.c_str()); return -1.0; }
+            if (!bw)
+            {
+                std::printf("    [%s] backward: %s\n", name, bw.error().message.c_str());
+                return -1.0;
+            }
             auto st = opt->step();
-            if (!st) { std::printf("    [%s] step: %s\n", name, st.error().message.c_str()); return -1.0; }
+            if (!st)
+            {
+                std::printf("    [%s] step: %s\n", name, st.error().message.c_str());
+                return -1.0;
+            }
         }
         std::printf("    [%s] loss: %.6f → %.6f\n", name, first, last);
         return last;
@@ -975,7 +1033,7 @@ double test_bitnet_training(nn::ComputeEngine& eng, const char* tag)
     t1.param = nn::Precision::T1_58;
     const double t1_tied = train_one(t1, /*tie=*/true, "bitnet_t1_58_tied");
     const double t1_head = train_one(t1, /*tie=*/false, "bitnet_t1_58_lmhead");
-    const double base    = train_one(f32p, /*tie=*/false, "f32_baseline");
+    const double base = train_one(f32p, /*tie=*/false, "f32_baseline");
     std::printf("    （随机基线 ln(V)=%.4f）\n", std::log(static_cast<double>(V)));
 
     CHECK(t1_tied >= 0.0 && t1_tied < 0.30, "三值 + tied（2B4T 形状）收敛到 < 0.30");
@@ -1030,13 +1088,12 @@ int main(int argc, char* argv[])
         test_gqa_head_mapping(**eng_r, "GPU");
         if (!test_training(**eng_r, "GPU")) g_failures++;
         const double gpu_bitnet_loss = test_bitnet_training(**eng_r, "GPU");
-        if (gpu_bitnet_loss < 0.0)
-            ++g_failures;
+        if (gpu_bitnet_loss < 0.0) ++g_failures;
         else
         {
             const double d = std::fabs(gpu_bitnet_loss - cpu_bitnet_loss);
-            std::printf("    [parity] 末步 loss CPU=%.6f GPU=%.6f 差=%.3e\n",
-                        cpu_bitnet_loss, gpu_bitnet_loss, d);
+            std::printf("    [parity] 末步 loss CPU=%.6f GPU=%.6f 差=%.3e\n", cpu_bitnet_loss,
+                        gpu_bitnet_loss, d);
             // 阈值 2e-3（原 1e-3）：合并后 GPU 的 wgrad 走 matmul K 切分
             // （`#ks`/`#kr`，跨段 K 累加序 ≠ 逐 k 串联，main 侧已裁定"数学等价
             // 不保证逐位一致"）→ 200 步训练的末步 loss 差被抬高到 1.051e-3。

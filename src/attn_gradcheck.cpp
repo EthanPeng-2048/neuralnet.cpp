@@ -20,33 +20,37 @@
 #include <string_view>
 #include "test_common.hpp"
 
-using nn::Scalar;
+using nn::CausalSelfAttention;
+using nn::ComputeEngine;
 using nn::Matrix;
+using nn::PosEncodingType;
+using nn::Scalar;
 using nn::Tensor;
 using nn::TensorRef;
-using nn::ComputeEngine;
-using nn::CausalSelfAttention;
-using nn::PosEncodingType;
 
-namespace {
+namespace
+{
 
 
-Scalar eval_loss(ComputeEngine& engine, CausalSelfAttention& attn,
-                 const Tensor& x, const Tensor& go)
+Scalar eval_loss(ComputeEngine& engine, CausalSelfAttention& attn, const Tensor& x,
+                 const Tensor& go)
 {
     auto y = attn.forward(x);
-    if (!y) { std::cerr << "  [eval] forward failed: " << y.error().message << "\n"; std::abort(); }
+    if (!y)
+    {
+        std::cerr << "  [eval] forward failed: " << y.error().message << "\n";
+        std::abort();
+    }
     auto y_m = engine.to_matrix(*y);
     auto go_m = engine.to_matrix(go);
     return dot(*y_m, *go_m);
 }
 
 
-bool check_grad_tensor(
-    ComputeEngine& engine, CausalSelfAttention& attn,
-    const Tensor& x, const Tensor& go,
-    Tensor& param, const Matrix& base, const Matrix& grad_analytical,
-    const std::string& name, Scalar eps, Scalar tol)
+bool check_grad_tensor(ComputeEngine& engine, CausalSelfAttention& attn, const Tensor& x,
+                       const Tensor& go, Tensor& param, const Matrix& base,
+                       const Matrix& grad_analytical, const std::string& name, Scalar eps,
+                       Scalar tol)
 {
     bool ok = true;
     std::size_t bad = 0;
@@ -76,14 +80,14 @@ bool check_grad_tensor(
             {
                 ok = false;
                 if (bad < 5)
-                    std::cout << "  [FAIL] " << name << "(" << r << "," << c
-                              << ") num=" << num << " ana=" << ana << " err=" << err << "\n";
+                    std::cout << "  [FAIL] " << name << "(" << r << "," << c << ") num=" << num
+                              << " ana=" << ana << " err=" << err << "\n";
                 ++bad;
             }
         }
     }
-    std::cout << "  " << name << ": " << (ok ? "OK" : "FAIL")
-              << "  max_err=" << max_err << "  bad=" << bad << "\n";
+    std::cout << "  " << name << ": " << (ok ? "OK" : "FAIL") << "  max_err=" << max_err
+              << "  bad=" << bad << "\n";
     return ok;
 }
 
@@ -101,14 +105,16 @@ int main(int argc, char* argv[])
     {
         std::string a = argv[i];
         if (a == "--tol" && i + 1 < argc) tol = static_cast<Scalar>(std::atof(argv[++i]));
-        else if (a == "--batch" && i + 1 < argc) batch = static_cast<std::size_t>(std::atoi(argv[++i]));
+        else if (a == "--batch" && i + 1 < argc)
+            batch = static_cast<std::size_t>(std::atoi(argv[++i]));
         else if (a == "--seq" && i + 1 < argc) seq = static_cast<std::size_t>(std::atoi(argv[++i]));
         else if (a == "--pos-enc" && i + 1 < argc) pos_enc_name = argv[++i];
         else if (a == "--doc") use_doc = true;
         else if (a == "--gpu") use_gpu = true;
         else if (a == "--help")
         {
-            std::cout << "用法: attn_gradcheck [--gpu] [--batch N] [--seq N] [--tol <f>] [--pos-enc learned|sinusoidal|alibi|rope] [--doc]\n";
+            std::cout << "用法: attn_gradcheck [--gpu] [--batch N] [--seq N] [--tol <f>] "
+                         "[--pos-enc learned|sinusoidal|alibi|rope] [--doc]\n";
             return 0;
         }
     }
@@ -131,10 +137,9 @@ int main(int argc, char* argv[])
     std::cout << "========================================\n";
     std::cout << "  CausalSelfAttention 数值梯度检查 (gradcheck)\n";
     std::cout << "========================================\n";
-    std::cout << "  d_model=" << d_model << " heads=" << num_heads
-              << " seq=" << seq << " batch=" << batch << " tol=" << tol
-              << " pos_enc=" << pos_enc_name << " doc=" << (use_doc ? 1 : 0)
-              << "\n";
+    std::cout << "  d_model=" << d_model << " heads=" << num_heads << " seq=" << seq
+              << " batch=" << batch << " tol=" << tol << " pos_enc=" << pos_enc_name
+              << " doc=" << (use_doc ? 1 : 0) << "\n";
 
     CausalSelfAttention attn(d_model, num_heads, seq, seq, pos_enc);
     NN_EXIT(attn.init(eng), 1, "CausalSelfAttention init 失败: ");
@@ -147,8 +152,7 @@ int main(int argc, char* argv[])
         std::vector<std::size_t> ids(batch * seq, 0);
         for (std::size_t b = 0; b < batch; ++b)
             for (std::size_t t = 0; t < seq; ++t)
-                ids[b * seq + t] = b * 2 + (t < seq / 2 ? std::size_t{0}
-                                                        : std::size_t{1});
+                ids[b * seq + t] = b * 2 + (t < seq / 2 ? std::size_t{0} : std::size_t{1});
         attn.set_doc_ids(ids);
     }
 
@@ -158,8 +162,10 @@ int main(int argc, char* argv[])
     const std::size_t total = seq * batch;
     Matrix x_m(d_model, total);
     Matrix go_m(d_model, total);
-    for (std::size_t i = 0; i < x_m.size(); ++i) x_m.span()[i] = dist(rng);
-    for (std::size_t i = 0; i < go_m.size(); ++i) go_m.span()[i] = dist(rng);
+    for (std::size_t i = 0; i < x_m.size(); ++i)
+        x_m.span()[i] = dist(rng);
+    for (std::size_t i = 0; i < go_m.size(); ++i)
+        go_m.span()[i] = dist(rng);
 
     auto x = eng.from_matrix(x_m);
     NN_EXIT(x, 1, "from_matrix(x) failed\n");
@@ -170,7 +176,7 @@ int main(int argc, char* argv[])
     NN_EXIT(y_fwd, 1, "forward failed: ");
 
     auto params = attn.parameters();
-    auto grads  = attn.param_gradients();
+    auto grads = attn.param_gradients();
     for (auto& g : grads)
     {
         auto rz = eng.zero(g.get());
@@ -181,13 +187,15 @@ int main(int argc, char* argv[])
 
     const Scalar eps = 1e-3f;
     bool all_pass = true;
-    static constexpr std::array<std::string_view, 8> tags{"wq.w","wq.b","wk.w","wk.b","wv.w","wv.b","wo.w","wo.b"};
+    static constexpr std::array<std::string_view, 8> tags{"wq.w", "wq.b", "wk.w", "wk.b",
+                                                          "wv.w", "wv.b", "wo.w", "wo.b"};
     for (std::size_t p = 0; p < params.size(); ++p)
     {
         auto pm = eng.to_matrix(params[p].get());
         auto gm = eng.to_matrix(grads[p].get());
         std::string name = (p < 8) ? std::string(tags[p]) : ("param[" + std::to_string(p) + "]");
-        all_pass &= check_grad_tensor(eng, attn, *x, *go, params[p].get(), *pm, *gm, name, eps, tol);
+        all_pass &=
+            check_grad_tensor(eng, attn, *x, *go, params[p].get(), *pm, *gm, name, eps, tol);
     }
 
     // 输入梯度

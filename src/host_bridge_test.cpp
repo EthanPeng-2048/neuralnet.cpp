@@ -18,12 +18,14 @@
 #include <vector>
 
 int g_fail = 0;
-#define CHECK(cond, msg)                                                     \
-    do {                                                                     \
-        if (!(cond)) {                                                       \
-            std::printf("[FAIL] %s:%d: %s\n", __FILE__, __LINE__, (msg));    \
-            ++g_fail;                                                        \
-        }                                                                    \
+#define CHECK(cond, msg)                                                  \
+    do                                                                    \
+    {                                                                     \
+        if (!(cond))                                                      \
+        {                                                                 \
+            std::printf("[FAIL] %s:%d: %s\n", __FILE__, __LINE__, (msg)); \
+            ++g_fail;                                                     \
+        }                                                                 \
     } while (0)
 
 int main()
@@ -56,7 +58,8 @@ int main()
             CHECK(t->precision() == nn::Precision::F16, "F16 目标精度");
             // 对拍 from_matrix 同值（RHE 同路径）
             nn::Matrix m(2, 2);
-            for (std::size_t i = 0; i < src.size(); ++i) m.span()[i] = src[i];
+            for (std::size_t i = 0; i < src.size(); ++i)
+                m.span()[i] = src[i];
             auto ref = engine->from_matrix(m, nn::Precision::F16);
             CHECK(ref.has_value(), "from_matrix F16 应成功");
             if (ref)
@@ -77,8 +80,8 @@ int main()
         std::vector<nn::Scalar> src{1.0f, 2.0f};
         auto t = nn::upload_span(*engine, 2, 3, nn::Precision::F32, src);
         CHECK(!t.has_value(), "元素数不匹配应报错");
-        auto t2 = nn::upload_span(*engine, 1, 2, nn::Precision::F32,
-                                  std::vector<nn::Scalar>{1.0f, 2.0f});
+        auto t2 =
+            nn::upload_span(*engine, 1, 2, nn::Precision::F32, std::vector<nn::Scalar>{1.0f, 2.0f});
         CHECK(t2.has_value(), "匹配尺寸应成功");
         if (t2)
         {

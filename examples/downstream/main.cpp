@@ -61,8 +61,8 @@ bool run_linear(nn::ComputeEngine& engine, const char* tag, float& first_out)
     }
     if (y->rows() != OUT || y->cols() != BATCH)
     {
-        std::fprintf(stderr, "[%s] 输出形状错误: 期望 (%zu,%zu)，实际 (%zu,%zu)\n",
-                     tag, OUT, BATCH, y->rows(), y->cols());
+        std::fprintf(stderr, "[%s] 输出形状错误: 期望 (%zu,%zu)，实际 (%zu,%zu)\n", tag, OUT, BATCH,
+                     y->rows(), y->cols());
         return false;
     }
 
@@ -95,8 +95,7 @@ int main()
     nn::CpuEngine& cpu = *cpu_owner;
     float cpu_out = 0.0f;
     if (!run_linear(cpu, "cpu", cpu_out)) return 1;
-    std::printf("[downstream] CPU Linear forward OK（y[0]=%.6f）\n",
-                static_cast<double>(cpu_out));
+    std::printf("[downstream] CPU Linear forward OK（y[0]=%.6f）\n", static_cast<double>(cpu_out));
 
 #ifdef NN_HAS_VULKAN
     // ── GPU 路径（neuralnet::nn 自动传入 NN_HAS_VULKAN 才编译进来）────────
@@ -105,8 +104,7 @@ int main()
     nn::GpuBackend& backend = *backend_owner;
     if (auto ir = backend.initialize(); !ir)
     {
-        std::printf("[downstream] GPU 初始化失败，跳过 GPU 校验：%s\n",
-                    ir.error().message.c_str());
+        std::printf("[downstream] GPU 初始化失败，跳过 GPU 校验：%s\n", ir.error().message.c_str());
         return 77;
     }
     auto gpu_owner = nn::GpuEngine::create(backend);
@@ -116,8 +114,7 @@ int main()
 
     // GPU 与 CPU 用不同随机权重初始化，无法直接对拍数值；
     // 这里只断言两者都跑通（真正的跨引擎对拍在库内测试覆盖）。
-    std::printf("[downstream] GPU Linear forward OK（y[0]=%.6f）\n",
-                static_cast<double>(gpu_out));
+    std::printf("[downstream] GPU Linear forward OK（y[0]=%.6f）\n", static_cast<double>(gpu_out));
     // GPU 与 CPU 权重不同 → 仅形状/有限性断言已由 run_linear 完成。
     (void)cpu_out;
 #else

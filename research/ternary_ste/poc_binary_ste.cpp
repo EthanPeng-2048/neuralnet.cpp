@@ -41,7 +41,8 @@ int main()
             Wt.set_value(r, c, (td(rng) == 0 ? -0.5f : 0.5f));
 
     Matrix X(IN, NB), Y(OUT, NB);
-    for (auto& v : X.span()) v = nd(rng);
+    for (auto& v : X.span())
+        v = nd(rng);
     Wt.multiply_to(Y, X);
 
     Tensor Xt = NN_CHECK(eng.from_matrix(X));
@@ -54,18 +55,17 @@ int main()
     {
         const Matrix Wh = NN_CHECK(eng.to_matrix(W, Precision::F32));
         Scalar gamma = 0.f;
-        for (auto v : Wh.span()) gamma += std::fabs(v);
+        for (auto v : Wh.span())
+            gamma += std::fabs(v);
         gamma /= static_cast<Scalar>(IN * OUT);
 
         // Wq = sign(W) —— 纯 1-bit（二值）量化
-        Tensor Wq = NN_CHECK(nn::dsl::compute(eng,
-            nn::dsl::select(nn::dsl::leaf(W) > nn::dsl::rparam(0.f),
-                Scalar{1}, Scalar{-1}),
+        Tensor Wq = NN_CHECK(nn::dsl::compute(
+            eng, nn::dsl::select(nn::dsl::leaf(W) > nn::dsl::rparam(0.f), Scalar{1}, Scalar{-1}),
             OUT, IN, Precision::F32));
 
-        Tensor Yhat = NN_CHECK(nn::dsl::compute(eng,
-            nn::dsl::matmul(Wq, Xt) * nn::dsl::rparam(gamma),
-            OUT, NB, Precision::F32));
+        Tensor Yhat = NN_CHECK(nn::dsl::compute(
+            eng, nn::dsl::matmul(Wq, Xt) * nn::dsl::rparam(gamma), OUT, NB, Precision::F32));
 
         const Matrix Yh = NN_CHECK(eng.to_matrix(Yhat, Precision::F32));
         Scalar loss = 0.f;
@@ -79,13 +79,14 @@ int main()
         last_loss = loss;
 
         Tensor dY = NN_CHECK(nn::dsl::compute(eng,
-            (nn::dsl::leaf(Yhat) - nn::dsl::leaf(Yt)) * nn::dsl::rparam(Scalar{2} / Scalar(OUT * NB)),
-            OUT, NB, Precision::F32));
-        Tensor dW = NN_CHECK(nn::dsl::compute(eng,
-            nn::dsl::matmul(dY, Xt, false, true) * nn::dsl::rparam(gamma),
-            OUT, IN, Precision::F32));
-        NN_CHECK(nn::dsl::compute_into(eng,
-            nn::dsl::leaf(W) - nn::dsl::leaf(dW) * nn::dsl::rparam(lr), W));
+                                              (nn::dsl::leaf(Yhat) - nn::dsl::leaf(Yt)) *
+                                                  nn::dsl::rparam(Scalar{2} / Scalar(OUT * NB)),
+                                              OUT, NB, Precision::F32));
+        Tensor dW = NN_CHECK(
+            nn::dsl::compute(eng, nn::dsl::matmul(dY, Xt, false, true) * nn::dsl::rparam(gamma),
+                             OUT, IN, Precision::F32));
+        NN_CHECK(nn::dsl::compute_into(
+            eng, nn::dsl::leaf(W) - nn::dsl::leaf(dW) * nn::dsl::rparam(lr), W));
 
         if (step % 500 == 0 || step == STEPS - 1)
             std::printf("step %4d  mse=%.6f  gamma=%.5f\n", step, loss, gamma);
@@ -95,12 +96,11 @@ int main()
     std::size_t match = 0;
     for (std::size_t r = 0; r < OUT; ++r)
         for (std::size_t c = 0; c < IN; ++c)
-            if ((Wh.at(r, c) > 0.f) == (Wt.at(r, c) > 0.f))
-                ++match;
+            if ((Wh.at(r, c) > 0.f) == (Wt.at(r, c) > 0.f)) ++match;
 
-    std::printf("\nmse: first=%.6f  final=%.6f  (降 %.1f%%)\n",
-                first_loss, last_loss, 100.0 * (1.0 - last_loss / first_loss));
-    std::printf("二值符号吻合率: %zu / %zu = %.1f%%\n",
-                match, IN * OUT, 100.0 * static_cast<double>(match) / double(IN * OUT));
+    std::printf("\nmse: first=%.6f  final=%.6f  (降 %.1f%%)\n", first_loss, last_loss,
+                100.0 * (1.0 - last_loss / first_loss));
+    std::printf("二值符号吻合率: %zu / %zu = %.1f%%\n", match, IN * OUT,
+                100.0 * static_cast<double>(match) / double(IN * OUT));
     return 0;
 }

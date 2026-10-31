@@ -71,8 +71,15 @@ def exe_path(exe: str) -> Path:
 
     历史上这里写死 `build/<exe>.exe`，在 Linux 上直接 FileNotFoundError ——
     本门禁因此只能在 Windows 跑。按"先 .exe 后无后缀"的顺序探测。
+    `CMakePresets.json` 的构建把产物放在 `build/<preset>/` 下，故再遍历一层 preset 目录
+    （`--help` 文案与构建类型无关，取哪个 preset 都不影响本门禁的判定）。
     """
-    for cand in (ROOT / "build" / f"{exe}.exe", ROOT / "build" / exe):
+    names = (f"{exe}.exe", exe)
+    cands = [ROOT / "build" / n for n in names]
+    for sub in sorted((ROOT / "build").glob("*")):
+        if sub.is_dir():
+            cands += [sub / n for n in names]
+    for cand in cands:
         if cand.exists():
             return cand
     return ROOT / "build" / f"{exe}.exe"

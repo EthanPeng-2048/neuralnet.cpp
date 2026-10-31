@@ -36,11 +36,8 @@ private:
     std::vector<RowBand> bands_;
     std::size_t total_rows_ = 0;
 
-    RowBandPacking(TensorSchema schema, std::vector<RowBand> bands,
-                   std::size_t total_rows)
-        : schema_(std::move(schema)),
-          bands_(std::move(bands)),
-          total_rows_(total_rows)
+    RowBandPacking(TensorSchema schema, std::vector<RowBand> bands, std::size_t total_rows)
+        : schema_(std::move(schema)), bands_(std::move(bands)), total_rows_(total_rows)
     {
     }
 
@@ -52,11 +49,10 @@ public:
     RowBandPacking& operator=(RowBandPacking&&) noexcept = default;
     ~RowBandPacking() = default;
 
-    [[nodiscard]] static Result<RowBandPacking> create(
-        const TensorSchema& schema, std::vector<std::string> order = {})
+    [[nodiscard]] static Result<RowBandPacking> create(const TensorSchema& schema,
+                                                       std::vector<std::string> order = {})
     {
-        if (!schema.valid())
-            NN_FAIL("RowBandPacking::create: schema 未初始化");
+        if (!schema.valid()) NN_FAIL("RowBandPacking::create: schema 未初始化");
         if (order.empty())
         {
             order.reserve(schema.size());
@@ -74,8 +70,7 @@ public:
         {
             NN_TRY(handle, schema.field(name));
             if (seen[handle->index])
-                NN_FAIL("RowBandPacking::create: 打包字段 '" + name +
-                        "' 重复");
+                NN_FAIL("RowBandPacking::create: 打包字段 '" + name + "' 重复");
             seen[handle->index] = true;
             const TensorFieldSpec& field = schema.fields()[handle->index];
             if (!field.shape.rows)
@@ -92,17 +87,12 @@ public:
 
     [[nodiscard]] bool valid() const noexcept { return schema_.valid(); }
     [[nodiscard]] const TensorSchema& schema() const noexcept { return schema_; }
-    [[nodiscard]] const std::vector<RowBand>& bands() const noexcept
-    {
-        return bands_;
-    }
+    [[nodiscard]] const std::vector<RowBand>& bands() const noexcept { return bands_; }
     [[nodiscard]] std::size_t total_rows() const noexcept { return total_rows_; }
 
-    [[nodiscard]] Result<Tensor> pack(
-        ComputeEngine& engine, const NamedTensorSet& outputs) const
+    [[nodiscard]] Result<Tensor> pack(ComputeEngine& engine, const NamedTensorSet& outputs) const
     {
-        if (!valid())
-            NN_FAIL("RowBandPacking::pack: packing 未初始化");
+        if (!valid()) NN_FAIL("RowBandPacking::pack: packing 未初始化");
         if (outputs.schema() != schema_)
             NN_FAIL("RowBandPacking::pack: 输出 schema 与 packing 不匹配");
 
@@ -110,23 +100,18 @@ public:
         for (const RowBand& band : bands_)
         {
             const Tensor* value = outputs.find(band.name);
-            if (value == nullptr)
-                NN_FAIL("RowBandPacking::pack: 缺少输出端口 '" + band.name + "'");
+            if (value == nullptr) NN_FAIL("RowBandPacking::pack: 缺少输出端口 '" + band.name + "'");
             if (first == nullptr) first = value;
-            if (value->cols() != first->cols())
-                NN_FAIL("RowBandPacking::pack: 端口列数不一致");
+            if (value->cols() != first->cols()) NN_FAIL("RowBandPacking::pack: 端口列数不一致");
             if (value->precision() != first->precision())
                 NN_FAIL("RowBandPacking::pack: 端口精度不一致");
             if (value->rows() != band.row_count)
                 NN_FAIL("RowBandPacking::pack: 端口 '" + band.name +
                         "' 行数与 schema/packing 不一致");
         }
-        if (first == nullptr)
-            NN_FAIL("RowBandPacking::pack: schema 没有输出端口");
+        if (first == nullptr) NN_FAIL("RowBandPacking::pack: schema 没有输出端口");
 
-        NN_TRY(packed,
-               engine.try_create_tensor(total_rows_, first->cols(),
-                                        first->precision()));
+        NN_TRY(packed, engine.try_create_tensor(total_rows_, first->cols(), first->precision()));
         for (const RowBand& band : bands_)
         {
             const Tensor* value = outputs.find(band.name);
@@ -136,22 +121,18 @@ public:
         return packed;
     }
 
-    [[nodiscard]] Result<NamedTensorSet> unpack(
-        ComputeEngine& engine, const Tensor& packed) const
+    [[nodiscard]] Result<NamedTensorSet> unpack(ComputeEngine& engine, const Tensor& packed) const
     {
-        if (!valid())
-            NN_FAIL("RowBandPacking::unpack: packing 未初始化");
+        if (!valid()) NN_FAIL("RowBandPacking::unpack: packing 未初始化");
         if (packed.rows() != total_rows_)
             NN_FAIL("RowBandPacking::unpack: 打包张量行数不匹配（期望 " +
-                    std::to_string(total_rows_) + "，实际 " +
-                    std::to_string(packed.rows()) + "）");
+                    std::to_string(total_rows_) + "，实际 " + std::to_string(packed.rows()) + "）");
 
         std::vector<NamedTensor> values;
         values.reserve(bands_.size());
         for (const RowBand& band : bands_)
         {
-            NN_TRY(part,
-                   engine.slice_rows(packed, band.first_row, band.row_count));
+            NN_TRY(part, engine.slice_rows(packed, band.first_row, band.row_count));
             values.push_back(NamedTensor{
                 .name = band.name,
                 .value = std::move(*part),
@@ -160,22 +141,20 @@ public:
         return NamedTensorSet::create(schema_, std::move(values));
     }
 
-    [[nodiscard]] Result<GradientBundle> unpack_gradients(
-        ComputeEngine& engine, const Tensor& packed) const
+    [[nodiscard]] Result<GradientBundle> unpack_gradients(ComputeEngine& engine,
+                                                          const Tensor& packed) const
     {
-        if (!valid())
-            NN_FAIL("RowBandPacking::unpack_gradients: packing 未初始化");
+        if (!valid()) NN_FAIL("RowBandPacking::unpack_gradients: packing 未初始化");
         if (packed.rows() != total_rows_)
             NN_FAIL("RowBandPacking::unpack_gradients: 打包张量行数不匹配"
-                    "（期望 " + std::to_string(total_rows_) + "，实际 " +
-                    std::to_string(packed.rows()) + "）");
+                    "（期望 " +
+                    std::to_string(total_rows_) + "，实际 " + std::to_string(packed.rows()) + "）");
 
         std::vector<NamedTensor> values;
         values.reserve(bands_.size());
         for (const RowBand& band : bands_)
         {
-            NN_TRY(part,
-                   engine.slice_rows(packed, band.first_row, band.row_count));
+            NN_TRY(part, engine.slice_rows(packed, band.first_row, band.row_count));
             values.push_back(NamedTensor{
                 .name = band.name,
                 .value = std::move(*part),
@@ -214,11 +193,10 @@ private:
         return nullptr;
     }
 
-    [[nodiscard]] Result<NamedTensorSet> run_forward_(
-        const Tensor& input, const TensorSchema& requested_schema)
+    [[nodiscard]] Result<NamedTensorSet> run_forward_(const Tensor& input,
+                                                      const TensorSchema& requested_schema)
     {
-        if (requested_schema != schema_)
-            NN_FAIL("OutputBundleLayer: named forward schema 不匹配");
+        if (requested_schema != schema_) NN_FAIL("OutputBundleLayer: named forward schema 不匹配");
 
         // 新一轮 forward 开始后，旧的配对状态立刻失效。否则 trunk 或分支
         // 中途失败时，调用方仍可能拿上一次成功的缓存执行 backward。
@@ -234,8 +212,7 @@ private:
             if (port == nullptr)
             {
                 if (field.required)
-                    NN_FAIL("OutputBundleLayer: 必需输出端口 '" + field.name +
-                            "' 没有分支");
+                    NN_FAIL("OutputBundleLayer: 必需输出端口 '" + field.name + "' 没有分支");
                 continue;
             }
             NN_TRY(out, port->branch->forward(input));
@@ -245,50 +222,35 @@ private:
                 .value = std::move(*out),
             });
         }
-        if (values.empty())
-            NN_FAIL("OutputBundleLayer: 本次 forward 没有产生任何输出");
+        if (values.empty()) NN_FAIL("OutputBundleLayer: 本次 forward 没有产生任何输出");
         NN_TRY(set, NamedTensorSet::create(schema_, std::move(values)));
         forward_ready_ = true;
         return set;
     }
 
 public:
-    explicit OutputBundleLayer(TensorSchema schema)
-        : schema_(std::move(schema))
-    {
-        NN_ASSERT_ALWAYS(schema_.valid(),
-                         "OutputBundleLayer: schema 必须有效");
-    }
+    explicit OutputBundleLayer(TensorSchema schema) : schema_(std::move(schema))
+    { NN_ASSERT_ALWAYS(schema_.valid(), "OutputBundleLayer: schema 必须有效"); }
 
-    [[nodiscard]] const char* layer_name() const noexcept override
-    {
-        return "OutputBundleLayer";
-    }
+    [[nodiscard]] const char* layer_name() const noexcept override { return "OutputBundleLayer"; }
 
-    [[nodiscard]] Result<TensorSchema> output_schema() const override
-    {
-        return schema_;
-    }
+    [[nodiscard]] Result<TensorSchema> output_schema() const override { return schema_; }
 
-    [[nodiscard]] Result<void> add_port(
-        std::string name, std::unique_ptr<Layer> branch)
+    [[nodiscard]] Result<void> add_port(std::string name, std::unique_ptr<Layer> branch)
     {
         if (binding_state() == BindingState::ready)
             NN_FAIL("OutputBundleLayer::add_port: 层已 init，不能增加端口");
-        if (!branch)
-            NN_FAIL("OutputBundleLayer::add_port: 分支为空");
+        if (!branch) NN_FAIL("OutputBundleLayer::add_port: 分支为空");
         NN_TRY_CHECK(schema_.field(name));
         if (find_port_(name) != nullptr)
-            NN_FAIL("OutputBundleLayer::add_port: 输出端口 '" + name +
-                    "' 重复");
+            NN_FAIL("OutputBundleLayer::add_port: 输出端口 '" + name + "' 重复");
 
         branch->set_precision_profile(p_);
         ports_.push_back(Port{std::move(name), std::move(branch)});
         return {};
     }
 
-    [[nodiscard]] Result<void> set_row_band_packing(
-        std::vector<std::string> order = {})
+    [[nodiscard]] Result<void> set_row_band_packing(std::vector<std::string> order = {})
     {
         if (binding_state() == BindingState::ready)
             NN_FAIL("OutputBundleLayer::set_row_band_packing: 层已 init，"
@@ -298,10 +260,7 @@ public:
         return {};
     }
 
-    [[nodiscard]] bool has_row_band_packing() const noexcept
-    {
-        return packing_.has_value();
-    }
+    [[nodiscard]] bool has_row_band_packing() const noexcept { return packing_.has_value(); }
 
     void set_precision_profile(const PrecisionProfile& profile) override
     {
@@ -326,43 +285,30 @@ public:
         return packing_->pack(engine_ref(), *set);
     }
 
-    [[nodiscard]] Result<Tensor> backward(
-        const Tensor& grad_output) override
+    [[nodiscard]] Result<Tensor> backward(const Tensor& grad_output) override
     {
         if (!packing_)
             NN_FAIL("OutputBundleLayer::backward: 多输出 backwards 必须使用 "
                     "backward_named()，或先配置 RowBandPacking");
-        NN_TRY(grads,
-               packing_->unpack_gradients(engine_ref(), grad_output));
+        NN_TRY(grads, packing_->unpack_gradients(engine_ref(), grad_output));
         return backward_named(*grads);
     }
 
-    [[nodiscard]] Result<NamedTensorSet> forward_named(
-        const Tensor& input) override
-    {
-        return run_forward_(input, schema_);
-    }
+    [[nodiscard]] Result<NamedTensorSet> forward_named(const Tensor& input) override
+    { return run_forward_(input, schema_); }
 
-    [[nodiscard]] Result<NamedTensorSet> forward_named(
-        const Tensor& input, const TensorSchema& schema) override
-    {
-        return run_forward_(input, schema);
-    }
+    [[nodiscard]] Result<NamedTensorSet> forward_named(const Tensor& input,
+                                                       const TensorSchema& schema) override
+    { return run_forward_(input, schema); }
 
-    [[nodiscard]] Result<Tensor> backward_named(
-        const GradientBundle& gradients) override
-    {
-        return backward_named(gradients, schema_);
-    }
+    [[nodiscard]] Result<Tensor> backward_named(const GradientBundle& gradients) override
+    { return backward_named(gradients, schema_); }
 
-    [[nodiscard]] Result<Tensor> backward_named(
-        const GradientBundle& gradients,
-        const TensorSchema& requested_schema) override
+    [[nodiscard]] Result<Tensor> backward_named(const GradientBundle& gradients,
+                                                const TensorSchema& requested_schema) override
     {
-        if (!forward_ready_)
-            NN_FAIL("OutputBundleLayer::backward_named: 没有匹配的 forward");
-        if (requested_schema != schema_ ||
-            gradients.schema() != schema_)
+        if (!forward_ready_) NN_FAIL("OutputBundleLayer::backward_named: 没有匹配的 forward");
+        if (requested_schema != schema_ || gradients.schema() != schema_)
             NN_FAIL("OutputBundleLayer::backward_named: schema 不匹配");
 
         // backward 只能消费一次；错误路径也不保留半配对状态。
@@ -379,15 +325,14 @@ public:
             if (!produced_[i])
             {
                 if (port == nullptr && grad != nullptr)
-                    NN_FAIL("OutputBundleLayer::backward_named: 未激活端口 '" +
-                            field.name + "' 收到了梯度");
+                    NN_FAIL("OutputBundleLayer::backward_named: 未激活端口 '" + field.name +
+                            "' 收到了梯度");
                 continue;
             }
             if (grad == nullptr)
-                NN_FAIL("OutputBundleLayer::backward_named: 激活端口 '" +
-                        field.name + "' 缺少梯度");
-            NN_ASSERT_ALWAYS(port != nullptr,
-                             "OutputBundleLayer backward lost active port");
+                NN_FAIL("OutputBundleLayer::backward_named: 激活端口 '" + field.name +
+                        "' 缺少梯度");
+            NN_ASSERT_ALWAYS(port != nullptr, "OutputBundleLayer backward lost active port");
             NN_TRY(branch_grad, port->branch->backward(*grad));
             if (!have_input_grad)
             {
@@ -404,8 +349,7 @@ public:
                 NN_TRY_CHECK(engine_ref().accumulate(input_grad, *branch_grad));
             }
         }
-        if (!have_input_grad)
-            NN_FAIL("OutputBundleLayer::backward_named: 没有可反向的输出端口");
+        if (!have_input_grad) NN_FAIL("OutputBundleLayer::backward_named: 没有可反向的输出端口");
         return input_grad;
     }
 
@@ -444,33 +388,39 @@ public:
 
     void set_training(bool training) override
     {
-        for (Port& p : ports_) p.branch->set_training(training);
+        for (Port& p : ports_)
+            p.branch->set_training(training);
     }
 
     void set_flush_interval(std::size_t interval) override
     {
-        for (Port& p : ports_) p.branch->set_flush_interval(interval);
+        for (Port& p : ports_)
+            p.branch->set_flush_interval(interval);
     }
 
     void set_checkpoint_every(std::size_t stride) override
     {
-        for (Port& p : ports_) p.branch->set_checkpoint_every(stride);
+        for (Port& p : ports_)
+            p.branch->set_checkpoint_every(stride);
     }
 
     void set_activation_offload(bool enabled) override
     {
-        for (Port& p : ports_) p.branch->set_activation_offload(enabled);
+        for (Port& p : ports_)
+            p.branch->set_activation_offload(enabled);
     }
 
     void set_doc_ids(std::span<const std::size_t> ids) override
     {
-        for (Port& p : ports_) p.branch->set_doc_ids(ids);
+        for (Port& p : ports_)
+            p.branch->set_doc_ids(ids);
     }
 
     [[nodiscard]] std::size_t offload_ram_bytes() override
     {
         std::size_t total = 0;
-        for (Port& p : ports_) total += p.branch->offload_ram_bytes();
+        for (Port& p : ports_)
+            total += p.branch->offload_ram_bytes();
         return total;
     }
 
@@ -487,7 +437,8 @@ public:
 
     void clear_cache() override
     {
-        for (Port& p : ports_) p.branch->clear_cache();
+        for (Port& p : ports_)
+            p.branch->clear_cache();
         forward_ready_ = false;
     }
 
@@ -499,8 +450,7 @@ protected:
         for (const TensorFieldSpec& field : schema_.fields())
         {
             if (field.required && find_port_(field.name) == nullptr)
-                NN_FAIL("OutputBundleLayer::init: 必需输出端口 '" + field.name +
-                        "' 没有分支");
+                NN_FAIL("OutputBundleLayer::init: 必需输出端口 '" + field.name + "' 没有分支");
         }
         return {};
     }
@@ -509,7 +459,8 @@ protected:
     {
         std::vector<Layer*> out;
         out.reserve(ports_.size());
-        for (Port& p : ports_) out.push_back(p.branch.get());
+        for (Port& p : ports_)
+            out.push_back(p.branch.get());
         return out;
     }
 };

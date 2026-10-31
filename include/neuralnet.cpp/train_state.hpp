@@ -52,14 +52,10 @@ namespace nn
 {
 // ── 浮点字段的落盘编码（double 位模式装进 u64）──────────────────────────
 [[nodiscard]] inline std::uint64_t frac_to_bits(double v) noexcept
-{
-    return std::bit_cast<std::uint64_t>(v);
-}
+{ return std::bit_cast<std::uint64_t>(v); }
 
 [[nodiscard]] inline double bits_to_frac(std::uint64_t bits) noexcept
-{
-    return std::bit_cast<double>(bits);
-}
+{ return std::bit_cast<double>(bits); }
 
 // ── 计数器（续训起点）──────────────────────────────────────────────────
 struct TrainCounters
@@ -115,16 +111,15 @@ struct DatasetIdentity
 // steps_per_epoch 变 ⇒ step 级调度的 total_steps、global_step 的语义、
 // epoch 边界**同时**改变 ⇒ "同一断点 + 不同数据集"不存在正确的续训语义。
 // 返回空串 = 一致；否则返回人类可读的差异说明（诊断面，逐项列出变了什么）。
-[[nodiscard]] inline std::string dataset_mismatch_reason(
-    const DatasetIdentity &saved, const DatasetIdentity &current)
+[[nodiscard]] inline std::string dataset_mismatch_reason(const DatasetIdentity& saved,
+                                                         const DatasetIdentity& current)
 {
-    auto short_sha = [](const std::string &s) {
-        return s.size() > 12 ? s.substr(0, 12) + "…" : s;
-    };
+    auto short_sha = [](const std::string& s) { return s.size() > 12 ? s.substr(0, 12) + "…" : s; };
     auto u64 = [](std::uint64_t v) { return std::to_string(v); };
 
     std::string why;
-    auto add = [&why](const std::string &line) {
+    auto add = [&why](const std::string& line)
+    {
         if (!why.empty()) why += "\n";
         why += "    · " + line;
     };
@@ -137,8 +132,7 @@ struct DatasetIdentity
     if (saved.num_samples != current.num_samples)
         add("样本数      : " + u64(saved.num_samples) + " → " + u64(current.num_samples));
     if (saved.steps_per_epoch != current.steps_per_epoch)
-        add("每 epoch 步数: " + u64(saved.steps_per_epoch) + " → " +
-            u64(current.steps_per_epoch));
+        add("每 epoch 步数: " + u64(saved.steps_per_epoch) + " → " + u64(current.steps_per_epoch));
     if (saved.loss_scope != current.loss_scope)
         add("loss 范围   : " + saved.loss_scope + " → " + current.loss_scope);
     return why;
@@ -155,22 +149,17 @@ public:
     virtual ~TrainState() = default;
 
     // 域状态种类（落盘键 `state_kind`；旧文件缺键 ⇒ "text"）
-    [[nodiscard]] virtual const char *state_kind() const noexcept = 0;
+    [[nodiscard]] virtual const char* state_kind() const noexcept = 0;
     // 深拷贝（状态段写盘需要快照；多态值语义的支撑）
     [[nodiscard]] virtual std::unique_ptr<TrainState> clone() const = 0;
 
     // 域字段落盘（基类通用字段之后追加）
-    virtual void write_extra_kv(KeyValueRecord & /*kv*/) const {}
+    virtual void write_extra_kv(KeyValueRecord& /*kv*/) const {}
     // 域字段读回（缺失键 → 保持默认）
-    [[nodiscard]] virtual Result<void> read_extra_kv(const KeyValueRecord & /*kv*/)
-    {
-        return {};
-    }
+    [[nodiscard]] virtual Result<void> read_extra_kv(const KeyValueRecord& /*kv*/) { return {}; }
     // 域级续训交叉校验（`verify_resume` 在通用校验后调用；返回错误 = 不可续训）
-    [[nodiscard]] virtual Result<void> verify_extra(const TrainState & /*current*/) const
-    {
-        return {};
-    }
+    [[nodiscard]] virtual Result<void> verify_extra(const TrainState& /*current*/) const
+    { return {}; }
 
     TrainCounters counters;
     TrainRecipe recipe;
@@ -182,16 +171,14 @@ public:
 class TextTrainState : public TrainState
 {
 public:
-    [[nodiscard]] const char *state_kind() const noexcept override { return "text"; }
+    [[nodiscard]] const char* state_kind() const noexcept override { return "text"; }
     [[nodiscard]] std::unique_ptr<TrainState> clone() const override
-    {
-        return std::make_unique<TextTrainState>(*this);
-    }
+    { return std::make_unique<TextTrainState>(*this); }
 
     std::uint64_t stride = 0;   // 滑动窗口步长（0 = 等于 seq_len）
     DatasetIdentity dataset;    // 数据集身份（续训门禁的数据源）
 
-    void write_extra_kv(KeyValueRecord &kv) const override
+    void write_extra_kv(KeyValueRecord& kv) const override
     {
         kv.set("stride", stride);
         kv.set("dataset_path", dataset.path);
@@ -203,7 +190,7 @@ public:
         kv.set("dataset_loss_scope", dataset.loss_scope);
     }
 
-    [[nodiscard]] Result<void> read_extra_kv(const KeyValueRecord &kv) override
+    [[nodiscard]] Result<void> read_extra_kv(const KeyValueRecord& kv) override
     {
         std::uint64_t u = 0;
         if (kv.get("stride", u)) stride = u;
@@ -222,19 +209,18 @@ public:
         return {};
     }
 
-    [[nodiscard]] Result<void> verify_extra(const TrainState &current) const override
+    [[nodiscard]] Result<void> verify_extra(const TrainState& current) const override
     {
-        const auto *ts = dynamic_cast<const TextTrainState *>(&current);
+        const auto* ts = dynamic_cast<const TextTrainState*>(&current);
         if (ts == nullptr)
             NN_FAIL("续训交叉校验: 断点是文本状态（text）而本次不是文本状态（kind=" +
                     std::string(current.state_kind()) + "）");
         const std::string why = dataset_mismatch_reason(dataset, ts->dataset);
         if (!why.empty())
-            NN_FAIL("续训交叉校验: 数据集身份不一致（内容身份变了 ⇒ 续训不存在正确语义）:\n" +
-                    why);
+            NN_FAIL("续训交叉校验: 数据集身份不一致（内容身份变了 ⇒ 续训不存在正确语义）:\n" + why);
         if (stride != ts->stride)
-            NN_FAIL("续训交叉校验: 滑窗 stride 不一致（" + std::to_string(stride) +
-                    " vs " + std::to_string(ts->stride) + "）");
+            NN_FAIL("续训交叉校验: 滑窗 stride 不一致（" + std::to_string(stride) + " vs " +
+                    std::to_string(ts->stride) + "）");
         return {};
     }
 };
@@ -244,7 +230,7 @@ public:
 // ═══════════════════════════════════════════════════════════════════════
 inline constexpr std::uint64_t TRAIN_STATE_VERSION = 1;
 
-[[nodiscard]] inline KeyValueRecord train_state_to_kv(const TrainState &s)
+[[nodiscard]] inline KeyValueRecord train_state_to_kv(const TrainState& s)
 {
     KeyValueRecord kv;
     kv.set("state_version", TRAIN_STATE_VERSION);
@@ -280,13 +266,13 @@ inline constexpr std::uint64_t TRAIN_STATE_VERSION = 1;
     kv.set("warmup_steps", s.recipe.warmup_steps);
     kv.set("batch_size", s.recipe.batch_size);
     kv.set("micro_batch_size", s.recipe.micro_batch_size);
-    kv.set("batch_size_semantics",
-           std::string(s.recipe.batch_size_is_global ? "global" : "micro"));
+    kv.set("batch_size_semantics", std::string(s.recipe.batch_size_is_global ? "global" : "micro"));
     kv.set("accum_steps", s.recipe.accum_steps);
     {
         std::vector<std::uint64_t> lrs;
         lrs.reserve(s.recipe.lr_per_epoch.size());
-        for (double v : s.recipe.lr_per_epoch) lrs.push_back(frac_to_bits(v));
+        for (double v : s.recipe.lr_per_epoch)
+            lrs.push_back(frac_to_bits(v));
         kv.set("lr_per_epoch_bits", lrs);
     }
 
@@ -296,8 +282,8 @@ inline constexpr std::uint64_t TRAIN_STATE_VERSION = 1;
 }
 
 // 精度槽读回：只接受**存储精度**与三值（BF16/F64 是保留值，文件里出现即报错）
-[[nodiscard]] inline Result<Precision> precision_from_state_kv(
-    const KeyValueRecord &kv, const std::string &key, Precision fallback)
+[[nodiscard]] inline Result<Precision>
+precision_from_state_kv(const KeyValueRecord& kv, const std::string& key, Precision fallback)
 {
     std::uint64_t v = 0;
     if (!kv.get(key, v)) return fallback;
@@ -311,16 +297,16 @@ inline constexpr std::uint64_t TRAIN_STATE_VERSION = 1;
 // 工厂：kind → 子类实例。旧文件缺 `state_kind` 键 ⇒ "text"（历史断点全部是
 // 文本训练；零破坏）。未知 kind ⇒ 硬报错（不用错误类型的字段布局读文件）。
 [[nodiscard]] inline Result<std::unique_ptr<TrainState>>
-train_state_from_kv(const KeyValueRecord &kv)
+train_state_from_kv(const KeyValueRecord& kv)
 {
     std::string kind = "text";
     if (!kv.get("state_kind", kind)) kind = "text";
 
     std::unique_ptr<TrainState> s;
-    if (kind == "text")
-        s = std::make_unique<TextTrainState>();
+    if (kind == "text") s = std::make_unique<TextTrainState>();
     else
-        NN_FAIL("未知的训练状态 kind=\"" + kind + "\"（本构建只认识 text；"
+        NN_FAIL("未知的训练状态 kind=\"" + kind +
+                "\"（本构建只认识 text；"
                 "自定义域请注册对应 TrainState 子类的读回路径）");
 
     std::uint64_t u = 0;
@@ -333,17 +319,15 @@ train_state_from_kv(const KeyValueRecord &kv)
     if (kv.get("optimizer_step", u)) s->optimizer_step = u;
     if (kv.get("optimizer_blob_count", u)) s->optimizer_blob_count = u;
 
-    NN_TRY(p_param, precision_from_state_kv(
-        kv, "precision_param", s->recipe.precision.param));
+    NN_TRY(p_param, precision_from_state_kv(kv, "precision_param", s->recipe.precision.param));
     s->recipe.precision.param = *p_param;
-    NN_TRY(p_compute, precision_from_state_kv(
-        kv, "precision_compute", s->recipe.precision.compute));
+    NN_TRY(p_compute,
+           precision_from_state_kv(kv, "precision_compute", s->recipe.precision.compute));
     s->recipe.precision.compute = *p_compute;
-    NN_TRY(p_stable, precision_from_state_kv(
-        kv, "precision_stable", s->recipe.precision.stable));
+    NN_TRY(p_stable, precision_from_state_kv(kv, "precision_stable", s->recipe.precision.stable));
     s->recipe.precision.stable = *p_stable;
-    NN_TRY(p_optimizer, precision_from_state_kv(
-        kv, "precision_optimizer", s->recipe.precision.optimizer));
+    NN_TRY(p_optimizer,
+           precision_from_state_kv(kv, "precision_optimizer", s->recipe.precision.optimizer));
     s->recipe.precision.optimizer = *p_optimizer;
 
     if (!kv.get("lr_schedule", s->recipe.lr_schedule)) s->recipe.lr_schedule = "fixed";
@@ -375,7 +359,8 @@ train_state_from_kv(const KeyValueRecord &kv)
         {
             s->recipe.lr_per_epoch.clear();
             s->recipe.lr_per_epoch.reserve(lrs.size());
-            for (std::uint64_t b : lrs) s->recipe.lr_per_epoch.push_back(bits_to_frac(b));
+            for (std::uint64_t b : lrs)
+                s->recipe.lr_per_epoch.push_back(bits_to_frac(b));
         }
     }
 
@@ -387,33 +372,35 @@ train_state_from_kv(const KeyValueRecord &kv)
 // Strict（默认）：kind 相等 + 配方关键维度相等 + 计数器不越界 + 域级
 // `verify_extra()`（文本 = 数据集身份 + stride）。Relaxed：只做 kind 检查，
 // 允许研究期换数据集 / 改配方（代价 = lr 曲线形状可能跨续训改变）。
-enum class ResumePolicy { Strict, Relaxed };
+enum class ResumePolicy
+{
+    Strict,
+    Relaxed
+};
 
-[[nodiscard]] inline Result<void> verify_resume(const TrainState &saved,
-                                                const TrainState &current,
+[[nodiscard]] inline Result<void> verify_resume(const TrainState& saved, const TrainState& current,
                                                 ResumePolicy policy = ResumePolicy::Strict)
 {
     if (std::string(saved.state_kind()) != std::string(current.state_kind()))
-        NN_FAIL("续训交叉校验: 状态 kind 不一致（" + std::string(saved.state_kind()) +
-                " vs " + std::string(current.state_kind()) + "）");
-    if (policy == ResumePolicy::Relaxed)
-        return {};
+        NN_FAIL("续训交叉校验: 状态 kind 不一致（" + std::string(saved.state_kind()) + " vs " +
+                std::string(current.state_kind()) + "）");
+    if (policy == ResumePolicy::Relaxed) return {};
 
-    const TrainRecipe &a = saved.recipe;
-    const TrainRecipe &b = current.recipe;
-    auto mismatch = [](const char *name, const std::string &x, const std::string &y) {
+    const TrainRecipe& a = saved.recipe;
+    const TrainRecipe& b = current.recipe;
+    auto mismatch = [](const char* name, const std::string& x, const std::string& y)
+    {
         return std::string("续训交叉校验: 配方 ") + name + " 不一致（断点 \"" + x +
                "\" vs 本次 \"" + y + "\"）；lr 曲线形状必须跨续训不变";
     };
-    if (a.optimizer != b.optimizer)
-        NN_FAIL(mismatch("optimizer", a.optimizer, b.optimizer));
+    if (a.optimizer != b.optimizer) NN_FAIL(mismatch("optimizer", a.optimizer, b.optimizer));
     if (a.lr_schedule != b.lr_schedule)
         NN_FAIL(mismatch("lr_schedule", a.lr_schedule, b.lr_schedule));
     if (a.epochs != b.epochs)
         NN_FAIL(mismatch("epochs", std::to_string(a.epochs), std::to_string(b.epochs)));
     if (a.total_steps != b.total_steps)
-        NN_FAIL(mismatch("total_steps", std::to_string(a.total_steps),
-                         std::to_string(b.total_steps)));
+        NN_FAIL(
+            mismatch("total_steps", std::to_string(a.total_steps), std::to_string(b.total_steps)));
     if (a.warmup_epochs != b.warmup_epochs)
         NN_FAIL(mismatch("warmup_epochs", std::to_string(a.warmup_epochs),
                          std::to_string(b.warmup_epochs)));
@@ -421,15 +408,12 @@ enum class ResumePolicy { Strict, Relaxed };
         NN_FAIL(mismatch("warmup_steps", std::to_string(a.warmup_steps),
                          std::to_string(b.warmup_steps)));
     if (a.batch_size != b.batch_size)
-        NN_FAIL(mismatch("batch_size", std::to_string(a.batch_size),
-                         std::to_string(b.batch_size)));
+        NN_FAIL(mismatch("batch_size", std::to_string(a.batch_size), std::to_string(b.batch_size)));
     if (a.accum_steps != b.accum_steps)
-        NN_FAIL(mismatch("accum_steps", std::to_string(a.accum_steps),
-                         std::to_string(b.accum_steps)));
-    if (a.precision.param != b.precision.param ||
-        a.precision.compute != b.precision.compute ||
-        a.precision.stable != b.precision.stable ||
-        a.precision.optimizer != b.precision.optimizer)
+        NN_FAIL(
+            mismatch("accum_steps", std::to_string(a.accum_steps), std::to_string(b.accum_steps)));
+    if (a.precision.param != b.precision.param || a.precision.compute != b.precision.compute ||
+        a.precision.stable != b.precision.stable || a.precision.optimizer != b.precision.optimizer)
         NN_FAIL(mismatch("precision", "(见断点)", "(见本次)"));
 
     // 计数器不越界：断点已训完的 epoch 超过本次配方的 epochs ⇒ 配方缩水

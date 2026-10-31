@@ -35,20 +35,12 @@ private:
         std::unique_ptr<TrainingSession> training;
         std::unique_ptr<Model> readonly;
 
-        [[nodiscard]] bool trainable() const noexcept
-        {
-            return training != nullptr;
-        }
+        [[nodiscard]] bool trainable() const noexcept { return training != nullptr; }
 
-        [[nodiscard]] Model& model()
-        {
-            return training ? training->model() : *readonly;
-        }
+        [[nodiscard]] Model& model() { return training ? training->model() : *readonly; }
 
         [[nodiscard]] const Model& model() const
-        {
-            return training ? training->model() : *readonly;
-        }
+        { return training ? training->model() : *readonly; }
     };
 
     ComputeEngine* engine_ = nullptr;
@@ -68,29 +60,24 @@ private:
         return nullptr;
     }
 
-    [[nodiscard]] Result<void> validate_new_role(
-        std::string_view name, Model& model)
+    [[nodiscard]] Result<void> validate_new_role(std::string_view name, Model& model)
     {
-        if (name.empty())
-            NN_FAIL("TrainingGroupSession: role 名不能为空");
+        if (name.empty()) NN_FAIL("TrainingGroupSession: role 名不能为空");
         if (find_role(name) != nullptr)
-            NN_FAIL("TrainingGroupSession: role '" + std::string(name) +
-                    "' 重复");
+            NN_FAIL("TrainingGroupSession: role '" + std::string(name) + "' 重复");
         if (!model.engine_bound())
-            NN_FAIL("TrainingGroupSession: role '" + std::string(name) +
-                    "' 的 Model 未绑定引擎");
+            NN_FAIL("TrainingGroupSession: role '" + std::string(name) + "' 的 Model 未绑定引擎");
         ComputeEngine& candidate = model.engine();
-        if (engine_ == nullptr)
-            engine_ = &candidate;
+        if (engine_ == nullptr) engine_ = &candidate;
         else if (engine_ != &candidate)
             NN_FAIL("TrainingGroupSession: 所有 role 必须共享同一 ComputeEngine"
-                    "（role='" + std::string(name) + "'）");
+                    "（role='" +
+                    std::string(name) + "'）");
 
         // 有效性校验；不同算法角色可拥有不同 schema，不强制 fingerprint 相同。
         NN_TRY(schema, model.output_schema());
         if (!schema->valid())
-            NN_FAIL("TrainingGroupSession: role '" + std::string(name) +
-                    "' 的 output schema 无效");
+            NN_FAIL("TrainingGroupSession: role '" + std::string(name) + "' 的 output schema 无效");
         return {};
     }
 
@@ -102,20 +89,17 @@ public:
     TrainingGroupSession& operator=(TrainingGroupSession&&) noexcept = default;
     ~TrainingGroupSession() = default;
 
-    [[nodiscard]] Result<void> add_training_role(
-        std::string name, TrainingSession session)
+    [[nodiscard]] Result<void> add_training_role(std::string name, TrainingSession session)
     {
         NN_TRY_CHECK(validate_new_role(name, session.model()));
         auto role = std::make_unique<Role>();
         role->name = std::move(name);
-        role->training =
-            std::make_unique<TrainingSession>(std::move(session));
+        role->training = std::make_unique<TrainingSession>(std::move(session));
         roles_.push_back(std::move(role));
         return {};
     }
 
-    [[nodiscard]] Result<void> add_readonly_role(
-        std::string name, Model model)
+    [[nodiscard]] Result<void> add_readonly_role(std::string name, Model model)
     {
         NN_TRY_CHECK(validate_new_role(name, model));
         auto role = std::make_unique<Role>();
@@ -127,14 +111,10 @@ public:
 
     [[nodiscard]] bool empty() const noexcept { return roles_.empty(); }
     [[nodiscard]] std::size_t size() const noexcept { return roles_.size(); }
-    [[nodiscard]] bool engine_bound() const noexcept
-    {
-        return engine_ != nullptr;
-    }
+    [[nodiscard]] bool engine_bound() const noexcept { return engine_ != nullptr; }
     [[nodiscard]] ComputeEngine& engine() const
     {
-        NN_ASSERT_ALWAYS(engine_ != nullptr,
-                         "TrainingGroupSession::engine: group 为空");
+        NN_ASSERT_ALWAYS(engine_ != nullptr, "TrainingGroupSession::engine: group 为空");
         return *engine_;
     }
 
@@ -150,50 +130,38 @@ public:
     [[nodiscard]] Result<bool> is_trainable(std::string_view name) const
     {
         const Role* role = find_role(name);
-        if (role == nullptr)
-            NN_FAIL("TrainingGroupSession: 未知 role '" + std::string(name) +
-                    "'");
+        if (role == nullptr) NN_FAIL("TrainingGroupSession: 未知 role '" + std::string(name) + "'");
         return role->trainable();
     }
 
     [[nodiscard]] Result<Model*> model(std::string_view name)
     {
         Role* role = find_role(name);
-        if (role == nullptr)
-            NN_FAIL("TrainingGroupSession: 未知 role '" + std::string(name) +
-                    "'");
+        if (role == nullptr) NN_FAIL("TrainingGroupSession: 未知 role '" + std::string(name) + "'");
         return &role->model();
     }
 
     [[nodiscard]] Result<const Model*> model(std::string_view name) const
     {
         const Role* role = find_role(name);
-        if (role == nullptr)
-            NN_FAIL("TrainingGroupSession: 未知 role '" + std::string(name) +
-                    "'");
+        if (role == nullptr) NN_FAIL("TrainingGroupSession: 未知 role '" + std::string(name) + "'");
         return &role->model();
     }
 
-    [[nodiscard]] Result<TrainingSession*> training_session(
-        std::string_view name)
+    [[nodiscard]] Result<TrainingSession*> training_session(std::string_view name)
     {
         Role* role = find_role(name);
-        if (role == nullptr)
-            NN_FAIL("TrainingGroupSession: 未知 role '" + std::string(name) +
-                    "'");
+        if (role == nullptr) NN_FAIL("TrainingGroupSession: 未知 role '" + std::string(name) + "'");
         if (role->training == nullptr)
             NN_FAIL("TrainingGroupSession: role '" + std::string(name) +
                     "' 是只读 Model，不是 TrainingSession");
         return role->training.get();
     }
 
-    [[nodiscard]] Result<const TrainingSession*> training_session(
-        std::string_view name) const
+    [[nodiscard]] Result<const TrainingSession*> training_session(std::string_view name) const
     {
         const Role* role = find_role(name);
-        if (role == nullptr)
-            NN_FAIL("TrainingGroupSession: 未知 role '" + std::string(name) +
-                    "'");
+        if (role == nullptr) NN_FAIL("TrainingGroupSession: 未知 role '" + std::string(name) + "'");
         if (role->training == nullptr)
             NN_FAIL("TrainingGroupSession: role '" + std::string(name) +
                     "' 是只读 Model，不是 TrainingSession");

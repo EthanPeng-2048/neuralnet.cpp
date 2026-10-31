@@ -52,8 +52,7 @@ namespace nn::detail
 #if defined(_MSC_VER)
     char* buf = nullptr;
     std::size_t len = 0;
-    if (_dupenv_s(&buf, &len, name) != 0 || buf == nullptr)
-        return {};
+    if (_dupenv_s(&buf, &len, name) != 0 || buf == nullptr) return {};
     std::string s(buf);
     std::free(buf);
     return s;
@@ -68,15 +67,12 @@ namespace nn::detail
 [[nodiscard]] inline int env_int_raw(const char* name, int fallback) noexcept
 {
     const std::string s = env_string_raw(name);
-    if (s.empty())
-        return fallback;
+    if (s.empty()) return fallback;
     const char* p = s.c_str();
     char* end = nullptr;
     const long v = std::strtol(p, &end, 10);
-    if (end == p || *end != '\0')
-        return fallback;
-    if (v < -2147483647L - 1L || v > 2147483647L)
-        return fallback;
+    if (end == p || *end != '\0') return fallback;
+    if (v < -2147483647L - 1L || v > 2147483647L) return fallback;
     return static_cast<int>(v);
 }
 

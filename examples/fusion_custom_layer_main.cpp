@@ -26,7 +26,8 @@ namespace
 // exp(0.5*0.7) / (sqrt(2.0) + 0.7)
 constexpr float kExpect = 1.419067549f / (1.414213562f + 0.7f);
 
-float abs_diff(float a, float b) { return a > b ? a - b : b - a; }
+float abs_diff(float a, float b)
+{ return a > b ? a - b : b - a; }
 
 } // namespace
 
@@ -35,15 +36,12 @@ int main()
     // ── CPU 参考 ─────────────────────────────────────────────────────────
     auto cpu_owner = nn::CpuEngine::create();
     nn::CpuEngine& cpu = *cpu_owner;
-    nn::Tensor x = cpu.create_tensor(4, 3, nn::Precision::F32,
-                                     nn::InitSpec::constant(0.5f));
-    nn::Tensor y = cpu.create_tensor(4, 3, nn::Precision::F32,
-                                     nn::InitSpec::constant(2.0f));
+    nn::Tensor x = cpu.create_tensor(4, 3, nn::Precision::F32, nn::InitSpec::constant(0.5f));
+    nn::Tensor y = cpu.create_tensor(4, 3, nn::Precision::F32, nn::InitSpec::constant(2.0f));
     auto cout_r = nn_example::fused_custom_op(cpu, x, y, 0.7f);
     if (!cout_r)
     {
-        std::fprintf(stderr, "[example] CPU 求值失败: %s\n",
-                     cout_r.error().message.c_str());
+        std::fprintf(stderr, "[example] CPU 求值失败: %s\n", cout_r.error().message.c_str());
         return 1;
     }
     std::vector<float> cbuf(12, 0.0f);
@@ -68,8 +66,7 @@ int main()
     nn::GpuBackend& backend = *backend_owner;
     if (auto ir = backend.initialize(); !ir)
     {
-        std::fprintf(stderr, "[example] GPU 初始化失败（跳过）：%s\n",
-                     ir.error().message.c_str());
+        std::fprintf(stderr, "[example] GPU 初始化失败（跳过）：%s\n", ir.error().message.c_str());
         return 77;   // ctest 约定：77 = skip
     }
     auto gpu_owner = nn::GpuEngine::create(backend);
@@ -77,10 +74,8 @@ int main()
 
     // ③ f32 路径（注册表命中 V0）
     {
-        nn::Tensor gx = gpu.create_tensor(4, 3, nn::Precision::F32,
-                                          nn::InitSpec::constant(0.5f));
-        nn::Tensor gy = gpu.create_tensor(4, 3, nn::Precision::F32,
-                                          nn::InitSpec::constant(2.0f));
+        nn::Tensor gx = gpu.create_tensor(4, 3, nn::Precision::F32, nn::InitSpec::constant(0.5f));
+        nn::Tensor gy = gpu.create_tensor(4, 3, nn::Precision::F32, nn::InitSpec::constant(2.0f));
         auto g_r = nn_example::fused_custom_op(gpu, gx, gy, 0.7f);
         if (!g_r)
         {
@@ -94,8 +89,7 @@ int main()
             std::fprintf(stderr, "[example] GPU f32 read 失败\n");
             return 1;
         }
-        std::printf("[example] GPU f32 (V0) = %.7f（与 CPU 差 %.3e）\n",
-                    static_cast<double>(gb[0]),
+        std::printf("[example] GPU f32 (V0) = %.7f（与 CPU 差 %.3e）\n", static_cast<double>(gb[0]),
                     static_cast<double>(abs_diff(gb[0], cpu_val)));
         if (abs_diff(gb[0], cpu_val) > 1e-5f)
         {
@@ -106,16 +100,12 @@ int main()
 
     // ② f16 路径（注册表命中 V1 运行期精度分派：双视图 + PC `prec`）
     {
-        nn::Tensor gx = gpu.create_tensor(4, 3, nn::Precision::F16,
-                                          nn::InitSpec::constant(0.5f));
-        nn::Tensor gy = gpu.create_tensor(4, 3, nn::Precision::F16,
-                                          nn::InitSpec::constant(2.0f));
-        auto g_r = nn_example::fused_custom_op(gpu, gx, gy, 0.7f,
-                                               nn::Precision::F16);
+        nn::Tensor gx = gpu.create_tensor(4, 3, nn::Precision::F16, nn::InitSpec::constant(0.5f));
+        nn::Tensor gy = gpu.create_tensor(4, 3, nn::Precision::F16, nn::InitSpec::constant(2.0f));
+        auto g_r = nn_example::fused_custom_op(gpu, gx, gy, 0.7f, nn::Precision::F16);
         if (!g_r)
         {
-            std::fprintf(stderr,
-                         "[example] GPU f16 分派变体未命中（闭合世界）: %s\n",
+            std::fprintf(stderr, "[example] GPU f16 分派变体未命中（闭合世界）: %s\n",
                          g_r.error().message.c_str());
             return 1;
         }
@@ -127,8 +117,7 @@ int main()
         }
         const float gv = static_cast<float>(hb[0]);
         std::printf("[example] GPU f16 (V1) = %.7f（与 CPU 差 %.3e，f16 容差内）\n",
-                    static_cast<double>(gv),
-                    static_cast<double>(abs_diff(gv, cpu_val)));
+                    static_cast<double>(gv), static_cast<double>(abs_diff(gv, cpu_val)));
         if (abs_diff(gv, cpu_val) > 2e-3f)
         {
             std::fprintf(stderr, "[example] GPU f16 与 CPU 不符\n");
@@ -140,15 +129,12 @@ int main()
     //     本层没有 dry-run —— 注册表若只靠锚点而符号实例与运行期不一致，
     //     这里会闭合世界硬报错。
     {
-        nn::Tensor gx = gpu.create_tensor(4, 3, nn::Precision::F16,
-                                          nn::InitSpec::constant(0.5f));
-        auto r = nn_example::fused_custom_norm(gpu, gx, 1.0f / 3.0f, 1e-5f,
-                                               nn::Precision::F16);
+        nn::Tensor gx = gpu.create_tensor(4, 3, nn::Precision::F16, nn::InitSpec::constant(0.5f));
+        auto r = nn_example::fused_custom_norm(gpu, gx, 1.0f / 3.0f, 1e-5f, nn::Precision::F16);
         if (!r)
         {
-            std::fprintf(stderr,
-                "[example] 归一化形态 GPU 未命中（闭合世界）：%s\n",
-                r.error().message.c_str());
+            std::fprintf(stderr, "[example] 归一化形态 GPU 未命中（闭合世界）：%s\n",
+                         r.error().message.c_str());
             return 1;
         }
         std::vector<nn::f16> hb(12, nn::f16(0.0f));

@@ -36,8 +36,7 @@ int g_fail = 0;
 
 // 手写 RoPE forward 参考（与 RotateHalfRef/RowModRef 语义一致）
 float rope_ref(nn::ComputeEngine& eng, const nn::Tensor& q, const nn::Tensor& cos,
-               const nn::Tensor& sin, std::size_t r, std::size_t c, std::size_t dk,
-               bool backward)
+               const nn::Tensor& sin, std::size_t r, std::size_t c, std::size_t dk, bool backward)
 {
     const std::size_t cols = q.cols();
     const auto qm = download(eng, q);
@@ -56,13 +55,12 @@ float rope_ref(nn::ComputeEngine& eng, const nn::Tensor& q, const nn::Tensor& co
 
 // 内联 RoPE 表达式（与 Layer 里写的同一段，唯一事实来源）
 template <bool Backward>
-auto rope_expr(const nn::Tensor& q, const nn::Tensor& cos, const nn::Tensor& sin,
-               std::uint32_t dk)
+auto rope_expr(const nn::Tensor& q, const nn::Tensor& cos, const nn::Tensor& sin, std::uint32_t dk)
 {
     auto term1 = leaf(q) * row_mod(cos, dk);
     auto term2 = rotate_half(q, dk) * row_mod(sin, dk);
     if constexpr (Backward) return term1 - term2;
-    else                    return term1 + term2;
+    else return term1 + term2;
 }
 
 void test_rope()
@@ -86,7 +84,11 @@ void test_rope()
             {
                 const float want = rope_ref(eng, q, cos, sin, r, c, DK, false);
                 const float got = os[r * COLS + c];
-                if (std::fabs(want - got) > 1e-5f) { ok = false; break; }
+                if (std::fabs(want - got) > 1e-5f)
+                {
+                    ok = false;
+                    break;
+                }
             }
         CHECK(ok, "RoPE forward CPU 求值与参考一致");
 
@@ -103,7 +105,8 @@ void test_rope()
 
         // 规范 key：同表达式折叠两次 key 相同（AOT 匹配前提）
         const std::string k1 = nn::expr_spec_key(spec);
-        const std::string k2 = nn::expr_spec_key(to_expr_spec(rope_expr<false>(q, cos, sin, DK)).first);
+        const std::string k2 =
+            nn::expr_spec_key(to_expr_spec(rope_expr<false>(q, cos, sin, DK)).first);
         CHECK(k1 == k2, "同表达式两次折叠 key 相同");
     }
 
@@ -118,13 +121,17 @@ void test_rope()
             for (std::size_t c = 0; c < COLS; ++c)
             {
                 const float want = rope_ref(eng, q, cos, sin, r, c, DK, true);
-                if (std::fabs(want - os[r * COLS + c]) > 1e-5f) { ok = false; break; }
+                if (std::fabs(want - os[r * COLS + c]) > 1e-5f)
+                {
+                    ok = false;
+                    break;
+                }
             }
         CHECK(ok, "RoPE backward CPU 求值与参考一致");
         auto [spec, _] = to_expr_spec(expr);
         CHECK(spec.instrs.back().op == static_cast<uint8_t>(nn::ExprOp::Sub), "backward 末条=Sub");
         CHECK(nn::expr_spec_key(spec) !=
-              nn::expr_spec_key(to_expr_spec(rope_expr<false>(q, cos, sin, DK)).first),
+                  nn::expr_spec_key(to_expr_spec(rope_expr<false>(q, cos, sin, DK)).first),
               "forward/backward key 可区分");
 
         // 形状无关融合：RowMod/RotateHalf 的 param（周期/块大小 = d_k）是
@@ -132,7 +139,7 @@ void test_rope()
         // shader，任意 d_k 全融合；glsl_gen 把 param 作为 push constant 读取）
         constexpr std::uint32_t DK2 = 64;
         CHECK(nn::expr_spec_key(spec) ==
-              nn::expr_spec_key(to_expr_spec(rope_expr<true>(q, cos, sin, DK2)).first),
+                  nn::expr_spec_key(to_expr_spec(rope_expr<true>(q, cos, sin, DK2)).first),
               "不同 d_k 的 key 相同（形状无关融合）");
     }
 }
@@ -157,7 +164,11 @@ void test_elementwise()
         const auto bs = bm.span();
         bool ok = true;
         for (std::size_t i = 0; i < R * C; ++i)
-            if (std::fabs((as[i] * 2.0f + bs[i]) - os[i]) > 1e-5f) { ok = false; break; }
+            if (std::fabs((as[i] * 2.0f + bs[i]) - os[i]) > 1e-5f)
+            {
+                ok = false;
+                break;
+            }
         CHECK(ok, "a*2+b 标量广播正确");
         auto [spec, inputs] = to_expr_spec(expr);
         CHECK(spec.instrs.size() == 2 && spec.num_regs == 2, "a*2+b: 2 指令 2 寄存器");
@@ -174,7 +185,11 @@ void test_elementwise()
         const auto as = am.span();
         bool ok = true;
         for (std::size_t i = 0; i < R * C; ++i)
-            if (std::fabs((as[i] > 0.0f ? as[i] : 0.0f) - os[i]) > 1e-5f) { ok = false; break; }
+            if (std::fabs((as[i] > 0.0f ? as[i] : 0.0f) - os[i]) > 1e-5f)
+            {
+                ok = false;
+                break;
+            }
         CHECK(ok, "relu(a) 正确");
         auto [spec, _] = to_expr_spec(expr);
         CHECK(spec.instrs.size() == 1 && spec.num_regs == 1, "relu: 单条指令");
@@ -191,7 +206,11 @@ void test_elementwise()
         const auto as = am.span();
         bool ok = true;
         for (std::size_t i = 0; i < R * C; ++i)
-            if (std::fabs((as[i] > 0.0f ? as[i] : 0.0f) - os[i]) > 1e-5f) { ok = false; break; }
+            if (std::fabs((as[i] > 0.0f ? as[i] : 0.0f) - os[i]) > 1e-5f)
+            {
+                ok = false;
+                break;
+            }
         CHECK(ok, "select(a>0,a,0) 正确");
         auto [spec, _] = to_expr_spec(expr);
         CHECK(spec.instrs.size() == 2, "select: 比较+Select 共 2 指令");
@@ -211,7 +230,11 @@ void test_elementwise()
         const auto bs = bm.span();
         bool ok = true;
         for (std::size_t i = 0; i < R * C; ++i)
-            if (std::fabs((std::tanh(as[i]) + std::exp(bs[i])) - os[i]) > 1e-4f) { ok = false; break; }
+            if (std::fabs((std::tanh(as[i]) + std::exp(bs[i])) - os[i]) > 1e-4f)
+            {
+                ok = false;
+                break;
+            }
         CHECK(ok, "tanh(a)+exp(b) 正确");
         auto [spec, _] = to_expr_spec(expr);
         CHECK(spec.instrs.size() == 3, "tanh+exp+: 3 指令");
@@ -231,8 +254,7 @@ void test_swiglu()
     // grad_gate = g*up*s*(1 + gate*(1-s))（内联，与 Layer 相同）
     {
         const Scalar one{1};
-        auto expr = leaf(g) * leaf(up)
-            * (leaf(s) * (one + leaf(gate) * (one - leaf(s))));
+        auto expr = leaf(g) * leaf(up) * (leaf(s) * (one + leaf(gate) * (one - leaf(s))));
         nn::Tensor out = eval_cpu(expr, R, C);
         const auto om = download(eng, out);
         const auto os = om.span();
@@ -248,13 +270,18 @@ void test_swiglu()
         for (std::size_t i = 0; i < R * C; ++i)
         {
             const float want = gs[i] * us[i] * ss[i] * (1.0f + gts[i] * (1.0f - ss[i]));
-            if (std::fabs(want - os[i]) > 1e-4f) { ok = false; break; }
+            if (std::fabs(want - os[i]) > 1e-4f)
+            {
+                ok = false;
+                break;
+            }
         }
         CHECK(ok, "swiglu grad_gate CPU 正确");
         auto [spec, _] = to_expr_spec(expr);
         CHECK(nn::expr_spec_key(spec) ==
-              nn::expr_spec_key(to_expr_spec(
-                  leaf(g) * leaf(up) * (leaf(s) * (one + leaf(gate) * (one - leaf(s))))).first),
+                  nn::expr_spec_key(to_expr_spec(leaf(g) * leaf(up) *
+                                                 (leaf(s) * (one + leaf(gate) * (one - leaf(s)))))
+                                        .first),
               "swiglu grad_gate 同表达式 key 稳定");
     }
     // grad_up = g*gate*s
@@ -271,13 +298,18 @@ void test_swiglu()
         const auto gts = gtm.span();
         bool ok = true;
         for (std::size_t i = 0; i < R * C; ++i)
-            if (std::fabs((gs[i] * gts[i] * ss[i]) - os[i]) > 1e-4f) { ok = false; break; }
+            if (std::fabs((gs[i] * gts[i] * ss[i]) - os[i]) > 1e-4f)
+            {
+                ok = false;
+                break;
+            }
         CHECK(ok, "swiglu grad_up CPU 正确");
         auto [spec, _] = to_expr_spec(expr);
         CHECK(nn::expr_spec_key(spec) !=
-              nn::expr_spec_key(to_expr_spec(
-                  leaf(g) * leaf(up)
-                  * (leaf(s) * (Scalar{1} + leaf(gate) * (Scalar{1} - leaf(s))))).first),
+                  nn::expr_spec_key(
+                      to_expr_spec(leaf(g) * leaf(up) *
+                                   (leaf(s) * (Scalar{1} + leaf(gate) * (Scalar{1} - leaf(s)))))
+                          .first),
               "grad_gate 与 grad_up key 不同");
     }
 }
@@ -290,9 +322,7 @@ int main()
     test_elementwise();
     test_swiglu();
 
-    if (g_fail == 0)
-        std::printf("ALL PASS\n");
-    else
-        std::printf("%d FAILED\n", g_fail);
+    if (g_fail == 0) std::printf("ALL PASS\n");
+    else std::printf("%d FAILED\n", g_fail);
     return g_fail == 0 ? 0 : 1;
 }

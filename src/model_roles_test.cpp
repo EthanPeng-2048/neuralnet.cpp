@@ -45,7 +45,7 @@ constexpr std::size_t B = 4;
 nn::ModelSpec ternary_spec()
 {
     nn::ModelSpec spec;
-    auto &sp = spec.emplace<nn::MlpSpec>();
+    auto& sp = spec.emplace<nn::MlpSpec>();
     sp.layer_dims = {IN, H, OUT};
     sp.weight_quant = nn::WeightQuant::T1_58;
     return spec;
@@ -56,7 +56,8 @@ nn::ModelSpec ternary_spec()
     nn::Matrix m(rows, cols);
     std::mt19937 rng(seed);
     std::uniform_real_distribution<float> d(-1.0f, 1.0f);
-    for (auto& v : m.span()) v = d(rng);
+    for (auto& v : m.span())
+        v = d(rng);
     return m;
 }
 
@@ -142,10 +143,8 @@ void test_model_and_checkpoint_roles()
         const std::uint64_t sm = file_size(f_model);
         const std::uint64_t scp = file_size(f_ckpt);
         std::printf("    .nnmodel = %llu B, .nnckpt = %llu B\n",
-                    static_cast<unsigned long long>(sm),
-                    static_cast<unsigned long long>(scp));
-        CHECK(sm > 0 && scp > 0 && sm < scp,
-              "推理文件小于断点文件（base-3 打包 + 无 latent）");
+                    static_cast<unsigned long long>(sm), static_cast<unsigned long long>(scp));
+        CHECK(sm > 0 && scp > 0 && sm < scp, "推理文件小于断点文件（base-3 打包 + 无 latent）");
     }
 
     // ── [1] Model 角色载入：只读态 + 前向逐位一致 ──
@@ -165,16 +164,14 @@ void test_model_and_checkpoint_roles()
         CHECK(bl != nullptr, "重建模型里有 BitLinear");
         if (bl != nullptr)
         {
-            CHECK(!bl->latent_weights().valid(),
-                  "推理文件载入后没有 latent（只读推理态）");
+            CHECK(!bl->latent_weights().valid(), "推理文件载入后没有 latent（只读推理态）");
             auto g = bl->backward(bl->latent_weights());   // 只读态 → 错误（不静默）
             CHECK(!g.has_value(), "只读态 backward() 明确报错");
         }
         auto y2_r = m2.forward(x);
         CHECK(y2_r.has_value(), "载入模型前向成功");
         if (y2_r.has_value())
-            CHECK(matrices_equal(y_ref, download(eng, *y2_r)),
-                  "前向输出与保存前**逐位一致**");
+            CHECK(matrices_equal(y_ref, download(eng, *y2_r)), "前向输出与保存前**逐位一致**");
     }
 
     // ── [2] Checkpoint 角色载入：latent 逐位一致 + 可继续训练 ──
@@ -226,8 +223,7 @@ void test_model_and_checkpoint_roles()
                 if (bl != nullptr)
                 {
                     auto e = bl->export_param(0, nn::ModelRole::Checkpoint);
-                    CHECK(!e.has_value(),
-                          "只读推理态按断点角色导出 → 明确错误（不静默）");
+                    CHECK(!e.has_value(), "只读推理态按断点角色导出 → 明确错误（不静默）");
                 }
             }
         }
@@ -325,8 +321,7 @@ void test_ternary_warm_start()
         {
             for (std::size_t i = 0; i < wpr; ++i)
                 words[i] = std::bit_cast<std::uint32_t>(src_packed.span()[o * wpr + i]);
-            const float s =
-                nn::trit_pack::latent_row_scale(words.data(), IN, tau.span()[o]);
+            const float s = nn::trit_pack::latent_row_scale(words.data(), IN, tau.span()[o]);
             for (std::size_t c = 0; c < IN; ++c)
                 if (lat.span()[o * IN + c] != nn::trit_pack::at(words.data(), c) * s)
                     formula_ok = false;
@@ -334,18 +329,16 @@ void test_ternary_warm_start()
             for (std::size_t c = 0; c < IN; ++c)
                 acc += std::fabs(static_cast<double>(lat.span()[o * IN + c]));
             const double mean = acc / static_cast<double>(IN);
-            const double tol =
-                2e-6 * std::max(1.0, std::fabs(static_cast<double>(tau.span()[o])));
-            if (std::fabs(mean - static_cast<double>(tau.span()[o])) > tol)
-                fixed_point_ok = false;
+            const double tol = 2e-6 * std::max(1.0, std::fabs(static_cast<double>(tau.span()[o])));
+            if (std::fabs(mean - static_cast<double>(tau.span()[o])) > tol) fixed_point_ok = false;
         }
         CHECK(formula_ok, "反量化 latent == trit·(τ·K/n)（逐位）");
         CHECK(fixed_point_ok, "逐行 absmean(latent) == τ（量化器不动点）");
     }
     // ⑤ 8 步 Adam：backward 可跑、latent（f32 主权重）确实移动
     {
-        auto opt = nn::create_optimizer("adam", eng, m2.parameters(), m2.param_gradients(),
-                                        1e-2f, 0.0f, t1);
+        auto opt = nn::create_optimizer("adam", eng, m2.parameters(), m2.param_gradients(), 1e-2f,
+                                        0.0f, t1);
         CHECK(opt != nullptr, "warm start 后能建 Adam 优化器");
         if (opt != nullptr)
         {
@@ -361,21 +354,40 @@ void test_ternary_warm_start()
             {
                 steps_ok = m2.zero_grad().has_value();
                 auto logits = m2.forward(x);
-                if (!logits) { steps_ok = false; break; }
+                if (!logits)
+                {
+                    steps_ok = false;
+                    break;
+                }
                 auto loss = ce.forward(eng, *logits, tgt_t);
-                if (!loss) { steps_ok = false; break; }
+                if (!loss)
+                {
+                    steps_ok = false;
+                    break;
+                }
                 auto grad = ce.backward();
-                if (!grad) { steps_ok = false; break; }
-                if (!m2.backward(*grad)) { steps_ok = false; break; }
-                if (!opt->step()) { steps_ok = false; break; }
+                if (!grad)
+                {
+                    steps_ok = false;
+                    break;
+                }
+                if (!m2.backward(*grad))
+                {
+                    steps_ok = false;
+                    break;
+                }
+                if (!opt->step())
+                {
+                    steps_ok = false;
+                    break;
+                }
             }
             CHECK(steps_ok, "warm start 后 8 步 Adam（forward/loss/backward/step）全部成功");
             const nn::Matrix lat_after = download(eng, bl->latent_weights());
             std::size_t moved = 0;
             for (std::size_t i = 0; i < lat_before.size() && i < lat_after.size(); ++i)
                 if (lat_before.span()[i] != lat_after.span()[i]) ++moved;
-            std::printf("    三值 latent 8 步 Adam：移动 %zu/%zu\n", moved,
-                        lat_before.size());
+            std::printf("    三值 latent 8 步 Adam：移动 %zu/%zu\n", moved, lat_before.size());
             CHECK(moved > 0, "8 步 Adam 后 latent 确实移动（三值续训可用）");
             CHECK(bl->quantize_calls() > 1, "latent 被写过 ⇒ 量化缓存按写版本重算");
         }
@@ -405,8 +417,8 @@ void test_ternary_warm_start()
                     nn::Model& a = *a_r;
                     nn::Model& b = *b_r;
                     auto la = nn::load_model(df, a);   // 默认 Inference
-                    auto lb = nn::load_model(df, b, nullptr, nullptr,
-                                             nn::WeightLoadIntent::Trainable);
+                    auto lb =
+                        nn::load_model(df, b, nullptr, nullptr, nn::WeightLoadIntent::Trainable);
                     CHECK(la.has_value() && lb.has_value(), "两种意图载入 dense 均成功");
                     if (la.has_value() && lb.has_value())
                     {

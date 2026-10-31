@@ -119,9 +119,7 @@ private:
         VkDeviceSize offset;
 
         bool operator==(const SuballocKey& o) const noexcept
-        {
-            return memory == o.memory && offset == o.offset;
-        }
+        { return memory == o.memory && offset == o.offset; }
     };
 
     struct SuballocKeyHash
@@ -176,8 +174,8 @@ private:
     // 相比 first-fit，best-fit 降低把一个大小合适的洞切成两个小洞的概率，
     // 且跳过对齐 padding 过大的候选（避免产生不可复用的残片）。
     // 返回 (offset, padding_bytes)；无合适候选返回 nullopt。
-    [[nodiscard]] static std::optional<std::pair<VkDeviceSize, VkDeviceSize>> find_best(
-        Block& block, VkDeviceSize alignment, VkDeviceSize size)
+    [[nodiscard]] static std::optional<std::pair<VkDeviceSize, VkDeviceSize>>
+    find_best(Block& block, VkDeviceSize alignment, VkDeviceSize size)
     {
         const VkDeviceSize align_mask = alignment - 1;
         // 对齐 padding 预算：超过该值即视为"残片"，跳过该候选。
@@ -193,10 +191,8 @@ private:
         {
             const VkDeviceSize aligned = (r.offset + align_mask) & ~align_mask;
             const VkDeviceSize padding = aligned - r.offset;
-            if (padding > max_padding)
-                continue;  // 对齐残片过大，跳过
-            if (r.size < padding + size)
-                continue;  // 放不下
+            if (padding > max_padding) continue;  // 对齐残片过大，跳过
+            if (r.size < padding + size) continue;  // 放不下
             // 剩余碎片 = 该区分配后剩下的字节数（越小越贴合）
             const VkDeviceSize waste = r.size - (padding + size);
             if (waste < best_waste)
@@ -207,8 +203,7 @@ private:
                 best_region_start = r.offset;
             }
         }
-        if (!best_offset)
-            return std::nullopt;
+        if (!best_offset) return std::nullopt;
 
         // 定位被选中的区域并从集合中剔除，按 padding/remaining 重插
         auto it = block.free_regions.lower_bound(FreeRegion{best_region_start, 1});
@@ -216,18 +211,16 @@ private:
             return std::nullopt;  // 防御：理论不可达
         const VkDeviceSize remaining = it->size - best_padding - size;
         block.free_regions.erase(it);
-        if (best_padding > 0)
-            block.free_regions.insert({best_region_start, best_padding});
-        if (remaining > 0)
-            block.free_regions.insert({*best_offset + size, remaining});
+        if (best_padding > 0) block.free_regions.insert({best_region_start, best_padding});
+        if (remaining > 0) block.free_regions.insert({*best_offset + size, remaining});
         return std::make_pair(*best_offset, best_padding);
     }
 
     // 注：Block 的移动赋值被 delete（防止 vector 操作引发意外释放），
     // 但移动构造可用。此处 `return block;` 经由移动构造构造 std::expected<Block, Error>，
     // 不触发移动赋值，故可正常编译。
-    [[nodiscard]] Result<Block> create_block(
-        uint32_t memory_type_index, VkMemoryPropertyFlags flags, VkDeviceSize size = 0)
+    [[nodiscard]] Result<Block> create_block(uint32_t memory_type_index,
+                                             VkMemoryPropertyFlags flags, VkDeviceSize size = 0)
     {
         VkDeviceSize alloc_size = (size > 0) ? size : block_size_;
         VkMemoryAllocateInfo alloc_info{};
@@ -240,14 +233,14 @@ private:
         VkMemoryAllocateFlagsInfo addr_flags{};
         addr_flags.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO;
         addr_flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
-        if (device_address_alloc_)
-            alloc_info.pNext = &addr_flags;
+        if (device_address_alloc_) alloc_info.pNext = &addr_flags;
 
         VkDeviceMemory memory = VK_NULL_HANDLE;
         const auto t0 = std::chrono::steady_clock::now();
         VkResult res = vkAllocateMemory(device_, &alloc_info, nullptr, &memory);
-        c_vkalloc_ms_ += std::chrono::duration<double, std::milli>(
-                             std::chrono::steady_clock::now() - t0).count();
+        c_vkalloc_ms_ +=
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
+                .count();
         if (res != VK_SUCCESS)
         {
             // issue #28：VK_ERROR_OUT_OF_DEVICE_MEMORY(-2) 的常见根因不是显存
@@ -272,20 +265,17 @@ private:
         return block;
     }
 
-    [[nodiscard]] std::optional<uint32_t> find_memory_type(
-        uint32_t type_bits, VkMemoryPropertyFlags preferred,
-        VkMemoryPropertyFlags fallback = 0) const
+    [[nodiscard]] std::optional<uint32_t> find_memory_type(uint32_t type_bits,
+                                                           VkMemoryPropertyFlags preferred,
+                                                           VkMemoryPropertyFlags fallback = 0) const
     {
         std::optional<uint32_t> best, fb;
         for (uint32_t i = 0; i < mem_props_.memoryTypeCount; ++i)
         {
-            if (!(type_bits & (1u << i)))
-                continue;
+            if (!(type_bits & (1u << i))) continue;
             auto flags = mem_props_.memoryTypes[i].propertyFlags;
-            if ((flags & preferred) == preferred && !best)
-                best = i;
-            if (fallback && (flags & fallback) == fallback && !fb)
-                fb = i;
+            if ((flags & preferred) == preferred && !best) best = i;
+            if (fallback && (flags & fallback) == fallback && !fb) fb = i;
         }
         return best ? best : fb;
     }
@@ -296,11 +286,8 @@ public:
                VkDeviceSize small_block_size = DEFAULT_SMALL_BLOCK_SIZE,
                VkDeviceSize ladder_max = 0)
         : device_(device), physical_device_(physical_device), block_size_(block_size),
-          small_block_size_(small_block_size), retain_free_bytes_(0),
-          ladder_max_(ladder_max)
-    {
-        vkGetPhysicalDeviceMemoryProperties(physical_device_, &mem_props_);
-    }
+          small_block_size_(small_block_size), retain_free_bytes_(0), ladder_max_(ladder_max)
+    { vkGetPhysicalDeviceMemoryProperties(physical_device_, &mem_props_); }
 
     ~MemoryPool() { blocks_.clear(); }
 
@@ -310,24 +297,22 @@ public:
     MemoryPool(MemoryPool&&) = delete;
     MemoryPool& operator=(MemoryPool&&) = delete;
 
-    [[nodiscard]] Result<Allocation> allocate(
-        VkMemoryRequirements requirements,
-        VkMemoryPropertyFlags preferred_flags,
-        VkMemoryPropertyFlags fallback_flags = 0)
+    [[nodiscard]] Result<Allocation> allocate(VkMemoryRequirements requirements,
+                                              VkMemoryPropertyFlags preferred_flags,
+                                              VkMemoryPropertyFlags fallback_flags = 0)
     {
         std::lock_guard lock(mutex_);
         c_alloc_calls_++;
 
-        auto mem_type = find_memory_type(requirements.memoryTypeBits, preferred_flags, fallback_flags);
-        if (!mem_type)
-            NN_FAIL("No suitable GPU memory type found");
+        auto mem_type =
+            find_memory_type(requirements.memoryTypeBits, preferred_flags, fallback_flags);
+        if (!mem_type) NN_FAIL("No suitable GPU memory type found");
         VkDeviceSize alignment = requirements.alignment > 0 ? requirements.alignment : 1;
         // matmul_tiled 等 vec4 SSBO 快路径要求基址 16B 对齐（std430 vec4 读的
         // 对齐门槛）。buffer requirements 可能小于 16，这里统一抬到 ≥16；
         // 仍保持 2 的幂，find_best 的位掩码取整不受影响。代价：每次分配
         // 最多 12B padding。
-        if (alignment < 16u)
-            alignment = 16u;
+        if (alignment < 16u) alignment = 16u;
         const VkDeviceSize alloc_size = requirements.size;
         // 尺寸分类分池：超大分配独占整块；小分配走小块池；其余走大块池。
         // 顺序：alloc > 大块阈值 → 独占超大块；alloc < 小块阈值 → 小块池。
@@ -340,25 +325,22 @@ public:
             // 最小 2 的幂"，夹在 [small_block_size_, ladder_max_]；超出上限
             // 则独占精确尺寸块。等价于把原来的单一中等类别拆成一串类别。
             VkDeviceSize c = small_block_size_;
-            while (c < alloc_size && c < ladder_max_) c <<= 1;
+            while (c < alloc_size && c < ladder_max_)
+                c <<= 1;
             pool_size = (alloc_size > ladder_max_) ? alloc_size : c;
         }
-        else if (alloc_size > block_size_)
-            pool_size = alloc_size;                 // 超出大块底材：独占整块
+        else if (alloc_size > block_size_) pool_size = alloc_size; // 超出大块底材：独占整块
         else if (alloc_size < SMALL_ALLOC_THRESHOLD)
-            pool_size = small_block_size_;          // 小分配：小块底材池（抗碎片）
-        else
-            pool_size = block_size_;
+            pool_size = small_block_size_; // 小分配：小块底材池（抗碎片）
+        else pool_size = block_size_;
 
         // 尝试在现有同类块中分配（best-fit）
         for (auto& block_ptr : blocks_)
         {
             auto& block = *block_ptr;
             c_block_scans_++;
-            if (block.memory_type_index != *mem_type)
-                continue;
-            if (block.size != pool_size)
-                continue;  // 只服务同尺寸分类的块，保持大块连续性
+            if (block.memory_type_index != *mem_type) continue;
+            if (block.size != pool_size) continue; // 只服务同尺寸分类的块，保持大块连续性
             c_region_scans_ += block.free_regions.size();
             auto best = find_best(block, alignment, alloc_size);
             if (best)
@@ -374,8 +356,7 @@ public:
         NN_TRY_CHECK(block_result);
         auto new_block = std::make_unique<Block>(std::move(*block_result));
         auto best = find_best(*new_block, alignment, alloc_size);
-        if (!best)
-            NN_FAIL("Suballocation failed in new block");
+        if (!best) NN_FAIL("Suballocation failed in new block");
         VkDeviceMemory mem = new_block->memory;
         VkMemoryPropertyFlags flags = new_block->property_flags;
         new_block->allocation_count++;
@@ -387,21 +368,18 @@ public:
 
     void free(const Allocation& alloc)
     {
-        if (!alloc.valid())
-            return;
+        if (!alloc.valid()) return;
 
         std::lock_guard lock(mutex_);
         c_free_calls_++;
         SuballocKey key{alloc.memory, alloc.offset};
         auto active_it = active_allocs_.find(key);
-        if (active_it == active_allocs_.end())
-            return;
+        if (active_it == active_allocs_.end()) return;
 
         for (auto& block_ptr : blocks_)
         {
             auto& block = *block_ptr;
-            if (block.memory != alloc.memory)
-                continue;
+            if (block.memory != alloc.memory) continue;
 
             FreeRegion new_reg{alloc.offset, alloc.size};
             auto ins_it = block.free_regions.insert(new_reg).first;
@@ -455,10 +433,10 @@ public:
             {
                 has_device_local = true;
                 if (!(flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT))
-                    return false;  // 存在纯 device-local（独显专用 VRAM）
+                    return false; // 存在纯 device-local（独显专用 VRAM）
             }
         }
-        return has_device_local;  // 全部 device-local 均可 host 映射 → UMA
+        return has_device_local; // 全部 device-local 均可 host 映射 → UMA
     }
 
     // ── P3：块分配的 buffer device address 标志 ─────────────────────────
@@ -466,21 +444,20 @@ public:
     // 之前）；读取端用于 buffer 创建侧配对 SHADER_DEVICE_ADDRESS usage 位
     // （usage 与 alloc 标志必须成对，见 create_block）。
     void set_device_address_alloc(bool on) noexcept { device_address_alloc_ = on; }
-    [[nodiscard]] bool device_address_alloc() const noexcept
-    { return device_address_alloc_; }
+    [[nodiscard]] bool device_address_alloc() const noexcept { return device_address_alloc_; }
 
     // ── 池统计（L2 仪器化，供显存采样/逐项归因） ──────────────────────
     struct PoolStats
     {
-        std::size_t block_count = 0;       // 活跃 block 数
-        std::size_t allocation_count = 0;  // 活跃子分配数
-        VkDeviceSize total_bytes = 0;      // 所有 block 底材总大小
-        VkDeviceSize free_bytes = 0;       // 空闲区域总大小
-        VkDeviceSize allocated_bytes = 0;  // total - free
-        VkDeviceSize max_contiguous_free = 0;  // 最大连续空闲块
-        double fragmentation = 0.0;        // 1 - 最大连续空闲/总空闲
-        VkDeviceSize device_bytes = 0;     // DEVICE_LOCAL 块（真实显存）
-        VkDeviceSize host_bytes = 0;       // HOST_VISIBLE 块（host RAM，offload/staging 用）
+        std::size_t block_count = 0; // 活跃 block 数
+        std::size_t allocation_count = 0; // 活跃子分配数
+        VkDeviceSize total_bytes = 0; // 所有 block 底材总大小
+        VkDeviceSize free_bytes = 0; // 空闲区域总大小
+        VkDeviceSize allocated_bytes = 0; // total - free
+        VkDeviceSize max_contiguous_free = 0; // 最大连续空闲块
+        double fragmentation = 0.0; // 1 - 最大连续空闲/总空闲
+        VkDeviceSize device_bytes = 0; // DEVICE_LOCAL 块（真实显存）
+        VkDeviceSize host_bytes = 0; // HOST_VISIBLE 块（host RAM，offload/staging 用）
 
         // 池账本计数器（诊断，见 MemoryPool::c_* 注释）
         std::size_t c_alloc_calls = 0;
@@ -505,8 +482,8 @@ public:
             // 池账本计数器（诊断；把"粒度变细 → 耗时翻倍"归因到线性扫描/底材申请）
             s += " | calls a/f=" + std::to_string(c_alloc_calls) + "/" +
                  std::to_string(c_free_calls);
-            s += " scans blk=" + std::to_string(c_block_scans) + " reg=" +
-                 std::to_string(c_region_scans);
+            s += " scans blk=" + std::to_string(c_block_scans) +
+                 " reg=" + std::to_string(c_region_scans);
             s += " blk_new/free=" + std::to_string(c_blocks_created) + "/" +
                  std::to_string(c_blocks_released);
             s += " vkalloc=" + std::to_string(vkalloc_ms) + "ms";
@@ -531,21 +508,18 @@ public:
             const auto& b = *bp;
             s.allocation_count += b.allocation_count;
             s.total_bytes += b.size;
-            if (b.property_flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
-                s.device_bytes += b.size;
-            if (b.property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
-                s.host_bytes += b.size;
+            if (b.property_flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) s.device_bytes += b.size;
+            if (b.property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) s.host_bytes += b.size;
             for (const auto& r : b.free_regions)
             {
                 s.free_bytes += r.size;
-                if (r.size > s.max_contiguous_free)
-                    s.max_contiguous_free = r.size;
+                if (r.size > s.max_contiguous_free) s.max_contiguous_free = r.size;
             }
         }
         s.allocated_bytes = s.total_bytes - s.free_bytes;
         if (s.free_bytes > 0)
-            s.fragmentation = 1.0 - static_cast<double>(s.max_contiguous_free)
-                                   / static_cast<double>(s.free_bytes);
+            s.fragmentation = 1.0 - static_cast<double>(s.max_contiguous_free) /
+                                        static_cast<double>(s.free_bytes);
         return s;
     }
 
@@ -582,13 +556,11 @@ public:
         // 单次释放扫描保持完全相同的安全条件，并避免额外 set 遍历。
         if (retain_free_bytes_ == 0)
         {
-            for (auto it = blocks_.begin(); it != blocks_.end(); )
+            for (auto it = blocks_.begin(); it != blocks_.end();)
             {
                 const auto& b = **it;
-                if (b.allocation_count == 0 &&
-                    b.free_regions.size() == 1 &&
-                    b.free_regions.begin()->offset == 0 &&
-                    b.free_regions.begin()->size == b.size)
+                if (b.allocation_count == 0 && b.free_regions.size() == 1 &&
+                    b.free_regions.begin()->offset == 0 && b.free_regions.begin()->size == b.size)
                 {
                     it = blocks_.erase(it);
                     c_blocks_released_++;
@@ -605,14 +577,12 @@ public:
             for (const auto& r : bp->free_regions)
                 total_free += r.size;
 
-        for (auto it = blocks_.begin(); it != blocks_.end(); )
+        for (auto it = blocks_.begin(); it != blocks_.end();)
         {
             const auto& b = **it;
             // 完全空闲：无活跃子分配，且整个 block 被单个空闲区覆盖
-            if (b.allocation_count == 0 &&
-                b.free_regions.size() == 1 &&
-                b.free_regions.begin()->offset == 0 &&
-                b.free_regions.begin()->size == b.size)
+            if (b.allocation_count == 0 && b.free_regions.size() == 1 &&
+                b.free_regions.begin()->offset == 0 && b.free_regions.begin()->size == b.size)
             {
                 // 仅当释放后总空闲仍 ≥ 保留目标时才释放（避免抖动）
                 if (total_free - b.size >= retain_free_bytes_)

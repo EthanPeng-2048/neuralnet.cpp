@@ -40,15 +40,11 @@ inline constexpr std::uint32_t kMask = (1u << kBits) - 1u;
 
 // 每行需要的字（f32 元素）数：(K + 15) / 16
 [[nodiscard]] inline constexpr std::size_t words_per_row(std::size_t k) noexcept
-{
-    return (k + kPerWord - 1) / kPerWord;
-}
+{ return (k + kPerWord - 1) / kPerWord; }
 
 // 每行打包后的字节数：4 字节/字 × 字数 = 0.25·K（向上取到 4B 对齐）
 [[nodiscard]] inline constexpr std::size_t bytes_per_row(std::size_t k) noexcept
-{
-    return words_per_row(k) * sizeof(std::uint32_t);
-}
+{ return words_per_row(k) * sizeof(std::uint32_t); }
 
 // 量化码：码 = 三值 + 2（∈{1,2,3}）；判据 = |w| > 0.5·τ（**严格**大于：
 // 恰好 |w| == 0.5·τ 归 0，半值向零）。与 BitLinear::quantize_weights_ 的
@@ -63,15 +59,12 @@ inline constexpr std::uint32_t kMask = (1u << kBits) - 1u;
 
 // 码 → 三值（float，精确可表示）
 [[nodiscard]] inline float value_of(std::uint32_t code) noexcept
-{
-    return static_cast<float>(static_cast<int>(code & kMask) - 2);
-}
+{ return static_cast<float>(static_cast<int>(code & kMask) - 2); }
 
 // 打包一行：w[0..K)（宿主连续）+ 逐行尺度 τ → words_per_row(K) 个 32-bit 字。
 // 尾部（idx ≥ K）填"码 2 = 三值 0"而不是 0：码 0 在映射里无定义，填 0 会让
 // 误读尾部的内核拿到 -2（静默错值），填 2 最多是多算一个 0。
-inline void pack_row(const float* w, std::size_t k, float tau,
-                     std::uint32_t* out) noexcept
+inline void pack_row(const float* w, std::size_t k, float tau, std::uint32_t* out) noexcept
 {
     const std::size_t words = words_per_row(k);
     for (std::size_t wi = 0; wi < words; ++wi)
@@ -127,11 +120,11 @@ inline void pack_row(const float* w, std::size_t k, float tau,
 }
 
 // 打包行（2-bit 容器）→ latent 行（k 个 f32；`out` 为宿主连续缓冲）
-inline void dequant_row(const std::uint32_t* words, std::size_t k, float tau,
-                        float* out) noexcept
+inline void dequant_row(const std::uint32_t* words, std::size_t k, float tau, float* out) noexcept
 {
     const float s = latent_row_scale(words, k, tau);
-    for (std::size_t i = 0; i < k; ++i) out[i] = at(words, i) * s;
+    for (std::size_t i = 0; i < k; ++i)
+        out[i] = at(words, i) * s;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -157,14 +150,11 @@ inline constexpr std::uint32_t kBase3PerByte = 5;   // 5 个三值/字节
 
 // 每行 base-3 字节数：ceil(K/5)
 [[nodiscard]] inline constexpr std::size_t base3_bytes_per_row(std::size_t k) noexcept
-{
-    return (k + kBase3PerByte - 1) / kBase3PerByte;
-}
+{ return (k + kBase3PerByte - 1) / kBase3PerByte; }
 
 // 2-bit 容器行 → base-3 字节（部署落盘方向）。尾部不足 5 个的位置补 digit 0
 // （解码按 k 截断，补位不承载信息）。
-inline void pack_row_base3(const std::uint32_t* words, std::size_t k,
-                           std::uint8_t* out) noexcept
+inline void pack_row_base3(const std::uint32_t* words, std::size_t k, std::uint8_t* out) noexcept
 {
     const std::size_t bytes = base3_bytes_per_row(k);
     for (std::size_t b = 0; b < bytes; ++b)
@@ -174,9 +164,9 @@ inline void pack_row_base3(const std::uint32_t* words, std::size_t k,
         for (std::uint32_t i = 0; i < kBase3PerByte; ++i)
         {
             const std::size_t idx = b * kBase3PerByte + i;
-            const std::uint32_t code = (idx < k)
-                ? ((words[idx / kPerWord] >> (kBits * (idx % kPerWord))) & kMask)
-                : 2u;   // 补位：码 2 → digit 1（无信息，解码截断）
+            const std::uint32_t code =
+                (idx < k) ? ((words[idx / kPerWord] >> (kBits * (idx % kPerWord))) & kMask)
+                          : 2u;   // 补位：码 2 → digit 1（无信息，解码截断）
             byte += (code - 1u) * pow3;
             pow3 *= 3u;
         }
@@ -185,15 +175,16 @@ inline void pack_row_base3(const std::uint32_t* words, std::size_t k,
 }
 
 // base-3 字节行 → 2-bit 容器行（部署读盘方向）。尾部字按既有约定填"码 2 = 三值 0"。
-inline void unpack_row_base3(const std::uint8_t* in, std::size_t k,
-                             std::uint32_t* words) noexcept
+inline void unpack_row_base3(const std::uint8_t* in, std::size_t k, std::uint32_t* words) noexcept
 {
     const std::size_t nwords = words_per_row(k);
-    for (std::size_t wi = 0; wi < nwords; ++wi) words[wi] = 0;
+    for (std::size_t wi = 0; wi < nwords; ++wi)
+        words[wi] = 0;
     for (std::size_t idx = 0; idx < k; ++idx)
     {
         std::uint32_t byte = in[idx / kBase3PerByte];
-        for (std::uint32_t i = 0; i < idx % kBase3PerByte; ++i) byte /= 3u;
+        for (std::uint32_t i = 0; i < idx % kBase3PerByte; ++i)
+            byte /= 3u;
         const std::uint32_t code = (byte % 3u) + 1u;   // digit → 码
         words[idx / kPerWord] |= code << (kBits * (idx % kPerWord));
     }
@@ -206,7 +197,8 @@ inline void unpack_row_base3(const std::uint8_t* in, std::size_t k,
 [[nodiscard]] inline float at_base3(const std::uint8_t* in, std::size_t idx) noexcept
 {
     std::uint32_t byte = in[idx / kBase3PerByte];
-    for (std::uint32_t i = 0; i < idx % kBase3PerByte; ++i) byte /= 3u;
+    for (std::uint32_t i = 0; i < idx % kBase3PerByte; ++i)
+        byte /= 3u;
     return value_of((byte % 3u) + 1u);
 }
 

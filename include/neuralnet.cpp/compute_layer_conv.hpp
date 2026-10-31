@@ -26,15 +26,15 @@ namespace nn
 //   rearrange_3d  +  gather_rows/scatter_add_rows（配一份形状相关的置换索引）
 // 组合出这两个方向，置换索引与数据无关，由各层缓存一次即可。
 // ══════════════════════════════════════════════════════════════════════════
-namespace conv_engine {
+namespace conv_engine
+{
 
 // 构造置换索引 perm（长度 C*P，一列）：perm[c*P + p] = p*C + c
 // 说明：rearrange_3d(Z, C, P, B) 得到行序 (p*C + c)，按 perm 用 gather 重排即得 (c*P + p)。
-[[nodiscard]] inline Result<Tensor> make_layout_perm(
-    ComputeEngine& engine, std::size_t C, std::size_t P)
+[[nodiscard]] inline Result<Tensor> make_layout_perm(ComputeEngine& engine, std::size_t C,
+                                                     std::size_t P)
 {
-    if (C == 0 || P == 0)
-        NN_FAIL("make_layout_perm: C/P must be > 0");
+    if (C == 0 || P == 0) NN_FAIL("make_layout_perm: C/P must be > 0");
     std::vector<Scalar> perm(C * P);          // 宿主桥（17 §3 D11）：不经 Matrix
     for (std::size_t c = 0; c < C; ++c)
         for (std::size_t p = 0; p < P; ++p)
@@ -43,9 +43,9 @@ namespace conv_engine {
 }
 
 // (C, B*P) → (C*P, B)：cols 布局转 samples 布局（Conv/Pool 层输出）
-[[nodiscard]] inline Result<Tensor> cols_to_samples(
-    ComputeEngine& engine, const Tensor& Z,
-    std::size_t C, std::size_t P, std::size_t B, const Tensor& perm)
+[[nodiscard]] inline Result<Tensor> cols_to_samples(ComputeEngine& engine, const Tensor& Z,
+                                                    std::size_t C, std::size_t P, std::size_t B,
+                                                    const Tensor& perm)
 {
     auto w = engine.rearrange_3d(Z, C, P, B, /*inverse=*/false);   // (P*C, B)
     NN_TRY_CHECK(w);
@@ -53,15 +53,18 @@ namespace conv_engine {
 }
 
 // (C*P, B) → (C, B*P)：samples 布局转回 cols 布局（Conv/Pool 层反向入口）
-[[nodiscard]] inline Result<Tensor> samples_to_cols(
-    ComputeEngine& engine, const Tensor& g,
-    std::size_t C, std::size_t P, std::size_t B, const Tensor& perm)
+[[nodiscard]] inline Result<Tensor> samples_to_cols(ComputeEngine& engine, const Tensor& g,
+                                                    std::size_t C, std::size_t P, std::size_t B,
+                                                    const Tensor& perm)
 {
     Tensor x2 = engine.create_tensor(P * C, B);
-    if (!x2.valid())
-        NN_FAIL("samples_to_cols: 张量分配失败");
-    { NN_TRY(r, engine.zero(x2)); }
-    { NN_TRY(r, engine.scatter_add_rows(x2, perm, g)); }
+    if (!x2.valid()) NN_FAIL("samples_to_cols: 张量分配失败");
+    {
+        NN_TRY(r, engine.zero(x2));
+    }
+    {
+        NN_TRY(r, engine.scatter_add_rows(x2, perm, g));
+    }
     return engine.rearrange_3d(x2, C, P, B, /*inverse=*/true);    // (C, B*P)
 }
 
@@ -115,12 +118,11 @@ private:
 public:
     [[nodiscard]] const char* layer_name() const noexcept override { return "Conv2D"; }
 
-    Conv2D(std::size_t in_channels, std::size_t out_channels,
-           std::size_t kernel, std::size_t stride = 1, std::size_t padding = 0,
-           std::size_t in_h = 0, std::size_t in_w = 0)
-        : in_channels_(in_channels), out_channels_(out_channels),
-          kernel_(kernel), stride_(stride != 0 ? stride : 1), padding_(padding),
-          in_h_(in_h), in_w_(in_w)
+    Conv2D(std::size_t in_channels, std::size_t out_channels, std::size_t kernel,
+           std::size_t stride = 1, std::size_t padding = 0, std::size_t in_h = 0,
+           std::size_t in_w = 0)
+        : in_channels_(in_channels), out_channels_(out_channels), kernel_(kernel),
+          stride_(stride != 0 ? stride : 1), padding_(padding), in_h_(in_h), in_w_(in_w)
     {
         // API 级守卫：kernel 过大时 (in + 2*pad - kernel) 无符号下溢 →
         // out_h_/out_w_ 巨值 → 分配 abort。记录无效，init() 时报错。
@@ -139,8 +141,7 @@ public:
 
     [[nodiscard]] Result<void> init_impl(ComputeEngine& engine) override
     {
-        if (shape_invalid_)
-            NN_FAIL("Conv2D: kernel 过大 (kernel > in + 2*padding)");
+        if (shape_invalid_) NN_FAIL("Conv2D: kernel 过大 (kernel > in + 2*padding)");
         const std::size_t fan_in = in_channels_ * kernel_ * kernel_;
 
         // ── 声明式初始化（M2，17 §4.4）：He 风格均匀分布，层算 limit、引擎
@@ -154,8 +155,7 @@ public:
         if (!b_.valid()) NN_FAIL("Conv2D: 偏置初始化失败");
         grad_w_ = engine.create_tensor(out_channels_, fan_in, p_.param, InitSpec::zero());
         grad_b_ = engine.create_tensor(out_channels_, 1, p_.param, InitSpec::zero());
-        if (!grad_w_.valid() || !grad_b_.valid())
-            NN_FAIL("Conv2D: 梯度缓冲初始化失败");
+        if (!grad_w_.valid() || !grad_b_.valid()) NN_FAIL("Conv2D: 梯度缓冲初始化失败");
         return {};
     }
 
@@ -174,23 +174,22 @@ public:
     // ── forward: Z = W × im2col(x) + b，再转 samples 布局 ───────────────
     // 全程引擎原语 + DSL：窗口展开在 im2col 原语内完成（CPU/GPU 各自实现），
     // 无 to_matrix/from_matrix 往返、无 CPU 标量循环。
-    [[nodiscard]] Result<Tensor> forward(
-        const Tensor& input) override
+    [[nodiscard]] Result<Tensor> forward(const Tensor& input) override
     {
         ComputeEngine& engine = engine_ref();
-        if (shape_invalid_)
-            NN_FAIL("Conv2D: kernel 过大 (kernel > in + 2*padding)");
+        if (shape_invalid_) NN_FAIL("Conv2D: kernel 过大 (kernel > in + 2*padding)");
         if (input.rows() != in_channels_ * in_h_ * in_w_)
             NN_FAIL("conv forward: input shape mismatch");
         const std::size_t batch = input.cols();
-        if (batch == 0)
-            NN_FAIL("conv forward: batch must be > 0");
-        { NN_TRY(r, ensure_perm_(engine)); }
+        if (batch == 0) NN_FAIL("conv forward: batch must be > 0");
+        {
+            NN_TRY(r, ensure_perm_(engine));
+        }
         const std::size_t P = out_h_ * out_w_;
 
         // 1) 窗口展开（引擎原语）：x (C_in*H*W, B) → col (C_in*k*k, P*B)
-        auto col = engine.im2col(input, in_channels_, in_h_, in_w_,
-                                 kernel_, stride_, padding_, out_h_, out_w_);
+        auto col = engine.im2col(input, in_channels_, in_h_, in_w_, kernel_, stride_, padding_,
+                                 out_h_, out_w_);
         NN_TRY_CHECK(col);
         // checkpoint 模式不驻留：显式清空，避免 size 相同导致静默用陈旧 im2col
         col_cache_ = checkpoint_mode_ ? Tensor{} : *col;
@@ -198,9 +197,8 @@ public:
         // 2) Z = W × col + b → (C_out, P*B)：matmul 段与行广播偏置**融合为单次
         //    dispatch**（不物化 matmul 中间结果；与 Linear::forward /
         //    matmul_with_bias 同一结构）。
-        auto Z = dsl::compute(engine,
-            dsl::matmul(w_, *col, false, false) + dsl::row_broadcast(b_),
-            out_channels_, batch * P, p_.compute);
+        auto Z = dsl::compute(engine, dsl::matmul(w_, *col, false, false) + dsl::row_broadcast(b_),
+                              out_channels_, batch * P, p_.compute);
         NN_TRY_CHECK(Z);
 
         // 3) 布局转换 (C_out, P*B) → (C_out*P, B)（rearrange_3d + gather 置换）
@@ -208,53 +206,50 @@ public:
     }
 
     // ── backward ───────────────────────────────────────────────────────
-    [[nodiscard]] Result<Tensor> backward(
-        const Tensor& grad_output) override
+    [[nodiscard]] Result<Tensor> backward(const Tensor& grad_output) override
     {
         ComputeEngine& engine = engine_ref();
-        if (shape_invalid_)
-            NN_FAIL("Conv2D: kernel 过大 (kernel > in + 2*padding)");
+        if (shape_invalid_) NN_FAIL("Conv2D: kernel 过大 (kernel > in + 2*padding)");
         if (grad_output.rows() != out_channels_ * out_h_ * out_w_)
             NN_FAIL("conv backward: grad_output shape mismatch");
         const std::size_t batch = grad_output.cols();
-        if (batch == 0)
-            NN_FAIL("conv backward: batch must be > 0");
+        if (batch == 0) NN_FAIL("conv backward: batch must be > 0");
         const std::size_t kk = kernel_ * kernel_;
         const std::size_t P = out_h_ * out_w_;
         // 缓存前置校验：checkpoint 模式（尚未 forward_recompute）下 forward 不驻留
         // col_cache_；backward 必须校验缓存命中且形状匹配，否则会静默算出错误梯度。
         if (col_cache_.rows() != in_channels_ * kk || col_cache_.cols() != P * batch)
-            NN_FAIL("conv backward: im2col 缓存缺失或不匹配"                 "（checkpoint 模式需先 forward_recompute；batch 变化后需重新 forward）");
-        { NN_TRY(r, ensure_perm_(engine)); }
+            NN_FAIL("conv backward: im2col 缓存缺失或不匹配"
+                    "（checkpoint 模式需先 forward_recompute；batch 变化后需重新 forward）");
+        {
+            NN_TRY(r, ensure_perm_(engine));
+        }
         // 1) grad_output (C_out*P, B) → gZ (C_out, P*B)
-        auto gZ = conv_engine::samples_to_cols(engine, grad_output,
-                                               out_channels_, P, batch, perm_cache_);
+        auto gZ =
+            conv_engine::samples_to_cols(engine, grad_output, out_channels_, P, batch, perm_cache_);
         NN_TRY_CHECK(gZ);
 
         // 2) grad_W += gZ × col^T → (C_out, C_in*k*k)：matmul 段与累加**融合为单次
         //    dispatch**并原地写入 grad_w_（不物化 gw 中间结果）
-        auto r1 = dsl::compute_into(engine,
-            dsl::leaf(grad_w_) + dsl::matmul(*gZ, col_cache_, false, true), grad_w_);
+        auto r1 = dsl::compute_into(
+            engine, dsl::leaf(grad_w_) + dsl::matmul(*gZ, col_cache_, false, true), grad_w_);
         NN_TRY_CHECK(r1);
 
         // 3) grad_b += row_reduce_sum(gZ) → (C_out, 1)（对全部位置与样本求和）
         //    归约步用 dsl::compute_reduce、累加步用 dsl::compute_into（同 Linear）
-        auto gb = dsl::compute_reduce(engine,
-            dsl::row_reduce_sum(dsl::leaf(*gZ)), gZ->rows(), gZ->cols(),
-            p_.compute);
+        auto gb = dsl::compute_reduce(engine, dsl::row_reduce_sum(dsl::leaf(*gZ)), gZ->rows(),
+                                      gZ->cols(), p_.compute);
         NN_TRY_CHECK(gb);
-        auto r2 = dsl::compute_into(engine,
-            dsl::leaf(grad_b_) + dsl::leaf(*gb), grad_b_);
+        auto r2 = dsl::compute_into(engine, dsl::leaf(grad_b_) + dsl::leaf(*gb), grad_b_);
         NN_TRY_CHECK(r2);
 
         // 4) gcol = W^T × gZ → (C_in*k*k, P*B) ；5) grad_x = col2im(gcol)
         //    纯 matmul 段由 dsl::compute 直写（scan 的 Conv2D backward dry-run 自动登记）
-        auto gcol = dsl::compute(engine,
-            dsl::matmul(w_, *gZ, true, false),
-            w_.cols(), gZ->cols(), p_.compute);
+        auto gcol = dsl::compute(engine, dsl::matmul(w_, *gZ, true, false), w_.cols(), gZ->cols(),
+                                 p_.compute);
         NN_TRY_CHECK(gcol);
-        return engine.col2im(*gcol, in_channels_, in_h_, in_w_,
-                             kernel_, stride_, padding_, out_h_, out_w_);
+        return engine.col2im(*gcol, in_channels_, in_h_, in_w_, kernel_, stride_, padding_, out_h_,
+                             out_w_);
     }
 };
 
@@ -313,8 +308,7 @@ private:
         for (std::size_t c = 0; c < channels_; ++c)
             for (std::size_t i = 0; i < kk; ++i)
                 expand[c * kk + i] = static_cast<Scalar>(c);
-        auto t = detail::upload_span(engine, channels_ * kk, 1, Precision::F32,
-                                     std::span(expand));
+        auto t = detail::upload_span(engine, channels_ * kk, 1, Precision::F32, std::span(expand));
         NN_TRY_CHECK(t);
         expand_cache_ = std::move(*t);
         return {};
@@ -323,10 +317,10 @@ private:
 public:
     [[nodiscard]] const char* layer_name() const noexcept override { return "MaxPool2D"; }
 
-    MaxPool2D(std::size_t channels, std::size_t in_h, std::size_t in_w,
-              std::size_t pool = 2, std::size_t stride = 0)
-        : channels_(channels), in_h_(in_h), in_w_(in_w),
-          pool_(pool), stride_(stride != 0 ? stride : (pool != 0 ? pool : 1))
+    MaxPool2D(std::size_t channels, std::size_t in_h, std::size_t in_w, std::size_t pool = 2,
+              std::size_t stride = 0)
+        : channels_(channels), in_h_(in_h), in_w_(in_w), pool_(pool),
+          stride_(stride != 0 ? stride : (pool != 0 ? pool : 1))
     {
         // API 级守卫：pool 过大（或 pool=0）时 (in - pool) 无符号下溢 →
         // out_h_/out_w_ 巨值 → 分配 abort。记录无效，forward/backward 时报错。
@@ -354,24 +348,22 @@ public:
     [[nodiscard]] bool recompute_supported() const override { return true; }
 
     // ── forward ─────────────────────────────────────────────────────────
-    [[nodiscard]] Result<Tensor> forward(
-        const Tensor& input) override
+    [[nodiscard]] Result<Tensor> forward(const Tensor& input) override
     {
         ComputeEngine& engine = engine_ref();
-        if (shape_invalid_)
-            NN_FAIL("MaxPool2D: pool 窗口大于输入尺寸");
+        if (shape_invalid_) NN_FAIL("MaxPool2D: pool 窗口大于输入尺寸");
         if (input.rows() != channels_ * in_h_ * in_w_)
             NN_FAIL("maxpool forward: input shape mismatch");
         const std::size_t batch = input.cols();
-        if (batch == 0)
-            NN_FAIL("maxpool forward: batch must be > 0");
-        { NN_TRY(r, ensure_perm_(engine)); }
+        if (batch == 0) NN_FAIL("maxpool forward: batch must be > 0");
+        {
+            NN_TRY(r, ensure_perm_(engine));
+        }
         const std::size_t kk = pool_ * pool_;
         const std::size_t P = out_h_ * out_w_;
 
         // 1) 窗口展开（引擎原语）：x (C*H*W, B) → col (C*kk, P*B)
-        auto col = engine.im2col(input, channels_, in_h_, in_w_,
-                                 pool_, stride_, 0, out_h_, out_w_);
+        auto col = engine.im2col(input, channels_, in_h_, in_w_, pool_, stride_, 0, out_h_, out_w_);
         NN_TRY_CHECK(col);
 
         // 2) 分组归约求窗口 max：每 kk 行一组 → (C, P*B)。
@@ -382,9 +374,9 @@ public:
         //    与 RAPT 的 row_broadcast(x) + rparam(0) 同一处理：与一个**运行时 0**
         //    相加使表达式合法，语义不变（rparam 值不进 expr_spec_key）。
         auto pooled = dsl::compute(engine,
-            dsl::grouped_reduce_max(*col, static_cast<std::uint32_t>(kk))
-                + dsl::rparam(Scalar{0}),
-            channels_, col->cols());
+                                   dsl::grouped_reduce_max(*col, static_cast<std::uint32_t>(kk)) +
+                                       dsl::rparam(Scalar{0}),
+                                   channels_, col->cols());
         NN_TRY_CHECK(pooled);
 
         // 3) checkpoint 模式不驻留：显式清空（避免 size 相同静默用陈旧数据）
@@ -404,17 +396,14 @@ public:
     }
 
     // ── backward: 按窗口 mask 散射（重叠窗在 col2im 内累加）──────────────
-    [[nodiscard]] Result<Tensor> backward(
-        const Tensor& grad_output) override
+    [[nodiscard]] Result<Tensor> backward(const Tensor& grad_output) override
     {
         ComputeEngine& engine = engine_ref();
-        if (shape_invalid_)
-            NN_FAIL("MaxPool2D: pool 窗口大于输入尺寸");
+        if (shape_invalid_) NN_FAIL("MaxPool2D: pool 窗口大于输入尺寸");
         if (grad_output.rows() != channels_ * out_h_ * out_w_)
             NN_FAIL("maxpool backward: grad_output shape mismatch");
         const std::size_t batch = grad_output.cols();
-        if (batch == 0)
-            NN_FAIL("maxpool backward: batch must be > 0");
+        if (batch == 0) NN_FAIL("maxpool backward: batch must be > 0");
         const std::size_t kk = pool_ * pool_;
         const std::size_t P = out_h_ * out_w_;
         // 缓存前置校验：checkpoint（尚未 forward_recompute）或 clear_cache 后缓存为空，
@@ -422,52 +411,52 @@ public:
         if (col_cache_.rows() != channels_ * kk || col_cache_.cols() != P * batch ||
             pooled_cache_.rows() != channels_ || pooled_cache_.cols() != P * batch ||
             !perm_cache_.valid())
-            NN_FAIL("maxpool backward: 展开/max 缓存缺失或不匹配"                 "（checkpoint 模式需先 forward_recompute；clear_cache 后需重新 forward）");
+            NN_FAIL("maxpool backward: 展开/max 缓存缺失或不匹配"
+                    "（checkpoint 模式需先 forward_recompute；clear_cache 后需重新 forward）");
 
         // 1) grad_output (C*P, B) → g_pooled (C, P*B)
-        auto g_pooled = conv_engine::samples_to_cols(engine, grad_output,
-                                                     channels_, P, batch, perm_cache_);
+        auto g_pooled =
+            conv_engine::samples_to_cols(engine, grad_output, channels_, P, batch, perm_cache_);
         NN_TRY_CHECK(g_pooled);
 
         // 2) 并列均分（全部为整张量原语 + DSL，无逐通道循环）
         //    mx_exp = 组内广播(pooled)：gather_rows 把每个通道的 max 复制 kk 次
         //    总梯度守恒（Σ share = 窗口梯度）；无并列时（cnt=1）全部梯度落在该
         //    唯一最大值位置。
-        { NN_TRY(r, ensure_expand_(engine)); }
+        {
+            NN_TRY(r, ensure_expand_(engine));
+        }
         auto mx_exp = engine.gather_rows(pooled_cache_, expand_cache_);   // (C*kk, P*B)
         NN_TRY_CHECK(mx_exp);
 
         // 并列个数 cnt = 分组求和([x == 窗口 max]) → (C, P*B)
         // （grouped_reduce_sum 视图，同 forward）
-        auto eq = dsl::compute(engine,
-            dsl::select(dsl::leaf(col_cache_) == dsl::leaf(*mx_exp),
-                        Scalar{1}, Scalar{0}),
+        auto eq = dsl::compute(
+            engine, dsl::select(dsl::leaf(col_cache_) == dsl::leaf(*mx_exp), Scalar{1}, Scalar{0}),
             channels_ * kk, P * batch);                                   // (C*kk, P*B)
         NN_TRY_CHECK(eq);
         //    同 forward：裸分组归约视图根 = 空指令表（GPU 校验拒绝）→ + rparam(0)
         auto cnt = dsl::compute(engine,
-            dsl::grouped_reduce_sum(*eq, static_cast<std::uint32_t>(kk))
-                + dsl::rparam(Scalar{0}),
-            channels_, P * batch);
+                                dsl::grouped_reduce_sum(*eq, static_cast<std::uint32_t>(kk)) +
+                                    dsl::rparam(Scalar{0}),
+                                channels_, P * batch);
         NN_TRY_CHECK(cnt);
 
         // 每个并列元素分到的梯度 g/cnt → 再广播回窗口内
-        auto gdiv = dsl::compute(engine,
-            dsl::leaf(*g_pooled) / dsl::leaf(*cnt),
-            channels_, P * batch);                                        // (C, P*B)
+        auto gdiv = dsl::compute(engine, dsl::leaf(*g_pooled) / dsl::leaf(*cnt), channels_,
+                                 P * batch);                                        // (C, P*B)
         NN_TRY_CHECK(gdiv);
         auto gdiv_exp = engine.gather_rows(*gdiv, expand_cache_);         // (C*kk, P*B)
         NN_TRY_CHECK(gdiv_exp);
 
         auto gc = dsl::compute(engine,
-            dsl::select(dsl::leaf(col_cache_) == dsl::leaf(*mx_exp),
-                        dsl::leaf(*gdiv_exp), Scalar{0}),
-            channels_ * kk, P * batch);                                   // (C*kk, P*B)
+                               dsl::select(dsl::leaf(col_cache_) == dsl::leaf(*mx_exp),
+                                           dsl::leaf(*gdiv_exp), Scalar{0}),
+                               channels_ * kk, P * batch); // (C*kk, P*B)
         NN_TRY_CHECK(gc);
 
         // 3) 反向散射到输入像素（重叠窗口在 col2im 内累加）
-        return engine.col2im(*gc, channels_, in_h_, in_w_,
-                             pool_, stride_, 0, out_h_, out_w_);
+        return engine.col2im(*gc, channels_, in_h_, in_w_, pool_, stride_, 0, out_h_, out_w_);
     }
 };
 } // namespace nn

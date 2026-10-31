@@ -41,19 +41,15 @@ namespace nn
 
 // ── 常量折叠求值（仅 IEEE 754 基本运算；不折叠超越函数/归约）────────────
 // 返回 false 表示该算子不参与折叠（调用方保留原指令）。
-[[nodiscard]] inline bool expr_eval_const_fold(ExprOp op, Scalar a, Scalar b,
-                                               Scalar c, Scalar& out_v)
+[[nodiscard]] inline bool expr_eval_const_fold(ExprOp op, Scalar a, Scalar b, Scalar c,
+                                               Scalar& out_v)
 {
     // 可折叠性 + 标量语义均来自 expr_op_table（超越函数 / 归约 foldable=false）
     const detail::ExprOpInfo& info = detail::expr_op_info(op);
-    if (!info.foldable)
-        return false;
-    if (info.arity == 1)
-        out_v = info.unary(a);
-    else if (info.arity == 2)
-        out_v = info.binary(a, b);
-    else
-        out_v = (a != Scalar{0}) ? b : c;   // Select
+    if (!info.foldable) return false;
+    if (info.arity == 1) out_v = info.unary(a);
+    else if (info.arity == 2) out_v = info.binary(a, b);
+    else out_v = (a != Scalar{0}) ? b : c;   // Select
     return true;
 }
 
@@ -67,16 +63,14 @@ namespace nn
 //  注意：0-x→neg(x) 需生成新指令，不在此处理（调用方负责）。
 //  需要向常量池写入时（x*0→0）经 consts 就地追加（确定性：保持出现序）。
 // ═══════════════════════════════════════════════════════════════════════════
-[[nodiscard]] inline std::optional<ExprOperand> expr_try_algebraic_simplify(
-    ExprOp op, const ExprOperand& a, const ExprOperand& b, const ExprOperand& c,
-    std::vector<Scalar>& consts,
-    const std::vector<ExprOp>& def_op, const std::vector<ExprOperand>& def_a)
+[[nodiscard]] inline std::optional<ExprOperand>
+expr_try_algebraic_simplify(ExprOp op, const ExprOperand& a, const ExprOperand& b,
+                            const ExprOperand& c, std::vector<Scalar>& consts,
+                            const std::vector<ExprOp>& def_op,
+                            const std::vector<ExprOperand>& def_a)
 {
     const auto is_const = [&](const ExprOperand& o, Scalar v)
-    {
-        return o.kind == static_cast<std::uint8_t>(ExprOperandKind::Const) &&
-               consts[o.idx] == v;
-    };
+    { return o.kind == static_cast<std::uint8_t>(ExprOperandKind::Const) && consts[o.idx] == v; };
     const auto add_const_op = [&](Scalar v) -> ExprOperand
     {
         for (std::size_t j = 0; j < consts.size(); ++j)
@@ -147,7 +141,7 @@ namespace nn
 [[nodiscard]] inline ExprSpec fold_constants_and_algebra(const ExprSpec& spec)
 {
     ExprSpec out;
-    out.views  = spec.views;   // 不变量：views 不变
+    out.views = spec.views;   // 不变量：views 不变
     out.matmul = spec.matmul;  // 不变量：matmul 段不变（pass 只优化 instrs/consts）
     out.rparams = spec.rparams; // RParam 值序列：非结构、不进 key，原样透传
                                // （值不参与常量折叠/代数化简，跨 pass 保持顺序）
@@ -158,7 +152,11 @@ namespace nn
     {
         int hit = -1;
         for (std::size_t j = 0; j < out.consts.size(); ++j)
-            if (out.consts[j] == spec.consts[i]) { hit = static_cast<int>(j); break; }
+            if (out.consts[j] == spec.consts[i])
+            {
+                hit = static_cast<int>(j);
+                break;
+            }
         if (hit < 0)
         {
             hit = static_cast<int>(out.consts.size());
@@ -176,7 +174,7 @@ namespace nn
     // replace[r]：寄存器 r 化简后等价的操作数（非空则引用处替换）
     std::vector<std::optional<ExprOperand>> replace(spec.num_regs);
     // 定义 r 的指令（化简后）的 op 与 a 操作数（用于 neg(neg(x)) 化简）
-    std::vector<ExprOp>   def_op(spec.num_regs, ExprOp::Add);
+    std::vector<ExprOp> def_op(spec.num_regs, ExprOp::Add);
     std::vector<ExprOperand> def_a(spec.num_regs, ExprOperand{});
 
     const auto remap_op = [&](const ExprOperand& op) -> ExprOperand
@@ -191,11 +189,15 @@ namespace nn
         return op;
     };
 
-    const auto emit = [&](std::uint8_t opc, std::uint8_t dst,
-                          const ExprOperand& a, const ExprOperand& b,
-                          const ExprOperand& c) -> void
+    const auto emit = [&](std::uint8_t opc, std::uint8_t dst, const ExprOperand& a,
+                          const ExprOperand& b, const ExprOperand& c) -> void
     {
-        ExprInstr ni; ni.op = opc; ni.dst = dst; ni.a = a; ni.b = b; ni.c = c;
+        ExprInstr ni;
+        ni.op = opc;
+        ni.dst = dst;
+        ni.a = a;
+        ni.b = b;
+        ni.c = c;
         out.instrs.push_back(ni);
         def_op[dst] = static_cast<ExprOp>(opc);
         def_a[dst] = a;
@@ -210,7 +212,11 @@ namespace nn
         // P2 多输出（extras）：额外输出的定义指令同输出指令处理（只重映射
         // 操作数，不折叠 / 不 alias）——值必须落在真实寄存器供输出存储。
         for (const auto e : spec.extras)
-            if (e == ins.dst) { is_output = true; break; }
+            if (e == ins.dst)
+            {
+                is_output = true;
+                break;
+            }
 
         // 只重映射实际使用的操作数（未使用的 b/c 是默认哨兵 {0,0}，
         // 不得当 Reg(0) 重编号——见 docs/internal/03-ir-optimization.md 关键坑 ②）
@@ -239,7 +245,10 @@ namespace nn
             const ExprOperand* ops[3] = {&a, &b, &c};
             for (std::size_t oi = 0; oi < nops; ++oi)
                 if (ops[oi]->kind != static_cast<std::uint8_t>(ExprOperandKind::Const))
-                { all_const = false; break; }
+                {
+                    all_const = false;
+                    break;
+                }
             if (all_const)
             {
                 Scalar v = Scalar{0};
@@ -249,8 +258,12 @@ namespace nn
                     // 常量入池（去重）
                     std::optional<ExprOperand> cv;
                     for (std::size_t j = 0; j < out.consts.size(); ++j)
-                        if (out.consts[j] == v) { cv = {static_cast<std::uint8_t>(ExprOperandKind::Const),
-                                                        static_cast<std::uint8_t>(j)}; break; }
+                        if (out.consts[j] == v)
+                        {
+                            cv = {static_cast<std::uint8_t>(ExprOperandKind::Const),
+                                  static_cast<std::uint8_t>(j)};
+                            break;
+                        }
                     if (!cv)
                     {
                         const std::uint8_t ci = static_cast<std::uint8_t>(out.consts.size());
@@ -270,8 +283,7 @@ namespace nn
             emit(static_cast<std::uint8_t>(ExprOp::Neg), ins.dst, b, {}, {});
             continue;
         }
-        if (auto repl = expr_try_algebraic_simplify(op, a, b, c, out.consts,
-                                                    def_op, def_a))
+        if (auto repl = expr_try_algebraic_simplify(op, a, b, c, out.consts, def_op, def_a))
         {
             replace[dst] = *repl;
             continue;
@@ -294,8 +306,7 @@ namespace nn
 // ═══════════════════════════════════════════════════════════════════════════
 [[nodiscard]] inline ExprSpec dead_code_elimination(const ExprSpec& spec)
 {
-    if (spec.instrs.empty())
-        return spec;
+    if (spec.instrs.empty()) return spec;
     const std::size_t n = spec.instrs.size();
     std::vector<std::uint8_t> live_reg(spec.num_regs, 0);
     std::vector<std::uint8_t> live_instr(n, 0);
@@ -306,10 +317,8 @@ namespace nn
     for (std::size_t i = n; i-- > 0;)
     {
         const ExprInstr& ins = spec.instrs[i];
-        if (ins.dst < spec.num_regs && live_reg[ins.dst])
-            live_instr[i] = 1;
-        if (!live_instr[i])
-            continue;
+        if (ins.dst < spec.num_regs && live_reg[ins.dst]) live_instr[i] = 1;
+        if (!live_instr[i]) continue;
         const ExprOp op = static_cast<ExprOp>(ins.op);
         const ExprOperand* ops[3] = {&ins.a, &ins.b, &ins.c};
         const std::size_t nops = expr_instr_num_operands(op);
@@ -325,16 +334,15 @@ namespace nn
     }
 
     ExprSpec out;
-    out.views   = spec.views;
-    out.consts  = spec.consts;
+    out.views = spec.views;
+    out.consts = spec.consts;
     out.rparams = spec.rparams;  // RParam 值序列：非结构、跨 pass 原样透传
     out.num_regs = spec.num_regs;
-    out.matmul  = spec.matmul;
-    out.extras  = spec.extras;   // P2 多输出：跨 pass 原样透传（寄存器号未变）
+    out.matmul = spec.matmul;
+    out.extras = spec.extras;   // P2 多输出：跨 pass 原样透传（寄存器号未变）
     out.instrs.reserve(n);
     for (std::size_t i = 0; i < n; ++i)
-        if (live_instr[i])
-            out.instrs.push_back(spec.instrs[i]);
+        if (live_instr[i]) out.instrs.push_back(spec.instrs[i]);
     return out;
 }
 
@@ -347,7 +355,7 @@ namespace nn
 [[nodiscard]] inline ExprSpec renumber_registers(const ExprSpec& spec)
 {
     ExprSpec out;
-    out.views  = spec.views;
+    out.views = spec.views;
     out.rparams = spec.rparams;  // RParam 值序列：跨 pass 原样透传
     out.matmul = spec.matmul;
 
@@ -397,8 +405,7 @@ namespace nn
             return o;
         };
         // 只重映射实际使用的操作数（未用 b/c 是默认哨兵，不得当 Reg(0) 重编号）
-        const std::size_t nops =
-            expr_instr_num_operands(static_cast<ExprOp>(in.op));
+        const std::size_t nops = expr_instr_num_operands(static_cast<ExprOp>(in.op));
         ni.a = remap(in.a);
         if (nops >= 2) ni.b = remap(in.b);
         if (nops >= 3) ni.c = remap(in.c);
@@ -407,8 +414,8 @@ namespace nn
     // P2 多输出：extras 随新寄存器号重映射
     out.extras.reserve(spec.extras.size());
     for (const auto e : spec.extras)
-        out.extras.push_back((e < spec.num_regs && new_reg[e] >= 0)
-            ? static_cast<std::uint8_t>(new_reg[e]) : e);
+        out.extras.push_back(
+            (e < spec.num_regs && new_reg[e] >= 0) ? static_cast<std::uint8_t>(new_reg[e]) : e);
     out.num_regs = next;
     return out;
 }
@@ -424,7 +431,7 @@ namespace nn
 [[nodiscard]] inline ExprSpec common_subexpression_elimination(const ExprSpec& spec)
 {
     ExprSpec out;
-    out.views  = spec.views;
+    out.views = spec.views;
     out.consts = spec.consts;
     out.rparams = spec.rparams;  // RParam 值序列：跨 pass 原样透传
     out.matmul = spec.matmul;
@@ -454,19 +461,18 @@ namespace nn
             return o;
         };
         // 只重映射实际使用的操作数（未用 b/c 是默认哨兵；key 中保持哨兵不变）
-        const std::size_t nops =
-            expr_instr_num_operands(static_cast<ExprOp>(in.op));
+        const std::size_t nops = expr_instr_num_operands(static_cast<ExprOp>(in.op));
         const ExprOperand a = remap(in.a);
         const ExprOperand b = (nops >= 2) ? remap(in.b) : in.b;
         const ExprOperand c = (nops >= 3) ? remap(in.c) : in.c;
 
         std::uint64_t key = static_cast<std::uint64_t>(in.op);
         key |= static_cast<std::uint64_t>(a.kind) << 8;
-        key |= static_cast<std::uint64_t>(a.idx)  << 16;
+        key |= static_cast<std::uint64_t>(a.idx) << 16;
         key |= static_cast<std::uint64_t>(b.kind) << 24;
-        key |= static_cast<std::uint64_t>(b.idx)  << 32;
+        key |= static_cast<std::uint64_t>(b.idx) << 32;
         key |= static_cast<std::uint64_t>(c.kind) << 40;
-        key |= static_cast<std::uint64_t>(c.idx)  << 48;
+        key |= static_cast<std::uint64_t>(c.idx) << 48;
 
         const auto it = cse.find(key);
         if (it != cse.end())
@@ -477,14 +483,19 @@ namespace nn
         const std::uint8_t nd = next++;
         cse.emplace(key, nd);
         dst_map[in.dst] = nd;
-        ExprInstr ni; ni.op = in.op; ni.dst = nd; ni.a = a; ni.b = b; ni.c = c;
+        ExprInstr ni;
+        ni.op = in.op;
+        ni.dst = nd;
+        ni.a = a;
+        ni.b = b;
+        ni.c = c;
         out.instrs.push_back(ni);
     }
     // P2 多输出：extras 随 CSE 复用映射重指向（同一值合并后指向规范 dst）
     out.extras.reserve(spec.extras.size());
     for (const auto e : spec.extras)
-        out.extras.push_back((e < spec.num_regs && dst_map[e] >= 0)
-            ? static_cast<std::uint8_t>(dst_map[e]) : e);
+        out.extras.push_back(
+            (e < spec.num_regs && dst_map[e] >= 0) ? static_cast<std::uint8_t>(dst_map[e]) : e);
     out.num_regs = next;
     return out;
 }
@@ -505,8 +516,7 @@ namespace nn
 // ═══════════════════════════════════════════════════════════════════════════
 [[nodiscard]] inline ExprSpec allocate_registers_liveness(const ExprSpec& spec)
 {
-    if (spec.instrs.empty())
-        return spec;
+    if (spec.instrs.empty()) return spec;
     const std::size_t n = spec.instrs.size();
 
     // def_at[reg] = 定义该寄存器的指令下标
@@ -528,15 +538,13 @@ namespace nn
                  o.kind == static_cast<std::uint8_t>(ExprOperandKind::Fanout) ||
                  o.kind == static_cast<std::uint8_t>(ExprOperandKind::Reduce)) &&
                 o.idx < spec.num_regs && def_at[o.idx] >= 0)
-                last_use[def_at[o.idx]] =
-                    std::max(last_use[def_at[o.idx]], static_cast<int>(i));
+                last_use[def_at[o.idx]] = std::max(last_use[def_at[o.idx]], static_cast<int>(i));
         }
     }
     last_use[n - 1] = static_cast<int>(n - 1);  // 输出寄存器保护
     // P2 多输出：extras 的定义值同样存活到 kernel 末（防被 liveness 复用）
     for (const auto e : spec.extras)
-        if (e < spec.num_regs && def_at[e] >= 0)
-            last_use[def_at[e]] = static_cast<int>(n - 1);
+        if (e < spec.num_regs && def_at[e] >= 0) last_use[def_at[e]] = static_cast<int>(n - 1);
 
     // 分配（确定性贪心；逐元素 liveness 复用，归约独立区段）
     std::vector<int> reg_of(n, -1);
@@ -545,8 +553,7 @@ namespace nn
     for (std::size_t i = 0; i < n; ++i)
     {
         const ExprOp op = static_cast<ExprOp>(spec.instrs[i].op);
-        if (expr_op_is_reduce(op))
-            continue;  // 归约指令第二遍独立分配
+        if (expr_op_is_reduce(op)) continue;  // 归约指令第二遍独立分配
         // 释放所有 last_use < i 的逐元素寄存器
         for (std::size_t r = 0; r < release_pos.size(); ++r)
             if (release_pos[r] >= 0 && release_pos[r] < static_cast<int>(i) && !free_mark[r])
@@ -554,7 +561,12 @@ namespace nn
         // 取最小可用
         int reg = -1;
         for (std::size_t r = 0; r < release_pos.size(); ++r)
-            if (free_mark[r]) { reg = static_cast<int>(r); free_mark[r] = 0; break; }
+            if (free_mark[r])
+            {
+                reg = static_cast<int>(r);
+                free_mark[r] = 0;
+                break;
+            }
         if (reg < 0)
         {
             reg = static_cast<int>(release_pos.size());
@@ -569,13 +581,12 @@ namespace nn
     for (std::size_t i = 0; i < n; ++i)
     {
         const ExprOp op = static_cast<ExprOp>(spec.instrs[i].op);
-        if (expr_op_is_reduce(op))
-            reg_of[i] = static_cast<int>(next_red++);
+        if (expr_op_is_reduce(op)) reg_of[i] = static_cast<int>(next_red++);
     }
     const std::uint32_t num_regs = next_red;
 
     ExprSpec out;
-    out.views  = spec.views;
+    out.views = spec.views;
     out.consts = spec.consts;
     out.rparams = spec.rparams;  // RParam 值序列：跨 pass 原样透传
     out.matmul = spec.matmul;
@@ -583,7 +594,8 @@ namespace nn
     out.extras.reserve(spec.extras.size());
     for (const auto e : spec.extras)
         out.extras.push_back((e < spec.num_regs && def_at[e] >= 0)
-            ? static_cast<std::uint8_t>(reg_of[def_at[e]]) : e);
+                                 ? static_cast<std::uint8_t>(reg_of[def_at[e]])
+                                 : e);
     out.instrs.reserve(n);
     for (std::size_t i = 0; i < n; ++i)
     {
@@ -599,8 +611,7 @@ namespace nn
             return o;
         };
         // 只重映射实际使用的操作数（未用 b/c 是默认哨兵，不得当 Reg(0) 重编号）
-        const std::size_t nops =
-            expr_instr_num_operands(static_cast<ExprOp>(spec.instrs[i].op));
+        const std::size_t nops = expr_instr_num_operands(static_cast<ExprOp>(spec.instrs[i].op));
         ni.a = remap(ni.a);
         if (nops >= 2) ni.b = remap(ni.b);
         if (nops >= 3) ni.c = remap(ni.c);
@@ -626,8 +637,7 @@ namespace nn
     // （canonical 不变式：expr_spec_key(spec) ≡ expr_spec_key(canonical(spec))，
     //   对 fold spec 退化为恒等——双域 fold 若要在 body 上跑 DCE/CSE，须先给
     //   各 pass 补 fold 字段透传再放开，勿直接删本行）。
-    if (spec.fold)
-        return spec;
+    if (spec.fold) return spec;
     ExprSpec s = fold_constants_and_algebra(spec);
     s = dead_code_elimination(s);
     s = renumber_registers(s);
@@ -637,4 +647,3 @@ namespace nn
 }
 
 } // namespace nn
-

@@ -44,7 +44,8 @@ int main()
             Wt.set_value(r, c, static_cast<Scalar>(td(rng) - 1) * 0.5f);
 
     Matrix X(IN, NB), Y(OUT, NB);
-    for (auto& v : X.span()) v = nd(rng);
+    for (auto& v : X.span())
+        v = nd(rng);
     Wt.multiply_to(Y, X);
 
     Tensor Xt = NN_CHECK(eng.from_matrix(X));
@@ -61,23 +62,23 @@ int main()
         // Layer 化时改为 dsl 的 row_reduce_sum + row_broadcast（逐行 absmean）。
         const Matrix Wh = NN_CHECK(eng.to_matrix(W, Precision::F32));
         Scalar gamma = 0.f;
-        for (auto v : Wh.span()) gamma += std::fabs(v);
+        for (auto v : Wh.span())
+            gamma += std::fabs(v);
         gamma /= static_cast<Scalar>(IN * OUT);
         const Scalar thr = 0.5f * gamma;
 
         // Wq = select(W > thr, +1, select(W < -thr, -1, 0)) —— 纯 DSL 三值量化
         // （DSL 没有 round/floor；在 [-1,1] 区间内这条 select 链等价于 RoundClip(w/γ, -1, 1)）
-        Tensor Wq = NN_CHECK(nn::dsl::compute(eng,
-            nn::dsl::select(nn::dsl::leaf(W) > nn::dsl::rparam(thr),
-                Scalar{1},
-                nn::dsl::select(nn::dsl::leaf(W) < nn::dsl::rparam(-thr),
-                    Scalar{-1}, Scalar{0})),
+        Tensor Wq = NN_CHECK(nn::dsl::compute(
+            eng,
+            nn::dsl::select(
+                nn::dsl::leaf(W) > nn::dsl::rparam(thr), Scalar{1},
+                nn::dsl::select(nn::dsl::leaf(W) < nn::dsl::rparam(-thr), Scalar{-1}, Scalar{0})),
             OUT, IN, Precision::F32));
 
         // Ŷ = γ · (Wq · X)（matmul 段 + 缩放融合为单 kernel）
-        Tensor Yhat = NN_CHECK(nn::dsl::compute(eng,
-            nn::dsl::matmul(Wq, Xt) * nn::dsl::rparam(gamma),
-            OUT, NB, Precision::F32));
+        Tensor Yhat = NN_CHECK(nn::dsl::compute(
+            eng, nn::dsl::matmul(Wq, Xt) * nn::dsl::rparam(gamma), OUT, NB, Precision::F32));
 
         // MSE + 其雅可比 dY = 2(Ŷ - Y)/(OUT·NB)
         const Matrix Yh = NN_CHECK(eng.to_matrix(Yhat, Precision::F32));
@@ -92,16 +93,17 @@ int main()
         last_loss = loss;
 
         Tensor dY = NN_CHECK(nn::dsl::compute(eng,
-            (nn::dsl::leaf(Yhat) - nn::dsl::leaf(Yt)) * nn::dsl::rparam(Scalar{2} / Scalar(OUT * NB)),
-            OUT, NB, Precision::F32));
+                                              (nn::dsl::leaf(Yhat) - nn::dsl::leaf(Yt)) *
+                                                  nn::dsl::rparam(Scalar{2} / Scalar(OUT * NB)),
+                                              OUT, NB, Precision::F32));
 
         // STE：把 Wq 当常数，梯度直接穿回 latent W（dW = γ · dY · Xᵀ）
-        Tensor dW = NN_CHECK(nn::dsl::compute(eng,
-            nn::dsl::matmul(dY, Xt, false, true) * nn::dsl::rparam(gamma),
-            OUT, IN, Precision::F32));
+        Tensor dW = NN_CHECK(
+            nn::dsl::compute(eng, nn::dsl::matmul(dY, Xt, false, true) * nn::dsl::rparam(gamma),
+                             OUT, IN, Precision::F32));
 
-        NN_CHECK(nn::dsl::compute_into(eng,
-            nn::dsl::leaf(W) - nn::dsl::leaf(dW) * nn::dsl::rparam(lr), W));
+        NN_CHECK(nn::dsl::compute_into(
+            eng, nn::dsl::leaf(W) - nn::dsl::leaf(dW) * nn::dsl::rparam(lr), W));
 
         if (step % 500 == 0 || step == STEPS - 1)
             std::printf("step %4d  mse=%.6f  gamma=%.5f\n", step, loss, gamma);
@@ -110,7 +112,8 @@ int main()
     // ── 验收：量化后的符号/零帽与教师三元模式的重合度 ──
     const Matrix Wh = NN_CHECK(eng.to_matrix(W, Precision::F32));
     Scalar gamma = 0.f;
-    for (auto v : Wh.span()) gamma += std::fabs(v);
+    for (auto v : Wh.span())
+        gamma += std::fabs(v);
     gamma /= static_cast<Scalar>(IN * OUT);
 
     std::size_t nz = 0, match = 0;
@@ -124,13 +127,12 @@ int main()
             Scalar q = 0.f;
             if (w > 0.5f * gamma) q = 1.f;
             else if (w < -0.5f * gamma) q = -1.f;
-            if ((q > 0.f && t > 0.f) || (q < 0.f && t < 0.f) || q == 0.f)
-                ++match;
+            if ((q > 0.f && t > 0.f) || (q < 0.f && t < 0.f) || q == 0.f) ++match;
         }
 
-    std::printf("\nmse: first=%.6f  final=%.6f  (降 %.1f%%)\n",
-                first_loss, last_loss, 100.0 * (1.0 - last_loss / first_loss));
-    std::printf("教师非零项符号/零帽吻合率: %zu / %zu = %.1f%%\n",
-                match, nz, 100.0 * static_cast<double>(match) / static_cast<double>(nz));
+    std::printf("\nmse: first=%.6f  final=%.6f  (降 %.1f%%)\n", first_loss, last_loss,
+                100.0 * (1.0 - last_loss / first_loss));
+    std::printf("教师非零项符号/零帽吻合率: %zu / %zu = %.1f%%\n", match, nz,
+                100.0 * static_cast<double>(match) / static_cast<double>(nz));
     return 0;
 }

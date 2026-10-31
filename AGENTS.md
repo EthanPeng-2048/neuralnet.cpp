@@ -69,7 +69,7 @@ cmake -B build -G Ninja -DNN_ENABLE_TESTS=ON && cmake --build build && ctest --t
 | 加/改 GUI 参数行（P2-6 声明式表） | `gui.py` 各 Tab 的 `fields()` —— **一个 `Field` = 一行 UI + 一条 `collect_args` 语义**（`Field`/`collect_fields`/`ParamsMixin` 在文件中部）；表表达不了的条件语义（engine→`--gpu`、精度预设→`--f16`/`--t1_58`、输入方式→`input`）留在该 Tab 的 `collect_args` 后处理里，并用 `_v()`/`ui_only=True` 声明给门禁 |
 | 参与/贡献入口（**给非作者**：构建/测试/规范/PR/CI 口径） | `CONTRIBUTING.md` + `CODE_OF_CONDUCT.md`；预设构建 `CMakePresets.json`（`cmake --preset dev/portable/cpu/probes`） |
 | 可引用的实测结论（结论/证据/重跑命令/边界） | `research/`（索引 `research/README.md`；一次研究一个子目录）。代码/设计稿引用这些结论时按四段式引用 |
-| 代码风格（机器可读） | `.clang-format`（**目标风格**，用 `git clang-format` 只格式化自己的改动行；**不要**整仓重排）+ `.editorconfig` + `.gitattributes`（全仓 **LF**）；规则文本见 `docs/contributors/cpp-standards.md` §8 |
+| 代码风格（机器可读） | `.clang-format`（全仓已于 2026-10-31 按本配置统一格式化，现有代码即基线；改动时用 `git clang-format` 只格式化自己的改动行）+ `.editorconfig` + `.gitattributes`（全仓 **LF**）；规则文本见 `docs/contributors/cpp-standards.md` §8 |
 
 ## 4. 分层架构（L0→L5，严格单向依赖，上层只依赖下层公有接口）
 

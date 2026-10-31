@@ -24,33 +24,32 @@
 
 namespace nn::cli
 {
-    // 危险精度组合启动期告警文本（无危险组合 → 空串）。
-    inline std::string dangerous_precision_warning(const nn::PrecisionProfile& p)
-    {
-        using nn::Precision;
+// 危险精度组合启动期告警文本（无危险组合 → 空串）。
+inline std::string dangerous_precision_warning(const nn::PrecisionProfile& p)
+{
+    using nn::Precision;
 
-        // 唯一触发字段：优化器状态精度 = F16（Adam 的 m/v 下溢 → 更新爆炸）。
-        if (p.optimizer != Precision::F16)
-            return {};
+    // 唯一触发字段：优化器状态精度 = F16（Adam 的 m/v 下溢 → 更新爆炸）。
+    if (p.optimizer != Precision::F16) return {};
 
-        const bool all_f16 = p.param == Precision::F16 && p.compute == Precision::F16 &&
-                             p.stable == Precision::F16 && p.optimizer == Precision::F16;
+    const bool all_f16 = p.param == Precision::F16 && p.compute == Precision::F16 &&
+                         p.stable == Precision::F16 && p.optimizer == Precision::F16;
 
-        std::string w;
-        w += "[精度警告] 检测到危险精度组合（仅提醒，不阻断训练，详见 "
-             "docs/internal/24-f16-training-defects.md §2）：\n";
-        w += std::string("  · optimizer=") + nn::precision_name(p.optimizer) +
-             "：Adam 二阶矩 v≈g²~1e-10 在 f16 下溢为 0 → 更新量 -lr·m̂/(√v̂+eps) "
-             "爆炸 → loss 发散/NaN。\n";
-        if (p.stable == Precision::F16)
-            w += std::string("  · stable=") + nn::precision_name(p.stable) +
-                 "：CE/softmax 归约在 f16 下范围(65504)/尾数(10 位)不足 → 大词表 "
-                 "~200 步 NaN。\n";
-        if (all_f16)
-            w += "  · param/compute/stable/optimizer 全 f16：更新量 |delta| 可能小于"
-                 "参数所在的 f16 网格步长 → 原地写回被舍入吃光（loss 恒定，数值性冻结）。\n";
-        w += "  安全配方：`--f16`（param+compute=f16，stable/optimizer=f32）。"
-             "如需继续实验请自行留意数值稳定性。\n";
-        return w;
-    }
+    std::string w;
+    w += "[精度警告] 检测到危险精度组合（仅提醒，不阻断训练，详见 "
+         "docs/internal/24-f16-training-defects.md §2）：\n";
+    w += std::string("  · optimizer=") + nn::precision_name(p.optimizer) +
+         "：Adam 二阶矩 v≈g²~1e-10 在 f16 下溢为 0 → 更新量 -lr·m̂/(√v̂+eps) "
+         "爆炸 → loss 发散/NaN。\n";
+    if (p.stable == Precision::F16)
+        w += std::string("  · stable=") + nn::precision_name(p.stable) +
+             "：CE/softmax 归约在 f16 下范围(65504)/尾数(10 位)不足 → 大词表 "
+             "~200 步 NaN。\n";
+    if (all_f16)
+        w += "  · param/compute/stable/optimizer 全 f16：更新量 |delta| 可能小于"
+             "参数所在的 f16 网格步长 → 原地写回被舍入吃光（loss 恒定，数值性冻结）。\n";
+    w += "  安全配方：`--f16`（param+compute=f16，stable/optimizer=f32）。"
+         "如需继续实验请自行留意数值稳定性。\n";
+    return w;
+}
 } // namespace nn::cli

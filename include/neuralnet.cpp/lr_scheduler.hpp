@@ -128,7 +128,9 @@ struct LrScheduleConfig
         int seg, off, this_len;
         if (seg_len <= 0)
         {
-            seg = 0; off = 0; this_len = anneal_span > 0 ? anneal_span : 1;
+            seg = 0;
+            off = 0;
+            this_len = anneal_span > 0 ? anneal_span : 1;
         }
         else if (rel >= anneal_span)
         {
@@ -160,8 +162,8 @@ struct LrScheduleConfig
         }
         const Scalar progress = static_cast<Scalar>(off) / static_cast<Scalar>(this_len);
         const Scalar p = progress < 0 ? Scalar{0} : (progress > 1 ? Scalar{1} : progress);
-        const Scalar annealed = lr_min + 0.5f * (max_lr - lr_min) *
-                                (1.0f + std::cos(3.14159265358979323846f * p));
+        const Scalar annealed =
+            lr_min + 0.5f * (max_lr - lr_min) * (1.0f + std::cos(3.14159265358979323846f * p));
         // 最后一段不重启（停在 min_lr）；其余段末重启回 base_lr（下一段起点）
         if (seg + 1 >= segs) return annealed;
         // 段内最后一个 epoch（off == this_len-1）即"段末"，已 annealed 到接近

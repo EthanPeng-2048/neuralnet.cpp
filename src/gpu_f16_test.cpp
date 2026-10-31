@@ -5,7 +5,8 @@
 #include "neuralnet.cpp/compute_gpu_engine.hpp"
 #include "neuralnet.cpp/compute_cpu_engine.hpp"
 
-int main() {
+int main()
+{
     printf("=== GPU f16 Capability Check ===\n");
     auto backend_owner = nn::GpuBackend::shared();
     nn::GpuBackend& backend = *backend_owner;
@@ -28,8 +29,10 @@ int main() {
 
     // Create f32 matrix
     nn::Matrix m(2, 2);
-    m.set_value(0, 0, 1.0f); m.set_value(0, 1, 2.0f);
-    m.set_value(1, 0, 3.0f); m.set_value(1, 1, 4.0f);
+    m.set_value(0, 0, 1.0f);
+    m.set_value(0, 1, 2.0f);
+    m.set_value(1, 0, 3.0f);
+    m.set_value(1, 1, 4.0f);
 
     // Upload as f32
     auto t32 = engine.from_matrix(m);
@@ -48,14 +51,17 @@ int main() {
     auto result = engine.to_matrix(*t32_back);
     NN_EXIT(result, 1, "to_matrix failed: %s\n");
 
-    printf("Original:  [%.1f %.1f; %.1f %.1f]\n", m.at(0,0), m.at(0,1), m.at(1,0), m.at(1,1));
-    printf("GPU f16:   [%.1f %.1f; %.1f %.1f]\n", result->at(0,0), result->at(0,1), result->at(1,0), result->at(1,1));
+    printf("Original:  [%.1f %.1f; %.1f %.1f]\n", m.at(0, 0), m.at(0, 1), m.at(1, 0), m.at(1, 1));
+    printf("GPU f16:   [%.1f %.1f; %.1f %.1f]\n", result->at(0, 0), result->at(0, 1),
+           result->at(1, 0), result->at(1, 1));
 
     // Test f16 matmul
     printf("\n=== GPU f16 Matmul ===\n");
     nn::Matrix m2(2, 2);
-    m2.set_value(0, 0, 5.0f); m2.set_value(0, 1, 6.0f);
-    m2.set_value(1, 0, 7.0f); m2.set_value(1, 1, 8.0f);
+    m2.set_value(0, 0, 5.0f);
+    m2.set_value(0, 1, 6.0f);
+    m2.set_value(1, 0, 7.0f);
+    m2.set_value(1, 1, 8.0f);
 
     auto t16_a = engine.cast(engine.from_matrix(m).value(), nn::Precision::F16);
     auto t16_b = engine.cast(engine.from_matrix(m2).value(), nn::Precision::F16);
@@ -65,8 +71,8 @@ int main() {
 
     auto c32 = engine.cast(*t16_c, nn::Precision::F32);
     auto c_mat = engine.to_matrix(*c32);
-    printf("A*B (f16): [%.1f %.1f; %.1f %.1f]\n",
-        c_mat->at(0,0), c_mat->at(0,1), c_mat->at(1,0), c_mat->at(1,1));
+    printf("A*B (f16): [%.1f %.1f; %.1f %.1f]\n", c_mat->at(0, 0), c_mat->at(0, 1), c_mat->at(1, 0),
+           c_mat->at(1, 1));
     printf("Expected:  [19.0 22.0; 43.0 50.0]\n");
 
     // ── 算子 f16 变体对拍（GPU f16 vs CPU f32 参考）─────────────
@@ -77,13 +83,13 @@ int main() {
     auto cpu_owner = nn::CpuEngine::create();
     nn::CpuEngine& cpu = *cpu_owner;
     int fails = 0;
-    const auto check = [&](const char* name, const nn::Matrix& got,
-                           const nn::Matrix& ref, float tol)
+    const auto check =
+        [&](const char* name, const nn::Matrix& got, const nn::Matrix& ref, float tol)
     {
         if (got.rows() != ref.rows() || got.cols() != ref.cols())
         {
-            printf("[FAIL] %s: shape %zux%zu vs ref %zux%zu\n", name,
-                   got.rows(), got.cols(), ref.rows(), ref.cols());
+            printf("[FAIL] %s: shape %zux%zu vs ref %zux%zu\n", name, got.rows(), got.cols(),
+                   ref.rows(), ref.cols());
             ++fails;
             return;
         }
@@ -100,8 +106,7 @@ int main() {
             printf("[FAIL] %s: max_rel=%.3e (tol %.1e)\n", name, maxr, tol);
             ++fails;
         }
-        else
-            printf("[ok] %s (max_rel=%.2e)\n", name, maxr);
+        else printf("[ok] %s (max_rel=%.2e)\n", name, maxr);
     };
     // GPU f16 算子 → 结果 cast f32 → to_matrix
     const auto gpu_op = [&](auto&& fn) -> nn::Matrix
@@ -114,9 +119,19 @@ int main() {
             return {};
         }
         auto f32r = engine.cast(*r, nn::Precision::F32);
-        if (!f32r) { printf("[FAIL] cast: %s\n", f32r.error().message.c_str()); ++fails; return {}; }
+        if (!f32r)
+        {
+            printf("[FAIL] cast: %s\n", f32r.error().message.c_str());
+            ++fails;
+            return {};
+        }
         auto m = engine.to_matrix(*f32r);
-        if (!m) { printf("[FAIL] to_matrix: %s\n", m.error().message.c_str()); ++fails; return {}; }
+        if (!m)
+        {
+            printf("[FAIL] to_matrix: %s\n", m.error().message.c_str());
+            ++fails;
+            return {};
+        }
         return std::move(*m);
     };
     const auto to_gpu_f16 = [&](const nn::Matrix& m) -> nn::Tensor
@@ -128,9 +143,19 @@ int main() {
     const auto cpu_op = [&](auto&& fn) -> nn::Matrix
     {
         auto r = fn();
-        if (!r) { printf("[FAIL] cpu ref: %s\n", r.error().message.c_str()); ++fails; return {}; }
+        if (!r)
+        {
+            printf("[FAIL] cpu ref: %s\n", r.error().message.c_str());
+            ++fails;
+            return {};
+        }
         auto m = cpu.to_matrix(*r);
-        if (!m) { printf("[FAIL] cpu to_matrix: %s\n", m.error().message.c_str()); ++fails; return {}; }
+        if (!m)
+        {
+            printf("[FAIL] cpu to_matrix: %s\n", m.error().message.c_str());
+            ++fails;
+            return {};
+        }
         return std::move(*m);
     };
     const auto fill = [](nn::Matrix& m, auto&& gen)
@@ -157,8 +182,10 @@ int main() {
     {
         nn::Matrix x(6, 2);
         fill(x, [](std::size_t i) { return 0.25f * static_cast<float>((i * 5) % 11) - 1.0f; });
-        auto ref_s = cpu_op([&] { return cpu.grouped_reduce_sum(cpu.from_matrix(x).value(), 2, 3); });
-        auto ref_m = cpu_op([&] { return cpu.grouped_reduce_max(cpu.from_matrix(x).value(), 2, 3); });
+        auto ref_s =
+            cpu_op([&] { return cpu.grouped_reduce_sum(cpu.from_matrix(x).value(), 2, 3); });
+        auto ref_m =
+            cpu_op([&] { return cpu.grouped_reduce_max(cpu.from_matrix(x).value(), 2, 3); });
         auto x16 = to_gpu_f16(x);
         auto got_s = gpu_op([&] { return engine.grouped_reduce_sum(x16, 2, 3); });
         auto got_m = gpu_op([&] { return engine.grouped_reduce_max(x16, 2, 3); });
@@ -170,33 +197,45 @@ int main() {
     {
         nn::Matrix dst_m(4, 2), grad_m(2, 2), idx_m(2, 1);
         fill(dst_m, [](std::size_t) { return 0.0f; });
-        grad_m.set_value(0, 0, 1.5f); grad_m.set_value(0, 1, -2.25f);
-        grad_m.set_value(1, 0, 0.75f); grad_m.set_value(1, 1, 3.0f);
-        idx_m.set_value(0, 0, 1.0f);   idx_m.set_value(1, 0, 3.0f);
+        grad_m.set_value(0, 0, 1.5f);
+        grad_m.set_value(0, 1, -2.25f);
+        grad_m.set_value(1, 0, 0.75f);
+        grad_m.set_value(1, 1, 3.0f);
+        idx_m.set_value(0, 0, 1.0f);
+        idx_m.set_value(1, 0, 3.0f);
         // CPU f32 参考
         auto d_cpu = cpu.from_matrix(dst_m).value();
         auto sc = cpu.scatter_add_rows(d_cpu, cpu.from_matrix(idx_m).value(),
                                        cpu.from_matrix(grad_m).value());
-        if (!sc) { printf("[FAIL] cpu scatter: %s\n", sc.error().message.c_str()); ++fails; }
+        if (!sc)
+        {
+            printf("[FAIL] cpu scatter: %s\n", sc.error().message.c_str());
+            ++fails;
+        }
         auto ref = cpu.to_matrix(d_cpu).value();
         // GPU f16（原生打包 half CAS 路径）
         auto d16 = to_gpu_f16(dst_m);
         auto g16 = to_gpu_f16(grad_m);
         auto idx = engine.from_matrix(idx_m).value();
         auto r = engine.scatter_add_rows(d16, idx, g16);
-        if (!r) { printf("[FAIL] scatter_add_rows f16: %s\n", r.error().message.c_str()); ++fails; }
-        else check("scatter_add_rows f16", gpu_op([&] { return engine.cast(d16, nn::Precision::F32); }), ref, 1e-3f);
+        if (!r)
+        {
+            printf("[FAIL] scatter_add_rows f16: %s\n", r.error().message.c_str());
+            ++fails;
+        }
+        else
+            check("scatter_add_rows f16",
+                  gpu_op([&] { return engine.cast(d16, nn::Precision::F32); }), ref, 1e-3f);
     }
 
     // 4) im2col / col2im（窗口展开 f16 变体；C=2,H=W=3,k=2,stride=1,pad=0）
     {
         nn::Matrix xm(18, 2);   // C*H*W=18, B=2
         fill(xm, [](std::size_t i) { return 0.3f * static_cast<float>((i * 11) % 17) - 2.0f; });
-        auto ref_col_t = cpu.im2col(cpu.from_matrix(xm).value(),
-                                    2, 3, 3, 2, 1, 0, 2, 2).value();
+        auto ref_col_t = cpu.im2col(cpu.from_matrix(xm).value(), 2, 3, 3, 2, 1, 0, 2, 2).value();
         auto ref_col = cpu.to_matrix(ref_col_t).value();
-        auto ref_back = cpu_op([&] {
-            return cpu.col2im(cpu.from_matrix(ref_col).value(), 2, 3, 3, 2, 1, 0, 2, 2); });
+        auto ref_back = cpu_op(
+            [&] { return cpu.col2im(cpu.from_matrix(ref_col).value(), 2, 3, 3, 2, 1, 0, 2, 2); });
         auto x16 = to_gpu_f16(xm);
         auto got_col = gpu_op([&] { return engine.im2col(x16, 2, 3, 3, 2, 1, 0, 2, 2); });
         check("im2col f16", got_col, ref_col, 1e-3f);
@@ -213,14 +252,17 @@ int main() {
         const std::size_t dk = 4, seq = 5, rows = 4;
         auto gen = [](std::size_t seed)
         {
-            return [seed](std::size_t i) {
-                return 0.2f * static_cast<float>((i * 7 + seed * 13) % 11) - 1.0f;
-            };
+            return [seed](std::size_t i)
+            { return 0.2f * static_cast<float>((i * 7 + seed * 13) % 11) - 1.0f; };
         };
         nn::Matrix K_m(rows, seq), V_m(rows, seq), P_m(rows, seq), R_m(rows, seq);
         nn::Matrix A0_m(dk, dk), B0_m(dk, dk), bnd_m(1, seq);
-        fill(K_m, gen(1)); fill(V_m, gen(2)); fill(P_m, gen(3)); fill(R_m, gen(4));
-        fill(A0_m, gen(5)); fill(B0_m, gen(6));
+        fill(K_m, gen(1));
+        fill(V_m, gen(2));
+        fill(P_m, gen(3));
+        fill(R_m, gen(4));
+        fill(A0_m, gen(5));
+        fill(B0_m, gen(6));
         fill(bnd_m, [](std::size_t i) { return (i == 2) ? 1.0f : 0.0f; });   // 文档边界 @t=2
         const auto f16 = [&](const nn::Matrix& m) { return to_gpu_f16(m); };
         auto K16 = f16(K_m), V16 = f16(V_m), P16 = f16(P_m), R16 = f16(R_m);
@@ -230,44 +272,69 @@ int main() {
         auto run_cpu = [&](auto&& fn) -> nn::Matrix
         {
             auto t = fn();
-            if (!t) { printf("[FAIL] cpu scan: %s\n", t.error().message.c_str()); ++fails; return {}; }
+            if (!t)
+            {
+                printf("[FAIL] cpu scan: %s\n", t.error().message.c_str());
+                ++fails;
+                return {};
+            }
             auto m = cpu.to_matrix(*t);
-            if (!m) { printf("[FAIL] cpu scan to_matrix: %s\n", m.error().message.c_str()); ++fails; return {}; }
+            if (!m)
+            {
+                printf("[FAIL] cpu scan to_matrix: %s\n", m.error().message.c_str());
+                ++fails;
+                return {};
+            }
             return std::move(*m);
         };
-        auto ref_pre = run_cpu([&] {
-            return cpu.scan_prefix_outer(
-                cpu.from_matrix(K_m).value(), cpu.from_matrix(V_m).value(),
-                cpu.from_matrix(P_m).value(), cpu.from_matrix(R_m).value(),
-                cpu.from_matrix(A0_m).value(), cpu.from_matrix(B0_m).value(),
-                true, dk, 1u, true, cpu.from_matrix(bnd_m).value(), true); });
-        auto got_pre = gpu_op([&] {
-            return engine.scan_prefix_outer(K16, V16, P16, R16, A016, B016,
-                                            true, dk, 1u, true, bnd16, true,
-                                            nn::Precision::F16); });
+        auto ref_pre = run_cpu(
+            [&]
+            {
+                return cpu.scan_prefix_outer(
+                    cpu.from_matrix(K_m).value(), cpu.from_matrix(V_m).value(),
+                    cpu.from_matrix(P_m).value(), cpu.from_matrix(R_m).value(),
+                    cpu.from_matrix(A0_m).value(), cpu.from_matrix(B0_m).value(), true, dk, 1u,
+                    true, cpu.from_matrix(bnd_m).value(), true);
+            });
+        auto got_pre = gpu_op(
+            [&]
+            {
+                return engine.scan_prefix_outer(K16, V16, P16, R16, A016, B016, true, dk, 1u, true,
+                                                bnd16, true, nn::Precision::F16);
+            });
         // 扫描族容差 5e-3：输入双侧 f16 舍入（eps≈4.9e-4）+ 跨 seq 步累加
         // 的舍入传播——2e-3 实测卡在 scan_prefix 2.03e-3 上，非缺陷
         check("scan_prefix_outer f16", got_pre, ref_pre, 5e-3f);
 
         nn::Matrix D_m(rows * dk, seq), X_m(rows, seq), Y_m(rows, seq);
-        fill(D_m, gen(7)); fill(X_m, gen(8)); fill(Y_m, gen(9));
+        fill(D_m, gen(7));
+        fill(X_m, gen(8));
+        fill(Y_m, gen(9));
         auto D16 = f16(D_m), X16 = f16(X_m), Y16 = f16(Y_m);
-        auto ref_suf = run_cpu([&] {
-            return cpu.scan_suffix_outer(
-                cpu.from_matrix(D_m).value(), cpu.from_matrix(X_m).value(),
-                cpu.from_matrix(Y_m).value(), dk, 1u, true,
-                cpu.from_matrix(bnd_m).value(), true); });
-        auto got_suf = gpu_op([&] {
-            return engine.scan_suffix_outer(D16, X16, Y16, dk, 1u, true,
-                                            bnd16, true, nn::Precision::F16); });
+        auto ref_suf = run_cpu(
+            [&]
+            {
+                return cpu.scan_suffix_outer(cpu.from_matrix(D_m).value(),
+                                             cpu.from_matrix(X_m).value(),
+                                             cpu.from_matrix(Y_m).value(), dk, 1u, true,
+                                             cpu.from_matrix(bnd_m).value(), true);
+            });
+        auto got_suf = gpu_op(
+            [&]
+            {
+                return engine.scan_suffix_outer(D16, X16, Y16, dk, 1u, true, bnd16, true,
+                                                nn::Precision::F16);
+            });
         check("scan_suffix_outer f16", got_suf, ref_suf, 5e-3f);
 
-        auto ref_oc = run_cpu([&] {
-            return cpu.outer_col(cpu.from_matrix(P_m).value(),
-                                 cpu.from_matrix(R_m).value(),
-                                 cpu.from_matrix(V_m).value(), dk, true); });
-        auto got_oc = gpu_op([&] {
-            return engine.outer_col(P16, R16, V16, dk, true, nn::Precision::F16); });
+        auto ref_oc = run_cpu(
+            [&]
+            {
+                return cpu.outer_col(cpu.from_matrix(P_m).value(), cpu.from_matrix(R_m).value(),
+                                     cpu.from_matrix(V_m).value(), dk, true);
+            });
+        auto got_oc =
+            gpu_op([&] { return engine.outer_col(P16, R16, V16, dk, true, nn::Precision::F16); });
         check("outer_col f16", got_oc, ref_oc, 5e-3f);
     }
 
@@ -281,7 +348,8 @@ int main() {
 }
 #else
 #include <cstdio>
-int main() {
+int main()
+{
     // 纯 CPU 构建：无法执行 GPU 用例 → 77 = ctest SKIP（不得计为 Passed）
     printf("[SKIP] Vulkan not available\n");
     return 77;

@@ -130,17 +130,13 @@ struct RunDriverConfig
 class RunDriver
 {
 public:
-    [[nodiscard]] static Result<RunDriver> create(TrainingSession& session,
-                                                  BatchSource& source,
+    [[nodiscard]] static Result<RunDriver> create(TrainingSession& session, BatchSource& source,
                                                   std::unique_ptr<TrainState> state,
                                                   RunDriverConfig cfg)
     {
-        if (!state)
-            NN_FAIL("RunDriver::create: state 不能为空（域需提供其 TrainState 子类）");
-        if (cfg.epochs < 0)
-            NN_FAIL("RunDriver::create: epochs 不能为负");
-        if (cfg.stop_after_epoch < 0)
-            NN_FAIL("RunDriver::create: stop_after_epoch 不能为负");
+        if (!state) NN_FAIL("RunDriver::create: state 不能为空（域需提供其 TrainState 子类）");
+        if (cfg.epochs < 0) NN_FAIL("RunDriver::create: epochs 不能为负");
+        if (cfg.stop_after_epoch < 0) NN_FAIL("RunDriver::create: stop_after_epoch 不能为负");
         if (cfg.stop_after_epoch > cfg.epochs && cfg.epochs > 0)
             NN_FAIL("RunDriver::create: stop_after_epoch 超出 epochs");
         return RunDriver(session, source, std::move(state), std::move(cfg));
@@ -152,8 +148,7 @@ public:
     // 驱动：epoch×step 循环 + lr 接线 + 断点节奏 + 报告。
     [[nodiscard]] Result<RunReport> fit()
     {
-        if (!hooks_.do_update)
-            NN_FAIL("RunDriver::fit: do_update 钩子必选（域的单步更新逻辑）");
+        if (!hooks_.do_update) NN_FAIL("RunDriver::fit: do_update 钩子必选（域的单步更新逻辑）");
 
         const auto t0 = std::chrono::steady_clock::now();
         RunReport report;
@@ -164,8 +159,7 @@ public:
 
         // 起点（断点续训 = 计数器"下一步的位置"）
         const std::size_t start_epoch = static_cast<std::size_t>(state_->counters.epoch);
-        const std::size_t start_step =
-            static_cast<std::size_t>(state_->counters.step_in_epoch);
+        const std::size_t start_step = static_cast<std::size_t>(state_->counters.step_in_epoch);
         if (epoch_mode && start_epoch > static_cast<std::size_t>(cfg_.epochs))
             NN_FAIL("RunDriver::fit: 断点 epoch 超出本次配方 epochs");
 
@@ -176,7 +170,8 @@ public:
         epoch_lr_cfg.warmup_epochs = cfg_.warmup_epochs;
         epoch_lr_cfg.total_epochs = (cfg_.epochs > 0) ? cfg_.epochs : 1;
         epoch_lr_cfg.schedule = cfg_.lr_schedule;
-        for (Scalar v : cfg_.lr_per_epoch) epoch_lr_cfg.lr_per_epoch.push_back(v);
+        for (Scalar v : cfg_.lr_per_epoch)
+            epoch_lr_cfg.lr_per_epoch.push_back(v);
 
         // lr 调度配置（step 级；step_cosine 用）
         StepLrScheduleConfig step_lr_cfg;
@@ -184,9 +179,9 @@ public:
         step_lr_cfg.min_lr = cfg_.min_lr;
         step_lr_cfg.warmup_steps = static_cast<int>(cfg_.warmup_steps);
         step_lr_cfg.total_steps = static_cast<int>(
-            (steps_per_epoch > 0) ? steps_per_epoch * static_cast<std::size_t>(
-                                       (cfg_.epochs > 0) ? cfg_.epochs : 1)
-                                  : cfg_.max_steps);
+            (steps_per_epoch > 0)
+                ? steps_per_epoch * static_cast<std::size_t>((cfg_.epochs > 0) ? cfg_.epochs : 1)
+                : cfg_.max_steps);
         step_lr_cfg.cosine = (cfg_.lr_schedule == "step_cosine");
 
         Scalar current_lr = cfg_.lr;
@@ -215,9 +210,9 @@ public:
         // 绝对步号 = epoch·steps_per_epoch + step（与 step 级调度同定义；
         // 跨续训累计，进程无关）。步进驱动退化为 step 本身。
         auto abs_global_step = [steps_per_epoch](std::size_t epoch,
-                                                 std::size_t step) -> std::uint64_t {
-            return static_cast<std::uint64_t>(epoch) *
-                       static_cast<std::uint64_t>(steps_per_epoch) +
+                                                 std::size_t step) -> std::uint64_t
+        {
+            return static_cast<std::uint64_t>(epoch) * static_cast<std::uint64_t>(steps_per_epoch) +
                    static_cast<std::uint64_t>(step);
         };
 
@@ -257,17 +252,16 @@ public:
 
                 const std::size_t epoch_first_step =
                     (static_cast<std::size_t>(epoch) == start_epoch) ? start_step : 0;
-                NN_TRY(rw2, source_.rewind(static_cast<std::size_t>(epoch),
-                                           epoch_first_step));
+                NN_TRY(rw2, source_.rewind(static_cast<std::size_t>(epoch), epoch_first_step));
 
                 for (std::size_t step = epoch_first_step; step < steps_per_epoch; ++step)
                 {
                     if (cfg_.lr_schedule == "step_cosine")
                     {
-                        const int gstep = static_cast<int>(
-                            static_cast<std::uint64_t>(epoch) *
-                                static_cast<std::uint64_t>(steps_per_epoch) +
-                            static_cast<std::uint64_t>(step));
+                        const int gstep =
+                            static_cast<int>(static_cast<std::uint64_t>(epoch) *
+                                                 static_cast<std::uint64_t>(steps_per_epoch) +
+                                             static_cast<std::uint64_t>(step));
                         const Scalar slr = compute_step_lr(step_lr_cfg, gstep);
                         if (slr != current_lr)
                         {
@@ -283,8 +277,7 @@ public:
                     UpdateRequest req;
                     req.epoch = static_cast<std::size_t>(epoch);
                     req.step = step;
-                    req.global_step =
-                        abs_global_step(static_cast<std::size_t>(epoch), step);
+                    req.global_step = abs_global_step(static_cast<std::size_t>(epoch), step);
                     req.lr = current_lr;
                     req.is_final_step = is_final;
                     req.steps_per_epoch = steps_per_epoch;
@@ -303,8 +296,7 @@ public:
 
                     // save_interval 断点（以 update step 计）
                     if (cfg_.save_interval > 0 &&
-                        ((step + 1) % cfg_.save_interval == 0 ||
-                         step + 1 == steps_per_epoch))
+                        ((step + 1) % cfg_.save_interval == 0 || step + 1 == steps_per_epoch))
                     {
                         NN_TRY(ck, do_checkpoint(static_cast<std::size_t>(epoch), step + 1));
                     }
@@ -348,8 +340,7 @@ public:
                 }
 
                 // --stop-after-epoch：训到该 epoch（1-based，不含）即退出
-                if (cfg_.stop_after_epoch > 0 &&
-                    epoch + 1 >= cfg_.stop_after_epoch)
+                if (cfg_.stop_after_epoch > 0 && epoch + 1 >= cfg_.stop_after_epoch)
                 {
                     stop_training = true;
                     last_epoch = static_cast<std::size_t>(epoch) + 1;
@@ -443,8 +434,8 @@ public:
     [[nodiscard]] const RunDriverConfig& config() const noexcept { return cfg_; }
 
 private:
-    RunDriver(TrainingSession& session, BatchSource& source,
-              std::unique_ptr<TrainState> state, RunDriverConfig cfg)
+    RunDriver(TrainingSession& session, BatchSource& source, std::unique_ptr<TrainState> state,
+              RunDriverConfig cfg)
         : session_(session), source_(source), state_(std::move(state)), cfg_(std::move(cfg))
     {
     }

@@ -8,6 +8,8 @@
 //   [3] 交叉校验：配方不一致 Strict fail-fast、Relaxed 放行
 //   [4] 续训连通：resume 后继续 train_step，参数确实移动（优化器状态接上）
 //   [5] 域字段不被覆盖：save_checkpoint 不清掉域预填的 dataset 身份
+//   [6] 续训 → 再存档 → 再续训：优化器 t 连续累计不退化（issue #42）
+//   [7] 失败路径无半提交：Strict 校验失败后模型参数逐位不变（issue #43）
 // ─────────────────────────────────────────────────────────────────────────
 
 #include <cmath>
@@ -22,20 +24,20 @@
 
 int g_fail = 0;
 
-namespace {
+namespace
+{
 
-constexpr std::size_t VOCAB = 32, D_MODEL = 16, SEQ_LEN = 8, HEADS = 2,
-                      D_FF = 32, LAYERS = 1;
+constexpr std::size_t VOCAB = 32, D_MODEL = 16, SEQ_LEN = 8, HEADS = 2, D_FF = 32, LAYERS = 1;
 
 std::filesystem::path scratch_dir()
 {
-    const auto dir = std::filesystem::temp_directory_path() /
-                     "nn_session_ckpt_test";
+    const auto dir = std::filesystem::temp_directory_path() / "nn_session_ckpt_test";
     std::filesystem::create_directories(dir);
     return dir;
 }
 
-nn::ModelSpec tiny_spec() { return nn::make_gpt_spec(VOCAB, D_MODEL, SEQ_LEN, HEADS, D_FF, LAYERS); }
+nn::ModelSpec tiny_spec()
+{ return nn::make_gpt_spec(VOCAB, D_MODEL, SEQ_LEN, HEADS, D_FF, LAYERS); }
 
 std::vector<nn::Scalar> snapshot(nn::CpuEngine& e, nn::Model& m)
 {
@@ -44,31 +46,32 @@ std::vector<nn::Scalar> snapshot(nn::CpuEngine& e, nn::Model& m)
     {
         auto m2 = e.to_matrix(t.get(), nn::Precision::F32);
         NN_ASSERT_ALWAYS(m2, "snapshot: to_matrix");
-        for (auto v : m2->span()) out.push_back(v);
+        for (auto v : m2->span())
+            out.push_back(v);
     }
     return out;
 }
 
 // 走一遍 train_step（固定输入/标签，确定性）
-nn::Result<nn::TrainingStepReport> one_step(nn::TrainingSession& s,
-                                            const nn::Tensor& x, nn::Scalar lr)
+nn::Result<nn::TrainingStepReport> one_step(nn::TrainingSession& s, const nn::Tensor& x,
+                                            nn::Scalar lr)
 {
     nn::TrainingStepOptions opts;
     opts.lr = lr;
     opts.normalization_units = 1;
     opts.force_update = true;
-    return s.train_step(0, opts, [&](nn::Model& model, nn::ComputeEngine& eng,
-                                     int) -> nn::Result<nn::TrainingStepOutput> {
-        auto logits = model.forward(x);
-        if (!logits) return std::unexpected(logits.error());
-        // step_fn 契约：返回**对模型输出**的梯度；model.backward 由 session 执行
-        //（本测试焦点是断点编排，直接给常数输出梯度，不经 loss 层）
-        auto go = eng.create_tensor(logits->rows(), logits->cols(),
-                                    nn::Precision::F32, nn::InitSpec::constant(0.01f));
-        if (!go.valid())
-            return std::unexpected(nn::Error{"one_step: go 分配失败"});
-        return nn::TrainingStepOutput{std::move(go), 1, {}, 0};
-    });
+    return s.train_step(
+        0, opts,
+        [&](nn::Model& model, nn::ComputeEngine& eng, int) -> nn::Result<nn::TrainingStepOutput>
+        {
+            NN_TRY(logits, model.forward(x));
+            // step_fn 契约：返回**对模型输出**的梯度；model.backward 由 session 执行
+            //（本测试焦点是断点编排，直接给常数输出梯度，不经 loss 层）
+            auto go = eng.create_tensor(logits->rows(), logits->cols(), nn::Precision::F32,
+                                        nn::InitSpec::constant(0.01f));
+            if (!go.valid()) NN_FAIL("one_step: go 分配失败");
+            return nn::TrainingStepOutput{std::move(go), 1, {}, 0};
+        });
 }
 
 nn::TextTrainState sample_domain_state()
@@ -119,8 +122,7 @@ void test_roundtrip()
 
     // ── [1][2][5] 保存（域字段预填）──
     auto domain = sample_domain_state();
-    CHECK(session.save_checkpoint(path, tiny_spec(), domain).has_value(),
-          "[1] save_checkpoint");
+    CHECK(session.save_checkpoint(path, tiny_spec(), domain).has_value(), "[1] save_checkpoint");
     auto loaded_state = snapshot(engine, session.model());   // 保存不应改动参数
     CHECK(loaded_state == mid, "[1] save_checkpoint 不改动参数");
 
@@ -179,6 +181,8 @@ void test_roundtrip()
     auto resumed = snapshot(engine, session2.model());
     CHECK(resumed == mid, "[1] resume 后权重与断点时刻逐位一致");
     CHECK(session2.step_count() == 2, "[1] 会话计数器恢复 = 2");
+    CHECK(session2.step_count() == session2.optimizer().state_step(),
+          "[1] 会话镜像 = 优化器权威 t（issue #42）");
 
     // [3] 交叉校验：数据集身份变了 → Strict fail-fast；Relaxed 放行
     auto bad = sample_domain_state();
@@ -186,10 +190,13 @@ void test_roundtrip()
     bad.dataset.sha256 = "0000000000000000000000000000";
     auto strict_r = session2.resume(path, &bad, nn::ResumePolicy::Strict);
     CHECK(!strict_r.has_value(), "[3] Strict：数据集身份不一致 fail-fast");
+    // issue #43：校验在载权重之前 ⇒ 失败路径不得改写模型参数
+    auto after_strict = snapshot(engine, session2.model());
+    CHECK(after_strict == mid, "[3] Strict 失败后模型参数与调用前逐位一致（无半提交）");
+    CHECK(session2.step_count() == 2, "[3] Strict 失败后会话计数器不变");
     auto relaxed_r = session2.resume(path, &bad, nn::ResumePolicy::Relaxed);
     CHECK(relaxed_r.has_value(), "[3] Relaxed：放行");
-    if (!relaxed_r)
-        std::printf("     %s\n", relaxed_r.error().message.c_str());
+    if (!relaxed_r) std::printf("     %s\n", relaxed_r.error().message.c_str());
 
     // ── [4] resume 后继续训练：参数确实移动（优化器状态已接上）──
     auto before = snapshot(engine, session2.model());
@@ -201,6 +208,37 @@ void test_roundtrip()
         auto after = snapshot(engine, session2.model());
         CHECK(before != after, "[4] resume 后参数确实移动");
         CHECK(session2.step_count() == 3, "[4] 计数器继续累计 = 3");
+    }
+
+    // ── [6] 续训 → 再存档 → 再续训：优化器 t 不退化（issue #42）──
+    const auto path2 = (scratch_dir() / "roundtrip2.nnckpt").string();
+    auto domain2 = sample_domain_state();
+    CHECK(session2.save_checkpoint(path2, tiny_spec(), domain2).has_value(), "[6] 再存档");
+    auto peek2 = nn::peek_train_state(path2);
+    CHECK(peek2.has_value(), "[6] peek 二次断点");
+    if (peek2)
+    {
+        const nn::TrainState& ps = **peek2;
+        CHECK(ps.optimizer_step == session2.optimizer().state_step(),
+              "[6] 二次断点里的 optimizer_step = 优化器真实 t");
+        CHECK(ps.optimizer_step == 3, "[6] t 连续累计（2 → 3），不退化成本段步数");
+    }
+
+    auto model3_r = nn::build_gpt_model_from_spec(engine, tiny_spec(), nn::PrecisionProfile{});
+    CHECK(model3_r.has_value(), "建模型 C");
+    if (!model3_r) return;
+    auto ses3_r = nn::TrainingSession::create(std::move(*model3_r), cfg);
+    CHECK(ses3_r.has_value(), "create session C");
+    if (!ses3_r) return;
+    auto session3 = std::move(*ses3_r);
+    auto cur2 = sample_domain_state();
+    session3.fill_recipe(cur2.recipe);
+    auto st3_r = session3.resume(path2, &cur2, nn::ResumePolicy::Strict);
+    CHECK(st3_r.has_value(), "[6] 二次续训成功");
+    if (st3_r)
+    {
+        CHECK(session3.step_count() == 3, "[6] 二次续训后会话镜像 = 3");
+        CHECK(session3.optimizer().state_step() == 3, "[6] 二次续训后 Adam 的 t = 3");
     }
 }
 
@@ -228,17 +266,28 @@ void test_recipe_mismatch()
 
     // 新会话用不同优化器名 → Strict 下配方不一致 fail-fast
     auto model2_r = nn::build_gpt_model_from_spec(engine, tiny_spec(), nn::PrecisionProfile{});
-    if (!model2_r) { CHECK(false, "建模型 B"); return; }
+    if (!model2_r)
+    {
+        CHECK(false, "建模型 B");
+        return;
+    }
     nn::TrainingConfig cfg2;
     cfg2.optimizer = "sgd";   // 与断点的 adam 不一致
     auto ses2_r = nn::TrainingSession::create(std::move(*model2_r), cfg2);
-    if (!ses2_r) { CHECK(false, "create B"); return; }
+    if (!ses2_r)
+    {
+        CHECK(false, "create B");
+        return;
+    }
     auto session2 = std::move(*ses2_r);
     auto cur = sample_domain_state();
     session2.fill_recipe(cur.recipe);   // cfg2.optimizer = "sgd" ≠ 断点 "adam"
+    auto before = snapshot(engine, session2.model());
     auto r = session2.resume(path, &cur, nn::ResumePolicy::Strict);
     CHECK(!r.has_value(), "[3] Strict：optimizer 配方不一致 fail-fast");
-    // 注意：resume 内 load_model 已载入权重（断点参数），此处会话仍可用
+    // issue #43：校验先于载权重 ⇒ 失败后模型仍是这次的初始化参数
+    auto after = snapshot(engine, session2.model());
+    CHECK(after == before, "[3] Strict 配方不一致失败后模型参数未被改写");
 }
 
 } // namespace

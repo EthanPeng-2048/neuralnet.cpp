@@ -34,14 +34,14 @@ private:
     [[nodiscard]] Result<void> rebuild_encoding(ComputeEngine& engine, std::size_t total_len)
     {
         const std::size_t base_len = (tile_size_ > 0) ? tile_size_ : total_len;
-        const std::size_t batch    = (tile_size_ > 0) ? total_len / tile_size_ : 1;
+        const std::size_t batch = (tile_size_ > 0) ? total_len / tile_size_ : 1;
 
         std::vector<Scalar> enc(d_model_ * total_len);   // 宿主桥（17 §3 D11）
         const std::size_t half = d_model_ / 2;
         std::vector<Scalar> freqs(half);
         for (std::size_t i = 0; i < half; ++i)
-            freqs[i] = Scalar{1} / std::pow(Scalar{10000},
-                static_cast<Scalar>(2 * i) / static_cast<Scalar>(d_model_));
+            freqs[i] = Scalar{1} / std::pow(Scalar{10000}, static_cast<Scalar>(2 * i) /
+                                                               static_cast<Scalar>(d_model_));
 
         for (std::size_t b = 0; b < batch; ++b)
         {
@@ -52,13 +52,14 @@ private:
                 for (std::size_t i = 0; i < half; ++i)
                 {
                     const Scalar angle = pos_d * freqs[i];
-                    enc[(2 * i)     * total_len + col_off + pos] = std::sin(angle);
+                    enc[(2 * i) * total_len + col_off + pos] = std::sin(angle);
                     enc[(2 * i + 1) * total_len + col_off + pos] = std::cos(angle);
                 }
                 if (d_model_ % 2 == 1)
                 {
-                    const Scalar freq_last = Scalar{1} / std::pow(Scalar{10000},
-                        static_cast<Scalar>(2 * half) / static_cast<Scalar>(d_model_));
+                    const Scalar freq_last =
+                        Scalar{1} / std::pow(Scalar{10000}, static_cast<Scalar>(2 * half) /
+                                                                static_cast<Scalar>(d_model_));
                     enc[(d_model_ - 1) * total_len + col_off + pos] = std::sin(pos_d * freq_last);
                 }
             }
@@ -70,35 +71,26 @@ private:
     }
 
 public:
-    PositionalEncoding(std::size_t d_model, std::size_t max_len = 5000,
-                       std::size_t tile_size = 0)
+    PositionalEncoding(std::size_t d_model, std::size_t max_len = 5000, std::size_t tile_size = 0)
         : d_model_(d_model), max_len_(max_len), tile_size_(tile_size)
     {
     }
 
-    [[nodiscard]] Result<Tensor> forward(
-        const Tensor& input) override
+    [[nodiscard]] Result<Tensor> forward(const Tensor& input) override
     {
         ComputeEngine& engine = engine_ref();
-        if (input.rows() != d_model_)
-            NN_FAIL("PE forward: d_model mismatch");
+        if (input.rows() != d_model_) NN_FAIL("PE forward: d_model mismatch");
         const std::size_t total_len = input.cols();
         if (tile_size_ > 0 && total_len % tile_size_ != 0)
             NN_FAIL("PE forward: total_len not divisible by tile_size");
-        if (tile_size_ == 0 && total_len > max_len_)
-            NN_FAIL("PE forward: seq_len exceeds max_len");
-        if (cached_total_ != total_len)
-        {
-            NN_TRY(r, rebuild_encoding(engine, total_len));
-        }
+        if (tile_size_ == 0 && total_len > max_len_) NN_FAIL("PE forward: seq_len exceeds max_len");
+        if (cached_total_ != total_len) { NN_TRY(r, rebuild_encoding(engine, total_len)); }
 
-        return dsl::compute(engine,
-            dsl::leaf(input) + dsl::leaf(encoding_cache_),
-            input.rows(), input.cols(), p_.compute);
+        return dsl::compute(engine, dsl::leaf(input) + dsl::leaf(encoding_cache_), input.rows(),
+                            input.cols(), p_.compute);
     }
 
-    [[nodiscard]] Result<Tensor> backward(
-        const Tensor& grad_output) override
+    [[nodiscard]] Result<Tensor> backward(const Tensor& grad_output) override
     {
         return grad_output;  // 位置编码不可学习，梯度直接穿透
     }
@@ -124,15 +116,15 @@ private:
     Tensor residual2_cache_;
 
 public:
-    [[nodiscard]] const char* layer_name() const noexcept override { return "TransformerEncoderLayer"; }
+    [[nodiscard]] const char* layer_name() const noexcept override
+    { return "TransformerEncoderLayer"; }
 
-    TransformerEncoderLayer(std::size_t d_model, std::size_t num_heads,
-                            std::size_t d_ff, std::size_t seq_len = 0,
-                            NormType norm_type = NormType::LayerNorm)
-        : self_attn_(d_model, num_heads, seq_len),
-          norm1_(make_norm_layer(d_model, norm_type)),
-          ff_(d_model, d_ff),
-          norm2_(make_norm_layer(d_model, norm_type)) {}
+    TransformerEncoderLayer(std::size_t d_model, std::size_t num_heads, std::size_t d_ff,
+                            std::size_t seq_len = 0, NormType norm_type = NormType::LayerNorm)
+        : self_attn_(d_model, num_heads, seq_len), norm1_(make_norm_layer(d_model, norm_type)),
+          ff_(d_model, d_ff), norm2_(make_norm_layer(d_model, norm_type))
+    {
+    }
 
     [[nodiscard]] Result<void> init_impl(ComputeEngine& engine) override
     {
@@ -155,18 +147,14 @@ public:
 
     std::vector<TensorRef> parameters() override
     {
-        return collect_refs(self_attn_.parameters(),
-                            norm1_->parameters(),
-                            ff_.parameters(),
+        return collect_refs(self_attn_.parameters(), norm1_->parameters(), ff_.parameters(),
                             norm2_->parameters());
     }
 
     std::vector<TensorRef> param_gradients() override
     {
-        return collect_refs(self_attn_.param_gradients(),
-                            norm1_->param_gradients(),
-                            ff_.param_gradients(),
-                            norm2_->param_gradients());
+        return collect_refs(self_attn_.param_gradients(), norm1_->param_gradients(),
+                            ff_.param_gradients(), norm2_->param_gradients());
     }
 
     // 梯度检查点：把模式传播给内部注意力/归一化/FFN
@@ -181,8 +169,7 @@ public:
 
     [[nodiscard]] bool recompute_supported() const override { return true; }
 
-    [[nodiscard]] Result<Tensor> forward_recompute(
-        const Tensor& saved_input) override
+    [[nodiscard]] Result<Tensor> forward_recompute(const Tensor& saved_input) override
     {
         // 临时关闭本层及其子层的 checkpoint 模式，使 forward 重建缓存
         set_checkpoint_mode(false);
@@ -211,26 +198,22 @@ public:
         norm2_->set_training(training);
     }
 
-    [[nodiscard]] Result<Tensor> forward(
-        const Tensor& input) override
+    [[nodiscard]] Result<Tensor> forward(const Tensor& input) override
     {
         ComputeEngine& engine = engine_ref();
         // 残差分支 1（Pre-Norm + 自注意力），与 GPTBlock/RAPTBlock 同骨架
         NN_TRY(r2, prenorm_residual_forward_(engine, input, *norm1_, self_attn_, p_.compute));
         Tensor res2 = std::move(*r2);
-        if (!checkpoint_mode_)
-            residual2_cache_ = res2;
+        if (!checkpoint_mode_) residual2_cache_ = res2;
         // 残差分支 2（Pre-Norm + FFN）
         return prenorm_residual_forward_(engine, res2, *norm2_, ff_, p_.compute);
     }
 
-    [[nodiscard]] Result<Tensor> backward(
-        const Tensor& grad_output) override
+    [[nodiscard]] Result<Tensor> backward(const Tensor& grad_output) override
     {
         ComputeEngine& engine = engine_ref();
         // 两处残差分流 + 子层反向（与 GPTBlock / RAPTBlock 同一骨架）
-        return prenorm_residual_backward_(engine, grad_output,
-                                          *norm1_, self_attn_, *norm2_, ff_,
+        return prenorm_residual_backward_(engine, grad_output, *norm1_, self_attn_, *norm2_, ff_,
                                           p_.compute);
     }
 };
@@ -270,11 +253,9 @@ private:
 public:
     [[nodiscard]] const char* layer_name() const noexcept override { return "TransformerEncoder"; }
 
-    TransformerEncoder(std::size_t d_model, std::size_t num_heads,
-                       std::size_t d_ff, std::size_t num_layers,
-                       std::size_t num_patches,
-                       NormType norm_type = NormType::LayerNorm,
-                       bool final_norm = false)
+    TransformerEncoder(std::size_t d_model, std::size_t num_heads, std::size_t d_ff,
+                       std::size_t num_layers, std::size_t num_patches,
+                       NormType norm_type = NormType::LayerNorm, bool final_norm = false)
         : d_model_(d_model), num_patches_(num_patches),
           inv_num_patches_(Scalar{1} / static_cast<Scalar>(num_patches)),
           // PE 启用 tiling：每个样本独立使用 (d_model, num_patches) 的编码
@@ -283,8 +264,7 @@ public:
         // 所有 EncoderLayer 传入 seq_len=num_patches，启用 MHA 批量化路径
         for (std::size_t i = 0; i < num_layers; ++i)
             layers_.emplace_back(d_model, num_heads, d_ff, num_patches, norm_type);
-        if (final_norm)
-            ln_f_ = make_norm_layer(d_model, norm_type);
+        if (final_norm) ln_f_ = make_norm_layer(d_model, norm_type);
     }
 
     [[nodiscard]] Result<void> init_impl(ComputeEngine& engine) override
@@ -299,13 +279,9 @@ public:
         }
         // 预创建 ones_row_ (1, num_patches) 全1，用于 backward 广播
         // （M2 声明式：引擎填数，原 from_matrix 口径 = F32）
-        if (ln_f_)
-        {
-            NN_TRY(rn, ln_f_->init(engine));
-        }
+        if (ln_f_) { NN_TRY(rn, ln_f_->init(engine)); }
         ones_row_ = engine.create_tensor(1, num_patches_, Precision::F32, InitSpec::constant(1));
-        if (!ones_row_.valid())
-            NN_FAIL("TransformerEncoder: ones_row_ 初始化失败");
+        if (!ones_row_.valid()) NN_FAIL("TransformerEncoder: ones_row_ 初始化失败");
         return {};
     }
 
@@ -313,7 +289,8 @@ public:
     void set_precision_profile(const PrecisionProfile& profile) override
     {
         Layer::set_precision_profile(profile);
-        for (auto& l : layers_) l.set_precision_profile(profile);
+        for (auto& l : layers_)
+            l.set_precision_profile(profile);
         if (ln_f_) ln_f_->set_precision_profile(profile);
         pos_encoding_.set_precision_profile(profile);
     }
@@ -323,14 +300,16 @@ public:
     void set_training(bool training) override
     {
         Layer::set_training(training);
-        for (auto& l : layers_) l.set_training(training);
+        for (auto& l : layers_)
+            l.set_training(training);
         if (ln_f_) ln_f_->set_training(training);
     }
 
     // 缓存释放同 GPTModel/RAPTModel：逐层下传（含 final norm）
     void clear_cache() override
     {
-        for (auto& l : layers_) l.clear_cache();
+        for (auto& l : layers_)
+            l.clear_cache();
         if (ln_f_) ln_f_->clear_cache();
     }
 
@@ -356,13 +335,11 @@ public:
         return refs;
     }
 
-    [[nodiscard]] Result<Tensor> forward(
-        const Tensor& input) override
+    [[nodiscard]] Result<Tensor> forward(const Tensor& input) override
     {
         ComputeEngine& engine = engine_ref();
         // input: (d_model, batch * num_patches)
-        if (input.rows() != d_model_)
-            NN_FAIL("TransformerEncoder: row count mismatch");
+        if (input.rows() != d_model_) NN_FAIL("TransformerEncoder: row count mismatch");
         if (input.cols() % num_patches_ != 0)
             NN_FAIL("TransformerEncoder: cols not divisible by num_patches");
         batch_size_ = input.cols() / num_patches_;
@@ -394,19 +371,18 @@ public:
         //   再 rearrange_3d inverse 回 (d_model, batch)。
         NN_TRY(re, engine.rearrange_3d(x, d_model_, batch_size_, num_patches_, false));
         // 归约步走 dsl::compute_reduce（输出与输入同形）
-        auto row_sum = dsl::compute_reduce(engine,
-            dsl::row_reduce_sum(dsl::leaf(*re)), re->rows(), re->cols(), p_.compute);
+        auto row_sum = dsl::compute_reduce(engine, dsl::row_reduce_sum(dsl::leaf(*re)), re->rows(),
+                                           re->cols(), p_.compute);
         NN_TRY_CHECK(row_sum);
         NN_TRY(rs_re, engine.rearrange_3d(*row_sum, d_model_, batch_size_, 1, true));
         // 原地缩放走 dsl::compute_into（inv_num_patches_ 走 rparam，值不进 key）
-        auto r = dsl::compute_into(engine,
-            dsl::leaf(*rs_re) * dsl::rparam(inv_num_patches_), *rs_re);
+        auto r =
+            dsl::compute_into(engine, dsl::leaf(*rs_re) * dsl::rparam(inv_num_patches_), *rs_re);
         NN_TRY_CHECK(r);
         return *rs_re;
     }
 
-    [[nodiscard]] Result<Tensor> backward(
-        const Tensor& grad_output) override
+    [[nodiscard]] Result<Tensor> backward(const Tensor& grad_output) override
     {
         ComputeEngine& engine = engine_ref();
         // grad_output: (d_model, batch) — 来自下游 Linear.backward
@@ -419,15 +395,13 @@ public:
         //         rearrange_3d(result, d_model, batch, num_patches, true) → (d_model, batch*num_patches)
         NN_TRY(g_re, engine.rearrange_3d(grad_output, d_model_, batch_size_, 1, false));
         // 原地缩放走 dsl::compute_into（inv_num_patches_ 走 rparam，值不进 key）
-        auto r = dsl::compute_into(engine,
-            dsl::leaf(*g_re) * dsl::rparam(inv_num_patches_), *g_re);
+        auto r = dsl::compute_into(engine, dsl::leaf(*g_re) * dsl::rparam(inv_num_patches_), *g_re);
         NN_TRY_CHECK(r);
         // (*g_re): (batch*d_model, 1) × ones_row_ (1, num_patches) → (batch*d_model, num_patches)
         // 纯 matmul 走 DSL 直写（结构经 scan 的 TransformerEncoderLayer dry-run 登记；
         // 注意该调用在 pooling 路径，scan 的 enc dry-run 覆盖 forward/backward）
-        auto unpooled = dsl::compute(engine,
-            dsl::matmul(*g_re, ones_row_, false, false),
-            g_re->rows(), ones_row_.cols(), p_.compute);
+        auto unpooled = dsl::compute(engine, dsl::matmul(*g_re, ones_row_, false, false),
+                                     g_re->rows(), ones_row_.cols(), p_.compute);
         NN_TRY_CHECK(unpooled);
         NN_TRY(grad, engine.rearrange_3d(*unpooled, d_model_, batch_size_, num_patches_, true));
         Tensor grad_x = std::move(*grad);
@@ -442,8 +416,7 @@ public:
 
         for (auto it = layers_.rbegin(); it != layers_.rend(); ++it)
         {
-            const std::size_t li =
-                static_cast<std::size_t>(layers_.rend() - it) - 1;
+            const std::size_t li = static_cast<std::size_t>(layers_.rend() - it) - 1;
             NN_PROF_SCOPE(nn::prof::interned("bwd.enc", li));
             NN_TRY(br, it->backward(grad_x));
             grad_x = std::move(*br);
@@ -482,14 +455,10 @@ private:
 public:
     [[nodiscard]] const char* layer_name() const noexcept override { return "PatchEmbedding"; }
 
-    PatchEmbedding(std::size_t img_size, std::size_t patch_size,
-                   std::size_t d_model)
-        : img_size_(img_size), patch_size_(patch_size),
-          grid_size_(img_size / patch_size),
-          num_patches_(grid_size_ * grid_size_),
-          patch_dim_(patch_size * patch_size),
-          d_model_(d_model),
-          projection_(patch_dim_, d_model)
+    PatchEmbedding(std::size_t img_size, std::size_t patch_size, std::size_t d_model)
+        : img_size_(img_size), patch_size_(patch_size), grid_size_(img_size / patch_size),
+          num_patches_(grid_size_ * grid_size_), patch_dim_(patch_size * patch_size),
+          d_model_(d_model), projection_(patch_dim_, d_model)
     {
         // RV-01：不整除 → num_patches_ 少算、后续按错误形状索引 → 无条件终止
         NN_ASSERT_ALWAYS(img_size % patch_size == 0,
@@ -497,9 +466,7 @@ public:
     }
 
     [[nodiscard]] Result<void> init_impl(ComputeEngine& engine) override
-    {
-        return projection_.init(engine);
-    }
+    { return projection_.init(engine); }
 
     // ── D7：精度配置下传（§9.2）：投影层是复合层的唯一子层 ───────────────
     void set_precision_profile(const PrecisionProfile& profile) override
@@ -509,16 +476,13 @@ public:
     }
 
     [[nodiscard]] std::size_t num_patches() const noexcept { return num_patches_; }
-    [[nodiscard]] std::size_t d_model()     const noexcept { return d_model_; }
+    [[nodiscard]] std::size_t d_model() const noexcept { return d_model_; }
 
-    std::vector<TensorRef> parameters() override
-    { return projection_.parameters(); }
+    std::vector<TensorRef> parameters() override { return projection_.parameters(); }
 
-    std::vector<TensorRef> param_gradients() override
-    { return projection_.param_gradients(); }
+    std::vector<TensorRef> param_gradients() override { return projection_.param_gradients(); }
 
-    [[nodiscard]] Result<Tensor> forward(
-        const Tensor& input) override
+    [[nodiscard]] Result<Tensor> forward(const Tensor& input) override
     {
         ComputeEngine& engine = engine_ref();
         input_cache_ = input;
@@ -546,23 +510,22 @@ public:
                     for (std::size_t pc = 0; pc < patch_size_; ++pc)
                     {
                         const std::size_t flat = pr * patch_size_ + pc;
-                        const std::size_t pix  = (gr + pr) * img_size_ + (gc + pc);
+                        const std::size_t pix = (gr + pr) * img_size_ + (gc + pc);
                         all_patches[flat * (batch * num_patches_) + col_idx] =
                             (*in_v)[pix * in_cols + b];
                     }
             }
         }
 
-        auto ap_t = detail::upload_span(engine, patch_dim_, batch * num_patches_,
-                                        Precision::F32, std::span(all_patches));
+        auto ap_t = detail::upload_span(engine, patch_dim_, batch * num_patches_, Precision::F32,
+                                        std::span(all_patches));
         NN_TRY_CHECK(ap_t);
 
         // Step 2: 投影 → (d_model, batch * num_patches) — 已是 batch-major，无需重排
         return projection_.forward(*ap_t);
     }
 
-    [[nodiscard]] Result<Tensor> backward(
-        const Tensor& grad_output) override
+    [[nodiscard]] Result<Tensor> backward(const Tensor& grad_output) override
     {
         ComputeEngine& engine = engine_ref();
         // grad_output: (d_model, batch * num_patches) — batch-major
@@ -588,15 +551,14 @@ public:
                     for (std::size_t pc = 0; pc < patch_size_; ++pc)
                     {
                         const std::size_t flat = pr * patch_size_ + pc;
-                        const std::size_t pix  = (gr + pr) * img_size_ + (gc + pc);
-                        const std::size_t gi   = pix * batch + b;
-                        grad_input[gi] = grad_input[gi]
-                                       + (*gp_v)[flat * gp_cols + col_idx];
+                        const std::size_t pix = (gr + pr) * img_size_ + (gc + pc);
+                        const std::size_t gi = pix * batch + b;
+                        grad_input[gi] = grad_input[gi] + (*gp_v)[flat * gp_cols + col_idx];
                     }
             }
         }
-        return detail::upload_span(engine, img_size_ * img_size_, batch,
-                                   Precision::F32, std::span(grad_input));
+        return detail::upload_span(engine, img_size_ * img_size_, batch, Precision::F32,
+                                   std::span(grad_input));
     }
 };
 

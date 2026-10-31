@@ -10,7 +10,7 @@ cmake_minimum_required(VERSION 3.30)
 
 # VERSION 以 git tag 为准（本仓无 CONFIGURE_FILE 消费该字段，
 # 它只是元数据——发版时同步到最新 tag，实际版本以 git tag / gh release 为准）
-project(neuralnet.cpp VERSION 1.13.0 LANGUAGES CXX)
+project(neuralnet.cpp VERSION 1.14.1 LANGUAGES CXX)
 
 # ── IDE / clangd：导出 compile_commands.json（仅顶层工程时）───────────────
 # include 路径（include/ + extern/*/include + build/generated）全部来自
@@ -120,6 +120,14 @@ if(MSVC)
     add_link_options(/STACK:8388608)
 else()
     add_compile_options(-fno-exceptions -Wall -Wextra -Wpedantic -Werror)
+    # GCC 15.2 在 -O3 + PCH 下对 std::optional / std::unique_ptr 的**内联析构**
+    # 报 -Wmaybe-uninitialized 假阳性（诊断里的内存位置全是 <unknown>；实测
+    # src/layer_lifetime_test.cpp 的 `unique_ptr<nn::Model>` 析构路径，成员已由
+    # make_unique/默认初始化，无真实未初始化读取）。Clang 不产生该告警，因此
+    # 只对 GNU 关闭此子告警；-Wuninitialized 保持开启。
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        add_compile_options(-Wno-maybe-uninitialized)
+    endif()
 endif()
 
 # Windows 上的 clang++（GNU-like 驱动）不是 CMake 的 MSVC 分支，但链接仍走

@@ -51,14 +51,12 @@ public:
     // float16，全链 float16_t 计算）。仅当 expr_prec_sig_native16(spec, sig)
     // 为真时请求；否则返回空串（上层跳过）。f32 算术变体（native16=false）
     // 与 native16 变体**并存**——设备按 shaderFloat16 能力选 pipeline。
-    [[nodiscard]] virtual std::string generate(
-        const std::string& name_, const ExprSpec& spec,
-        ExprPrecSig sig = 0, bool native16 = false) = 0;
+    [[nodiscard]] virtual std::string generate(const std::string& name_, const ExprSpec& spec,
+                                               ExprPrecSig sig = 0, bool native16 = false) = 0;
 
     // 归约 kernel 源码；不支持（混合轴/超槽/带类型变体）返回空串
-    [[nodiscard]] virtual std::string generate_reduce(
-        const std::string& name_, const ExprSpec& spec,
-        ExprPrecSig sig = 0) = 0;
+    [[nodiscard]] virtual std::string
+    generate_reduce(const std::string& name_, const ExprSpec& spec, ExprPrecSig sig = 0) = 0;
 
     // 批量变体 kernel 源码（键 = key#b，P3 跨链批量派发）：同结构多实例
     // 经实例表（uvec2 数组，stride = 输入+输出+尾槽）+ buffer device address
@@ -68,8 +66,9 @@ public:
     // 编码里 → 带 extras 的 f16 结构仍逐 kernel 降级）。运行期分派哨兵不支持。
     // 默认返回空串 = 该后端不支持 → 运行期回退逐 kernel 派发（闭合世界降级，
     // 不是错误）。
-    [[nodiscard]] virtual std::string generate_batched(
-        const std::string&, const ExprSpec&, ExprPrecSig = 0) const { return {}; }
+    [[nodiscard]] virtual std::string generate_batched(const std::string&, const ExprSpec&,
+                                                       ExprPrecSig = 0) const
+    { return {}; }
 
     // matmul 细 tile 变体 kernel 源码（键 = key#f，P0 wgrad 网格饥饿）：
     // 输出块 64×64 → 16×16、16×16 线程 → 8×8、每线程 4×4 → 2×2 输出
@@ -81,8 +80,9 @@ public:
     // EXPR_PREC_STORAGE_SUFFIX / expr_prec_sig_key）。运行期分派哨兵不支持。
     // 默认返回空串 = 该后端不支持 → 构建期不产出条目、运行期留在 64-tile
     // 路径（降级，不是错误）。
-    [[nodiscard]] virtual std::string generate_matmul_fine(
-        const std::string&, const ExprSpec&, ExprPrecSig = 0) const { return {}; }
+    [[nodiscard]] virtual std::string generate_matmul_fine(const std::string&, const ExprSpec&,
+                                                           ExprPrecSig = 0) const
+    { return {}; }
 
     // matmul K 切分变体 kernel 源码（键 = key#ks，wgrad 二次归约）：
     // 细 tile 网格仍低于 EXPR_MATMUL_KSPLIT_MIN_WGS 时，把求和维 K 切成
@@ -94,16 +94,18 @@ public:
     // 由伴生 #kr（generate_matmul_ksplit_reduce）完成二次归约 + 尾链。
     // 默认返回空串 = 该后端不支持 → 构建期不产出条目、运行期留细 tile
     // 路径（降级，不是错误）。
-    [[nodiscard]] virtual std::string generate_matmul_ksplit(
-        const std::string&, const ExprSpec&, ExprPrecSig = 0) const { return {}; }
+    [[nodiscard]] virtual std::string generate_matmul_ksplit(const std::string&, const ExprSpec&,
+                                                             ExprPrecSig = 0) const
+    { return {}; }
 
     // K 切分伴生归约 kernel 源码（键 = key#kr）：绑定 = 原输入 0..N-1 +
     // 部分和（binding N）+ 输出（binding N+1）；读段数经 PC（mm_k 槽位）。
     // 求和按段号升序左折（确定性），随后跑与 V0 同源的尾链。
     // 与 generate_matmul_ksplit 配对产出（有 #ks 才有 #kr）。
     // 默认返回空串 = 该后端不支持 → 构建期不产出条目（#ks 同步不产出）。
-    [[nodiscard]] virtual std::string generate_matmul_ksplit_reduce(
-        const std::string&, const ExprSpec&, ExprPrecSig = 0) const { return {}; }
+    [[nodiscard]] virtual std::string
+    generate_matmul_ksplit_reduce(const std::string&, const ExprSpec&, ExprPrecSig = 0) const
+    { return {}; }
 };
 
 // ── 简单注册表：按后端名选择 emitter 工厂 ────────────────────────────────
@@ -114,7 +116,7 @@ namespace emitter_registry
 {
 
 // 工厂返回 unique_ptr（铁律 2：无裸指针所有权）；make() 直接转发。
-using Factory = std::unique_ptr<ExprEmitter>(*)();
+using Factory = std::unique_ptr<ExprEmitter> (*)();
 
 // 后端表（静态初始化，见各 emitter 头文件的登记语句）
 inline std::unordered_map<std::string, Factory>& backends()
@@ -135,8 +137,7 @@ inline bool register_backend(std::string_view name, Factory factory)
 {
     const auto& m = backends();
     const auto it = m.find(std::string(name));
-    if (it == m.end())
-        return nullptr;
+    if (it == m.end()) return nullptr;
     return it->second();
 }
 
@@ -153,4 +154,3 @@ inline bool register_backend(std::string_view name, Factory factory)
 } // namespace emitter_registry
 
 } // namespace nn
-

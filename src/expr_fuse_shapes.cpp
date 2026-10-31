@@ -17,15 +17,16 @@
 #ifdef NN_EXPR_SCAN
 namespace
 {
-const int g_scan_self_registered = [] {
+const int g_scan_self_registered = []
+{
     auto eng_owner = nn::CpuEngine::create();
     nn::CpuEngine& eng = *eng_owner;
     constexpr std::size_t R = 5, C = 7, M = 3, K = 4, N = 2;
-    auto x    = eng.create_tensor(R, C);
-    auto g    = eng.create_tensor(R, 1);
-    auto w    = eng.create_tensor(R, C);
-    auto a0   = eng.create_tensor(M, K);
-    auto b0   = eng.create_tensor(K, N);
+    auto x = eng.create_tensor(R, C);
+    auto g = eng.create_tensor(R, 1);
+    auto w = eng.create_tensor(R, C);
+    auto a0 = eng.create_tensor(M, K);
+    auto b0 = eng.create_tensor(K, N);
     auto bias = eng.create_tensor(M, N);
 
     // 录制段 1：3 节点链（用例 1）

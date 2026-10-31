@@ -26,7 +26,7 @@
 using nn::Scalar;
 
 // ==================== 帮助信息 ====================
-void print_usage(const char *prog)
+void print_usage(const char* prog)
 {
     nn::cli::Help help(std::cout, prog, "GPT 文本生成推理程序");
 
@@ -36,11 +36,17 @@ void print_usage(const char *prog)
                "多轮对话（历史由调用方自带，一次一问）");
 
     help.section("选项");
-    help.opt("--model <path>", "模型文件路径 (默认: gpt_model.bin)\nV3 格式模型自动读取规格和嵌入 tokenizer");
-    help.opt("--vocab <path>", "词表 .nnvocab 路径 (默认: bpe_vocab.nnvocab)\n仅当模型未嵌入 tokenizer 时使用；自动识别分词器类型 (bpe / charbpe)");
+    help.opt("--model <path>",
+             "模型文件路径 (默认: gpt_model.bin)\nV3 格式模型自动读取规格和嵌入 tokenizer");
+    help.opt("--vocab <path>", "词表 .nnvocab 路径 (默认: bpe_vocab.nnvocab)\n仅当模型未嵌入 "
+                               "tokenizer 时使用；自动识别分词器类型 (bpe / charbpe)");
     help.opt("--prompt <text>", "输入提示文本");
-    help.opt("--turn <role>:<text>", "追加一轮对话历史；role = user|assistant，可重复。\n给了 --turn 即进入多轮对话模式：按词表的对话标记拼 prompt\n（末条必须是 user），并从最旧的一问一答开始截断到模型 seq_len");
-    help.opt("--reply-out <path>", "多轮模式：把本轮回复（纯文本）另写一份到该文件\n（GUI 靠它取回复，无需解析日志）");
+    help.opt("--turn <role>:<text>",
+             "追加一轮对话历史；role = user|assistant，可重复。\n给了 --turn "
+             "即进入多轮对话模式：按词表的对话标记拼 prompt\n（末条必须是 "
+             "user），并从最旧的一问一答开始截断到模型 seq_len");
+    help.opt("--reply-out <path>",
+             "多轮模式：把本轮回复（纯文本）另写一份到该文件\n（GUI 靠它取回复，无需解析日志）");
     help.opt("--system <text>", "对话模式的系统提示（默认: 你是一个有用的AI助手。）");
     help.opt("--interactive", "交互式生成模式（多轮，上下文累积保留）");
     help.opt("--max-tokens <n>", "最大生成 token 数 (默认: 200)");
@@ -51,7 +57,9 @@ void print_usage(const char *prog)
     help.opt("--repeat-window <n>", "重复惩罚只看最近 n 个 token (默认: 0=全部上下文)");
     help.opt("--seed <n>", "随机种子 (给了就固定种子 ⇒ 同 prompt 输出可复现)");
     help.opt("--show-tokens", "显示 token ID (调试用)");
-    help.opt("--gpu [索引|名称]", "启用 GPU 加速 (需要 Vulkan SDK)\n空格形式只收枚举索引；名称子串用 --gpu=<名称>，如 --gpu=NVIDIA / --gpu=40HX");
+    help.opt("--gpu [索引|名称]",
+             "启用 GPU 加速 (需要 Vulkan SDK)\n空格形式只收枚举索引；名称子串用 --gpu=<名称>，如 "
+             "--gpu=NVIDIA / --gpu=40HX");
     help.opt("--help, -h", "显示此帮助信息");
 }
 
@@ -79,7 +87,7 @@ struct InferConfig
     std::string gpu_device;      // --gpu 的可选设备选择子（空 = 自动选卡）
 };
 
-InferConfig parse_args(int argc, char *argv[])
+InferConfig parse_args(int argc, char* argv[])
 {
     InferConfig cfg;
     for (int i = 1; i < argc; ++i)
@@ -90,19 +98,15 @@ InferConfig parse_args(int argc, char *argv[])
             print_usage(argv[0]);
             std::exit(0);
         }
-        else if (arg == "--model" && i + 1 < argc)
-            cfg.model_path = argv[++i];
-        else if (arg == "--vocab" && i + 1 < argc)
-            cfg.vocab_path = argv[++i];
+        else if (arg == "--model" && i + 1 < argc) cfg.model_path = argv[++i];
+        else if (arg == "--vocab" && i + 1 < argc) cfg.vocab_path = argv[++i];
         else if (arg == "--prompt" && i + 1 < argc)
         {
             cfg.prompt = argv[++i];
             cfg.prompt_given = true;
         }
-        else if (arg == "--system" && i + 1 < argc)
-            cfg.system_prompt = argv[++i];
-        else if (arg == "--reply-out" && i + 1 < argc)
-            cfg.reply_out = argv[++i];
+        else if (arg == "--system" && i + 1 < argc) cfg.system_prompt = argv[++i];
+        else if (arg == "--reply-out" && i + 1 < argc) cfg.reply_out = argv[++i];
         else if (arg == "--turn" && i + 1 < argc)
         {
             // <role>:<text>：取**第一个**冒号分段（正文里的冒号不转义）
@@ -120,19 +124,30 @@ InferConfig parse_args(int argc, char *argv[])
             t.text = val.substr(sep + 1);
             cfg.turns.push_back(std::move(t));
         }
-        else if (arg == "--interactive")
-            cfg.interactive = true;
+        else if (arg == "--interactive") cfg.interactive = true;
         else if (arg == "--max-tokens" && i + 1 < argc)
         {
             auto v = nn::parse_number<int>(argv[++i]);
-            if (!v) { std::cerr << "无效 --max-tokens\n"; std::exit(1); }
-            if (*v < 1) { std::cerr << "--max-tokens 必须 >= 1\n"; std::exit(1); }
+            if (!v)
+            {
+                std::cerr << "无效 --max-tokens\n";
+                std::exit(1);
+            }
+            if (*v < 1)
+            {
+                std::cerr << "--max-tokens 必须 >= 1\n";
+                std::exit(1);
+            }
             cfg.max_tokens = *v;
         }
         else if (arg == "--temperature" && i + 1 < argc)
         {
             auto v = nn::parse_number<double>(argv[++i]);
-            if (!v) { std::cerr << "无效 --temperature\n"; std::exit(1); }
+            if (!v)
+            {
+                std::cerr << "无效 --temperature\n";
+                std::exit(1);
+            }
             cfg.temperature = *v;
         }
         else if (arg == "--top-k" && i + 1 < argc)
@@ -191,8 +206,7 @@ InferConfig parse_args(int argc, char *argv[])
             cfg.gpu_enabled = true;
             if (!gpu_dev->empty()) cfg.gpu_device = *gpu_dev;
         }
-        else if (arg == "--show-tokens")
-            cfg.show_tokens = true;
+        else if (arg == "--show-tokens") cfg.show_tokens = true;
         else if (!arg.starts_with("--"))
         {
             cfg.prompt = arg;
@@ -229,8 +243,8 @@ InferConfig parse_args(int argc, char *argv[])
             const bool expect_user = (i % 2 == 0);
             if (cfg.turns[i].user != expect_user)
             {
-                std::cerr << "--turn 角色必须 user/assistant 交替（第 " << (i + 1)
-                          << " 条应为 " << (expect_user ? "user" : "assistant") << "）\n";
+                std::cerr << "--turn 角色必须 user/assistant 交替（第 " << (i + 1) << " 条应为 "
+                          << (expect_user ? "user" : "assistant") << "）\n";
                 std::exit(1);
             }
         }
@@ -269,15 +283,15 @@ nn::Result<std::vector<std::size_t>> generate_text(nn::Model& model, nn::Compute
                                                    const nn::SamplingConfig& sc,
                                                    std::size_t eos_token_id)
 {
-    auto &layer_ref = model.layer_at(0);
+    auto& layer_ref = model.layer_at(0);
 
     // 传入 EOS_ID，生成遇到 EOS 自动停止
     // min_new_tokens = max_new_tokens/2，至少生成一半 token 才允许 EOS 停止，
     // 避免模型因训练偏置一上来就输出 EOS 导致无输出。
     const std::size_t min_new = max_new_tokens / 2;
-    if (auto *gpt_ptr = dynamic_cast<nn::GPTModel *>(&layer_ref))
+    if (auto* gpt_ptr = dynamic_cast<nn::GPTModel*>(&layer_ref))
         return gpt_ptr->generate(engine, prompt_tokens, max_new_tokens, sc, eos_token_id, min_new);
-    if (auto *rapt_ptr = dynamic_cast<nn::RAPTModel *>(&layer_ref))
+    if (auto* rapt_ptr = dynamic_cast<nn::RAPTModel*>(&layer_ref))
         return rapt_ptr->generate(engine, prompt_tokens, max_new_tokens, sc, eos_token_id, min_new);
     NN_FAIL("Model does not contain a GPTModel or RAPTModel layer");
 }
@@ -286,43 +300,35 @@ nn::Result<std::vector<std::size_t>> generate_text(nn::Model& model, nn::Compute
 // 多轮（P0-5 尾项）：每轮把**本轮及之前的所有轮次**拼进 prompt（`chat_prompt`），
 // 因此连续 N 轮不丢上下文；超 `seq_len` 时从最旧的一问一答开始整轮丢弃。
 // 助手轮用**生成的原 token** 回灌（不经 decode → encode 往返）。
-void interactive_mode(nn::Model &model, nn::ComputeEngine &engine,
-                     const nn::Tokenizer &tokenizer, const InferConfig &cfg,
-                     std::size_t seq_len)
+void interactive_mode(nn::Model& model, nn::ComputeEngine& engine, const nn::Tokenizer& tokenizer,
+                      const InferConfig& cfg, std::size_t seq_len)
 {
     const std::size_t eos_id = tokenizer.eos_id();
     const bool has_dialogue = tokenizer.has_dialogue_markers();
     std::vector<nn::Tokenizer::ChatTurn> history;   // 交替：user → assistant → …
 
-    if (has_dialogue)
-        std::cout << "GPT 交互式对话（多轮，上下文保留；输入 'quit' 退出）\n\n";
-    else
-        std::cout << "GPT 交互式生成（多轮，上下文保留；输入 'quit' 退出）\n\n";
+    if (has_dialogue) std::cout << "GPT 交互式对话（多轮，上下文保留；输入 'quit' 退出）\n\n";
+    else std::cout << "GPT 交互式生成（多轮，上下文保留；输入 'quit' 退出）\n\n";
 
     while (true)
     {
         std::cout << ">>> ";
         std::string prompt;
-        if (!std::getline(std::cin, prompt))
-            break;
-        if (prompt == "quit" || prompt == "exit")
-            break;
-        if (prompt.empty())
-            prompt = " ";
+        if (!std::getline(std::cin, prompt)) break;
+        if (prompt == "quit" || prompt == "exit") break;
+        if (prompt.empty()) prompt = " ";
 
         // 本轮用户输入入列 → 整个历史（含之前 N-1 轮）一起进 prompt
         history.push_back(nn::Tokenizer::ChatTurn{true, prompt, {}});
 
         std::size_t dropped = 0;
-        auto prompt_tokens = tokenizer.chat_prompt(history, cfg.system_prompt, seq_len,
-                                                  &dropped);
+        auto prompt_tokens = tokenizer.chat_prompt(history, cfg.system_prompt, seq_len, &dropped);
         if (dropped > 0)
         {
             // 历史按"一问一答"整轮丢弃（丢弃后仍以 user 起头）
-            history.erase(history.begin(),
-                          history.begin() + static_cast<std::ptrdiff_t>(dropped));
-            std::cout << "[上下文] 已达 seq_len=" << seq_len << " 上限：丢弃最旧 "
-                      << dropped << " 轮，当前保留 " << history.size() << " 轮\n";
+            history.erase(history.begin(), history.begin() + static_cast<std::ptrdiff_t>(dropped));
+            std::cout << "[上下文] 已达 seq_len=" << seq_len << " 上限：丢弃最旧 " << dropped
+                      << " 轮，当前保留 " << history.size() << " 轮\n";
         }
 
         std::cout << "生成中...\n";
@@ -343,7 +349,11 @@ void interactive_mode(nn::Model &model, nn::ComputeEngine &engine,
             const std::size_t end_asst = tokenizer.end_assistant_marker_id();
             if (end_asst != nn::Tokenizer::npos)
                 for (std::size_t i = 0; i < shown.size(); ++i)
-                    if (shown[i] == end_asst) { shown.resize(i); break; }
+                    if (shown[i] == end_asst)
+                    {
+                        shown.resize(i);
+                        break;
+                    }
         }
         std::cout << "\n" << tokenizer.decode(shown) << "\n\n";
 
@@ -370,7 +380,7 @@ void interactive_mode(nn::Model &model, nn::ComputeEngine &engine,
 }
 
 // ==================== 主函数 ====================
-int main(int argc, char *argv[])
+int main(int argc, char* argv[])
 {
     InferConfig cfg = parse_args(argc, argv);
 
@@ -382,25 +392,31 @@ int main(int argc, char *argv[])
     NN_EXIT(role_r, 1, "读取模型文件失败: ");
     if (!spec.is_gpt() && !spec.is_rapt())
     {
-        std::cerr << "模型文件不是 GPT/RAPT 类型 (type="
-                  << spec.type_name() << ")\n";
+        std::cerr << "模型文件不是 GPT/RAPT 类型 (type=" << spec.type_name() << ")\n";
         return 1;
     }
 
     // GPT/RAPT 共享的规格视图（两者类型参数同名，按实际类型取值）
-    std::size_t v_vocab = 0, v_d_model = 0, v_heads = 0, v_layers = 0, v_d_ff = 0,
-                v_seq_len = 0;
+    std::size_t v_vocab = 0, v_d_model = 0, v_heads = 0, v_layers = 0, v_d_ff = 0, v_seq_len = 0;
     nn::PosEncodingType v_pos = nn::PosEncodingType::Learned;
-    if (const auto *g = spec.as<nn::GptSpec>())
+    if (const auto* g = spec.as<nn::GptSpec>())
     {
-        v_vocab = g->vocab_size; v_d_model = g->d_model; v_heads = g->num_heads;
-        v_layers = g->num_layers; v_d_ff = g->d_ff; v_seq_len = g->seq_len;
+        v_vocab = g->vocab_size;
+        v_d_model = g->d_model;
+        v_heads = g->num_heads;
+        v_layers = g->num_layers;
+        v_d_ff = g->d_ff;
+        v_seq_len = g->seq_len;
         v_pos = g->pos_encoding;
     }
-    else if (const auto *r = spec.as<nn::RaptSpec>())
+    else if (const auto* r = spec.as<nn::RaptSpec>())
     {
-        v_vocab = r->vocab_size; v_d_model = r->d_model; v_heads = r->num_heads;
-        v_layers = r->num_layers; v_d_ff = r->d_ff; v_seq_len = r->seq_len;
+        v_vocab = r->vocab_size;
+        v_d_model = r->d_model;
+        v_heads = r->num_heads;
+        v_layers = r->num_layers;
+        v_d_ff = r->d_ff;
+        v_seq_len = r->seq_len;
         v_pos = r->pos_encoding;
     }
 
@@ -413,29 +429,17 @@ int main(int argc, char *argv[])
     auto engine = std::move(*engine_res);
 
     // ── 构建 GPT 模型 ────────────────────────────────────────
-    std::cout << "模型规格: vocab=" << v_vocab
-              << " d_model=" << v_d_model
-              << " heads=" << v_heads
-              << " layers=" << v_layers
-              << " d_ff=" << v_d_ff
-              << " seq_len=" << v_seq_len;
-    if (spec.is_rapt())
-    {
-        std::cout << " [RAPT (ReLU 线性注意力)]";
-    }
-    if (spec.is_alibi_gpt() || v_pos == nn::PosEncodingType::ALiBi)
-        std::cout << " [ALiBi]";
-    else if (v_pos == nn::PosEncodingType::Sinusoidal)
-        std::cout << " [Sinusoidal]";
-    else if (v_pos == nn::PosEncodingType::RoPE)
-        std::cout << " [RoPE]";
-    else
-        std::cout << " [Learned]";
+    std::cout << "模型规格: vocab=" << v_vocab << " d_model=" << v_d_model << " heads=" << v_heads
+              << " layers=" << v_layers << " d_ff=" << v_d_ff << " seq_len=" << v_seq_len;
+    if (spec.is_rapt()) { std::cout << " [RAPT (ReLU 线性注意力)]"; }
+    if (spec.is_alibi_gpt() || v_pos == nn::PosEncodingType::ALiBi) std::cout << " [ALiBi]";
+    else if (v_pos == nn::PosEncodingType::Sinusoidal) std::cout << " [Sinusoidal]";
+    else if (v_pos == nn::PosEncodingType::RoPE) std::cout << " [RoPE]";
+    else std::cout << " [Learned]";
     std::cout << "\n";
 
     nn::Result<nn::Model> model_result;
-    if (spec.is_rapt())
-        model_result = nn::build_rapt_model_from_spec(*engine, spec);
+    if (spec.is_rapt()) model_result = nn::build_rapt_model_from_spec(*engine, spec);
     else  // 统一的 GPTModel 通过 pos_encoding 区分 Learned/Sinusoidal/ALiBi
         model_result = nn::build_gpt_model_from_spec(*engine, spec);
     NN_EXIT(model_result, 1, "构建模型失败: ");
@@ -449,8 +453,7 @@ int main(int argc, char *argv[])
         auto load_result = nn::load_model(cfg.model_path, model, &model_version);
         NN_EXIT(load_result, 1, "加载模型失败: ");
         embedded_vocab = std::move(*load_result);
-        std::cout << "模型已加载（角色: " << nn::model_role_name(*role_r) << "）"
-                  << std::endl;
+        std::cout << "模型已加载（角色: " << nn::model_role_name(*role_r) << "）" << std::endl;
     }
 
     // ── 加载 tokenizer（按模型版本分派：v5=JSON / v6=.nnvocab kvrec）──
@@ -471,7 +474,8 @@ int main(int argc, char *argv[])
             std::cerr << "加载词表失败: " << cfg.vocab_path << '\n'
                       << tok_r.error().message
                       << "\n请使用 --vocab 指定 .nnvocab 词表路径，"
-                         "或使用嵌入 tokenizer 的模型" << std::endl;
+                         "或使用嵌入 tokenizer 的模型"
+                      << std::endl;
             return 1;
         }
         tokenizer = std::move(*tok_r);
@@ -494,8 +498,8 @@ int main(int argc, char *argv[])
     if (!cfg.turns.empty())
     {
         std::size_t dropped = 0;
-        auto prompt_tokens = tokenizer->chat_prompt(cfg.turns, cfg.system_prompt, seq_len,
-                                                   &dropped);
+        auto prompt_tokens =
+            tokenizer->chat_prompt(cfg.turns, cfg.system_prompt, seq_len, &dropped);
         std::cout << "多轮对话: " << cfg.turns.size() << " 轮 ("
                   << (tokenizer->has_dialogue_markers() ? "对话标记模板" : "纯文本拼接") << ")"
                   << " → 进入上下文 " << (cfg.turns.size() - dropped) << " 轮";
@@ -528,7 +532,11 @@ int main(int argc, char *argv[])
             const std::size_t end_asst = tokenizer->end_assistant_marker_id();
             if (end_asst != nn::Tokenizer::npos)
                 for (std::size_t i = 0; i < shown.size(); ++i)
-                    if (shown[i] == end_asst) { shown.resize(i); break; }
+                    if (shown[i] == end_asst)
+                    {
+                        shown.resize(i);
+                        break;
+                    }
         }
         const std::string reply = tokenizer->decode(shown);
         std::cout << reply << std::endl;
@@ -551,11 +559,10 @@ int main(int argc, char *argv[])
         }
 
         std::cout << "\n----------------------------------------" << std::endl;
-        std::cout << "生成 " << generated.size() << " tokens, 耗时 "
-                  << std::fixed << std::setprecision(1) << gen_sec << "s"
-                  << " (" << std::setprecision(0)
-                  << (gen_sec > 0 ? generated.size() / gen_sec : 0) << " tokens/s)"
-                  << std::endl;
+        std::cout << "生成 " << generated.size() << " tokens, 耗时 " << std::fixed
+                  << std::setprecision(1) << gen_sec << "s"
+                  << " (" << std::setprecision(0) << (gen_sec > 0 ? generated.size() / gen_sec : 0)
+                  << " tokens/s)" << std::endl;
 
         // GUI 取回复的唯一通道（日志可能被其他行插花，不做解析）
         if (!cfg.reply_out.empty())
@@ -580,8 +587,7 @@ int main(int argc, char *argv[])
     const std::size_t bos_id = tokenizer->bos_id();
     auto prompt_tokens = tokenizer->encode(cfg.prompt);
     // 添加 BOS 前缀：tokenizer 提供 bos_id 时，用作 prompt 的起始标记
-    if (bos_id != nn::Tokenizer::npos)
-        prompt_tokens.insert(prompt_tokens.begin(), bos_id);
+    if (bos_id != nn::Tokenizer::npos) prompt_tokens.insert(prompt_tokens.begin(), bos_id);
     std::cout << "提示: \"" << cfg.prompt << "\"\n";
     std::cout << "Prompt tokens: " << prompt_tokens.size() << " 个\n";
     std::cout << "生成 " << cfg.max_tokens << " 个 token"
@@ -616,11 +622,10 @@ int main(int argc, char *argv[])
     }
 
     std::cout << "\n----------------------------------------" << std::endl;
-    std::cout << "生成 " << generated.size() << " tokens, 耗时 "
-              << std::fixed << std::setprecision(1) << gen_sec << "s"
-              << " (" << std::setprecision(0)
-              << (gen_sec > 0 ? generated.size() / gen_sec : 0) << " tokens/s)"
-              << std::endl;
+    std::cout << "生成 " << generated.size() << " tokens, 耗时 " << std::fixed
+              << std::setprecision(1) << gen_sec << "s"
+              << " (" << std::setprecision(0) << (gen_sec > 0 ? generated.size() / gen_sec : 0)
+              << " tokens/s)" << std::endl;
 
     return 0;
 }

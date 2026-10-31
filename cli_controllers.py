@@ -160,7 +160,12 @@ class CLIController(ABC):
         exe_path = build_dir / exe_name
         if exe_path.exists():
             return str(exe_path)
-        
+
+        # preset 构建（CMakePresets.json）把产物放在 build/<preset>/ 下
+        for sub in sorted(build_dir.glob("*")):
+            if sub.is_dir() and (sub / exe_name).exists():
+                return str(sub / exe_name)
+
         # 尝试在当前目录查找
         current_dir = Path(__file__).parent
         exe_path = current_dir / exe_name

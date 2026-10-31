@@ -684,20 +684,27 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 ### 8.2 格式规范
 
+> 机器可读真源是仓库根的 [`.clang-format`](../../.clang-format)（全仓已于 2026-10-31
+> 按该配置统一格式化，现有代码即基线）；下面只列最常用的几条。
+
 ```cpp
-// 缩进：4 个空格
-if (condition) {
-    do_something();
+// 缩进：4 个空格；行宽：100 列
+// 大括号：Allman（函数 / 类型 / 控制语句一律另起一行）
+void function()
+{
+    // ...
 }
 
-// 大括号：K&R 风格
-void function() {
-    // ...
+if (condition)
+{
+    do_something();
 }
 
 // 指针/引用：靠近类型名
 int* ptr;       // 推荐
 const std::vector<int>& vec;  // 推荐
+
+// 注释不重排、行尾注释不对齐；include 顺序按 §8.3（工具不排序）
 ```
 
 ### 8.3 包含顺序

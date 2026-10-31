@@ -21,13 +21,13 @@ namespace nn
 //    原语的契约，DSL 只是其唯一使用者）────────────────────────────────────
 /// 表达式：可按索引求值为 Scalar 的类型（Span/ConstSpan 与所有 DSL 节点满足）
 template <typename T>
-concept Expression = requires(const T &t, std::size_t i) {
+concept Expression = requires (const T& t, std::size_t i) {
     { t.eval(i) } -> std::convertible_to<Scalar>;
 };
 
 /// 布尔表达式：可按索引求值为 bool 的类型（用于条件选择 select）
 template <typename T>
-concept BoolExpression = requires(const T &t, std::size_t i) {
+concept BoolExpression = requires (const T& t, std::size_t i) {
     { t.eval(i) } -> std::convertible_to<bool>;
 };
 
@@ -38,25 +38,25 @@ concept BoolExpression = requires(const T &t, std::size_t i) {
 class Span
 {
 private:
-    Scalar *data_;
+    Scalar* data_;
     std::size_t size_;
 
 public:
     // ── 构造函数 ──────────────────────────────────────────────────────────
     constexpr Span() noexcept : data_(nullptr), size_(0) {}
-    constexpr Span(Scalar *data, std::size_t size) noexcept : data_(data), size_(size) {}
+    constexpr Span(Scalar* data, std::size_t size) noexcept : data_(data), size_(size) {}
 
     /// 从 std::span<Scalar> 隐式构造（兼容 Matrix::span()）
     constexpr Span(std::span<Scalar> sp) noexcept : data_(sp.data()), size_(sp.size()) {}
 
     // ── 访问器 ───────────────────────────────────────────────────────────
-    [[nodiscard]] constexpr Scalar *data() noexcept { return data_; }
-    [[nodiscard]] constexpr const Scalar *data() const noexcept { return data_; }
+    [[nodiscard]] constexpr Scalar* data() noexcept { return data_; }
+    [[nodiscard]] constexpr const Scalar* data() const noexcept { return data_; }
     [[nodiscard]] constexpr std::size_t size() const noexcept { return size_; }
     [[nodiscard]] constexpr bool empty() const noexcept { return size_ == 0; }
 
     // ── 索引访问 ─────────────────────────────────────────────────────────
-    [[nodiscard]] constexpr Scalar &operator[](std::size_t i) noexcept { return data_[i]; }
+    [[nodiscard]] constexpr Scalar& operator[](std::size_t i) noexcept { return data_[i]; }
     [[nodiscard]] constexpr Scalar operator[](std::size_t i) const noexcept { return data_[i]; }
 
     // ── 表达式树叶子节点的 eval ──────────────────────────────────────────
@@ -64,14 +64,10 @@ public:
 
     // ── 子视图 ───────────────────────────────────────────────────────────
     [[nodiscard]] constexpr Span subspan(std::size_t offset, std::size_t count) const noexcept
-    {
-        return Span{data_ + offset, count};
-    }
+    { return Span{data_ + offset, count}; }
 
     [[nodiscard]] constexpr Span subspan(std::size_t offset) const noexcept
-    {
-        return Span{data_ + offset, size_ - offset};
-    }
+    { return Span{data_ + offset, size_ - offset}; }
 
     // 注：Span 不定义成员运算符；逐元素算法一律通过表达式 DSL
     // （nn::dsl，见 expr_dsl.hpp）表达。
@@ -95,13 +91,13 @@ public:
 class ConstSpan
 {
 private:
-    const Scalar *data_;
+    const Scalar* data_;
     std::size_t size_;
 
 public:
     // ── 构造函数 ──────────────────────────────────────────────────────────
     constexpr ConstSpan() noexcept : data_(nullptr), size_(0) {}
-    constexpr ConstSpan(const Scalar *data, std::size_t size) noexcept : data_(data), size_(size) {}
+    constexpr ConstSpan(const Scalar* data, std::size_t size) noexcept : data_(data), size_(size) {}
 
     /// 从 std::span<const Scalar> 隐式构造（兼容 const Matrix::span()）
     constexpr ConstSpan(std::span<const Scalar> sp) noexcept : data_(sp.data()), size_(sp.size()) {}
@@ -112,10 +108,10 @@ public:
     constexpr ConstSpan(std::span<Scalar> sp) noexcept : data_(sp.data()), size_(sp.size()) {}
 
     /// 从 Span 隐式构造（Span 可作为只读输入）
-    constexpr ConstSpan(const Span &s) noexcept : data_(s.data()), size_(s.size()) {}
+    constexpr ConstSpan(const Span& s) noexcept : data_(s.data()), size_(s.size()) {}
 
     // ── 访问器 ───────────────────────────────────────────────────────────
-    [[nodiscard]] constexpr const Scalar *data() const noexcept { return data_; }
+    [[nodiscard]] constexpr const Scalar* data() const noexcept { return data_; }
     [[nodiscard]] constexpr std::size_t size() const noexcept { return size_; }
     [[nodiscard]] constexpr bool empty() const noexcept { return size_ == 0; }
 
@@ -127,14 +123,10 @@ public:
 
     // ── 子视图 ───────────────────────────────────────────────────────────
     [[nodiscard]] constexpr ConstSpan subspan(std::size_t offset, std::size_t count) const noexcept
-    {
-        return ConstSpan{data_ + offset, count};
-    }
+    { return ConstSpan{data_ + offset, count}; }
 
     [[nodiscard]] constexpr ConstSpan subspan(std::size_t offset) const noexcept
-    {
-        return ConstSpan{data_ + offset, size_ - offset};
-    }
+    { return ConstSpan{data_ + offset, size_ - offset}; }
 
     // 注：ConstSpan 不定义成员运算符；逐元素算法一律通过表达式 DSL
     // （nn::dsl，见 expr_dsl.hpp）表达，DSL 运算符只接受可折叠节点
@@ -142,4 +134,3 @@ public:
 };
 
 } // namespace nn
-

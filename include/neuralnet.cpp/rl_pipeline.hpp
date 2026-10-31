@@ -33,22 +33,14 @@ private:
     std::mt19937_64 engine_;
 
 public:
-    explicit DeterministicRng(std::uint64_t seed = 0)
-        : seed_(seed), engine_(seed)
-    {
-    }
+    explicit DeterministicRng(std::uint64_t seed = 0) : seed_(seed), engine_(seed) {}
 
     [[nodiscard]] std::uint64_t seed() const noexcept { return seed_; }
-    [[nodiscard]] std::uint64_t next_u64()
-    {
-        return engine_();
-    }
+    [[nodiscard]] std::uint64_t next_u64() { return engine_(); }
     [[nodiscard]] std::size_t uniform_index(std::size_t upper_exclusive)
     {
-        if (upper_exclusive == 0)
-            NN_UNWRAP(false, "DeterministicRng: uniform_index 上界必须 > 0");
-        std::uniform_int_distribution<std::size_t> dist(0,
-                                                        upper_exclusive - 1);
+        if (upper_exclusive == 0) NN_UNWRAP(false, "DeterministicRng: uniform_index 上界必须 > 0");
+        std::uniform_int_distribution<std::size_t> dist(0, upper_exclusive - 1);
         return dist(engine_);
     }
 
@@ -65,11 +57,9 @@ public:
         std::string tag;
         std::uint64_t saved_seed = 0;
         in >> tag >> saved_seed;
-        if (!in || tag != "RNGS1")
-            NN_FAIL("DeterministicRng::restore_state: 状态头非法");
+        if (!in || tag != "RNGS1") NN_FAIL("DeterministicRng::restore_state: 状态头非法");
         in >> engine_;
-        if (!in)
-            NN_FAIL("DeterministicRng::restore_state: 状态不完整");
+        if (!in) NN_FAIL("DeterministicRng::restore_state: 状态不完整");
         seed_ = saved_seed;
         return {};
     }
@@ -89,17 +79,11 @@ private:
     std::size_t capacity_ = 0;
 
 public:
-    explicit ExperienceBuffer(std::size_t capacity = 0)
-        : capacity_(capacity)
-    {
-    }
+    explicit ExperienceBuffer(std::size_t capacity = 0) : capacity_(capacity) {}
 
     [[nodiscard]] Result<void> add(TensorRecord record)
     {
-        if (capacity_ > 0 && records_.size() >= capacity_)
-        {
-            records_.erase(records_.begin());
-        }
+        if (capacity_ > 0 && records_.size() >= capacity_) { records_.erase(records_.begin()); }
         records_.push_back(std::move(record));
         return {};
     }
@@ -111,15 +95,13 @@ public:
 
     [[nodiscard]] Result<TensorRecord*> at(std::size_t index)
     {
-        if (index >= records_.size())
-            NN_FAIL("ExperienceBuffer::at: 下标越界");
+        if (index >= records_.size()) NN_FAIL("ExperienceBuffer::at: 下标越界");
         return &records_[index];
     }
 
     [[nodiscard]] Result<const TensorRecord*> at(std::size_t index) const
     {
-        if (index >= records_.size())
-            NN_FAIL("ExperienceBuffer::at: 下标越界");
+        if (index >= records_.size()) NN_FAIL("ExperienceBuffer::at: 下标越界");
         return &records_[index];
     }
 };
@@ -128,9 +110,8 @@ class BatchSampler
 {
 public:
     virtual ~BatchSampler() = default;
-    virtual Result<std::vector<std::size_t>> sample(
-        std::size_t available, std::size_t batch_size,
-        DeterministicRng& rng) = 0;
+    virtual Result<std::vector<std::size_t>> sample(std::size_t available, std::size_t batch_size,
+                                                    DeterministicRng& rng) = 0;
 };
 
 class UniformBatchSampler final : public BatchSampler
@@ -139,24 +120,19 @@ private:
     bool replacement_ = false;
 
 public:
-    explicit UniformBatchSampler(bool replacement = false)
-        : replacement_(replacement)
-    {
-    }
+    explicit UniformBatchSampler(bool replacement = false) : replacement_(replacement) {}
 
-    [[nodiscard]] Result<std::vector<std::size_t>> sample(
-        std::size_t available, std::size_t batch_size,
-        DeterministicRng& rng) override
+    [[nodiscard]] Result<std::vector<std::size_t>>
+    sample(std::size_t available, std::size_t batch_size, DeterministicRng& rng) override
     {
-        if (batch_size == 0)
-            NN_FAIL("UniformBatchSampler: batch_size 必须 > 0");
-        if (available == 0)
-            NN_FAIL("UniformBatchSampler: buffer 为空");
+        if (batch_size == 0) NN_FAIL("UniformBatchSampler: batch_size 必须 > 0");
+        if (available == 0) NN_FAIL("UniformBatchSampler: buffer 为空");
         if (!replacement_ && batch_size > available)
             NN_FAIL("UniformBatchSampler: 无放回采样时 batch_size > buffer size");
 
         std::vector<std::size_t> pool(available);
-        for (std::size_t i = 0; i < available; ++i) pool[i] = i;
+        for (std::size_t i = 0; i < available; ++i)
+            pool[i] = i;
         std::vector<std::size_t> out;
         out.reserve(batch_size);
         if (replacement_)
@@ -191,10 +167,7 @@ public:
 class NullMetricSink final : public MetricSink
 {
 public:
-    [[nodiscard]] Result<void> emit(const MetricRecord&) override
-    {
-        return {};
-    }
+    [[nodiscard]] Result<void> emit(const MetricRecord&) override { return {}; }
 };
 
 class CollectingMetricSink final : public MetricSink
@@ -209,10 +182,7 @@ public:
         return {};
     }
 
-    [[nodiscard]] const std::vector<MetricRecord>& records() const noexcept
-    {
-        return records_;
-    }
+    [[nodiscard]] const std::vector<MetricRecord>& records() const noexcept { return records_; }
     void clear() noexcept { records_.clear(); }
 };
 
@@ -220,8 +190,7 @@ class CheckpointProvider
 {
 public:
     virtual ~CheckpointProvider() = default;
-    virtual Result<void> save_section(
-        std::string_view name, std::string_view bytes) = 0;
+    virtual Result<void> save_section(std::string_view name, std::string_view bytes) = 0;
     virtual Result<std::string> load_section(std::string_view name) const = 0;
 };
 
@@ -231,11 +200,9 @@ private:
     std::vector<std::pair<std::string, std::string>> sections_;
 
 public:
-    [[nodiscard]] Result<void> save_section(
-        std::string_view name, std::string_view bytes) override
+    [[nodiscard]] Result<void> save_section(std::string_view name, std::string_view bytes) override
     {
-        if (name.empty())
-            NN_FAIL("InMemoryCheckpointProvider: section 名不能为空");
+        if (name.empty()) NN_FAIL("InMemoryCheckpointProvider: section 名不能为空");
         for (auto& section : sections_)
         {
             if (section.first == name)
@@ -248,22 +215,18 @@ public:
         return {};
     }
 
-    [[nodiscard]] Result<std::string> load_section(
-        std::string_view name) const override
+    [[nodiscard]] Result<std::string> load_section(std::string_view name) const override
     {
         for (const auto& section : sections_)
             if (section.first == name) return section.second;
-        NN_FAIL("InMemoryCheckpointProvider: 缺少 section '" +
-                std::string(name) + "'");
+        NN_FAIL("InMemoryCheckpointProvider: 缺少 section '" + std::string(name) + "'");
     }
 };
 
 struct TrainerHooks
 {
-    std::function<Result<void>(std::span<const TensorRecord* const>)>
-        before_update;
-    std::function<Result<void>(std::span<const TensorRecord* const>)>
-        after_update;
+    std::function<Result<void>(std::span<const TensorRecord* const>)> before_update;
+    std::function<Result<void>(std::span<const TensorRecord* const>)> after_update;
 };
 
 struct RLPipelineConfig
@@ -290,19 +253,12 @@ private:
     std::uint64_t update_count_ = 0;
     std::uint64_t rollout_cursor_ = 0;
 
-    RLTrainingPipeline(RLPipelineConfig cfg,
-                       std::unique_ptr<RolloutSource> source,
-                       std::unique_ptr<BatchSampler> sampler,
-                       std::shared_ptr<MetricSink> metrics,
-                       std::shared_ptr<CheckpointProvider> checkpoints,
-                       std::uint64_t seed)
-        : cfg_(std::move(cfg)),
-          source_(std::move(source)),
-          sampler_(std::move(sampler)),
-          metrics_(std::move(metrics)),
-          checkpoints_(std::move(checkpoints)),
-          buffer_(cfg_.buffer_capacity),
-          rng_(seed)
+    RLTrainingPipeline(RLPipelineConfig cfg, std::unique_ptr<RolloutSource> source,
+                       std::unique_ptr<BatchSampler> sampler, std::shared_ptr<MetricSink> metrics,
+                       std::shared_ptr<CheckpointProvider> checkpoints, std::uint64_t seed)
+        : cfg_(std::move(cfg)), source_(std::move(source)), sampler_(std::move(sampler)),
+          metrics_(std::move(metrics)), checkpoints_(std::move(checkpoints)),
+          buffer_(cfg_.buffer_capacity), rng_(seed)
     {
     }
 
@@ -313,23 +269,17 @@ private:
         state.set("update_count", update_count_);
         state.set("rollout_cursor", rollout_cursor_);
         state.set("rng_state", rng_.save_state());
-        return checkpoints_->save_section(
-            cfg_.checkpoint_section,
-            state.serialize());
+        return checkpoints_->save_section(cfg_.checkpoint_section, state.serialize());
     }
 
 public:
-    [[nodiscard]] static Result<RLTrainingPipeline> create(
-        RLPipelineConfig cfg, std::unique_ptr<RolloutSource> source,
-        std::unique_ptr<BatchSampler> sampler,
-        std::shared_ptr<MetricSink> metrics = {},
-        std::shared_ptr<CheckpointProvider> checkpoints = {},
-        std::uint64_t seed = 0)
+    [[nodiscard]] static Result<RLTrainingPipeline>
+    create(RLPipelineConfig cfg, std::unique_ptr<RolloutSource> source,
+           std::unique_ptr<BatchSampler> sampler, std::shared_ptr<MetricSink> metrics = {},
+           std::shared_ptr<CheckpointProvider> checkpoints = {}, std::uint64_t seed = 0)
     {
-        if (!source || !sampler)
-            NN_FAIL("RLTrainingPipeline::create: source/sampler 不能为空");
-        if (cfg.batch_size == 0 || cfg.collect_per_update == 0 ||
-            cfg.min_buffer_size == 0)
+        if (!source || !sampler) NN_FAIL("RLTrainingPipeline::create: source/sampler 不能为空");
+        if (cfg.batch_size == 0 || cfg.collect_per_update == 0 || cfg.min_buffer_size == 0)
             NN_FAIL("RLTrainingPipeline::create: batch/collect/min_buffer 必须 > 0");
         if (cfg.min_buffer_size < cfg.batch_size)
             NN_FAIL("RLTrainingPipeline::create: min_buffer_size 不能小于 batch_size");
@@ -338,13 +288,10 @@ public:
                     " buffer_capacity");
         if (cfg.checkpoint_section.empty())
             NN_FAIL("RLTrainingPipeline::create: checkpoint_section 不能为空");
-        if (!metrics)
-            metrics = std::make_shared<NullMetricSink>();
-        if (!checkpoints)
-            checkpoints = std::make_shared<InMemoryCheckpointProvider>();
-        return RLTrainingPipeline(std::move(cfg), std::move(source),
-                                  std::move(sampler), std::move(metrics),
-                                  std::move(checkpoints), seed);
+        if (!metrics) metrics = std::make_shared<NullMetricSink>();
+        if (!checkpoints) checkpoints = std::make_shared<InMemoryCheckpointProvider>();
+        return RLTrainingPipeline(std::move(cfg), std::move(source), std::move(sampler),
+                                  std::move(metrics), std::move(checkpoints), seed);
     }
 
     RLTrainingPipeline(RLTrainingPipeline&&) noexcept = default;
@@ -353,36 +300,17 @@ public:
     RLTrainingPipeline& operator=(const RLTrainingPipeline&) = delete;
     ~RLTrainingPipeline() = default;
 
-    [[nodiscard]] const RLPipelineConfig& config() const noexcept
-    {
-        return cfg_;
-    }
-    [[nodiscard]] const ExperienceBuffer& buffer() const noexcept
-    {
-        return buffer_;
-    }
-    [[nodiscard]] std::uint64_t update_count() const noexcept
-    {
-        return update_count_;
-    }
-    [[nodiscard]] std::uint64_t rollout_cursor() const noexcept
-    {
-        return rollout_cursor_;
-    }
-    void set_rollout_cursor(std::uint64_t cursor) noexcept
-    {
-        rollout_cursor_ = cursor;
-    }
+    [[nodiscard]] const RLPipelineConfig& config() const noexcept { return cfg_; }
+    [[nodiscard]] const ExperienceBuffer& buffer() const noexcept { return buffer_; }
+    [[nodiscard]] std::uint64_t update_count() const noexcept { return update_count_; }
+    [[nodiscard]] std::uint64_t rollout_cursor() const noexcept { return rollout_cursor_; }
+    void set_rollout_cursor(std::uint64_t cursor) noexcept { rollout_cursor_ = cursor; }
     [[nodiscard]] DeterministicRng& rng() noexcept { return rng_; }
     [[nodiscard]] MetricSink& metrics() noexcept { return *metrics_; }
-    [[nodiscard]] CheckpointProvider& checkpoints() noexcept
-    {
-        return *checkpoints_;
-    }
+    [[nodiscard]] CheckpointProvider& checkpoints() noexcept { return *checkpoints_; }
 
     template <class UpdateFn>
-    [[nodiscard]] Result<void> run(std::size_t updates, UpdateFn&& update,
-                                   TrainerHooks hooks = {})
+    [[nodiscard]] Result<void> run(std::size_t updates, UpdateFn&& update, TrainerHooks hooks = {})
     {
         for (std::size_t i = 0; i < updates; ++i)
         {
@@ -394,8 +322,7 @@ public:
             }
             if (buffer_.size() < cfg_.min_buffer_size)
                 NN_FAIL("RLTrainingPipeline: buffer 未达到 min_buffer_size");
-            NN_TRY(indices,
-                   sampler_->sample(buffer_.size(), cfg_.batch_size, rng_));
+            NN_TRY(indices, sampler_->sample(buffer_.size(), cfg_.batch_size, rng_));
             if (indices->size() != cfg_.batch_size)
                 NN_FAIL("RLTrainingPipeline: sampler 返回 batch size 不符");
 
@@ -406,8 +333,7 @@ public:
                 NN_TRY(record, buffer_.at(index));
                 selected.push_back(*record);
             }
-            if (hooks.before_update)
-                NN_TRY_CHECK(hooks.before_update(selected));
+            if (hooks.before_update) NN_TRY_CHECK(hooks.before_update(selected));
             NN_TRY_CHECK(update(selected, rng_, *metrics_));
 
             // update 已成功修改外部模型；即使后置 hook 失败，也必须提交
@@ -415,20 +341,15 @@ public:
             ++update_count_;
             Result<void> after_r{};
             if (hooks.after_update) after_r = hooks.after_update(selected);
-            if (cfg_.clear_buffer_after_update)
-                buffer_.clear();
+            if (cfg_.clear_buffer_after_update) buffer_.clear();
             NN_TRY_CHECK(after_r);
-            if (cfg_.checkpoint_every > 0 &&
-                update_count_ % cfg_.checkpoint_every == 0)
+            if (cfg_.checkpoint_every > 0 && update_count_ % cfg_.checkpoint_every == 0)
                 NN_TRY_CHECK(save_pipeline_state_());
         }
         return {};
     }
 
-    [[nodiscard]] Result<void> save_checkpoint()
-    {
-        return save_pipeline_state_();
-    }
+    [[nodiscard]] Result<void> save_checkpoint() { return save_pipeline_state_(); }
 
     [[nodiscard]] Result<void> restore_checkpoint()
     {
@@ -439,8 +360,7 @@ public:
             NN_FAIL("RLTrainingPipeline::restore_checkpoint: 版本不兼容");
         std::uint64_t updates = 0, cursor = 0;
         std::string rng_state;
-        if (!kv->get("update_count", updates) ||
-            !kv->get("rollout_cursor", cursor) ||
+        if (!kv->get("update_count", updates) || !kv->get("rollout_cursor", cursor) ||
             !kv->get("rng_state", rng_state))
             NN_FAIL("RLTrainingPipeline::restore_checkpoint: 状态字段缺失");
         NN_TRY_CHECK(rng_.restore_state(rng_state));

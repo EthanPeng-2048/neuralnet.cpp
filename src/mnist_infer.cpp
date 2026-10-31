@@ -32,7 +32,7 @@ namespace fs = std::filesystem;
 using nn::Scalar;
 
 // ==================== 帮助信息 ====================
-void print_usage(const char *prog)
+void print_usage(const char* prog)
 {
     nn::cli::Help help(std::cout, prog, "MNIST 手写数字推理程序");
 
@@ -43,7 +43,9 @@ void print_usage(const char *prog)
     help.opt("--model <path>", "模型文件路径 (默认: pretrained/model.bin)");
     help.opt("--topk <n>", "显示前 n 个预测结果 (默认: 3)");
     help.opt("--show-pixels", "显示像素矩阵 (调试用)");
-    help.opt("--gpu [索引|名称]", "启用 GPU 加速 (需要 Vulkan SDK)\n空格形式只收枚举索引；名称子串用 --gpu=<名称>，如 --gpu=NVIDIA / --gpu=40HX");
+    help.opt("--gpu [索引|名称]",
+             "启用 GPU 加速 (需要 Vulkan SDK)\n空格形式只收枚举索引；名称子串用 --gpu=<名称>，如 "
+             "--gpu=NVIDIA / --gpu=40HX");
     help.opt("--help, -h", "显示此帮助信息");
 }
 
@@ -58,7 +60,7 @@ struct InferConfig
     std::string gpu_device;      // --gpu 的可选设备选择子（空 = 自动选卡）
 };
 
-nn::Result<InferConfig> parse_args(int argc, char *argv[])
+nn::Result<InferConfig> parse_args(int argc, char* argv[])
 {
     InferConfig cfg;
     bool has_input = false;
@@ -71,24 +73,17 @@ nn::Result<InferConfig> parse_args(int argc, char *argv[])
             print_usage(argv[0]);
             std::exit(0);
         }
-        else if (arg == "--model" && i + 1 < argc)
-        {
-            cfg.model_path = argv[++i];
-        }
+        else if (arg == "--model" && i + 1 < argc) { cfg.model_path = argv[++i]; }
         else if (arg == "--topk" && i + 1 < argc)
         {
             auto v = nn::parse_number<int>(argv[++i]);
             NN_TRY_CHECK(v);
-            if (*v <= 0)
-                NN_FAIL("--topk 必须为正整数");
+            if (*v <= 0) NN_FAIL("--topk 必须为正整数");
             if (*v > static_cast<int>(nn::MNIST_NUM_CLASSES))
                 NN_FAIL("--topk 不能超过类别数 " + std::to_string(nn::MNIST_NUM_CLASSES));
             cfg.topk = *v;
         }
-        else if (arg == "--show-pixels")
-        {
-            cfg.show_pixels = true;
-        }
+        else if (arg == "--show-pixels") { cfg.show_pixels = true; }
         else if (auto dev = nn::cli::parse_gpu_option(argc, argv, i))
         {
             cfg.gpu_enabled = true;
@@ -105,8 +100,7 @@ nn::Result<InferConfig> parse_args(int argc, char *argv[])
         }
     }
 
-    if (!has_input)
-        NN_FAIL("请指定图片文件或目录，使用 --help 查看用法");
+    if (!has_input) NN_FAIL("请指定图片文件或目录，使用 --help 查看用法");
     return cfg;
 }
 
@@ -119,9 +113,9 @@ struct Prediction
 
 // 前向：Matrix → engine.from_matrix → model.forward → engine.to_matrix
 // 后续 softmax / top-k 在 CPU 上完成（单张图片，开销可忽略）
-nn::Result<std::vector<Prediction>> predict_with_confidence(
-    nn::Model &model, nn::ComputeEngine &engine,
-    const nn::Matrix &img, int topk)
+nn::Result<std::vector<Prediction>> predict_with_confidence(nn::Model& model,
+                                                            nn::ComputeEngine& engine,
+                                                            const nn::Matrix& img, int topk)
 {
     auto x_tensor_r = engine.from_matrix(img);
     NN_TRY_CHECK(x_tensor_r);
@@ -129,7 +123,7 @@ nn::Result<std::vector<Prediction>> predict_with_confidence(
     NN_TRY_CHECK(logits_tensor_r);
     auto logits_r = engine.to_matrix(*logits_tensor_r);
     NN_TRY_CHECK(logits_r);
-    const auto &logits = *logits_r;
+    const auto& logits = *logits_r;
 
     // Softmax 计算概率
     Scalar max_val = logits.at_unchecked(0, 0);
@@ -146,12 +140,12 @@ nn::Result<std::vector<Prediction>> predict_with_confidence(
     // 防御：logits 全为 -inf 时 sum_exp == 0，回退为均匀分布避免 NaN
     if (!(sum_exp > 0.0) || !std::isfinite(sum_exp))
     {
-        for (auto &p : probs)
+        for (auto& p : probs)
             p = Scalar{1} / static_cast<Scalar>(nn::MNIST_NUM_CLASSES);
     }
     else
     {
-        for (auto &p : probs)
+        for (auto& p : probs)
             p /= sum_exp;
     }
 
@@ -169,7 +163,7 @@ nn::Result<std::vector<Prediction>> predict_with_confidence(
 }
 
 // ==================== 显示像素矩阵 ====================
-void show_pixels(const nn::Matrix &img)
+void show_pixels(const nn::Matrix& img)
 {
     for (int r = 0; r < 28; ++r)
     {
@@ -177,25 +171,20 @@ void show_pixels(const nn::Matrix &img)
         for (int c = 0; c < 28; ++c)
         {
             Scalar val = img.at_unchecked(r * 28 + c, 0);
-            if (val > 0.5)
-                std::cout << "##";
-            else if (val > 0.1)
-                std::cout << "..";
-            else
-                std::cout << "  ";
+            if (val > 0.5) std::cout << "##";
+            else if (val > 0.1) std::cout << "..";
+            else std::cout << "  ";
         }
         std::cout << "\n";
     }
 }
 
 // ==================== 推理单张图片 ====================
-nn::Result<void> infer_single(
-    nn::Model &model, nn::ComputeEngine &engine,
-    const std::string &filepath, const InferConfig &cfg)
+nn::Result<void> infer_single(nn::Model& model, nn::ComputeEngine& engine,
+                              const std::string& filepath, const InferConfig& cfg)
 {
     std::ifstream file(filepath);
-    if (!file)
-        NN_FAIL("无法打开文件: " + filepath);
+    if (!file) NN_FAIL("无法打开文件: " + filepath);
     std::string line;
     std::getline(file, line);
     auto img_result = nn::load_image_from_csv_line(line);
@@ -215,15 +204,15 @@ nn::Result<void> infer_single(
     for (std::size_t k = 0; k < results->size(); ++k)
     {
         if (k > 0) std::cout << "  ";
-        std::cout << (*results)[k].digit
-                  << " (" << std::fixed << std::setprecision(1) << (*results)[k].confidence * 100.0 << "%)";
+        std::cout << (*results)[k].digit << " (" << std::fixed << std::setprecision(1)
+                  << (*results)[k].confidence * 100.0 << "%)";
     }
     std::cout << std::endl;
     return {};
 }
 
 // ==================== 主函数 ====================
-int main(int argc, char *argv[])
+int main(int argc, char* argv[])
 {
     auto cfg_result = parse_args(argc, argv);
     NN_EXIT(cfg_result, 1, "参数错误: ");
@@ -237,18 +226,9 @@ int main(int argc, char *argv[])
     NN_EXIT(role_r, 1, "读取模型文件失败: ");
 
     // 支持的模型类型：MLP、Transformer（ViT）、CNN
-    if (spec.is_mlp())
-    {
-        std::cout << "从模型文件读取规格: MLP\n";
-    }
-    else if (spec.is_transformer())
-    {
-        std::cout << "从模型文件读取规格: Transformer (ViT)\n";
-    }
-    else if (spec.is_cnn())
-    {
-        std::cout << "从模型文件读取规格: CNN (LeNet)\n";
-    }
+    if (spec.is_mlp()) { std::cout << "从模型文件读取规格: MLP\n"; }
+    else if (spec.is_transformer()) { std::cout << "从模型文件读取规格: Transformer (ViT)\n"; }
+    else if (spec.is_cnn()) { std::cout << "从模型文件读取规格: CNN (LeNet)\n"; }
     else
     {
         std::cerr << "不支持的模型类型 (type=" << spec.type_name() << ")\n";
@@ -272,8 +252,9 @@ int main(int argc, char *argv[])
     {
         auto load_result = nn::load_any_model(cfg.model_path, model, nullptr, nullptr);
         NN_EXIT(load_result, 1, "加载模型失败: ");
-        std::cout << "模型已加载（角色: " << nn::model_role_name(*role_r) << "）: "
-                  << cfg.model_path << "\n" << std::endl;
+        std::cout << "模型已加载（角色: " << nn::model_role_name(*role_r)
+                  << "）: " << cfg.model_path << "\n"
+                  << std::endl;
     }
 
     // 推理模式：BatchNorm 使用保存的 running 统计量（batch 可能为 1，不能算 batch 统计）
@@ -285,10 +266,9 @@ int main(int argc, char *argv[])
     {
         // 批量推理
         std::vector<fs::path> csv_files;
-        for (auto &entry : fs::directory_iterator(input))
+        for (auto& entry : fs::directory_iterator(input))
         {
-            if (entry.path().extension() == ".csv")
-                csv_files.push_back(entry.path());
+            if (entry.path().extension() == ".csv") csv_files.push_back(entry.path());
         }
         std::sort(csv_files.begin(), csv_files.end());
 
@@ -300,10 +280,14 @@ int main(int argc, char *argv[])
 
         std::cout << "找到 " << csv_files.size() << " 个文件\n" << std::endl;
 
-        for (auto &f : csv_files)
+        for (auto& f : csv_files)
         {
             auto result = infer_single(model, *engine, f.string(), cfg);
-            if (!result) { std::cerr << "推理失败: " << f.filename().string() << ": " << result.error().message << '\n'; }
+            if (!result)
+            {
+                std::cerr << "推理失败: " << f.filename().string() << ": " << result.error().message
+                          << '\n';
+            }
         }
 
         std::cout << "\n共推理 " << csv_files.size() << " 张图片" << std::endl;

@@ -55,12 +55,11 @@ public:
               std::span<const nn::Tensor> optimizer_blobs, std::ostream& err)
     {
         const nn::CheckpointState ckpt{&state, optimizer_blobs};
-        auto r = nn::save_model(path, model, spec, tokenizer_bytes,
-                                nn::ModelRole::Checkpoint, ckpt);
+        auto r =
+            nn::save_model(path, model, spec, tokenizer_bytes, nn::ModelRole::Checkpoint, ckpt);
         if (r) return;
         ++failures_;
-        err << "\n  [ckpt] 保存失败（第 " << failures_ << " 次）: " << r.error().message
-            << "\n";
+        err << "\n  [ckpt] 保存失败（第 " << failures_ << " 次）: " << r.error().message << "\n";
     }
 
     // 状态导出失败等"这一份断点没写出去"的事件：与写失败同一记账口径
@@ -90,10 +89,9 @@ private:
 // ── 推理模型产出（Model 角色）──────────────────────────────────────────
 // 只含推理所需参数（三值层写打包形态 + τ）；失败即失败：写不出去 = 这一轮训练
 // 对用户没有产出，调用方据此非零退出。
-[[nodiscard]] inline nn::Result<void> save_text_train_model(
-    const std::string& path, nn::Model& model, const nn::ModelSpec& spec,
-    const std::string& tokenizer_bytes)
-{
-    return nn::save_model(path, model, spec, tokenizer_bytes, nn::ModelRole::Model);
-}
+[[nodiscard]] inline nn::Result<void> save_text_train_model(const std::string& path,
+                                                            nn::Model& model,
+                                                            const nn::ModelSpec& spec,
+                                                            const std::string& tokenizer_bytes)
+{ return nn::save_model(path, model, spec, tokenizer_bytes, nn::ModelRole::Model); }
 } // namespace nn::cli

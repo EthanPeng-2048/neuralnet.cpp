@@ -63,7 +63,8 @@ inline const bool g_enabled = ::nn::detail::env_flag_raw("NN_PROFILE") ||
                               !::nn::detail::env_string_raw("NN_PROFILE_TRACE").empty();
 inline const std::string g_trace_path = ::nn::detail::env_string_raw("NN_PROFILE_TRACE");
 
-[[nodiscard]] inline bool enabled() noexcept { return g_enabled; }
+[[nodiscard]] inline bool enabled() noexcept
+{ return g_enabled; }
 
 // ── 聚合桶 ──────────────────────────────────────────────────────────────────
 struct Bucket
@@ -86,8 +87,7 @@ namespace detail
 {
 
 // key = 字符串字面量地址（见文件头"命名约束"）
-using StageMap = std::unordered_map<std::string_view,
-                    std::unordered_map<std::string_view, Bucket>>;
+using StageMap = std::unordered_map<std::string_view, std::unordered_map<std::string_view, Bucket>>;
 
 // Chrome trace 逐事件（仅 NN_PROFILE_TRACE 时记录）
 struct Event
@@ -102,7 +102,7 @@ struct Event
 struct State
 {
     std::mutex mu;
-    StageMap stages;                                        // stage → op → 桶（op=="" = stage 本身）
+    StageMap stages; // stage → op → 桶（op=="" = stage 本身）
     std::unordered_map<std::string_view, DeviceBucket> device;
     // per-key 归因（"shader_key@label@stage" → 桶）：device 表按 label 聚合后
     // 看不出 fused@fwd.blk 这类大桶由哪些结构贡献——此表把逐 dispatch 的
@@ -124,8 +124,8 @@ inline State& state()
 //   入口）天然不重复计数。
 struct Frame
 {
-    const char* stage;         // 静态字符串；op 帧沿用最内层 stage
-    const char* op;            // nullptr = 纯 stage 帧
+    const char* stage; // 静态字符串；op 帧沿用最内层 stage
+    const char* op; // nullptr = 纯 stage 帧
     std::uint64_t start_ns;
     std::uint64_t child_ns;
 };
@@ -138,18 +138,17 @@ inline std::vector<Frame>& stack()
 
 [[nodiscard]] inline std::uint64_t now_ns() noexcept
 {
-    return static_cast<std::uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count());
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                          std::chrono::steady_clock::now().time_since_epoch())
+                                          .count());
 }
 
-inline void accumulate(const char* stage, const char* op,
-                       std::uint64_t incl_ns, std::uint64_t excl_ns)
+inline void accumulate(const char* stage, const char* op, std::uint64_t incl_ns,
+                       std::uint64_t excl_ns)
 {
     State& s = state();
     std::lock_guard<std::mutex> lock(s.mu);
-    Bucket& b = s.stages[stage][op != nullptr ? std::string_view(op)
-                                              : std::string_view()];
+    Bucket& b = s.stages[stage][op != nullptr ? std::string_view(op) : std::string_view()];
     ++b.calls;
     b.incl_ns += incl_ns;
     b.excl_ns += excl_ns;
@@ -159,13 +158,13 @@ inline void accumulate(const char* stage, const char* op,
 // ── Chrome trace ────────────────────────────────────────────────────────────
 inline std::uint32_t current_tid() noexcept
 {
-    thread_local const std::uint32_t hashed = static_cast<std::uint32_t>(
-        std::hash<std::thread::id>{}(std::this_thread::get_id()));
+    thread_local const std::uint32_t hashed =
+        static_cast<std::uint32_t>(std::hash<std::thread::id>{}(std::this_thread::get_id()));
     return hashed;
 }
 
-inline void trace_event(const char* name, const char* cat,
-                        std::uint64_t ts_us, std::uint64_t dur_us)
+inline void trace_event(const char* name, const char* cat, std::uint64_t ts_us,
+                        std::uint64_t dur_us)
 {
     if (g_trace_path.empty()) return;
     State& s = state();
@@ -173,7 +172,7 @@ inline void trace_event(const char* name, const char* cat,
     s.trace.push_back(Event{name, cat, ts_us, dur_us, current_tid()});
 }
 
-}   // namespace detail
+} // namespace detail
 
 // ── 动态名驻留（层号等非字面量名）──────────────────────────────────────────
 //   返回 "prefix#idx" 的稳定 const char*（首次生成后驻留，之后零分配）；
@@ -181,7 +180,7 @@ inline void trace_event(const char* name, const char* cat,
 [[nodiscard]] inline const char* interned(const char* prefix, std::size_t idx)
 {
     static std::mutex mu;
-    static std::deque<std::string> pool;                       // 地址稳定
+    static std::deque<std::string> pool; // 地址稳定
     static std::unordered_map<std::string, const char*> seen;
     std::string key = std::string(prefix) + "#" + std::to_string(idx);
     std::lock_guard<std::mutex> lock(mu);
@@ -208,7 +207,7 @@ inline void trace_event(const char* name, const char* cat,
 [[nodiscard]] inline const char* interned_pair(const char* a, const char* b)
 {
     static std::mutex mu;
-    static std::deque<std::string> pool;                       // 地址稳定
+    static std::deque<std::string> pool; // 地址稳定
     static std::unordered_map<std::string, const char*> seen;
     std::string key = std::string(a) + "@" + b;
     std::lock_guard<std::mutex> lock(mu);
@@ -226,13 +225,11 @@ inline void trace_event(const char* name, const char* cat,
 //   必须拷进稳定池才能当聚合表 key（见文件头"命名约束"）。suffix 单列是为了
 //   让调用点零分配传细 tile 变体（detail=shader_name、suffix="#f"）。
 //   产出 "detail[suffix]@label[@stage]"；仅剖析开启时被调用。
-[[nodiscard]] inline const char* interned_detail(std::string_view detail,
-                                                 const char* suffix,
-                                                 const char* label,
-                                                 const char* stage)
+[[nodiscard]] inline const char* interned_detail(std::string_view detail, const char* suffix,
+                                                 const char* label, const char* stage)
 {
     static std::mutex mu;
-    static std::deque<std::string> pool;                       // 地址稳定
+    static std::deque<std::string> pool; // 地址稳定
     static std::unordered_map<std::string, const char*> seen;
     std::string key(detail);
     if (suffix != nullptr && suffix[0] != '\0') key += suffix;
@@ -254,7 +251,8 @@ inline void trace_event(const char* name, const char* cat,
 
 // ── RAII 计时器 ─────────────────────────────────────────────────────────────
 
-namespace detail {
+namespace detail
+{
 
 // 收掉栈顶帧并记账（Scope::stop 与 Phase::stop 共用）。
 // 幂等契约：name != nullptr 表示"本句柄仍持有一个未结束的段"；收口后置空
@@ -369,8 +367,7 @@ private:
 // ── 设备侧回填（Vulkan timestamp query 解析后调用）─────────────────────────
 //   detail：可选的 per-key 归因串（已驻留，见 interned_detail）——非空时同时
 //   计入 device_keys 表；device 表口径不变。
-inline void device_add(const char* name, std::uint64_t ns,
-                       const char* detail = nullptr)
+inline void device_add(const char* name, std::uint64_t ns, const char* detail = nullptr)
 {
     if (!g_enabled) return;
     detail::State& s = detail::state();
@@ -391,10 +388,8 @@ inline void device_add(const char* name, std::uint64_t ns,
 // ── 宏（__LINE__ 拼接出唯一变量名）──────────────────────────────────────────
 #define NN_PROF_CONCAT_(a, b) a##b
 #define NN_PROF_CONCAT(a, b) NN_PROF_CONCAT_(a, b)
-#define NN_PROF_SCOPE(name) \
-    ::nn::prof::Scope NN_PROF_CONCAT(nn_prof_scope_, __LINE__)(name)
-#define NN_PROF_OP(name) \
-    ::nn::prof::Op NN_PROF_CONCAT(nn_prof_op_, __LINE__)(name)
+#define NN_PROF_SCOPE(name) ::nn::prof::Scope NN_PROF_CONCAT(nn_prof_scope_, __LINE__)(name)
+#define NN_PROF_OP(name) ::nn::prof::Op NN_PROF_CONCAT(nn_prof_op_, __LINE__)(name)
 
 // ── 报告 ────────────────────────────────────────────────────────────────────
 //   out        : 打表文件（默认 stderr）
@@ -407,7 +402,7 @@ void dump(std::FILE* out, std::uint64_t wall_ns = 0, bool reset = false);
 //   时也会自动调用它）。
 void write_trace(const std::string& path);
 
-}   // namespace nn::prof
+} // namespace nn::prof
 
 // ── dump / write_trace 实现（放头尾部，header-only 需 inline）───────────────
 namespace nn::prof
@@ -437,17 +432,16 @@ inline void write_trace(const std::string& path)
     bool first = true;
     for (const auto& e : events)
     {
-        std::fprintf(f, "%s{\"name\":\"%s\",\"cat\":\"%s\",\"ph\":\"X\","
-                        "\"ts\":%llu,\"dur\":%llu,\"pid\":0,\"tid\":%u}",
-                     first ? "" : ",", e.name, e.cat,
-                     static_cast<unsigned long long>(e.ts_us),
+        std::fprintf(f,
+                     "%s{\"name\":\"%s\",\"cat\":\"%s\",\"ph\":\"X\","
+                     "\"ts\":%llu,\"dur\":%llu,\"pid\":0,\"tid\":%u}",
+                     first ? "" : ",", e.name, e.cat, static_cast<unsigned long long>(e.ts_us),
                      static_cast<unsigned long long>(e.dur_us), e.tid);
         first = false;
     }
     std::fprintf(f, "]}\n");
     std::fclose(f);
-    std::fprintf(stderr, "[profile] trace 已写入 %s（%zu 事件）\n",
-                 path.c_str(), events.size());
+    std::fprintf(stderr, "[profile] trace 已写入 %s（%zu 事件）\n", path.c_str(), events.size());
 }
 
 inline void dump(std::FILE* out, std::uint64_t wall_ns, bool reset)
@@ -470,8 +464,7 @@ inline void dump(std::FILE* out, std::uint64_t wall_ns, bool reset)
 
     // ── 表 1：stage（inclusive = 阶段墙钟；% 相对墙钟，嵌套阶段可读）──────
     std::fprintf(out, "[profile] ── 阶段构成（inclusive 墙钟）──\n");
-    std::fprintf(out, "[profile] %-28s %10s %8s %12s\n",
-                 "stage", "ms", "%wall", "calls");
+    std::fprintf(out, "[profile] %-28s %10s %8s %12s\n", "stage", "ms", "%wall", "calls");
     // 收集 stage 行（op 键为空串 = stage 本身），按耗时降序
     std::vector<std::pair<std::string_view, Bucket>> stage_rows;
     std::uint64_t stage_sum = 0;
@@ -483,25 +476,22 @@ inline void dump(std::FILE* out, std::uint64_t wall_ns, bool reset)
         stage_sum += it->second.incl_ns;
     }
     std::sort(stage_rows.begin(), stage_rows.end(),
-              [](const auto& a, const auto& b)
-              { return a.second.incl_ns > b.second.incl_ns; });
+              [](const auto& a, const auto& b) { return a.second.incl_ns > b.second.incl_ns; });
     for (const auto& [st, b] : stage_rows)
     {
         const double ms = static_cast<double>(b.incl_ns) / 1e6;
         // 分母 = 调用方给的墙钟；没给墙钟时退回 stage 合计
-        const double denom = wall_ns > 0 ? static_cast<double>(wall_ns)
-                                         : static_cast<double>(stage_sum);
-        const double pct = denom > 0
-            ? 100.0 * static_cast<double>(b.incl_ns) / denom : 0.0;
-        std::fprintf(out, "[profile] %-28s %10.2f %7.1f%% %12llu\n",
-                     std::string(st).c_str(), ms, pct,
-                     static_cast<unsigned long long>(b.calls));
+        const double denom =
+            wall_ns > 0 ? static_cast<double>(wall_ns) : static_cast<double>(stage_sum);
+        const double pct = denom > 0 ? 100.0 * static_cast<double>(b.incl_ns) / denom : 0.0;
+        std::fprintf(out, "[profile] %-28s %10.2f %7.1f%% %12llu\n", std::string(st).c_str(), ms,
+                     pct, static_cast<unsigned long long>(b.calls));
     }
 
     // ── 表 2：op 跨 stage 汇总（exclusive = 净归属）────────────────────────
     std::fprintf(out, "[profile] ── 原语净归属（exclusive，跨 stage 汇总）──\n");
-    std::fprintf(out, "[profile] %-24s %10s %12s %10s %8s\n",
-                 "op", "ms", "calls", "avg_us", "%wall");
+    std::fprintf(out, "[profile] %-24s %10s %12s %10s %8s\n", "op", "ms", "calls", "avg_us",
+                 "%wall");
     std::unordered_map<std::string_view, Bucket> op_rollup;
     for (const auto& [st, ops] : stages)
     {
@@ -516,27 +506,24 @@ inline void dump(std::FILE* out, std::uint64_t wall_ns, bool reset)
             if (b.max_ns > r.max_ns) r.max_ns = b.max_ns;
         }
     }
-    std::vector<std::pair<std::string_view, Bucket>> op_rows(op_rollup.begin(),
-                                                             op_rollup.end());
+    std::vector<std::pair<std::string_view, Bucket>> op_rows(op_rollup.begin(), op_rollup.end());
     std::sort(op_rows.begin(), op_rows.end(),
-              [](const auto& a, const auto& b)
-              { return a.second.excl_ns > b.second.excl_ns; });
+              [](const auto& a, const auto& b) { return a.second.excl_ns > b.second.excl_ns; });
     for (const auto& [op, b] : op_rows)
     {
         const double ms = static_cast<double>(b.excl_ns) / 1e6;
-        const double avg_us = b.calls > 0
-            ? static_cast<double>(b.excl_ns) / 1e3 / static_cast<double>(b.calls) : 0.0;
-        const double pctw = wall_ns > 0
-            ? 100.0 * static_cast<double>(b.excl_ns) / static_cast<double>(wall_ns) : 0.0;
-        std::fprintf(out, "[profile] %-24s %10.2f %12llu %10.1f %7.1f%%\n",
-                     std::string(op).c_str(), ms,
-                     static_cast<unsigned long long>(b.calls), avg_us, pctw);
+        const double avg_us =
+            b.calls > 0 ? static_cast<double>(b.excl_ns) / 1e3 / static_cast<double>(b.calls) : 0.0;
+        const double pctw =
+            wall_ns > 0 ? 100.0 * static_cast<double>(b.excl_ns) / static_cast<double>(wall_ns)
+                        : 0.0;
+        std::fprintf(out, "[profile] %-24s %10.2f %12llu %10.1f %7.1f%%\n", std::string(op).c_str(),
+                     ms, static_cast<unsigned long long>(b.calls), avg_us, pctw);
     }
 
     // ── 表 3：stage × op 明细（top 40，exclusive 降序）────────────────────
     std::fprintf(out, "[profile] ── stage × op 明细（exclusive，top 40）──\n");
-    std::fprintf(out, "[profile] %-28s %-20s %10s %12s\n",
-                 "stage", "op", "ms", "calls");
+    std::fprintf(out, "[profile] %-28s %-20s %10s %12s\n", "stage", "op", "ms", "calls");
     std::vector<std::pair<std::string, Bucket>> mix_rows;
     for (const auto& [st, ops] : stages)
     {
@@ -547,16 +534,14 @@ inline void dump(std::FILE* out, std::uint64_t wall_ns, bool reset)
         }
     }
     std::sort(mix_rows.begin(), mix_rows.end(),
-              [](const auto& a, const auto& b)
-              { return a.second.excl_ns > b.second.excl_ns; });
+              [](const auto& a, const auto& b) { return a.second.excl_ns > b.second.excl_ns; });
     for (std::size_t i = 0; i < mix_rows.size() && i < 40; ++i)
     {
         const auto& [key, b] = mix_rows[i];
         const auto pos = key.find("::");
         const std::string st = key.substr(0, pos);
         std::fprintf(out, "[profile] %-28s %-20s %10.2f %12llu\n",
-                     st.empty() ? "(step 外)" : st.c_str(),
-                     key.substr(pos + 2).c_str(),
+                     st.empty() ? "(step 外)" : st.c_str(), key.substr(pos + 2).c_str(),
                      static_cast<double>(b.excl_ns) / 1e6,
                      static_cast<unsigned long long>(b.calls));
     }
@@ -565,8 +550,7 @@ inline void dump(std::FILE* out, std::uint64_t wall_ns, bool reset)
     if (!device.empty())
     {
         std::fprintf(out, "[profile] ── GPU 设备侧 kernel（timestamp query）──\n");
-        std::fprintf(out, "[profile] %-28s %10s %12s %10s\n",
-                     "kernel", "ms", "calls", "avg_us");
+        std::fprintf(out, "[profile] %-28s %10s %12s %10s\n", "kernel", "ms", "calls", "avg_us");
         std::uint64_t dev_sum = 0;
         std::vector<std::pair<std::string_view, DeviceBucket>> dev_rows;
         for (const auto& [name, b] : device)
@@ -574,24 +558,22 @@ inline void dump(std::FILE* out, std::uint64_t wall_ns, bool reset)
             dev_rows.emplace_back(name, b);
             dev_sum += b.total_ns;
         }
-        std::sort(dev_rows.begin(), dev_rows.end(),
-                  [](const auto& a, const auto& b)
+        std::sort(dev_rows.begin(), dev_rows.end(), [](const auto& a, const auto& b)
                   { return a.second.total_ns > b.second.total_ns; });
         for (const auto& [name, b] : dev_rows)
         {
-            std::fprintf(out, "[profile] %-28s %10.2f %12llu %10.1f\n",
-                         std::string(name).c_str(),
-                         static_cast<double>(b.total_ns) / 1e6,
-                         static_cast<unsigned long long>(b.calls),
-                         b.calls > 0 ? static_cast<double>(b.total_ns) / 1e3
-                                         / static_cast<double>(b.calls) : 0.0);
+            std::fprintf(
+                out, "[profile] %-28s %10.2f %12llu %10.1f\n", std::string(name).c_str(),
+                static_cast<double>(b.total_ns) / 1e6, static_cast<unsigned long long>(b.calls),
+                b.calls > 0 ? static_cast<double>(b.total_ns) / 1e3 / static_cast<double>(b.calls)
+                            : 0.0);
         }
         if (wall_ns > 0)
         {
-            std::fprintf(out, "[profile] GPU busy%% = %.1f%%（设备 kernel %.2f ms / 墙钟 %.2f ms）\n",
+            std::fprintf(out,
+                         "[profile] GPU busy%% = %.1f%%（设备 kernel %.2f ms / 墙钟 %.2f ms）\n",
                          100.0 * static_cast<double>(dev_sum) / static_cast<double>(wall_ns),
-                         static_cast<double>(dev_sum) / 1e6,
-                         static_cast<double>(wall_ns) / 1e6);
+                         static_cast<double>(dev_sum) / 1e6, static_cast<double>(wall_ns) / 1e6);
         }
 
         // ── 表 5：per-key 归因（key@label@stage，逐结构细分 top 60）────────
@@ -601,32 +583,29 @@ inline void dump(std::FILE* out, std::uint64_t wall_ns, bool reset)
         if (!device_keys.empty())
         {
             std::fprintf(out, "[profile] ── 设备侧 per-key 归因（key@label@stage，top 60）──\n");
-            std::fprintf(out, "[profile] %-52s %10s %12s %10s\n",
-                         "key@label@stage", "ms", "calls", "avg_us");
-            std::vector<std::pair<std::string_view, DeviceBucket>> key_rows(
-                device_keys.begin(), device_keys.end());
-            std::sort(key_rows.begin(), key_rows.end(),
-                      [](const auto& a, const auto& b)
+            std::fprintf(out, "[profile] %-52s %10s %12s %10s\n", "key@label@stage", "ms", "calls",
+                         "avg_us");
+            std::vector<std::pair<std::string_view, DeviceBucket>> key_rows(device_keys.begin(),
+                                                                            device_keys.end());
+            std::sort(key_rows.begin(), key_rows.end(), [](const auto& a, const auto& b)
                       { return a.second.total_ns > b.second.total_ns; });
             for (std::size_t i = 0; i < key_rows.size() && i < 60; ++i)
             {
                 const auto& [name, b] = key_rows[i];
                 std::fprintf(out, "[profile] %-52s %10.2f %12llu %10.1f\n",
-                             std::string(name).c_str(),
-                             static_cast<double>(b.total_ns) / 1e6,
+                             std::string(name).c_str(), static_cast<double>(b.total_ns) / 1e6,
                              static_cast<unsigned long long>(b.calls),
-                             b.calls > 0 ? static_cast<double>(b.total_ns) / 1e3
-                                             / static_cast<double>(b.calls) : 0.0);
+                             b.calls > 0 ? static_cast<double>(b.total_ns) / 1e3 /
+                                               static_cast<double>(b.calls)
+                                         : 0.0);
             }
             if (key_rows.size() > 60)
-                std::fprintf(out, "[profile]（共 %zu 条，仅显示 top 60）\n",
-                             key_rows.size());
+                std::fprintf(out, "[profile]（共 %zu 条，仅显示 top 60）\n", key_rows.size());
         }
     }
 
     if (wall_ns > 0)
-        std::fprintf(out, "[profile] 墙钟合计 %.2f ms\n",
-                     static_cast<double>(wall_ns) / 1e6);
+        std::fprintf(out, "[profile] 墙钟合计 %.2f ms\n", static_cast<double>(wall_ns) / 1e6);
     std::fprintf(out, "[profile] ════════════════════════\n");
     std::fflush(out);
 
@@ -644,4 +623,4 @@ inline void dump(std::FILE* out, std::uint64_t wall_ns, bool reset)
     }
 }
 
-}   // namespace nn::prof
+} // namespace nn::prof

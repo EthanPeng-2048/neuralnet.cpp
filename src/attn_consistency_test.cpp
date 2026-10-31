@@ -28,18 +28,18 @@
 #include <string>
 #include <vector>
 
-using nn::Scalar;
-using nn::Matrix;
-using nn::Tensor;
 using nn::ComputeEngine;
 using nn::GPTModel;
+using nn::Matrix;
 using nn::PosEncodingType;
+using nn::Scalar;
+using nn::Tensor;
 
-namespace {
+namespace
+{
 
 // ── 辅助：从 (vocab, seq) logits 矩阵取第 col 列 → 向量 ──
-std::vector<Scalar> extract_logits_column(
-    const Matrix& logits, std::size_t col)
+std::vector<Scalar> extract_logits_column(const Matrix& logits, std::size_t col)
 {
     const std::size_t vocab = logits.rows();
     std::vector<Scalar> out(vocab);
@@ -50,9 +50,7 @@ std::vector<Scalar> extract_logits_column(
 
 // ── 辅助：从 (vocab, 1) logits 矩阵取第 0 列 → 向量 ──
 std::vector<Scalar> extract_logits_single(const Matrix& logits)
-{
-    return extract_logits_column(logits, 0);
-}
+{ return extract_logits_column(logits, 0); }
 
 // ── 辅助：两个向量的最大绝对差 ──
 Scalar max_abs_diff(const std::vector<Scalar>& a, const std::vector<Scalar>& b)
@@ -83,35 +81,32 @@ void print_vec_head(const std::vector<Scalar>& v, std::size_t n = 8)
 
 // ── 单引擎一致性测试 ──
 // 返回 true 表示通过（forward 与 forward_step 输出一致）
-bool test_consistency(
-    ComputeEngine& engine,
-    const std::string& engine_name,
-    std::size_t seq_len,
-    std::size_t num_layers,
-    PosEncodingType pos_enc,
-    const std::string& pos_enc_name,
-    bool use_batch = true)
+bool test_consistency(ComputeEngine& engine, const std::string& engine_name, std::size_t seq_len,
+                      std::size_t num_layers, PosEncodingType pos_enc,
+                      const std::string& pos_enc_name, bool use_batch = true)
 {
     // 模型超参（小规模，加速测试）
     const std::size_t vocab_size = 100;
-    const std::size_t d_model    = 32;
-    const std::size_t num_heads  = 4;
-    const std::size_t d_ff       = 64;
+    const std::size_t d_model = 32;
+    const std::size_t num_heads = 4;
+    const std::size_t d_ff = 64;
 
     std::cout << "\n────────────────────────────────────────────────────────\n"
-              << "引擎: " << engine_name
-              << " | 位置编码: " << pos_enc_name
-              << " | seq=" << seq_len
-              << " | layers=" << num_layers
-              << " | batch=" << (use_batch ? "on" : "off") << "\n"
+              << "引擎: " << engine_name << " | 位置编码: " << pos_enc_name << " | seq=" << seq_len
+              << " | layers=" << num_layers << " | batch=" << (use_batch ? "on" : "off") << "\n"
               << "────────────────────────────────────────────────────────\n";
 
     // ── 1. 构建模型 ──
     std::cout << "[1/4] 构建 GPTModel..." << std::flush;
-    GPTModel model(
-        vocab_size, d_model, seq_len,
-        num_heads, d_ff, num_layers, pos_enc);
-    { auto r = model.init(engine); if (!r) { std::cerr << "GPTModel init 失败: " << r.error().message << "\n"; return false; } }
+    GPTModel model(vocab_size, d_model, seq_len, num_heads, d_ff, num_layers, pos_enc);
+    {
+        auto r = model.init(engine);
+        if (!r)
+        {
+            std::cerr << "GPTModel init 失败: " << r.error().message << "\n";
+            return false;
+        }
+    }
     std::cout << " 完成\n";
 
     // ── 2. 生成随机 token 序列 ──
@@ -119,7 +114,8 @@ bool test_consistency(
     std::mt19937_64 rng(12345);
     std::uniform_int_distribution<std::size_t> tok_dist(0, vocab_size - 1);
     std::vector<std::size_t> tokens(seq_len);
-    for (auto& t : tokens) t = tok_dist(rng);
+    for (auto& t : tokens)
+        t = tok_dist(rng);
     std::cout << " 完成 (tokens:";
     for (std::size_t i = 0; i < std::min<std::size_t>(8, seq_len); ++i)
         std::cout << " " << tokens[i];
@@ -169,8 +165,8 @@ bool test_consistency(
         std::cout << "\n  ❌ to_matrix 失败: " << fwd_logits_m.error().message << "\n";
         return false;
     }
-    std::cout << " 完成 (logits: " << fwd_logits_m->rows()
-              << " × " << fwd_logits_m->cols() << ")\n";
+    std::cout << " 完成 (logits: " << fwd_logits_m->rows() << " × " << fwd_logits_m->cols()
+              << ")\n";
 
     // ── 4. 逐 token forward_step ──
     std::cout << "[4/4] 运行 forward_step（增量推理）并对比..." << std::flush;
@@ -184,9 +180,17 @@ bool test_consistency(
         k_caches.push_back(engine.create_tensor(seq_len, d_model));
         v_caches.push_back(engine.create_tensor(seq_len, d_model));
         auto r1 = engine.zero(k_caches.back());
-        if (!r1) { std::cout << "\n  ❌ zero(k_cache) 失败\n"; return false; }
+        if (!r1)
+        {
+            std::cout << "\n  ❌ zero(k_cache) 失败\n";
+            return false;
+        }
         auto r2 = engine.zero(v_caches.back());
-        if (!r2) { std::cout << "\n  ❌ zero(v_cache) 失败\n"; return false; }
+        if (!r2)
+        {
+            std::cout << "\n  ❌ zero(v_cache) 失败\n";
+            return false;
+        }
     }
 
     Scalar total_max_diff = Scalar{0};
@@ -199,22 +203,29 @@ bool test_consistency(
         if (use_batch)
         {
             auto br = engine.begin_batch();
-            if (!br) { std::cout << "\n  ❌ begin_batch 失败\n"; return false; }
+            if (!br)
+            {
+                std::cout << "\n  ❌ begin_batch 失败\n";
+                return false;
+            }
         }
 
-        auto step_r = model.forward_step(
-            engine, tokens[i], i, k_caches, v_caches, i);
+        auto step_r = model.forward_step(engine, tokens[i], i, k_caches, v_caches, i);
         if (!step_r)
         {
-            std::cout << "\n  ❌ forward_step 在 pos=" << i
-                      << " 失败: " << step_r.error().message << "\n";
+            std::cout << "\n  ❌ forward_step 在 pos=" << i << " 失败: " << step_r.error().message
+                      << "\n";
             return false;
         }
 
         if (use_batch)
         {
             auto er = engine.end_batch();
-            if (!er) { std::cout << "\n  ❌ end_batch 失败\n"; return false; }
+            if (!er)
+            {
+                std::cout << "\n  ❌ end_batch 失败\n";
+                return false;
+            }
         }
 
         auto step_logits_m = engine.to_matrix(*step_r);
@@ -241,8 +252,8 @@ bool test_consistency(
         if (diff > tolerance)
         {
             all_ok = false;
-            std::cout << "\n  ❌ pos=" << i << " 不一致 (max_diff="
-                      << std::scientific << std::setprecision(4) << diff << ")\n";
+            std::cout << "\n  ❌ pos=" << i << " 不一致 (max_diff=" << std::scientific
+                      << std::setprecision(4) << diff << ")\n";
             std::cout << "    forward:    ";
             print_vec_head(fwd_col);
             std::cout << "\n    forward_step: ";
@@ -252,8 +263,8 @@ bool test_consistency(
     }
 
     std::cout << "\n";
-    std::cout << "  最大绝对误差: " << std::scientific << std::setprecision(6)
-              << total_max_diff << " (位置 " << worst_pos << ")\n";
+    std::cout << "  最大绝对误差: " << std::scientific << std::setprecision(6) << total_max_diff
+              << " (位置 " << worst_pos << ")\n";
     std::cout << "  结果: " << (all_ok ? "✅ 通过" : "❌ 失败") << "\n";
 
     return all_ok;
@@ -317,28 +328,20 @@ int main(int argc, char* argv[])
     bool all_pass = true;
 
     // 测试 1: Learned 位置编码（GPT 默认）
-    all_pass &= test_consistency(
-        *engine, use_gpu ? "GPU" : "CPU",
-        seq_len, num_layers,
-        PosEncodingType::Learned, "Learned", use_batch);
+    all_pass &= test_consistency(*engine, use_gpu ? "GPU" : "CPU", seq_len, num_layers,
+                                 PosEncodingType::Learned, "Learned", use_batch);
 
     // 测试 2: Sinusoidal 位置编码
-    all_pass &= test_consistency(
-        *engine, use_gpu ? "GPU" : "CPU",
-        seq_len, num_layers,
-        PosEncodingType::Sinusoidal, "Sinusoidal", use_batch);
+    all_pass &= test_consistency(*engine, use_gpu ? "GPU" : "CPU", seq_len, num_layers,
+                                 PosEncodingType::Sinusoidal, "Sinusoidal", use_batch);
 
     // 测试 3: ALiBi（无位置嵌入，因果 + 线性偏置）
-    all_pass &= test_consistency(
-        *engine, use_gpu ? "GPU" : "CPU",
-        seq_len, num_layers,
-        PosEncodingType::ALiBi, "ALiBi", use_batch);
+    all_pass &= test_consistency(*engine, use_gpu ? "GPU" : "CPU", seq_len, num_layers,
+                                 PosEncodingType::ALiBi, "ALiBi", use_batch);
 
     // 测试 4: RoPE（旋转位置编码，Q/K 上施加）
-    all_pass &= test_consistency(
-        *engine, use_gpu ? "GPU" : "CPU",
-        seq_len, num_layers,
-        PosEncodingType::RoPE, "RoPE", use_batch);
+    all_pass &= test_consistency(*engine, use_gpu ? "GPU" : "CPU", seq_len, num_layers,
+                                 PosEncodingType::RoPE, "RoPE", use_batch);
 
     std::cout << "\n════════════════════════════════════════\n";
     std::cout << "  总体结果: " << (all_pass ? "✅ 全部通过" : "❌ 存在失败");

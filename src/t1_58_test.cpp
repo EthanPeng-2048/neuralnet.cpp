@@ -51,7 +51,8 @@ std::string g_self;   // argv[0]：子进程自举用
     nn::Matrix m(rows, cols);
     std::mt19937 rng(seed);
     std::uniform_real_distribution<float> d(lo, hi);
-    for (auto& v : m.span()) v = d(rng);
+    for (auto& v : m.span())
+        v = d(rng);
     return upload(eng, m);
 }
 
@@ -76,8 +77,8 @@ void test_precision_set()
     nn::CpuEngine& eng = *eng_owner;
     nn::Linear probe(4, 3);
     const nn::PrecisionSupport sup = probe.precision_support();
-    CHECK(sup.param.mask == r.mask && sup.compute.mask == r.mask &&
-          sup.stable.mask == r.mask && sup.optimizer.mask == r.mask,
+    CHECK(sup.param.mask == r.mask && sup.compute.mask == r.mask && sup.stable.mask == r.mask &&
+              sup.optimizer.mask == r.mask,
           "默认 precision_support() = {f16,f32} × 四槽");
     CHECK(std::string(probe.layer_name()) == "Linear", "Linear::layer_name()");
     (void)eng;
@@ -223,13 +224,13 @@ void ref_quant(double (&tau_ref)[kOUT], double (&wq_ref)[kOUT][kIN])
     for (std::size_t o = 0; o < kOUT; ++o)
     {
         double s = 0.0;
-        for (std::size_t k = 0; k < kIN; ++k) s += std::fabs(static_cast<double>(kRawW[o][k]));
+        for (std::size_t k = 0; k < kIN; ++k)
+            s += std::fabs(static_cast<double>(kRawW[o][k]));
         tau_ref[o] = s / static_cast<double>(kIN);
         for (std::size_t k = 0; k < kIN; ++k)
         {
             const double w = static_cast<double>(kRawW[o][k]);
-            wq_ref[o][k] = (w > 0.5 * tau_ref[o]) ? 1.0
-                         : (w < -0.5 * tau_ref[o]) ? -1.0 : 0.0;
+            wq_ref[o][k] = (w > 0.5 * tau_ref[o]) ? 1.0 : (w < -0.5 * tau_ref[o]) ? -1.0 : 0.0;
         }
     }
 }
@@ -282,8 +283,7 @@ void test_bitlinear_rules()
         {
             const nn::Matrix packed = download(eng, bl.quantized_weights_packed());
             const std::size_t words = nn::trit_pack::words_per_row(IN);
-            CHECK(packed.rows() == OUT && packed.cols() == words,
-                  "打包容器形状 (out, ceil(K/16))");
+            CHECK(packed.rows() == OUT && packed.cols() == words, "打包容器形状 (out, ceil(K/16))");
             for (std::size_t o = 0; o < OUT; ++o)
             {
                 std::vector<std::uint32_t> row(words);
@@ -293,8 +293,7 @@ void test_bitlinear_rules()
                     wq.set_value(o, k, nn::trit_pack::at(row.data(), k));
             }
         }
-        else
-            wq = download(eng, bl.quantized_weights());
+        else wq = download(eng, bl.quantized_weights());
 
         bool exact = true, in_set = true;
         for (std::size_t o = 0; o < OUT; ++o)
@@ -368,7 +367,8 @@ void test_bitlinear_rules()
         for (std::size_t o = 0; o < OUT; ++o)
         {
             double s = 0.0;
-            for (std::size_t b = 0; b < B; ++b) s += static_cast<double>(dv[o][b]);
+            for (std::size_t b = 0; b < B; ++b)
+                s += static_cast<double>(dv[o][b]);
             mxb = std::max(mxb, std::fabs(static_cast<double>(gb.at(o, 0)) - s));
         }
         CHECK(mxb < 1e-5, "db = Σ_batch dY");
@@ -400,9 +400,9 @@ void test_bitlinear_f16_compute()
     constexpr std::size_t IN = kIN, OUT = kOUT, B = kB;
 
     nn::PrecisionProfile prof;
-    prof.param     = nn::Precision::T1_58;
-    prof.compute   = nn::Precision::F16;
-    prof.stable    = nn::Precision::F32;
+    prof.param = nn::Precision::T1_58;
+    prof.compute = nn::Precision::F16;
+    prof.stable = nn::Precision::F32;
     prof.optimizer = nn::Precision::F32;
     nn::BitLinear bl(IN, OUT);
     bl.set_precision_profile(prof);
@@ -437,8 +437,7 @@ void test_bitlinear_f16_compute()
     if (bl.uses_packed_weights())
         CHECK(bl.quantized_weights_packed().precision() == nn::Precision::F32,
               "打包容器是 f32 原始字容器");
-    else
-        CHECK(bl.quantized_weights().precision() == nn::Precision::F16, "wq 缓冲恒 f16");
+    else CHECK(bl.quantized_weights().precision() == nn::Precision::F16, "wq 缓冲恒 f16");
     CHECK(bl.latent_weights().precision() == nn::Precision::F32, "latent 恒 f32（STE 落点）");
 }
 
@@ -454,9 +453,9 @@ void test_spec_roundtrip()
     const nn::Matrix X = known_input_matrix();
 
     nn::ModelSpec spec;
-    auto &sp = spec.emplace<nn::MlpSpec>();
-    sp.layer_dims   = {IN, OUT};
-    sp.norm_type    = nn::NormType::LayerNorm;
+    auto& sp = spec.emplace<nn::MlpSpec>();
+    sp.layer_dims = {IN, OUT};
+    sp.norm_type = nn::NormType::LayerNorm;
     sp.weight_quant = nn::WeightQuant::T1_58;
 
     nn::PrecisionProfile t1;
@@ -508,8 +507,7 @@ void test_spec_roundtrip()
         {
             CHECK(peeked->as<nn::MlpSpec>()->weight_quant == nn::WeightQuant::T1_58,
                   "规格记住 weight_quant=t1_58");
-            CHECK(peeked->as<nn::MlpSpec>()->layer_dims ==
-                      spec.as<nn::MlpSpec>()->layer_dims,
+            CHECK(peeked->as<nn::MlpSpec>()->layer_dims == spec.as<nn::MlpSpec>()->layer_dims,
                   "layer_dims 往返一致");
             CHECK(nn::spec_matches(*peeked, spec), "spec_matches 含 weight_quant 比对");
             CHECK(nn::spec_summary(*peeked).find("wq=t1_58") != std::string::npos,
@@ -549,8 +547,8 @@ void test_spec_roundtrip()
         double mx = 0.0;
         for (std::size_t o = 0; o < OUT; ++o)
             for (std::size_t b = 0; b < B; ++b)
-                mx = std::max(mx, std::fabs(static_cast<double>(Y2.at(o, b))
-                                            - static_cast<double>(Y_ref.at(o, b))));
+                mx = std::max(mx, std::fabs(static_cast<double>(Y2.at(o, b)) -
+                                            static_cast<double>(Y_ref.at(o, b))));
         CHECK(mx == 0.0, "重建 + 加载后前向与保存前**逐位一致**");
     }
     std::remove(file.c_str());
@@ -569,7 +567,8 @@ bool test_training(nn::ComputeEngine& eng, const char* dev)
     for (auto& v : Wt.span())
         v = static_cast<float>(td(rng) - 1) * 0.5f;
     nn::Matrix Xm(IN, B);
-    for (auto& v : Xm.span()) v = ud(rng);
+    for (auto& v : Xm.span())
+        v = ud(rng);
     nn::Matrix Ym(OUT, B);
     Wt.multiply_to(Ym, Xm);   // Ym = Wt·Xm（教师权重**逐元素固定**，不随列变化）
 
@@ -604,18 +603,46 @@ bool test_training(nn::ComputeEngine& eng, const char* dev)
     };
     for (int step = 0; step < STEPS; ++step)
     {
-        if (auto r = model.zero_grad(); !r) { report("zero_grad", r.error().message); return false; }
+        if (auto r = model.zero_grad(); !r)
+        {
+            report("zero_grad", r.error().message);
+            return false;
+        }
         auto pred = model.forward(Xt);
-        if (!pred) { report("forward", pred.error().message); return false; }
+        if (!pred)
+        {
+            report("forward", pred.error().message);
+            return false;
+        }
         auto loss = mse.forward(eng, *pred, Yt);
-        if (!loss) { report("loss", loss.error().message); return false; }
-        if (!std::isfinite(*loss)) { CHECK(false, "loss 非有限"); return false; }
+        if (!loss)
+        {
+            report("loss", loss.error().message);
+            return false;
+        }
+        if (!std::isfinite(*loss))
+        {
+            CHECK(false, "loss 非有限");
+            return false;
+        }
         if (step == 0) first = *loss;
         last = *loss;
         auto grad = mse.backward();
-        if (!grad) { report("loss.backward", "no grad"); return false; }
-        if (auto r = model.backward(*grad); !r) { report("model.backward", r.error().message); return false; }
-        if (auto r = opt->step(); !r) { report("optimizer.step", r.error().message); return false; }
+        if (!grad)
+        {
+            report("loss.backward", "no grad");
+            return false;
+        }
+        if (auto r = model.backward(*grad); !r)
+        {
+            report("model.backward", r.error().message);
+            return false;
+        }
+        if (auto r = opt->step(); !r)
+        {
+            report("optimizer.step", r.error().message);
+            return false;
+        }
     }
     std::printf("    loss: %.6f → %.6f（%d 步）\n", first, last, STEPS);
     CHECK(last < first * 0.7f, "loss 显著下降（量化权重仍可训练）");
@@ -633,15 +660,14 @@ bool test_training(nn::ComputeEngine& eng, const char* dev)
 bool test_preset_t1_58(nn::ComputeEngine& eng, const char* dev)
 {
     std::printf("[9] 精度预设 profile_t1_58()（%s）：字段 + 真的接成 BitLinear\n", dev);
-    const nn::PrecisionProfile t1  = nn::profile_t1_58();
+    const nn::PrecisionProfile t1 = nn::profile_t1_58();
     const nn::PrecisionProfile f16 = nn::profile_f16();
 
     CHECK(t1.param == nn::Precision::T1_58, "预设 param = T1_58");
     CHECK(t1.compute == nn::Precision::F16, "预设 compute = F16（\"其他默认 f16\"）");
     CHECK(t1.stable == nn::Precision::F32, "预设 stable = F32（数值敏感链）");
     CHECK(t1.optimizer == nn::Precision::F32, "预设 optimizer = F32（Adam 的 m/v）");
-    CHECK(t1.compute == f16.compute && t1.stable == f16.stable &&
-              t1.optimizer == f16.optimizer,
+    CHECK(t1.compute == f16.compute && t1.stable == f16.stable && t1.optimizer == f16.optimizer,
           "预设与 --f16 只在 param 槽不同（另三槽逐字段相同 → 不会各自漂移）");
     CHECK(!nn::is_profile_f32(t1), "预设不是全 f32（适配层必须启用）");
 
@@ -677,8 +703,10 @@ bool test_preset_t1_58(nn::ComputeEngine& eng, const char* dev)
     std::mt19937 rng(20261010u);
     std::uniform_real_distribution<float> ud(-1.f, 1.f);
     nn::Matrix Xm(IN, B), Ym(OUT, B);
-    for (auto& v : Xm.span()) v = ud(rng);
-    for (auto& v : Ym.span()) v = ud(rng);
+    for (auto& v : Xm.span())
+        v = ud(rng);
+    for (auto& v : Ym.span())
+        v = ud(rng);
 
     auto opt = nn::create_optimizer("adamw", eng, model.parameters(), model.param_gradients(),
                                     /*lr=*/0.05f, /*wd=*/0.0f, t1);
@@ -699,18 +727,46 @@ bool test_preset_t1_58(nn::ComputeEngine& eng, const char* dev)
     constexpr int STEPS = 60;
     for (int step = 0; step < STEPS; ++step)
     {
-        if (auto r = model.zero_grad(); !r) { report("zero_grad", r.error().message); return false; }
+        if (auto r = model.zero_grad(); !r)
+        {
+            report("zero_grad", r.error().message);
+            return false;
+        }
         auto pred = model.forward(Xt);
-        if (!pred) { report("forward", pred.error().message); return false; }
+        if (!pred)
+        {
+            report("forward", pred.error().message);
+            return false;
+        }
         auto loss = mse.forward(eng, *pred, Yt);
-        if (!loss) { report("loss", loss.error().message); return false; }
-        if (!std::isfinite(*loss)) { CHECK(false, "loss 非有限"); return false; }
+        if (!loss)
+        {
+            report("loss", loss.error().message);
+            return false;
+        }
+        if (!std::isfinite(*loss))
+        {
+            CHECK(false, "loss 非有限");
+            return false;
+        }
         if (step == 0) first = *loss;
         last = *loss;
         auto grad = mse.backward();
-        if (!grad) { report("loss.backward", "no grad"); return false; }
-        if (auto r = model.backward(*grad); !r) { report("model.backward", r.error().message); return false; }
-        if (auto r = opt->step(); !r) { report("optimizer.step", r.error().message); return false; }
+        if (!grad)
+        {
+            report("loss.backward", "no grad");
+            return false;
+        }
+        if (auto r = model.backward(*grad); !r)
+        {
+            report("model.backward", r.error().message);
+            return false;
+        }
+        if (auto r = opt->step(); !r)
+        {
+            report("optimizer.step", r.error().message);
+            return false;
+        }
     }
     std::printf("    loss: %.6f → %.6f（%d 步）\n", first, last, STEPS);
     CHECK(last < first * 0.5f, "预设（三值权重 + f16 存储）训练 loss 下降到一半以下");

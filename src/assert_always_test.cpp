@@ -39,7 +39,8 @@
 
 int g_fail = 0;
 
-namespace {
+namespace
+{
 
 constexpr int kSkip = -1;   // std::system 无法启动子进程（区别于任何真实退出码）
 
@@ -47,7 +48,7 @@ std::string g_self;                              // argv[0]：子进程自举用
 const char* kLogPath = "nn_assert_always_child.log";   // 子进程 stderr 落地
 
 const char* kTagAssert = "NN_ASSERT_ALWAYS failed at";
-const char* kTagFatal  = "NN_FATAL failed at";
+const char* kTagFatal = "NN_FATAL failed at";
 
 int run_self(const char* arg)
 {
@@ -116,8 +117,7 @@ bool has_fatal_line(const std::string& log, const char* tag, const char* msg)
 }
 
 // 一个负例：非零退出 + 打印 tag/file:line/消息
-void check_crash_case(const char* arg, const char* tag, const char* msg,
-                      const char* what)
+void check_crash_case(const char* arg, const char* tag, const char* msg, const char* what)
 {
     const int rc = normalize_rc(run_self(arg));
     if (rc == kSkip) return;
@@ -126,8 +126,7 @@ void check_crash_case(const char* arg, const char* tag, const char* msg,
     const std::string log = read_log();
     const bool ok = has_fatal_line(log, tag, msg);
     CHECK(ok, (std::string(what) + "：stderr 含 tag/file:line/消息").c_str());
-    if (!ok)
-        std::printf("  子进程 stderr 捕获：<<<%s>>>\n", log.c_str());
+    if (!ok) std::printf("  子进程 stderr 捕获：<<<%s>>>\n", log.c_str());
 }
 
 } // namespace
@@ -197,17 +196,14 @@ int main(int argc, char* argv[])
     CHECK(true, "NN_ASSERT_ALWAYS 条件成立时不终止");
 
     // 负例三件（详见文件头）
-    check_crash_case("--crash-matrix-at", kTagFatal,
-                     "MatrixT::at index out of range",
+    check_crash_case("--crash-matrix-at", kTagFatal, "MatrixT::at index out of range",
                      "MatrixT::at 越界 → 非零退出");
     check_crash_case("--crash-model-unbound", kTagFatal,
                      "未绑定引擎（构造时引擎必须由 shared_ptr 管理）",
                      "未绑定 Model::engine() → 非零退出");
-    check_crash_case("--crash-empty-logits", kTagAssert,
-                     "sample_next_token_: empty logits",
+    check_crash_case("--crash-empty-logits", kTagAssert, "sample_next_token_: empty logits",
                      "sample_next_token_ 空 logits → 非零退出");
-    check_crash_case("--crash-layer-uninit", kTagFatal,
-                     "未绑定引擎（先调 init(engine)）",
+    check_crash_case("--crash-layer-uninit", kTagFatal, "未绑定引擎（先调 init(engine)）",
                      "未 init 的层 forward → 非零退出");
 
     std::remove(kLogPath);

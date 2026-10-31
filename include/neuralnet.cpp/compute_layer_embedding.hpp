@@ -59,36 +59,31 @@ private:
     {
         if (grad_table_.valid()) return;
         ComputeEngine& engine = engine_ref();
-        grad_table_ = engine.create_tensor(vocab_size_, d_model_, p_.param,
-                                           InitSpec::zero());
-        NN_UNWRAP(grad_table_.valid(),
-                 "Embedding: 梯度缓冲（惰性）初始化失败");
+        grad_table_ = engine.create_tensor(vocab_size_, d_model_, p_.param, InitSpec::zero());
+        NN_UNWRAP(grad_table_.valid(), "Embedding: 梯度缓冲（惰性）初始化失败");
     }
 
     // 清零 padding 行（覆盖语义：insert_rows 直接写目标行）
     [[nodiscard]] Result<void> clear_padding_row_(Tensor& t)
     {
         if (padding_idx_ < 0) return {};
-        return engine_ref().insert_rows(
-            t, static_cast<std::size_t>(padding_idx_), padding_zero_row_);
+        return engine_ref().insert_rows(t, static_cast<std::size_t>(padding_idx_),
+                                        padding_zero_row_);
     }
 
 public:
     // padding_idx：<0 = 无；否则 ∈ [0, vocab)
-    Embedding(std::size_t vocab_size, std::size_t d_model,
-              std::ptrdiff_t padding_idx = -1)
+    Embedding(std::size_t vocab_size, std::size_t d_model, std::ptrdiff_t padding_idx = -1)
         : vocab_size_(vocab_size), d_model_(d_model), padding_idx_(padding_idx)
     {
         // 前置条件校验（铁律 #1）：构造后仍会使用这些成员 → 无条件终止口径
         NN_ASSERT_ALWAYS(vocab_size > 0, "Embedding: vocab_size 必须 > 0");
         NN_ASSERT_ALWAYS(d_model > 0, "Embedding: d_model 必须 > 0");
-        NN_ASSERT_ALWAYS(padding_idx < 0 ||
-                             static_cast<std::size_t>(padding_idx) < vocab_size,
+        NN_ASSERT_ALWAYS(padding_idx < 0 || static_cast<std::size_t>(padding_idx) < vocab_size,
                          "Embedding: padding_idx 越界（须 < vocab_size 或负数表示无）");
     }
 
-    [[nodiscard]] const char* layer_name() const noexcept override
-    { return "Embedding"; }
+    [[nodiscard]] const char* layer_name() const noexcept override { return "Embedding"; }
 
     [[nodiscard]] std::size_t vocab_size() const noexcept { return vocab_size_; }
     [[nodiscard]] std::size_t d_model() const noexcept { return d_model_; }
@@ -100,10 +95,8 @@ public:
         table_ = engine.create_tensor(vocab_size_, d_model_, p_.param,
                                       InitSpec::normal(Scalar{0}, Scalar{1}, kInitSeed));
         if (!table_.valid()) NN_FAIL("Embedding: 嵌入表初始化失败");
-        padding_zero_row_ =
-            engine.create_tensor(1, d_model_, p_.param, InitSpec::zero());
-        if (!padding_zero_row_.valid())
-            NN_FAIL("Embedding: padding 零行缓冲初始化失败");
+        padding_zero_row_ = engine.create_tensor(1, d_model_, p_.param, InitSpec::zero());
+        if (!padding_zero_row_.valid()) NN_FAIL("Embedding: padding 零行缓冲初始化失败");
         // padding 行强制清零（分布初始化会填值）
         return clear_padding_row_(table_);
     }
@@ -154,8 +147,7 @@ public:
         }
         std::vector<Scalar> f(ids.begin(), ids.end());
         ComputeEngine& engine = engine_ref();
-        NN_TRY(idx, upload_span(engine, 1, ids.size(), Precision::F32,
-                                std::span(f)));
+        NN_TRY(idx, upload_span(engine, 1, ids.size(), Precision::F32, std::span(f)));
         return forward(*idx);
     }
 
@@ -178,8 +170,8 @@ public:
         // padding 行梯度清零（每步；torch 同语义）
         NN_TRY(cpr, clear_padding_row_(grad_table_));
         // 索引梯度 = 零（形状镜像输入）
-        Tensor zero = engine.create_tensor(ids_cache_.rows(), ids_cache_.cols(),
-                                           Precision::F32, InitSpec::zero());
+        Tensor zero = engine.create_tensor(ids_cache_.rows(), ids_cache_.cols(), Precision::F32,
+                                           InitSpec::zero());
         if (!zero.valid()) NN_FAIL("Embedding backward: 零梯度张量分配失败");
         return zero;
     }

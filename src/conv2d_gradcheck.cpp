@@ -20,13 +20,14 @@
 #include <random>
 #include <string>
 
-using nn::Scalar;
-using nn::Matrix;
-using nn::Tensor;
 using nn::ComputeEngine;
 using nn::Conv2D;
+using nn::Matrix;
+using nn::Scalar;
+using nn::Tensor;
 
-namespace {
+namespace
+{
 
 // 独立参考：直接卷积 + im2col 索引（不依赖层内任何实现）
 struct ConvRef
@@ -40,8 +41,8 @@ struct ConvRef
     {
         if (ih < 0 || iw < 0 || ih >= static_cast<long>(H) || iw >= static_cast<long>(W))
             return Scalar{0};
-        return x.at_unchecked(ci * H * W + static_cast<std::size_t>(ih) * W +
-                                  static_cast<std::size_t>(iw), bi);
+        return x.at_unchecked(
+            ci * H * W + static_cast<std::size_t>(ih) * W + static_cast<std::size_t>(iw), bi);
     }
     // forward 输出布局 (C_out*OH*OW, B)
     Matrix fwd() const
@@ -56,8 +57,8 @@ struct ConvRef
                         for (std::size_t ci = 0; ci < C_in; ++ci)
                             for (std::size_t kh = 0; kh < K; ++kh)
                                 for (std::size_t kw = 0; kw < K; ++kw)
-                                    s += w.at_unchecked(co, ci * K * K + kh * K + kw)
-                                       * xv(ci, static_cast<long>(oh) + static_cast<long>(kh),
+                                    s += w.at_unchecked(co, ci * K * K + kh * K + kw) *
+                                         xv(ci, static_cast<long>(oh) + static_cast<long>(kh),
                                             static_cast<long>(ow) + static_cast<long>(kw), bi);
                         out.set_value_unchecked(co * OH * OW + oh * OW + ow, bi, s);
                     }
@@ -130,9 +131,11 @@ int main(int argc, char* argv[])
 
     std::mt19937_64 rng(20260918);
     std::uniform_real_distribution<Scalar> dist(-0.5f, 0.5f);
-    const auto fill = [&](std::size_t r, std::size_t c) {
+    const auto fill = [&](std::size_t r, std::size_t c)
+    {
         Matrix m(r, c);
-        for (std::size_t i = 0; i < m.size(); ++i) m.span()[i] = dist(rng);
+        for (std::size_t i = 0; i < m.size(); ++i)
+            m.span()[i] = dist(rng);
         return m;
     };
 
@@ -151,7 +154,8 @@ int main(int argc, char* argv[])
     ConvRef ref{C_in, C_out, K, H, W, OH, OW, B, fill(C_in * H * W, B), wm, bm};
 
     int failures = 0;
-    const auto report = [&](const char* what, const Matrix& got, const Matrix& want) {
+    const auto report = [&](const char* what, const Matrix& got, const Matrix& want)
+    {
         const Scalar e = max_abs_diff(got, want);
         const bool ok = e < tol;
         std::printf("  %-14s %s  max_abs_diff=%.3e\n", what, ok ? "OK" : "FAIL",

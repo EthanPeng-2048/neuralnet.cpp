@@ -68,6 +68,7 @@ dist/
 
 # ==================== Editors ====================
 .vscode/
+.cache/
 .idea/
 *.swp
 *.swo

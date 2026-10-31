@@ -27,6 +27,7 @@
 
 | 版本 | 主题 |
 |---|---|
+| [v1.14.0](v1.14.0.md) | 训练骨架（`TrainState`/`BatchSource`/`RunDriver`）+ 开放规格（`ModelSpecBase`）+ `Embedding`/`CrossAttention` + 宿主桥公开 API + 全仓格式化基线 |
 | [v1.13.0](v1.13.0.md) | 子仓拆分（core / threadpool / kvrecord / dataset / tokenizer → `extern/` submodule） |
 | [v1.12.0](v1.12.0.md) | RL 与可组合训练基础设施（具名多输出 / experience / objectives / `TrainingGroupSession`） |
 | [v1.11.0](v1.11.0.md) | batch/step 计数语义统一 + 梯度累积归一化修复 |

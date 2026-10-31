@@ -109,16 +109,16 @@ NN_VULKAN_DEVICE=850M ./build/test/bitnet_struct_test --gpu     # 显式选卡
 （命名 / 缩进 4 空格 / include 顺序 / 注释语言），机器可读版本是同目录的 [`.clang-format`](.clang-format)。
 
 ```bash
-# ✅ 推荐：只格式化**你这次改动**的行（历史文件是手工排版的，整文件格式化会产生大 diff）
+# ✅ 推荐：只格式化**你这次改动**的行
 git clang-format                 # 对暂存区相对 HEAD 的改动
 git clang-format --diff          # 只看会改什么
 
-# 单文件（新文件随意；旧文件请确认 diff 可接受）
+# 单文件（新文件随意；旧文件整体跑通常已无 diff）
 clang-format -i path/to/new_file.hpp
 ```
 
-> `.clang-format` 是**目标风格**，不是整仓重排脚本：对现有文件整体跑它约 4 成行会变
-> （仓内 `if (c) stmt;` 单行与两行两种写法都大量存在）。**请不要在功能 PR 里顺手格式化无关文件。**
+> 全仓已于 2026-10-31 按 `.clang-format` **统一格式化**（提交 `5854b98`，子仓同步），
+> 现有代码即基线；新增/改动代码用上面的增量方式保持一致即可。**请不要在功能 PR 里顺手格式化无关文件。**
 > 缩进/行尾/编码这类字符级约定由 [`.editorconfig`](.editorconfig) 与 [`.gitattributes`](.gitattributes) 统一（**全仓 LF**）。
 
 ### 3.3 提交信息
